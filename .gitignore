@@ -80,3 +80,9 @@ __pycache__/
 *.poly
 *.log
 
+
+# Frozen measurement binaries. A finding that quotes ms/q is only reproducible
+# against the binary that produced it, so those get copied aside as
+# bench.<tag>-<date> and kept on disk until the finding is superseded -- but a
+# 53 MB fat binary does not belong in the history.
+bench/bench.*-[0-9]*

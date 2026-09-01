@@ -663,7 +663,7 @@ for geom in "${GEOMS[@]}"; do
     printf '  --- logI %s, J %s  (area %s) ---\n' "$logI" "$J" "$area"
     # Exact-norm width for THIS geometry over the WHOLE projected band, before
     # any sieving. Per geometry because the answer moves with it -- the 2,1139+
-    # septic needs 250 bits at 15e and 257 at 16e -- and over the whole band
+    # octic needs 250 bits at 15e and 257 at 16e -- and over the whole band
     # because the overflowing lattices are a ~1e-5 tail: the per-point sieve
     # windows below are far too short to contain one, and a client in a group
     # sieve is shorter still. This is the moment the width can still be changed,

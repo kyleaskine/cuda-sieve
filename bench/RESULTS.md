@@ -4115,6 +4115,13 @@ confirming finding 65's rule `our rectangle = 2^(J_bits+1) x 2^(I_bits-1)` at
 runs are nested sub-rectangles — one halving `j`, the other halving `i`. Two
 independent nestings, which is what makes the agreement below meaningful.
 
+> **Correction 2026-09-01: "which we still refuse" expired on 2026-08-24.** The
+> slab merge removed the total-area cap under `--pipeline` (the `I*J <= 2^31`
+> refusal is guarded by `!cfg.pipeline`), and `A = 32` has
+> since been sieved — `I16 J65536` in finding 74 and `I=J=2^16` in finding 72.
+> What is still unrun is *this* aspect ratio, `2^17 x 2^15`, which is what a
+> like-for-like rerun of this comparison would need.
+
 ### The rho budget was the whole story
 
 At the **default** `--cof-rounds 2 --cof-budget 65536`, in the identical
@@ -5304,7 +5311,11 @@ Byte-identical relations, `--td-record-scalar` against default, one binary:
 | c194 | I16 J32768, 30 q | 16 | 3,349 | identical |
 | c147 | I14 J8192, 5 q | 1 | 648 | identical |
 | c147 | I14 J65536, 5 q | 2 | 1,297 | identical |
-| **AS276** | **I17 J16384 (A=32), 3 q** | **4** | **246** | **identical** |
+| **AS276** | **I17 J16384, 3 q** | **4** | **246** | **identical** |
+
+(An earlier version of that row labelled the AS276 geometry "(A=32)". It is
+not: `2^17 x 2^14` is `2^31`. Corrected 2026-09-01 — no `2^32` run has been
+through the relation-identity gate.)
 
 The three c194 runs also agree with each other as sorted sets, so slab count
 does not move the relation population either. `--check-relations` rebuilds
@@ -5811,3 +5822,242 @@ counters, or from the model in finding 80, rather than by running trial fills.
 sweeps could bound it (contention out, capacity out) but could not identify it;
 one `ncu` run on a controlled pair did, because it separates what the kernel
 asked for from what the memory system actually moved.
+
+## Finding 82 — `A = 32` at NFS@Home's own aspect ratio runs, slabs 8 ways, and validates: 1,322 of 1,322 relations rebuild both norms exactly
+
+Item 8's remaining doubt was never the area — it was that nobody had run the
+*shape*. Both prior `2^32` runs (finding 74's `I16 J65536`, finding 72's L40 at
+`I=J=2^16`) were performance sweeps at an aspect ratio of our own choosing, and
+neither went through the relation gate. Finding 69's rerun target — NFS@Home's
+`I16e -J 16`, which in our coordinates is `2^17 x 2^15` — had never been sieved
+at all, and finding 69's text still said we refused it.
+
+**Run 2026-09-01, AS276 (C208), 10 special-q from q=80000023, `--logI 17
+--J 32768 --maxbits 17`, `as276.roots1.m17`, `--cofactor`:**
+
+```
+  j-slabbing: 8 slabs, up to 4096 rows/slab
+  bucket array 32768 x 9629 x 4 B = 1.18 GB, shared by both sides
+  first-q validation  side 1: 9996 of 9996 PASS   side 0: 3618 of 3618 PASS
+  1,322 relations, 132.20 per q
+```
+
+`bench --check-relations`: **1,322 of 1,322 rebuild both norms exactly, PASS.**
+
+**The rectangle was confirmed from the relations, not from the flags** — the
+whole point of `relgeom.py`, and the mistake findings 58/63 spent two sessions
+on:
+
+```
+1322 mapped, 0 unmapped     i in [-65477, 65239]   j in [1, 32761]
+rectangle: I = 2^17 x J = 2^15   (observed coverage, so a lower bound)
+```
+
+That is the same extent finding 69 recovered from GGNFS's own output for this
+job (`±65477`, `1 .. 32761`). **`A = 32` at their shape is sieved, gated and
+geometrically confirmed.**
+
+`8 x 2^29` is what the planner picks unaided: `slab_perf_jmax` gives 4096 rows
+at `logI 17`, and the safety bounds do not reduce it. No flag beyond the
+geometry, no `--slab-j`, and the walk state carries across all eight slabs.
+
+**No timing is quoted from this run.** The card was running someone else's job
+at 96-100% throughout, which per finding 53 inflates wall clock without moving
+the `cudaEvent` figures, and the device-wide memory headline is not ours to
+read either. The per-stage setup allocation IS ours and is contention-free:
+**bucket array 1.18 GB, factor bases + bitmaps 1.29, trial division context
+0.09, cofactor queue 0.15 — 2.71 GB of setup.** Sizing this geometry properly
+wants a rerun on an idle card, per the RUNBOOK's own rule about headline versus
+breakdown.
+
+**What this closes and what it does not.** It closes the last correctness
+question in item 8: nothing in the `2^32` path is unexercised, and a 12 GB card
+runs the NFS@Home geometry today. It does not make a like-for-like *performance*
+comparison against NFS@Home — that needs an idle card and a matched q band, and
+it is a different piece of work.
+
+## Finding 83 — item 0's geometry hole closed: the margin is rectangle-invariant at ~3x, and the bigger rectangle is a rel/J loss for BOTH sievers
+
+**Date:** 2026-09-01, RTX 5070 on finding 61's 950 mV curve, 16 `gnfs-lasieve4I15e`
+workers on the 9800X3D, c183 `oracle/input.job`, algebraic special-q, band
+`q = 190M` (above `alim`, so GGNFS cannot trim its base -- both run the identical
+7,605,406 entries). Whole-box watts metered on the UPS, monitors (45 W)
+subtracted. Neither siever ran while the other was on the box; the box was
+otherwise idle apart from a decaying load average in the first minute.
+
+Item 0 recorded three holes: only one geometry had a CPU comparator, there was
+no control at 130M, and the GPU probes ran at host load 1.0-1.9. This closes the
+first and third. **It also refutes the item's own premise.**
+
+### The control reproduced August byte for byte
+
+Arm A re-ran finding 71's exact geometry on today's binary:
+
+```
+md5  bc3fb27c93fd9affec8c50d4927b395f   q190M.rels      (2026-08-20)
+md5  bc3fb27c93fd9affec8c50d4927b395f   gA_logI15.rels  (2026-09-01)
+```
+
+Same 419,946 raw, 419,845 unique, 41.984 per pair. **Every change since
+2026-08-20 -- 12-limb norms, the 4608 fill default, `k_apply`'s launch bounds,
+the warp recorder -- is performance-only on this job**, which nothing had
+verified end to end before.
+
+Time improved 100.95 -> 97.46 ms/pair (-3.5%), which is well short of what
+findings 75, 76 and 77 compound to (-4.6%, -5.7%, -1.09%). Those were all
+measured on **c194 at I16**; this is **c183 at I15e**, half the area and a
+different factor base. Either the gains do not transfer, or the hotter card ate
+them -- the board drew 152.8 W today against 133.5 W in August on the same
+curve, in summer heat. Not separable from one session; do not assume those
+speedups are universal.
+
+### The 2x2
+
+Finding 65's rule -- our rectangle = `2^(J_bits+1) x 2^(I_bits-1)` -- makes
+`gnfs-lasieve4I15e -J 15` the same region as our `--logI 16 --J 16384`, so each
+rectangle has both sievers on it.
+
+| cell | ms/pair | uniq/pair | J/pair | **J/uniq rel** |
+|---|---:|---:|---:|---:|
+| GPU `2^15 x 2^14` | 97.46 | 41.984 | 24.61 | **0.5861** |
+| GPU `2^16 x 2^14` | 180.26 | 62.729 | 46.87 | **0.7471** |
+| CPU `2^15 x 2^14` (`-J 14`) | 301.47 | 41.953 | 71.15 | **1.6959** |
+| CPU `2^16 x 2^14` (`-J 15`) | 546.66 | 62.681 | 129.83 | **2.0713** |
+
+Whole box: GPU 252.5 W and 260 W, CPU 236 W and 237.5 W.
+
+**Yield agrees to 0.07% and 0.08%** -- the same tight matched control finding 71
+achieved, now at two rectangles instead of one. Both sievers find the same
+relations.
+
+| | time | energy |
+|---|---:|---:|
+| advantage at `2^15 x 2^14` | **3.09x** | **2.89x** |
+| advantage at `2^16 x 2^14` | **3.03x** | **2.77x** |
+
+### Doubling the area loses for both, and slightly more for us
+
+| | time | yield | rel/J |
+|---|---:|---:|---:|
+| GPU | 1.850x | 1.494x | **0.785x** |
+| GGNFS | 1.813x | 1.494x | **0.819x** |
+
+**So item 0's assumption was wrong in two ways.** The bigger rectangle is not
+better for us in absolute terms, and we pay slightly *more* than GGNFS to grow
+it. The margin to quote remains each siever at its own best-known shape for this
+job: **~3x time, ~2.8-2.9x energy**, now confirmed on two rectangles.
+
+The identical 1.494x yield on both sievers says the rel/J loss from a bigger
+rectangle is intrinsic to the mathematics -- larger norms, lower yield density --
+not to either implementation.
+
+**This does NOT test item 5's rule**, which is an EQUAL-AREA claim
+(`2^16 x 2^14` against `2^15 x 2^15`, both `2^30`). Item 0's phrase "finding
+65's `2^16 x 2^14` is our better rel/J shape" is sloppy and was read wrongly
+here at first: it is the better of the `2^30` shapes, not better than the `2^29`
+we deploy.
+
+### Still open
+
+No CPU control at 130M. And the GPU's 2.99x in finding 71 was measured on an
+undervolted card at 133.5 W board; the same curve drew 152.8 W today, so
+**ambient temperature moves the energy figure by several percent** and any rel/J
+comparison across sessions needs the board draw quoted with it.
+
+## Finding 84 — item 1 answered on the 5070: fill's knee is per-KERNEL, not per-device. Two concurrent fills run in 84% of serial time, and the gain saturates at two
+
+**Date:** 2026-09-01, RTX 5070, c183 `oracle/input.job` at `--logI 15 --J 16384`,
+`--reps 20`, idle box. Built as `--fill-streams N` in the standalone benchmark
+(`bench_kernels.cu`); the production pipeline is untouched.
+
+Every card swept plateaus at the same ABSOLUTE block count, which looks like a
+device limit -- but the 4090 is **1.80x slower at fill than a 5070 with 1.5x its
+bandwidth** (finding 51's table), which no device limit explains. The `ncu`
+profile showed the mechanism candidate: `waves per SM = 1.00`, so the whole grid
+is resident at once and a block that draws a heavy chunk has no queued block to
+backfill its slot -- **SMs idle for 26.5% of elapsed cycles**.
+
+Three arms, one binary, one geometry, **interleaved with each arm keeping its
+minimum over three passes** -- see the drift note below. Each workspace gets its
+own `plat`, cursor and bucket arrays; `slice` stays shared, as two real
+special-q on one factor base would share it. (`primes` and `roots` are not read
+by `k_fill_atomic` at all; an earlier draft of this finding listed them.)
+
+| arm, N=2 | 3 invocations | per workspace |
+|---|---|---:|
+| CONCURRENT 2 x 4608 on 2 streams | 23.087 / 23.050 / 23.040 ms | **11.53 ms** |
+| SERIAL 2 x 4608 on one stream | 27.194 / 27.073 / 27.202 ms | 13.58 ms |
+| WIDE 1 x 9216, ONE workspace | 12.709 / 12.752 / 12.722 ms | 12.73 ms |
+| single 4608, the standing control | 13.62 / 13.64 / 13.64 ms | 13.63 ms |
+
+**concurrent/serial = 0.8490 / 0.8514 / 0.8470, mean 0.849, spread +-0.2%.**
+
+**The knee is per-kernel.** Doubling ONE kernel's grid recovers 6.6% (13.63 ->
+12.73); running TWO kernels concurrently recovers 15.4%. A single fill kernel
+cannot saturate even this narrow card.
+
+### Arm order was a real confound, worth about one point
+
+The first version of this experiment ran the arms **once each in a fixed order,
+CONCURRENT first**, and read 0.8418 / 0.8219 / 0.8477 / 0.8504, mean 0.840.
+Boost clocks decay across the ~1.3 s each arm spends under load, so the first
+arm is measured at the highest clocks -- a bias pointing exactly at the
+conclusion. Interleaving the arms and taking each one's minimum over three
+passes moves the ratio **0.840 -> 0.849** and tightens the spread from +-1.5%
+to +-0.2%. **The effect is real and the correction is small**, but the original
+number was flattering and every other A/B in this file uses best-of-N for
+precisely this reason.
+
+### It saturates at two streams
+
+| N | concurrent/serial | per workspace |
+|---:|---:|---:|
+| 2 | 0.849 (3 invocations) | 11.53 ms |
+| 4 | 0.843 | 11.53 ms |
+| 8 | refused: needs 10.64 GB, 9.17 GB free | -- |
+
+Four streams give **the same per-workspace time as two**, and WIDE gets *worse*
+past 9216 blocks (18432 costs 13.68 ms against 9216's 12.73). So the idle
+capacity is real but bounded: **one extra independent kernel fills it, a third
+does not exist** -- on this card. N=8 needs a 24 GB+ card to test, which is the
+same card the extrapolation below needs anyway.
+
+### What it is worth, stated honestly
+
+Best single-kernel per workspace is 12.73 ms (9216 blocks); concurrent is 11.53.
+That is **9.4% off fill** at the operating point. Fill is 13.6 of this
+benchmark's 37.3 ms sieve chain and the sieve chain is 61.97 of arm A's 97.46
+ms/q wall (finding 83), i.e. fill is ~23% of wall, so the ceiling on a 5070 is
+roughly **2% of wall** -- against a production change that needs a second bucket
+array (+1.37 GB here) and a restructured per-q loop.
+
+**That is not the reason to care.** The reason is the card this predicts for:
+the 5090 returns only 1.16x on fill for 3.5x the SMs and the 4090 is slower than
+a 5070 outright. If a single kernel leaves 16% idle on the NARROWEST card in the
+set, the idle fraction on a wide one should be much larger, and concurrency is
+the only lever that reaches it. **Re-run this on a 4090 and a 5090 before
+costing any production work** -- that is a two-command check on a rented box and
+it decides whether wide cards are a poor fit for this workload or merely
+underfed.
+
+### Which pairing production would use
+
+The measurement is pairing-agnostic: it shows independent fills overlap, not
+which two. **The two SIDES of one special-q are the cheaper candidate** -- they
+already share the factor bases and run sequentially through one bucket
+allocation today, so pairing them needs no second special-q's host state. Two
+special-q is the symmetric option and doubles more. Neither is worth designing
+until the wide-card numbers exist.
+
+### What this does not model, stated more carefully than the first draft
+
+The workspaces hold **identical plat values**, and the values *are* the walk:
+`pl_first64`/`pl_next64` derive every hit position from them, so two real
+special-q would write different per-region distributions while these march their
+bucket frontiers in lockstep. Finding 81 established that fill is bound by
+read-modify-write on partly filled bucket lines -- i.e. by exactly that
+distribution. So this measures the **saturation** question honestly (N kernels,
+N x 42 B/entry from distinct addresses, no shared-read advantage) and does
+**not** predict how two real special-q interleave. That needs the production
+pipeline, and it is a reason to re-measure there before shipping, not a reason
+to doubt the 0.849.

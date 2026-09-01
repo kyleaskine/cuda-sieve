@@ -20,17 +20,21 @@ I15 -> 1 slab, I16 -> 4, I17 -> 16, I18 -> 64, I19 -> 256, and I20 -> 1024.
 The `2^29` target is a robust performance/memory default, not a universal
 speed optimum: an L40 benchmark preferred `2^30` positions per slab by 4.6%
 in complete time, while the `2^29` default still beat the former `2^31`
-behavior by 1.5% and reduced steady VRAM from 7.76 GB to 3.20 GB. Large-L2
-GPUs need more measurements before any cache-aware automatic policy is added.
+behavior by 1.5% and reduced steady VRAM from 7.76 GB to 3.20 GB. The quantity
+that target really tunes is a bucket-region count rather than an area, so it
+moves with `--region`; a per-card automatic policy is still open work.
+There is no cap on the total pipeline area: `--pipeline` slabs any geometry
+through `logI 20`, and `2^32` has been sieved on a 5070 and an L40.
 `lpb <= 64`,
-`mfb <= 128`, and at most three large primes per side remain checked limits.
+`mfb <= 128`, at most three large primes per side, and an exact norm within
+this build's `BN_LIMBS * 32` bits (384 by default) remain checked limits.
 Cofactor arithmetic width and
 factorisation method are both chosen **per side, automatically**, from that
 side's `mfb` and `lpb`: 3 limbs (96-bit residuals) or 4 (128-bit), and
 Pollard-Brent rho for a two-large-prime side or ECM for a three-large-prime
 one. The separate representation, memory,
 cofactor-performance, and filtering implications of lifting them are laid out
-in [Current size limits, and what lifting them entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
+in [Current size limits and j-slabbing](bench/STATUS.md#current-size-limits-and-j-slabbing).
 
 ## Build and test
 

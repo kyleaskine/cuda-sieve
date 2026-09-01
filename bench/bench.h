@@ -508,6 +508,12 @@ typedef struct {
      * finding 52. */
     int      fill_blocks;   /* 0 = auto (FILL_BLOCKS_DEFAULT) */
     int      fill_threads;  /* 0 = auto (FILL_THREADS_DEFAULT) */
+    /* Item 1's decisive test, benchmark-only: run N independent fill
+     * workspaces concurrently on N streams and compare against the same N
+     * fills issued back-to-back on one stream, and against a single kernel
+     * given N times the blocks. 0/1 = today's single-workspace behaviour.
+     * Costs a full bucket array per workspace, so N is memory-bound. */
+    int      fill_streams;  /* 0/1 = off; 2..FILL_STREAMS_MAX = concurrency test */
     int      reps;          /* timing repetitions */
     int      verify;        /* run CPU cross-check */
     /* ---- Path 2 ---- */
@@ -704,6 +710,10 @@ typedef struct {
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* Concurrency test only (item 1). Each workspace is a full bucket array, so
+ * the practical ceiling is memory, not this constant -- 2 and 4 fit a 12 GB
+ * card at the I15e/I16 geometries, 8 does not. */
+#define FILL_STREAMS_MAX     8
 /* k_apply's block size. APPLY_THREADS_MAX is NOT a taste limit: it is the first
  * argument of k_apply's __launch_bounds__, which is a hard ceiling -- a launch
  * with more threads per block fails outright. Keep these three in step with the

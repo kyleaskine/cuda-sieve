@@ -14,7 +14,14 @@
  * to be decided once, centrally, before work units are distributed. That is
  * planning time, i.e. testsieve.
  *
- * WHY THE SAMPLE MAXIMUM IS NOT THE ANSWER. Measured on the 2,1139+ septic over
+ * The 2,1139+ job named throughout is a DEGREE 8 SNFS form, and an earlier
+ * version of these comments called it a septic in three places. It is an octic
+ * by construction: 1139 = 17 * 67, so the substitution x = 2^67 + 2^-67 leaves
+ * the minimal polynomial of a 17th root of unity plus its inverse, of degree
+ * (17-1)/2 = 8. In the job file that is c8..c0 = 1 1 -7 -6 15 10 -10 -4 1 with
+ * Y1 = 2^67 and Y0 = -(2^134 + 1); F(Y0, Y1) == 0 mod n, checked 2026-09-01.
+ *
+ * WHY THE SAMPLE MAXIMUM IS NOT THE ANSWER. Measured on the 2,1139+ octic over
  * 60M-460M at logI 15: 2,500 (q,rho) sampled at scattered q gave a maximum of
  * 242 bits and the confident, wrong conclusion that 256 was enough. 160,018
  * sampled across the band found q=367699421 at 273.08 bits -- and its
@@ -253,10 +260,20 @@ int main(int argc, char **argv)
          *
          * Four scales plus a floor. The floor covers a degenerate fit where beta
          * collapses toward zero on a near-constant tail; four is judgement, not
-         * measurement, chosen so the septic against 384 (98 bits clear, beta 5.0)
-         * passes comfortably while AS276 against 256 (7.3 clear, beta 0.15)
-         * also passes and the octic against 256 refuses outright on the
-         * projection alone. */
+         * measurement, chosen so that octic against 384 passes comfortably
+         * while AS276 against 256 (7.3 clear, beta 0.15) also passes and the
+         * same octic against 256 refuses outright on the projection alone.
+         *
+         * The octic's own calibration numbers are NOT reproduced and are
+         * deliberately not repeated here. An earlier draft called this job a
+         * septic in three places, and the pair "(98 bits clear, beta 5.0)"
+         * belongs to that confusion -- one polynomial cannot have the beta 5.9
+         * quoted above and 5.0 here. Re-measured 2026-09-01 on the real
+         * coefficients over 60M-460M: 49.5-57.5 bits clear at beta 5.96-5.99
+         * across three geometries. The VERDICTS are unaffected (pass at 384,
+         * refuse at 256 and 320) and the 4x scale still holds against the
+         * measured beta; the parenthetical did not. See STATUS.md, Known
+         * defects. Re-derive from a fresh survey before tightening this rule. */
         {
             const double margin = (beta > 0.0) ? 4.0 + 4.0 * beta : 16.0;
             const double worst = (proj > v[n - 1]) ? proj : v[n - 1];

@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-08-26.**
+is not current. **Last updated 2026-09-01.**
 
 ## Architecture
 
@@ -30,6 +30,13 @@ per special-q:
 Two sides run **sequentially through one shared bucket allocation**. There is
 no stream concurrency and no second workspace. Every timing in `RESULTS.md` is
 one-q-at-a-time.
+
+**The algebraic factor base is generated in-process by default, added
+2026-08-24.** With `--fb1` omitted the pipeline calls the same GPU root finder
+that backs the standalone `fbgen_gpu`, so a run no longer needs a
+multi-gigabyte roots file staged first — which is what lets a BOINC work unit
+carry only the job. `FBGEN_GPU.md` is the reference and `fbgpucheck.sh` gates it
+across degrees; `--fb1`/`--cadofb` still take a file when one is wanted.
 
 `--relations NAME` stages to `NAME.part` and renames to `NAME` only when the
 band completes. The `.part` is the **durable artifact**, not scratch: after
@@ -94,10 +101,11 @@ There is still no unsafe override of the local arithmetic bounds.
 | quantity | current limit | immediate reason |
 |---|---:|---|
 | local sieve slab | `2^31` positions | bucket/bitmap/rank positions remain `uint32_t` |
-| full pipeline rectangle | default geometries through `logI 20` | host scheduler splits `J` into safe slabs |
+| full pipeline rectangle | no total-area cap under `--pipeline`; `logI` in [2,20] | host scheduler splits `J` into safe slabs. Outside `--pipeline` the old `I*J <= 2^31` refusal still stands (`bench_main.cu`, the `!cfg.pipeline` check) |
 | `lpb` | 64 | a resulting prime is stored in one `uint64_t` (was 32 until 2026-08-17) |
 | `mfb` | 128 | the cofactor queue narrows residuals to `mz<4>`; 96 in a `CF_LMAX=3` build |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
+| exact norm | 384 bits (`BN_LIMBS` 12) | build-time knob, even limbs 4..16; a lattice needing more is SKIPPED with a warning, never wrapped (was 256 until 2026-08-27) |
 
 Automatic planning uses `2^29` positions as a performance target once the full
 sieve reaches `2^30` positions; below that trigger it does not split for
@@ -338,6 +346,86 @@ production performance target per slab. Larger local slabs remain available
 through explicit `--slab-j` when they satisfy the safety limits. The `2^32` row
 is retained as the old monolithic projection, not as an allocation the automatic
 slabbed path makes.
+
+### Exact-norm width — WIDENED 256 -> 384 BITS 2026-08-27
+
+`bn_t` is the fixed-width magnitude that trial division builds the exact norm
+in. It was 8 limbs, sized on a quintic: at q=120000053 the largest homogeneous
+term was 224 bits, a 6-term sum stayed under 227, and 256 left ~28 spare.
+
+**That headroom was a property of that polynomial, and a large octic blows it.**
+On the Cunningham 2,1139+ SNFS form — **degree 8**, and provably so: 1139 =
+17 x 67, so `x = 2^67 + 2^-67` leaves the minimal polynomial of `zeta_17 +
+zeta_17^-1`, of degree `(17-1)/2 = 8`, with `Y1 = 2^67`, `Y0 = -(2^134 + 1)`
+and `F(Y0, Y1) == 0 mod n` (checked 2026-09-01) — the exact algebraic norm runs **232-292
+bits** depending on the q-lattice, and the tail is driven by the SHAPE of the
+reduced basis rather than by the sieve area — **shrinking `logI`/`J` does not
+escape it**, and neither does a tighter estimate, since `norm_exact_bound_bits`
+sits only 2-3 bits above the true maximum term. Measured: a 2000-q band at 8
+limbs died after 116 q needing 260.75 bits, having written **no relations**, and
+could not resume past that q because the checkpoint names it. The same band at
+12 limbs completed and all 4,015 relations rebuilt both norms exactly.
+
+**Cost, A/B on AS276** (C208, deg 5, logI 15, three runs each): `k_td` 1.138 ->
+1.593 ms (+40%) and `k_td_record_warp` 0.234 -> 0.284 ms (+21%) — **+0.45 ms on
+a 90 ms special-q, inside the ±0.8 ms run-to-run spread**. Registers 58 -> 78
+and 68 -> 80 with **no spill**; `k_apply`, `k_classify`, `k_cof_enqueue` and
+`k_rel_pack` untouched; the divide-down does not scale with the width at all
+because `td_divide_out` loops on `bn_top` and the added limbs are leading zeros.
+Memory is the term the timing hides: `sizeof(bn_t)` 32 -> 48 B, allocated **per
+survivor and per candidate**, so it scales with survivors/q — ~2 MB at AS276's
+39,042, and re-measure rather than assume on a job with far more.
+
+**The gate is byte-identity, not a benchmark.** Every value that fit the narrow
+build is represented identically in the wide one, so a wider binary must
+reproduce a narrower one exactly on any job the narrow one could run; 12 limbs
+qualified on AS276 with the same relation-file md5 and the same survivor,
+candidate and split/dead/stuck counts. `make BN_LIMBS=N` (even, 4..16) sets it,
+with a stamp file so changing it forces the rebuild.
+
+At runtime `pipe_side_prepare_q` checks each q against the built width and
+**skips** the ones that do not fit, warning each time and ending the band at
+`PIPE_SKIP_MAX`. That keeps a band alive across a rare bad lattice; it is damage
+control, not an answer, because every skip is a lost special-q.
+
+#### `normscan` — decide the width before distributing work
+
+The client cannot fix an overflow: the fix is a wider **rebuild**, and a work
+unit of a few hundred q out of tens of millions cannot even see a ~1e-5 tail
+coming. So the width has to be chosen once, centrally, at planning time.
+`normscan` (CPU only, built from the siever's own `sqgen_next`, `qlat_build`,
+`norm_setup` and `norm_exact_bound_bits`) surveys a whole projected band for a
+given poly and geometry.
+
+**The sample maximum is the wrong statistic and the tool does not report it.**
+On the 2,1139+ over 60M-460M at logI 15, 2,500 sampled (q,rho) gave a maximum of
+242 bits and the confident, wrong conclusion that 256 sufficed; 160,018 samples
+found q=367699421 at **273.08 bits**, with its nearest exceedances at 258.9 and
+258.4. A sample of n out of N sees the 1/n quantile, not the 1/N one. `normscan`
+therefore reports a **projected band maximum from an exponential fit to the
+upper tail** and warns on proximity, not only on crossing.
+
+**Exercised on the motivating job 2026-09-01**, with the 2,1139+ octic's real
+coefficients, band 60M-460M, special-q on the algebraic side, 160,000 samples:
+
+| geometry | median | 99% | sample max | projected band max | verdict vs 384 |
+|---|---:|---:|---:|---:|---|
+| `logI 15, J 16384` | 235.1 | 253.1 | 304.70 | 326.5 | OK, 57.5 bits clear |
+| `logI 16, J 16384` | 238.4 | 253.1 | 304.70 | 326.1 | OK, 57.9 bits clear |
+| `logI 16, J 32768` | 243.1 | 261.1 | 312.70 | 334.5 | OK, 49.5 bits clear |
+
+Exit codes behave as documented (2 against `--limit-bits` 256 and 320, 0 at the
+build's 384), the refusal names the right rebuild (`make BN_LIMBS=12`), and the
+fitted tail scale **5.96-5.99 bits reproduces the beta = 5.9** the margin rule
+was calibrated on. Doubling `J` costs ~8 bits at the 99th percentile, which is
+why the survey is per geometry.
+
+Exit codes are verdicts: **0 pass, 2 will overflow, 3 too little margin, 1 the
+survey could not run, 64 usage.** `testsieve.sh` runs it **per geometry** —
+the answer moves with the geometry (250 bits at 15e, 257 at 16e on that job) —
+records a non-zero verdict and repeats it in the summary, but does not abort the
+sweep, since the yield numbers are what say whether this geometry is the one to
+rebuild for.
 
 ### LPB and MFB are separate widths
 
@@ -718,20 +806,22 @@ required surplus.
 
 | item | status | rough engineering scope, including GPU validation |
 |---|---|---:|
-| A=32 whole-area endpoint/walk support | not started | about 1 week |
-| A=32 stateful slabbing for 12 GB | not started | about 2–3 weeks |
+| A=32 by j-slabbing, state carried across slabs | **done 2026-08-24**, merged from `greg/slab`, tuned through 2026-08-26, **validated at NFS@Home's own shape 2026-09-01** (finding 82) | — |
+| A=32 as ONE unslabbed rectangle (`2^32` exclusive endpoint) | not started, **and not wanted** — finding 78 makes the slabbed path the faster one | about 1 week if a reason appears |
 | 64-bit large-prime outputs and gates | **done 2026-08-17** | — |
 | per-side `mz<3>` / `mz<4>` dispatch | **done 2026-08-18**, gated and timed (+8-9% wall when forced wide) | — |
 | per-side rho/ECM dispatch, default | **done 2026-08-19**, gated and timed (finding 70) | — |
 | cofactor outcome reporting (`split / dead / stuck`) | **done 2026-08-19** | — |
 | C208 validated against a 1.5B-relation GGNFS corpus | **done 2026-08-19**, 99.97% recall (finding 69) | — |
-| filter test on a real corpus | not captured | required before a performance claim |
+| 384-bit exact norms, `BN_LIMBS` a build knob | **done 2026-08-27**, byte-identical gate on AS276, +0.45 ms of a 90 ms q | — |
+| `normscan` band width survey, wired into `testsieve.sh` | **done 2026-08-27** | — |
+| in-process GPU factor-base generation | **done 2026-08-24** | — |
+| filter test on a real corpus | **captured — a C123 was factored end to end from our relations, 2026-08-05** (`work/c123run/msieve.log`) | — |
 
-Together, a robust slabbed implementation on top of the width dispatch is
-roughly a **3–5 focused engineering-week** change, not counting delays obtaining the
-target workload or GPU access. A whole-area path restricted to >=24 GB cards
-would be appreciably smaller. These are source-review estimates, not measured
-schedules.
+**The 3–5 engineering-week slabbing estimate that stood here was spent: the
+implementation landed 2026-08-24 and was tuned to 2026-08-26.** What is left of
+A=32 is the unslabbed whole-area path, which nothing currently needs. The
+remaining estimates are source review, not measured schedules.
 
 ## Validated
 
@@ -742,6 +832,8 @@ schedules.
 | **Transform gates** | root transform against its definition, over a real factor base | `fbtest` |
 | **Band runs** | c147: 1340 q → 159,837 relations, both sides PASS | 5070, 5090, 4090, A100 |
 | **Real job** | snfs236, ~20M relations before deliberate interruption | 5070 |
+| **Full NFS factorisation** | C123 sieved entirely by us, filtered and solved by msieve: `p42 * p82` | `work/c123run` |
+| **`A = 32`** | AS276 at `2^17 x 2^15`, 8 slabs: 1,322/1,322 norms rebuilt, rectangle confirmed from the relations (finding 82) | 5070 |
 
 Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 **A100 80GB** (native Linux), and an **RTX 3090** via an external reporter.
@@ -750,16 +842,58 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
 
 ## Measured, and what it means
 
+- **Our relations filter and factor — a complete NFS run, not a gate.** The
+  C123 `223187...173681` was sieved entirely by this siever (29,933 special-q
+  over `[400000, 800000]`, CADO for polynomial selection, msieve for
+  everything downstream) and msieve took it to `p42 * p82` on 2026-08-05.
+  `work/c123run/msieve.log` is the record:
+
+  | | |
+  |---|---:|
+  | relations in the file | 29,339,493 (+121,515 free) |
+  | duplicates removed | 7,073,204 — **24.0%** |
+  | unique relations | 22,387,804 |
+  | cycles found / needed | 849,784 / 825,717 — **2.9% surplus** |
+  | matrix | 823,658 x 823,845, 114.50 weight/col |
+  | outcome | `p42` x `p82`, BLanczos 61 s, sqrt 153 s |
+
+  **What this does and does not settle.** It settles that the relations are
+  filterable and sufficient — no structural defect survives to the matrix, and
+  the 2.9% cycle surplus says the band was sized about right. It does **not**
+  give the comparative number a performance claim needs: how many unique
+  relations GGNFS would have needed for this same job. The 24.0% duplicate
+  share is our own, at a band covering the full factor-base range, and it sits
+  at the top of the 15.8-25% range under Known defects — which is what that
+  defect predicts for full-band coverage.
+
 - **Fill does not scale with the GPU.** 5090 has 3.5× the SMs of a 5070 and
   returns far less than that on fill, against 3.33× transform and 2.01× apply.
-  All three swept cards reach the same **absolute knee at 1152 blocks × 32
-  threads**, flat above it. Mechanism unresolved; the leading candidate is now
-  **work granularity** (fine chunks balance the tail), which fits the plateau.
-  Both L2 stories are out: capacity was already dead, and one geometry fitting
-  48/72/96 MB of L2 argues against write-combining decay too. `ncu` is blocked
-  on the rented boxes (`ERR_NVGPUCTRPERM`), but **one local 5070 profile now
-  exists** — `work/c147/fill_5070.ncu-rep`, a single `k_fill_atomic` launch.
-  It corroborates granularity and kills the bandwidth stories outright:
+
+  **Two halves of this bullet were superseded on 2026-08-25/26; read the
+  correction before the profile below.**
+
+  *(a) The block default is 4608, not 1152.* The "absolute knee at 1152 blocks
+  × 32 threads, flat above it" was measured on one job; finding 76's two-axis
+  sweep on the production shape moved the default **1152 -> 4608** (fill −8.6%,
+  wall −5.7% on c194). **Wherever this file still says "the shipped 1152
+  blocks", read 4608.** No single constant serves every job — c147 unslabbed
+  wants more than 4608, c147 slabbed wants 1152 — which is item 2.
+
+  *(b) The mechanism is settled, and it is not work granularity.* Finding 81
+  profiled `k_fill_atomic` with `ncu` at the production geometry: **L2 read
+  sectors flat within 3% while DRAM read sectors rise 135%** (18.5M -> 43.5M)
+  as `nregion` moves past its knee, with DRAM writes going **1.15x -> 1.96x**
+  the theoretical floor. That is read-modify-write on partially-filled bucket
+  lines — 4 B records into 32 B sectors, the frontier evicted before eight
+  consecutive appends can fill one. Fill is **DRAM-traffic-bound at a flat
+  effective bandwidth**, so the tuned quantity is `nregion` (findings 79/80),
+  and "work granularity" is retired. This does not contradict the 12.8%
+  throughput row below: the cost is excess traffic, not saturation.
+
+  The profile that follows is retained for what it establishes about the
+  configuration it was taken on — `work/c147/fill_5070.ncu-rep`, a single
+  `k_fill_atomic` launch on a local 5070. `ncu` remains blocked on the rented
+  boxes (`ERR_NVGPUCTRPERM`). It did kill the L2-capacity story outright:
 
   | | |
   |---|---:|
@@ -791,8 +925,10 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   **Caveat: this profile is at 288 blocks × 256 threads** — the pre-finding-52
   geometry, and 256 threads is precisely the held-fixed axis that made
   finding 51 an artifact. So it characterises a configuration the project has
-  abandoned. The 288-vs-1152 A/B **at 32 threads** is still unrun, and is
-  still what would settle the mechanism rather than merely fit it.
+  abandoned twice over, since the block default has since moved to 4608. The
+  288-vs-1152 A/B **at 32 threads** was never run and is **no longer the
+  decisive experiment**: finding 81 settled the mechanism from traffic
+  counters instead.
 - **Finding 51's Ada-vs-Blackwell block response was an artifact.** It held
   `--threads` at 256; at 32 the 4090's degradation reverses to improvement and
   all three cards behave alike. See finding 52.
@@ -862,6 +998,21 @@ where the standalone gain is largest (16.7%).
 
 ## Known defects
 
+- **DOC 2026-09-01 — `normscan.c`'s calibration numbers for the 2,1139+ octic
+  do not reproduce.** The comment at `normscan.c:256` justifies the `4 + 4*beta`
+  margin with "(98 bits clear, beta 5.0)" — while the same comment block,
+  eleven lines earlier, gives that same polynomial **beta = 5.9**. One job
+  cannot have both, and the pair dates from when three comments called it a
+  septic. Re-run 2026-09-01 on the real coefficients over 60M-460M:
+  **49.5-57.5 bits clear at beta 5.96-5.99** across three geometries, matching
+  neither parenthetical. `testsieve.sh`'s "250 bits at 15e and 257 at 16e"
+  lands near the measured **99th percentile** (253.1 / 261.1), not near the
+  projected maximum the tool judges on. **No behavioural defect** — the
+  verdicts are the intended ones (pass at 384, refuse at 256 and 320) and the
+  `4 + 4*beta` scale still holds against the measured beta. The unreproduced
+  pair is now flagged in place in `normscan.c`; re-derive from a fresh survey
+  before tightening the rule.
+
 - **LATENT 2026-08-26 — `SLAB_PERF_TARGET_LOG2` is silently coupled to
   `log_region` (finding 79).** `slab_perf_jmax` (slab.h:69) computes
   `rows = 2^29 / I` with no reference to `cfg->log_region`, but the quantity
@@ -923,7 +1074,8 @@ where the standalone gain is largest (16.7%).
 - **`k_fill_l1` (twolevel path) has never been swept** at any geometry. It
   takes an explicit `--fill-blocks` but defaults to its own 144 × 512, because
   the 1152 × 32 result was measured on `k_fill_atomic` — a different kernel
-  with a different write pattern.
+  with a different write pattern. (That reference point is now 4608 × 32 on
+  `k_fill_atomic`; `k_fill_l1` still ships its own untuned 144 × 512.)
 - **Power is board-only.** The metric of record is whole-box
   relations/sec/watt; host draw is unmeasured. The A100 has no sampled power.
 - **Host contention costs up to 29% of wall clock, invisibly.** Saturating the
@@ -987,10 +1139,31 @@ absent from every document in the repo.
    box, measured 301.47. **Retire finding 57's 2.53x** (stock card, derived
    270 W) and **item 10's 3.14x** (a C194 figure on a different job).
 
-   **Still open:** no CPU control at 130M; one geometry only (`I15e`) — finding
-   65's `2^16 x 2^14` is our better rel/J shape but has no CPU comparator; and
-   the GPU probes ran at host load 1.0-1.9 rather than silent, which per
-   finding 53 makes the margin a floor.
+   **TWO OF THE THREE HOLES CLOSED 2026-09-01 (finding 83).** A full 2x2 --
+   both sievers on both rectangles, one session, idle box, metered watts:
+
+   | | time | energy |
+   |---|---:|---:|
+   | at `2^15 x 2^14` (each siever's own best shape) | **3.09x** | **2.89x** |
+   | at `2^16 x 2^14` | **3.03x** | **2.77x** |
+
+   Yield agrees to 0.07% and 0.08%. **The margin is rectangle-invariant**, and
+   the premise this item carried is refuted: the bigger rectangle is a rel/J
+   loss for BOTH sievers (0.785x for us, 0.819x for them), so we pay slightly
+   *more* to grow it. The phrase "our better rel/J shape" below was sloppy --
+   `2^16 x 2^14` is the better of the `2^30` shapes, not better than the `2^29`
+   we deploy. **Quote ~3x time and ~2.8-2.9x energy**, now confirmed on two
+   rectangles rather than one.
+
+   The control also reproduced 2026-08-20 **byte for byte** (same md5), which
+   is the first end-to-end proof that 12-limb norms, the 4608 fill default,
+   `k_apply`'s launch bounds and the warp recorder are all performance-only on
+   a real job.
+
+   **Still open:** no CPU control at 130M. And ambient now matters -- the same
+   950 mV curve drew 133.5 W board in August and 152.8 W in September heat, so
+   a rel/J figure is comparable across sessions only with its board draw quoted
+   alongside.
 
    *Original statement of the item follows.* The question the
    project was chartered to answer — unique relations/sec/watt on the **c183**
@@ -1121,8 +1294,37 @@ absent from every document in the repo.
    rather than deduplicated. Grade perf/watt on the three probes; settle the
    FB convention on one contiguous band wide enough to contain both q of a
    duplicate pair, or by replaying the attribution offline as item 3 now does.
-1. **Concurrent-q throughput.** Two independent fill workspaces, two q or two
-   sides in separate streams, sweep 1/2/4. This is the decisive test for
+1. **Concurrent-q throughput. MEASURED 2026-09-01 on the 5070 (finding 84):
+   the knee is per-KERNEL, and two concurrent fills run in 85% of serial time.**
+   `--fill-streams N` is built in the standalone benchmark; the production
+   pipeline is untouched. Arms interleaved, best of three passes, three
+   invocations: **concurrent/serial 0.849 +- 0.002**. The gain **saturates at
+   two streams** (four give the same 11.53 ms per workspace), and widening ONE
+   kernel's grid recovers 6.6% against concurrency's 15.4%. So a single fill
+   kernel cannot saturate even the narrowest card in the set, which is the
+   mechanism the `ncu` profile predicted (`waves per SM = 1.00`, SMs idle 26.5%
+   of elapsed cycles).
+
+   A first version of the experiment ran the arms in fixed order and read
+   0.840; the drift correction is worth about one point and the spread fell
+   from +-1.5% to +-0.2%.
+
+   **Worth ~2% of wall on a 5070** -- 9.4% off fill against the best
+   single-kernel configuration, and fill is ~23% of wall at this geometry --
+   against a production change costing a second bucket array (+1.37 GB) and a
+   restructured per-q loop. **Do not build it for that.**
+
+   **The next step is a 4090 and a 5090, not code.** This item exists because
+   the 4090 is 1.80x slower at fill than a 5070 with 1.5x its bandwidth and the
+   5090 returns 1.16x for 3.5x the SMs. If one kernel leaves 16% idle on the
+   narrowest card, the wide cards should show much more -- and that is what
+   decides whether they are a poor fit for this workload or merely underfed.
+   Two commands on a rented box. **If it does pay, the two SIDES of one q are
+   the cheaper pairing than two q**: they already share the factor bases and
+   run sequentially through one bucket allocation today.
+
+   *Original statement of the item follows.* Two independent fill workspaces,
+   two q or two sides in separate streams, sweep 1/2/4. This is the decisive test for
    whether wide cards are a poor fit or are simply being fed too little
    independent work. **Design it at the new knee** — the "144 blocks each" this
    item used to specify is the pre-finding-52 geometry and would reproduce the
@@ -1617,9 +1819,33 @@ absent from every document in the repo.
    AS276 has since been sieved end to end and validated against its own GGNFS
    corpus at 99.97% recall (finding 69), and the width measured at **×1.72 on
    the widened queue, +8-9% of wall** (finding 70) — the 1.8-2× projection was
-   close. What remains is the `2^32` exclusive position endpoint and the
-   14-16 GB whole-area footprint, which is what stops a like-for-like
-   comparison against NFS@Home's own `I16e -J 16` geometry for this job.
+   close.
+
+   **CORRECTED 2026-09-01 — the area blocker is gone; what is left is one
+   untested aspect ratio.** `--pipeline` applies no total-area cap at all:
+   `bench_main.cu`'s `I*J <= 2^31` refusal is guarded by `!cfg.pipeline`, the
+   non-pipeline
+   path, and the planner slabs any geometry through `logI 20`. **`A = 32` has
+   been sieved twice** — `I16 J65536` on the 5070 (finding 74's discriminating
+   run, 8 slabs of `2^29`) and `I=J=2^16` on the L40 (finding 72).
+
+   **CLOSED 2026-09-01 by finding 82: their shape is sieved, gated and
+   geometrically confirmed.** AS276 at `--logI 17 --J 32768 --maxbits 17`, 10 q
+   from 80000023, plans **8 slabs of 4096 rows** unaided and emits 1,322
+   relations; `--check-relations` rebuilds **1,322 of 1,322** norms exactly, and
+   `relgeom.py` recovers `i in [-65477, 65239]`, `j in [1, 32761]` — `2^17 x
+   2^15`, the same extent finding 69 recovered from GGNFS's own output for this
+   job. Setup allocation 2.71 GB (bucket array 1.18), so a 12 GB card runs it.
+   Finding 69's "their shape is `A = 32`, which we still refuse" is dated
+   2026-08-19, predates the slab merge, and is no longer true; the `2^17 x
+   2^14` runs in findings 69 and 77 are `2^31` sub-rectangles and finding 77's
+   "(A=32)" label on one was wrong. **The 14-16 GB figure applies only to the
+   monolithic allocation nothing makes now.**
+
+   **What is left of this item is a performance comparison, not a capability.**
+   A like-for-like run against NFS@Home at this geometry needs an idle card and
+   a matched q band; finding 82's run was on a card at 96-100% foreign load and
+   quotes no timing.
 
    **The per-slab cost side of that footprint improved on 2026-08-26**
    (finding 77): halving the slab now costs +1.7% rather than +3.4%, and on
@@ -1632,9 +1858,9 @@ absent from every document in the repo.
    sieve `2^15 × 2^14` and would prefer `2^15 × 2^15` — `2^30`, half the
    current area limit — so no A=32 work is required for that class of job at
    all. The current design assessment, performance accounting, alternatives,
-   and work status are consolidated in **"Current size limits, and what lifting
-   them entails"** above; that section is canonical rather than duplicating a
-   moving design here.
+   and work status are consolidated in **"Current size limits and j-slabbing"**
+   above; that section is canonical rather than duplicating a moving design
+   here.
 9. **Dead factor-base parses under `--sq-side 0`.** `fb1` is loaded and
    `fb_fill_logp`'d purely as the throwaway first parse that used to supply the
    q list, but under `sq_side 0` the band comes from the rational base instead
@@ -1643,6 +1869,12 @@ absent from every document in the repo.
    inverse per prime, each time. ~15–20 s of startup on snfs236. Irrelevant to
    a multi-day run, worth fixing before anything that restarts the process in a
    loop (parameter sweeps, `cofcheck`).
+
+   **Re-measure before taking this (2026-09-01).** In-process factor-base
+   generation landed 2026-08-24, so with `--fb1` omitted the throwaway first
+   pass may now cost a GPU *generation* rather than a file parse. The ~15-20 s
+   figure above was measured on the file path and has not been retaken under
+   either mode; the doubled `rfb_build` over `rlim` is untouched either way.
 10. **GPU power-limit sweep — MEASURED 2026-08-17 (finding 61); a floor, not
     a knee.** The premise was that consumer cards ship past their efficiency
     knee and a 60–80% cap buys 15–30% rel/J. **The sieve is not power-limited
@@ -2163,6 +2395,15 @@ absent from every document in the repo.
     CEILING BOUNDED THE SAME DAY by finding 78 at ~3% of wall at the realistic
     A=32 geometry. Gated on item 8: build it only if that measurement forces
     slabs below 16.**
+
+    **DO NOT BUILD — the gate was measured 2026-09-01 and it does not fire
+    (finding 82).** A 12 GB card runs `A = 32` at NFS@Home's own shape in **8
+    slabs of `2^29`** — the sweep optimum itself, not a memory compromise —
+    with 2.71 GB of setup allocation. This item exists to make slabs *below*
+    `2^29` affordable, and nothing is asking for them: at 8 slabs the dense-TD
+    excess is +2.95 ms and the whole item is worth −0.8% of wall, against
+    rewriting the hot dense path. Reopen only if a card smaller than 12 GB, or
+    an area beyond `2^32`, actually forces the slab count past 16.
 
     `k_td<1,0,0>` ("norms + trial division, both sides") gives one thread per
     survivor and each thread marches the whole `nsm` list — and because that

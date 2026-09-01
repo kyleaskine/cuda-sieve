@@ -171,8 +171,18 @@ Thus `2^29` is not claimed to be the universal maximum-throughput setting. On
 the L40 it is 4.6% slower than the `2^30` optimum, but it remains 1.5% faster
 than the former `2^31` default while using 59% less steady VRAM (3.20 vs
 7.76 GB). That performance/memory tradeoff is why `2^29` remains the generic
-default. More measurements are needed on cards with large L2 caches before
-introducing an L2-size or model-specific automatic slab target.
+default.
+
+**What `2^29` actually tunes is a bucket-region COUNT, not a slab area**
+(findings 79-81, 2026-08-26). `fill` is minimised at a fixed number of regions,
+so the optimal area halves with `--region`: `2^29` is what 32,768 regions means
+at the default `--region 14`, and the L40's preference above is a preference for
+65,536 regions. The mechanism is read-modify-write on partially-filled bucket
+lines — DRAM read sectors rise 135% past the knee while L2 reads stay flat — so
+it is traffic, not cache capacity, which is why a 6 MB 3090 and a 48 MB 5070
+agree. **No operator action:** the default already runs at 1.28x the write floor,
+`--region` 14 is the joint optimum (`k_apply` costs +52% at 13), and an
+automatic per-card target is still open work.
 
 `--slab-j N` remains a regression/tuning override and may select a larger or
 smaller slab subject to the mandatory safety bounds.
@@ -188,12 +198,27 @@ The remaining representation limits are:
 - `lpbr` or `lpba` above 64;
 - `mfbr` or `mfba` above 128 (above 96 in a `CF_LMAX=3` build — see
   [Cofactorisation](#cofactorisation-width-and-method-both-per-side) below);
-- a ratio `ceil(mfb/lpb)` above 3 on either side; or
+- a ratio `ceil(mfb/lpb)` above 3 on either side;
 - `lim^2 <= 2^lpb` on either side, which makes the "prime by size" test in the
-  splitter unsound (it binds around `lpb 55` at an `alim` of 240M).
+  splitter unsound (it binds around `lpb 55` at an `alim` of 240M); or
+- an exact norm wider than this build's `BN_LIMBS * 32` bits — 384 by default
+  since 2026-08-27, previously 256.
 
 These are checked limits, not tuning advice, and there is no unsafe override.
-The non-pipeline harness still requires its whole `I*J` area to fit in `2^31`.
+The non-pipeline harness still requires its whole `I*J` area to fit in `2^31`;
+**`--pipeline` has no total-area cap** and slabs anything through `logI 20`.
+
+**The norm-width limit is the one that bites mid-band, so survey it first.**
+A q-lattice whose exact norm does not fit is *skipped* with a warning rather
+than wrapped, and the band stops after `PIPE_SKIP_MAX` of them — so a job that
+needs more width than the binary has bleeds special-q until it dies, and the
+fix is a rebuild (`make BN_LIMBS=N`, even limbs 4..16) that every client would
+have to carry. The width therefore has to be decided centrally, before work
+units go out. `normscan` answers it; see [Sizing a job
+first](#sizing-a-job-first-testsievesh). A wider build is byte-identical to a
+narrower one on any job the narrower one could run, so widening is safe to ship
+mid-project. Cost measured on AS276: +0.45 ms on a 90 ms special-q, and
+`sizeof(bn_t)` 32 -> 48 bytes per survivor and per candidate.
 
 The p-lattice **increments** are 64-bit, and were so even when positions were
 still 32-bit. This is required for correctness: realistic large factor-base
@@ -391,9 +416,32 @@ and **rho rational / ECM algebraic** on its own, which is the measured optimum.
 
 That is `A = 31`. NFS@Home sieve this job at `I16e -J 16`, which in our
 coordinates is `2^17 x 2^15` — `A = 32` (finding 65's rule: our rectangle =
-`2^(J_bits+1) x 2^(I_bits-1)`). The production pipeline now runs that geometry
-through j-slabbing rather than refusing it; `--logI 17 --J 16384` gives the
-same total area with their full `i` range if you want the other nesting.
+`2^(J_bits+1) x 2^(I_bits-1)`). The production pipeline runs that geometry
+through j-slabbing rather than refusing it:
+
+```sh
+../../bench/fbgen --poly AS276.job --maxbits 17 --threads 12 --out as276.roots1.m17
+../../bench/bench --pipeline --cofactor --poly AS276.job --fb1 as276.roots1.m17 \
+    --logI 17 --J 32768 --maxbits 17 --qrange 80000023: --nq 10 \
+    --relations as276.a32.rels.txt
+```
+
+The planner picks **8 slabs of 4096 rows** on its own — no `--slab-j` — and
+setup allocates 2.71 GB, so this fits a 12 GB card. Validated 2026-09-01
+(finding 82): every relation rebuilds both norms exactly, and `relgeom.py
+extent` recovers `2^17 x 2^15` from the relations themselves, matching the
+extent GGNFS produced for the same job.
+
+`--logI 17 --J 16384` is a smaller job, not an alternative nesting of this one:
+same `i` range, half the area (`2^17 x 2^14` = `2^31`). It is what findings 69
+and 77 ran, and it is the right choice only if you want the smaller rectangle.
+
+**Check the rectangle from the relations, never from the flags**, before any
+cross-siever claim:
+
+```sh
+./relgeom.py --band 80000023:80000200 --skew 51059252.11 extent as276.a32.rels.txt
+```
 
 Note the ceiling that actually binds first is **not** the width. `CF_MAXFAC`
 caps a split at 3 large primes, so `mfb <= 3 * lpb` regardless — and at
@@ -404,8 +452,8 @@ not another limb.
 
 For the current status, A=32 memory/slabbing options, and why the end metric is
 time to a filterable matrix rather than raw relations/s, see [Current size
-limits, and what lifting them
-entails](bench/STATUS.md#current-size-limits-and-what-lifting-them-entails).
+limits and
+j-slabbing](bench/STATUS.md#current-size-limits-and-j-slabbing).
 
 ### Will it fit? VRAM sizing
 
@@ -496,6 +544,19 @@ cd bench
 asked for. The units stop there: `--width`, `--rlim` and `--alim` are absolute,
 and so is `bench`'s own `--target-rels`, which is a different flag on a
 different program and unchanged.
+
+**Each geometry's block begins with a `normscan` verdict on the exact-norm
+width.** It surveys the whole projected band for that poly and geometry and
+reports a *projected* band maximum from a fit to the upper tail, not the sample
+maximum — on the 2,1139+ job, 2,500 samples said 242 bits and "256 is fine",
+while 160,018 samples found a lattice at 273.08. The answer moves with the
+geometry (250 bits at 15e, 257 at 16e on that job), which is why it runs per
+geometry. Exit codes are verdicts: **0 pass, 2 will overflow, 3 too little
+margin, 1 the survey could not run**. A non-zero verdict is recorded and
+repeated in the summary but does **not** abort the sweep — you still want the
+yield numbers that say whether this is even the geometry to rebuild for. Act on
+it before distributing work: see [Current hard size
+limits](#current-hard-size-limits-and-j-slabbing).
 
 Each geometry's block ends with its measured device memory, so the sizing
 question and the yield question are answered by the same run. On the **c183** at

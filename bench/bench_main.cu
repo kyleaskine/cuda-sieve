@@ -250,6 +250,10 @@ static void usage(void)
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
 "  --fill-blocks N  fill only; 0 = auto (4608, absolute -- NOT per SM) [0]\n"
+"  --fill-streams N fill only; N independent workspaces on N streams, timed\n"
+"                   against the same N issued serially and against 1 kernel\n"
+"                   at N x the blocks. 0/1 = off [0]. Costs a bucket array\n"
+"                   per workspace (item 1)\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -870,6 +874,7 @@ static int bench_main_impl(int argc, char **argv)
     cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
+    cfg.fill_streams = 0;
     cfg.reps = 3; cfg.verify = 0;
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;
@@ -995,6 +1000,10 @@ static int bench_main_impl(int argc, char **argv)
         else if (!strcmp(argv[i], "--fill-threads") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-threads", argv[++i], 0,
                                     1024, &cfg.fill_threads)) return 1;
+        }
+        else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
+            if (parse_int_range_arg("--fill-streams", argv[++i], 0,
+                                    FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
         }
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) cfg.reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--verify")) cfg.verify = 1;
@@ -1813,6 +1822,15 @@ static int bench_main_impl(int argc, char **argv)
                cfg.fill_threads ? cfg.fill_threads : FILL_THREADS_DEFAULT,
                cfg.fill_blocks  ? "  [--fill-blocks]"  : "",
                cfg.fill_threads ? "  [--fill-threads]" : "");
+        /* A knob the banner does not name is a knob a log cannot prove was
+         * live -- the --fill-blocks lesson (bench_kernels.cu, twolevel note).
+         * --fill-streams reaches k_fill_atomic only, so say so HERE rather
+         * than letting --mode twolevel swallow it silently. */
+        if (cfg.fill_streams > 1)
+            printf("fill concurrency: %d workspaces on %d streams"
+                   "  [--fill-streams]%s\n", cfg.fill_streams, cfg.fill_streams,
+                   cfg.fill_mode == FILL_ATOMIC
+                       ? "" : "  ** IGNORED: --mode atomic only **");
     }
 
     /* ---- both sides in one process ---- */

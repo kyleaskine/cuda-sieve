@@ -2268,23 +2268,194 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         CK(cudaMalloc(&D.cursor, (size_t)nregion * 4));
         CK(cudaMalloc(&D.out, need));
         CK(cudaMemset(D.overflow, 0, 4));
+/* One dispatch for the control fill AND every concurrency arm below. Two copies
+ * of this three-way record-width switch would let the experiment silently
+ * measure a kernel specialisation the control never runs. */
+#define FILL_ONE(GRID, STREAM, PLAT, CUR, OUT, OVF)                          \
+    do {                                                                     \
+        if (cfg->record_bytes == 2)                                          \
+            k_fill_atomic<2, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
+                (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
+                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+        else if (cfg->record_bytes == 4)                                     \
+            k_fill_atomic<4, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
+                (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
+                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+        else                                                                 \
+            k_fill_atomic<8, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
+                (PLAT), D.slice, fb->n, xmax, cfg->logI, log_region,         \
+                (CUR), (OUT), cap, (OVF), NULL, NULL);                       \
+    } while (0)
+
         cudaEventRecord(e2);
         for (int rep = 0; rep < cfg->reps; rep++) {
             CK(cudaMemset(D.cursor, 0, (size_t)nregion * 4));
-            if (cfg->record_bytes == 2)
-                k_fill_atomic<2, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
-            else if (cfg->record_bytes == 4)
-                k_fill_atomic<4, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
-            else
-                k_fill_atomic<8, false><<<fblocks, fthreads>>>(D.plat, D.slice, fb->n, xmax,
-                    cfg->logI, log_region, D.cursor, D.out, cap, D.overflow, NULL, NULL);
+            FILL_ONE(fblocks, 0, D.plat, D.cursor, D.out, D.overflow);
         }
         cudaEventRecord(e3);
         CK(cudaEventSynchronize(e3));
         CK(cudaGetLastError());
         t_fill = time_kernel(e2, e3) / cfg->reps;
+
+        /* ---- item 1: is fill's knee per-KERNEL or per-DEVICE? ----
+         *
+         * Every card swept so far plateaus at the same ABSOLUTE block count,
+         * which is the shape of a device limit; but the 4090 is 1.80x SLOWER
+         * at fill than a 5070 with 1.5x its bandwidth, which no device limit
+         * explains. The `ncu` profile named the candidate: waves per SM = 1.00,
+         * so the whole grid is resident at once and a block that draws a heavy
+         * chunk has no queued block to backfill its slot -- SMs idle 26.5% of
+         * elapsed cycles. A second INDEPENDENT kernel could occupy those.
+         *
+         *   CONCURRENT  N workspaces, N streams, fblocks each   -- N workspaces
+         *   SERIAL      the same N launches, one stream         -- N workspaces
+         *   WIDE        one launch at N * fblocks               -- ONE workspace
+         *
+         * CONCURRENT vs SERIAL is the comparison: identical work, identical
+         * launches, only the stream assignment differs. CONCURRENT ~= SERIAL
+         * says the device is saturated and the plateau is real; CONCURRENT <
+         * SERIAL says one kernel cannot feed the card.
+         *
+         * WIDE DOES 1/N THE WORK OF THE OTHER TWO and is not comparable to
+         * them in raw ms. k_fill_atomic is a grid-stride loop over fb->n, so
+         * N*fblocks blocks still process one factor base into one workspace.
+         * It answers a different question -- can a single kernel buy the same
+         * capacity just by being wider? -- and is only ever quoted per
+         * workspace, which is why every row below is normalised.
+         *
+         * ARM ORDER AND DRIFT. Boost clocks decay under sustained load, and a
+         * fixed arm order would bias whichever arm runs first -- here, in
+         * exactly the direction of the conclusion. Arms are therefore
+         * interleaved and each keeps its MINIMUM over the outer repeats, the
+         * same best-of-N every other A/B in this file uses.
+         *
+         * WHAT THE WORKSPACES DO AND DO NOT MODEL. Each gets its own plat,
+         * cursor and bucket arrays, so the concurrent arm streams N x 42 B per
+         * entry from DISTINCT addresses -- sharing one plat would hand it an
+         * L2 advantage no pair of real special-q enjoys. `slice` stays shared
+         * because two real q on one factor base share it too. But the copies
+         * hold IDENTICAL plat values, and the values are the walk: two real q
+         * would write different per-region distributions, while these march
+         * their bucket frontiers in lockstep. Finding 81 makes that exactly
+         * the variable fill is bound by (read-modify-write on partly filled
+         * lines), so this measures the SATURATION question honestly and does
+         * NOT predict how two real q interleave. That needs the pipeline. */
+        if (cfg->fill_streams > 1) {
+            int NS = cfg->fill_streams;
+            /* run_bench is an exported boundary; the argv clamp lives in a
+             * different translation unit and cannot be relied on here. */
+            if (NS > FILL_STREAMS_MAX) NS = FILL_STREAMS_MAX;
+            const size_t wsz = (size_t)nregion * cap * cfg->record_bytes;
+            const size_t psz = (size_t)fb->n * sizeof(plat_t);
+            size_t extra = (size_t)(NS - 1) * (wsz + psz + (size_t)nregion * 4);
+            size_t fnow = 0, tnow = 0;
+            int maxgrid = 0;
+            CK(cudaMemGetInfo(&fnow, &tnow));
+            CK(cudaDeviceGetAttribute(&maxgrid, cudaDevAttrMaxGridDimX, 0));
+            printf("\n  --- fill concurrency, %d workspaces (item 1) ---\n", NS);
+            printf("  extra workspaces need %.2f GB of %.2f GB free\n",
+                   extra / 1073741824.0, fnow / 1073741824.0);
+            if (extra + 64u * 1024 * 1024 > fnow) {
+                printf("  SKIP: %d workspaces need %.2f GB but only %.2f GB is"
+                       " free%s\n", NS, extra / 1073741824.0,
+                       fnow / 1073741824.0,
+                       NS > 2 ? "; try --fill-streams 2" : "");
+            } else if ((double)fblocks * NS > (double)maxgrid) {
+                printf("  SKIP: the WIDE arm would need %d x %d = %.0f blocks,"
+                       " past this device's grid-x limit %d\n",
+                       fblocks, NS, (double)fblocks * NS, maxgrid);
+            } else {
+                plat_t   *wplat[FILL_STREAMS_MAX];
+                uint32_t *wcur [FILL_STREAMS_MAX];
+                uint8_t  *wout [FILL_STREAMS_MAX];
+                cudaStream_t st[FILL_STREAMS_MAX];
+                uint32_t *xovf = NULL;   /* NOT D.overflow -- see below */
+                int k;
+                wplat[0] = D.plat; wcur[0] = D.cursor; wout[0] = D.out;
+                for (k = 1; k < NS; k++) {
+                    CK(cudaMalloc(&wplat[k], psz));
+                    CK(cudaMalloc(&wcur[k], (size_t)nregion * 4));
+                    CK(cudaMalloc(&wout[k], wsz));
+                    CK(cudaMemcpy(wplat[k], D.plat, psz, cudaMemcpyDeviceToDevice));
+                }
+                for (k = 0; k < NS; k++) CK(cudaStreamCreate(&st[k]));
+                /* The run's overflow count is REPORTED and gates --verify, and
+                 * these arms issue (2*NS+1)*reps more fills into the same
+                 * buckets. Accumulating them into D.overflow would inflate the
+                 * figure an operator sizes the rerun from, and would fail
+                 * --verify on records this harness dropped rather than the
+                 * measured configuration. Give the experiment its own counter
+                 * and leave D.overflow untouched. */
+                CK(cudaMalloc(&xovf, 4));
+                CK(cudaMemset(xovf, 0, 4));
+
+                float t_arm[3] = { 1e30f, 1e30f, 1e30f };
+                const int outer = 3;
+                for (int pass = 0; pass < outer; pass++) {
+                    for (int arm = 0; arm < 3; arm++) {
+                        const int grid = (arm == 2) ? fblocks * NS : fblocks;
+                        const int nws  = (arm == 2) ? 1 : NS;
+                        cudaEventRecord(e2);
+                        for (int rep = 0; rep < cfg->reps; rep++) {
+                            for (k = 0; k < nws; k++) {
+                                if (arm == 0)
+                                    CK(cudaMemsetAsync(wcur[k], 0,
+                                        (size_t)nregion * 4, st[k]));
+                                else    /* same synchronous memset the control
+                                         * fill uses, so SERIAL and the control
+                                         * share one harness */
+                                    CK(cudaMemset(wcur[k], 0, (size_t)nregion * 4));
+                            }
+                            for (k = 0; k < nws; k++)
+                                FILL_ONE(grid, arm == 0 ? st[k] : 0,
+                                         wplat[k], wcur[k], wout[k], xovf);
+                        }
+                        /* Do not rely on legacy default-stream semantics to
+                         * fence the blocking streams: one --default-stream
+                         * per-thread in NVCCFLAGS would silently turn e3 into
+                         * a launch-issue timestamp and report a 20x win. */
+                        if (arm == 0)
+                            for (k = 0; k < NS; k++) CK(cudaStreamSynchronize(st[k]));
+                        cudaEventRecord(e3);
+                        CK(cudaEventSynchronize(e3));
+                        CK(cudaGetLastError());
+                        float t = time_kernel(e2, e3) / cfg->reps;
+                        if (t < t_arm[arm]) t_arm[arm] = t;
+                    }
+                }
+                {
+                    uint32_t xo = 0;
+                    CK(cudaMemcpy(&xo, xovf, 4, cudaMemcpyDeviceToHost));
+                    printf("  best of %d passes x %d reps, arms interleaved\n",
+                           outer, cfg->reps);
+                    printf("  CONCURRENT %2d x %5d blocks, %d streams : %8.3f ms"
+                           "  = %7.3f ms per workspace\n",
+                           NS, fblocks, NS, t_arm[0], t_arm[0] / NS);
+                    printf("  SERIAL     %2d x %5d blocks, one stream : %8.3f ms"
+                           "  = %7.3f ms per workspace\n",
+                           NS, fblocks, t_arm[1], t_arm[1] / NS);
+                    printf("  WIDE        1 x %5d blocks, ONE workspace: %8.3f ms"
+                           "  = %7.3f ms per workspace\n",
+                           fblocks * NS, t_arm[2], t_arm[2]);
+                    printf("  concurrent/serial %.4f   (<1 = one kernel cannot"
+                           " feed this card; same work, only the streams differ)\n",
+                           t_arm[0] / t_arm[1]);
+                    printf("  concurrent vs the best single kernel: %.4f"
+                           "  (wide %.3f, single %.3f ms per workspace)\n",
+                           (t_arm[0] / NS) / (t_arm[2] < t_fill ? t_arm[2] : t_fill),
+                           t_arm[2], t_fill);
+                    if (xo) printf("  note: %u records overflowed inside the"
+                                   " concurrency arms (own counter; the run's"
+                                   " own overflow figure is unaffected)\n", xo);
+                }
+                cudaFree(xovf);
+                for (k = 0; k < NS; k++) CK(cudaStreamDestroy(st[k]));
+                for (k = 1; k < NS; k++) {
+                    cudaFree(wplat[k]); cudaFree(wcur[k]); cudaFree(wout[k]);
+                }
+            }
+        }
+#undef FILL_ONE
     } else {
         /* Both levels stage their fan-out in a fixed number of shared buffers,
          * so the split has to fit: L1 needs nsuper <= L1_NBUF and L2 needs
