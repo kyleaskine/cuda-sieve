@@ -28,14 +28,46 @@ typedef struct {
 #define SLAB_TD_GROUP_POS 256u
 
 /* Performance policy: once a full sieve reaches 2^30 positions, auto mode
- * targets slabs no larger than 2^29 positions.  Two independent benchmarks
- * (Ampere RTX 3090 and Blackwell RTX 5070) found this working set near the
- * fill/TD crossover; an L40 with a larger L2 cache instead preferred 2^30 for
- * maximum throughput. This is a generic performance/memory tuning cap, not a
- * universal speed optimum. Explicit --slab-j overrides it, while the 2^31
- * position and direct-TD bounds below remain mandatory. */
-#define SLAB_PERF_TRIGGER_LOG2 30u
-#define SLAB_PERF_TARGET_LOG2  29u
+ * caps the slab.
+ *
+ * THE TARGET IS A BUCKET-REGION COUNT, NOT AN AREA (finding 79, 2026-08-26).
+ * `fill` is minimised at a fixed number of bucket regions, so the optimal slab
+ * AREA halves with --region: 2^29 at region 14, 2^28 at 13, 2^27 at 12. The
+ * old form of this constant was `2^29` with no reference to log_region, which
+ * left the target wrong by the same factor whenever --region moved -- measured
+ * +28.4% fill at region 13 and +68.3% at region 12. Expressing it as regions
+ * and deriving the rows is behaviour-preserving at the default (32768 << 14 =
+ * 2^29) and correct everywhere else.
+ *
+ * 32768 is the REACHABLE optimum at region 14, not the global one: finding 80
+ * puts the minimum of L(nregion) at 16,384, but reaching it from region 14
+ * needs twice the slabs and the factor-base re-stream cancels the gain. Region
+ * 14 remains the joint optimum because k_apply launches one block per region
+ * and costs +52% at region 13.
+ *
+ * Two independent benchmarks (Ampere RTX 3090 and Blackwell RTX 5070) found
+ * this working set near the fill/TD crossover; an L40 instead preferred twice
+ * it -- i.e. 65,536 regions -- and finding 81 leaves that card's preference
+ * unexplained, since the mechanism is sector-level read-modify-write and not
+ * L2 capacity. So this is a generic performance/memory cap and a per-card
+ * autotune candidate (item 2), not a universal speed optimum. Explicit
+ * --slab-j overrides it; the 2^31 position and direct-TD bounds below remain
+ * mandatory. */
+/* THE TRIGGER MUST SCALE WITH THE TARGET, and it keeps its factor of two.
+ *
+ * Splitting begins at TWICE the target, not at it: an area between one and two
+ * target-sized slabs is left alone deliberately, because splitting it buys a
+ * slab of half the target while paying a second full factor-base re-stream
+ * (929 MB, finding 78). That hysteresis is why `{16, J 16383}` -- just under
+ * 2^30 -- is one slab in the gate below, and it must stay.
+ *
+ * What was wrong was expressing it as an ABSOLUTE 2^30 while the target went
+ * region-relative. At --region 12 the target is 32768 << 12 = 2^27, but an
+ * area of 2^29 was still measured against 2^30 and so never split: 131,072
+ * regions in one slab, 4x the target, the exact shape finding 79 measured at
+ * +68.3% fill. Deriving the trigger as `target * 2` fixes that and reproduces
+ * the old 2^30 exactly at the default --region 14, so no default moves. */
+#define SLAB_PERF_REGIONS      32768u
 
 static inline uint32_t slab_row_quantum(int logI)
 {
@@ -62,18 +94,27 @@ static inline uint32_t slab_area_jmax(int logI)
     return (uint32_t)(((uint64_t)1 << 31) >> logI);
 }
 
-/* Return the auto-mode performance cap in rows. UINT32_MAX means that the
- * geometry is below the performance-slabbing trigger and should not be split
- * for performance alone.  If one row itself exceeds 2^29 positions, one row
- * is the smallest representable slab and the correctness caps still apply. */
-static inline uint32_t slab_perf_jmax(int logI, uint32_t J)
+/* Return the auto-mode performance cap in rows. UINT32_MAX means the geometry
+ * already fits one target-sized slab and should not be split for performance
+ * alone. If a single row exceeds the target -- SLAB_PERF_REGIONS << log_region
+ * positions, so 2^29 at the default --region 14 but 2^27 at region 12 -- one
+ * row is the smallest representable slab and the correctness caps still
+ * apply. */
+static inline uint32_t slab_perf_jmax(int logI, int log_region, uint32_t J)
 {
     uint64_t I, area, rows;
     if (logI < 0 || logI > 30 || !J) return 0;
+    if (log_region < 1 || log_region > 30) return 0;
     I = (uint64_t)1 << logI;
     area = I * (uint64_t)J;
-    if (area < ((uint64_t)1 << SLAB_PERF_TRIGGER_LOG2)) return 0xffffffffu;
-    rows = ((uint64_t)1 << SLAB_PERF_TARGET_LOG2) / I;
+    /* Target a region COUNT; the area follows from log_region, and so does
+     * the split trigger -- an area at or below one target-sized slab needs no
+     * splitting for performance. */
+    {
+        const uint64_t target = ((uint64_t)SLAB_PERF_REGIONS) << log_region;
+        if (area < target * 2u) return 0xffffffffu;   /* the hysteresis */
+        rows = target / I;
+    }
     if (!rows) rows = 1u;
     return rows > 0xffffffffull ? 0xffffffffu : (uint32_t)rows;
 }
@@ -102,7 +143,8 @@ static inline uint32_t slab_td_jmax(int logI, uint32_t max_prime)
 /* Build the host-side schedule. forced_j == 0 means auto. A nonzero value is
  * deliberately strict: it is a regression/testing knob, not permission to
  * violate either the position or direct-TD arithmetic bound. */
-static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
+static inline int slab_make_plan(int logI, int log_region, uint32_t J,
+                                 uint32_t max_small_prime,
                                  uint32_t forced_j, slab_plan_t *P)
 {
     uint32_t amax, tmax, perf_jmax, jmax, quantum;
@@ -119,7 +161,7 @@ static inline int slab_make_plan(int logI, uint32_t J, uint32_t max_small_prime,
         if (requested > jmax || !slab_rows_shape_ok(logI, requested)) return -1;
         jmax = requested;
     } else {
-        perf_jmax = slab_perf_jmax(logI, J);
+        perf_jmax = slab_perf_jmax(logI, log_region, J);
         if (!perf_jmax) return -1;
         if (perf_jmax < jmax) jmax = perf_jmax;
         jmax -= jmax % quantum;

@@ -9,28 +9,40 @@ static int check_plan(void)
 {
     slab_plan_t P = {0,0,0};
     const struct {
-        int logI; uint32_t J, pmax, forceJ, want_j, want_n;
+        int logI, lreg; uint32_t J, pmax, forceJ, want_j, want_n;
     } v[] = {
         /* Performance slabbing must not touch areas below 2^30. */
-        {16,  4096u, 65535u, 0u,      4096u, 1u}, /* 2^28 */
-        {16,  8192u, 65535u, 0u,      8192u, 1u}, /* 2^29 */
-        {16, 16383u, 65535u, 0u,     16383u, 1u}, /* just below 2^30 */
-        /* At 2^30 and above, auto mode targets 2^29 positions/slab. */
-        {16, 16384u, 65535u, 0u,      8192u, 2u}, /* 2^30 */
-        {16, 32768u, 65535u, 0u,      8192u, 4u}, /* 2^31 */
-        {16, 65536u, 65535u, 0u,      8192u, 8u}, /* 2^32 */
-        {17, 65536u,131071u, 0u,      4096u,16u},
-        {18,131072u,262143u, 0u,      2048u,64u},
-        {19,262144u,524287u, 0u,      1024u,256u},
-        {20,524288u,1048575u,0u,       512u,1024u},
-        {15, 16384u, 32767u, 0u,     16384u, 1u}, /* 2^29 */
-        {15, 16384u, 32767u, 123u,      123u,134u},
+        {16,14,  4096u, 65535u, 0u,      4096u, 1u}, /* 2^28 */
+        {16,14,  8192u, 65535u, 0u,      8192u, 1u}, /* 2^29 */
+        {16,14, 16383u, 65535u, 0u,     16383u, 1u}, /* just below 2^30 */
+        /* At 2^30 and above, auto mode targets 32768 bucket regions, which at
+         * the default --region 14 is 2^29 positions -- the value this table
+         * pinned before the target became region-relative (finding 79). Every
+         * row below is unchanged, which is the point: the fix is
+         * behaviour-preserving at the default. */
+        {16,14, 16384u, 65535u, 0u,      8192u, 2u}, /* 2^30 */
+        {16,14, 32768u, 65535u, 0u,      8192u, 4u}, /* 2^31 */
+        {16,14, 65536u, 65535u, 0u,      8192u, 8u}, /* 2^32 */
+        {17,14, 65536u,131071u, 0u,      4096u,16u},
+        {18,14,131072u,262143u, 0u,      2048u,64u},
+        {19,14,262144u,524287u, 0u,      1024u,256u},
+        {20,14,524288u,1048575u,0u,       512u,1024u},
+        {15,14, 16384u, 32767u, 0u,     16384u, 1u}, /* 2^29 */
+        {15,14, 16384u, 32767u, 123u,      123u,134u},
         /* Explicit --slab-j may override the performance target upward. */
-        {16, 32768u, 65535u,16384u,  16384u, 2u},
-        {17, 65536u,262143u, 0u,      4096u,16u},
+        {16,14, 32768u, 65535u,16384u,  16384u, 2u},
+        {17,14, 65536u,262143u, 0u,      4096u,16u},
+        /* THE BUG THIS SIGNATURE EXISTS TO CLOSE (finding 79). The target is a
+         * region COUNT, so halving --region must halve the slab AREA. Before
+         * the fix these three rows all returned the region-14 answer, leaving
+         * fill +28.4% at region 13 and +68.3% at region 12. */
+        {16,13, 16384u, 65535u, 0u,      4096u, 4u}, /* 2^28/slab */
+        {16,12, 16384u, 65535u, 0u,      2048u, 8u}, /* 2^27/slab */
+        {16,15, 32768u, 65535u, 0u,     16384u, 2u}, /* 2^30/slab */
     };
     for (unsigned k = 0; k < sizeof(v)/sizeof(v[0]); k++) {
-        if (slab_make_plan(v[k].logI, v[k].J, v[k].pmax, v[k].forceJ, &P) ||
+        if (slab_make_plan(v[k].logI, v[k].lreg, v[k].J, v[k].pmax,
+                           v[k].forceJ, &P) ||
             P.jmax != v[k].want_j || P.nslab != v[k].want_n ||
             P.enabled != (v[k].want_n > 1u)) {
             fprintf(stderr, "slabtest: plan %u got jmax=%u n=%u enabled=%d;"
@@ -60,14 +72,42 @@ static int check_plan(void)
         }
     }
     /* A forced slab is allowed to be smaller, never larger than a safety cap. */
-    if (!slab_make_plan(17, 65536u, 131071u, 20000u, &P)) {
+    /* The new log_region parameter must be USED, not merely accepted: an
+     * out-of-range region has to fail the plan, and a region that moves the
+     * target has to move the answer (the table above covers 12/13/15). */
+    if (!slab_make_plan(16, 0,  16384u, 65535u, 0u, &P) ||
+        !slab_make_plan(16, 31, 16384u, 65535u, 0u, &P)) {
+        fprintf(stderr, "slabtest: log_region out of range must fail the plan\n");
+        return -1;
+    }
+    /* The trigger scales with the target and keeps its factor of two. At
+     * region 12 the target is 2^27, so splitting starts at 2^28: J 4095 (area
+     * just under 2^28) is one slab, J 4096 (2^28) splits into two. Before the
+     * trigger was made region-relative, BOTH ran unsplit -- J 8192 at region 12
+     * gave one slab of 131,072 regions, 4x the target. */
+    if (slab_make_plan(16, 12, 4095u, 65535u, 0u, &P) || P.nslab != 1u) {
+        fprintf(stderr, "slabtest: region-12 below trigger got nslab=%u\n", P.nslab);
+        return -1;
+    }
+    if (slab_make_plan(16, 12, 4096u, 65535u, 0u, &P) || P.nslab != 2u ||
+        P.jmax != 2048u) {
+        fprintf(stderr, "slabtest: region-12 at trigger got jmax=%u nslab=%u\n",
+                P.jmax, P.nslab);
+        return -1;
+    }
+    if (slab_make_plan(16, 12, 8192u, 65535u, 0u, &P) || P.nslab != 4u) {
+        fprintf(stderr, "slabtest: region-12 2^29 got nslab=%u (was 1 unsplit)\n",
+                P.nslab);
+        return -1;
+    }
+    if (!slab_make_plan(17, 14, 65536u, 131071u, 20000u, &P)) {
         fprintf(stderr, "slabtest: unsafe forced slab height was accepted\n");
         return -1;
     }
     /* At logI=6 a TD rank group spans four j rows. Reject a forced height
      * that would leave partial groups, and accept an aligned one. */
-    if (!slab_make_plan(6, 64u, 63u, 3u, &P) ||
-        slab_make_plan(6, 64u, 63u, 4u, &P)) {
+    if (!slab_make_plan(6, 14, 64u, 63u, 3u, &P) ||
+        slab_make_plan(6, 14, 64u, 63u, 4u, &P)) {
         fprintf(stderr, "slabtest: slab row-quantum validation failed\n");
         return -1;
     }
@@ -113,7 +153,7 @@ static int check_bkthresh_integration(void)
         }
         pmax = fb_max_td_prime(&small);
         if (pmax != v[k].want_pmax ||
-            slab_make_plan(17, 65536u, pmax, 0u, &P) ||
+            slab_make_plan(17, 14, 65536u, pmax, 0u, &P) ||
             P.jmax != v[k].want_jmax || P.nslab != v[k].want_nslab) {
             fprintf(stderr,
                     "slabtest: bkthresh=%u integration got pmax=%u jmax=%u"
@@ -127,7 +167,7 @@ static int check_bkthresh_integration(void)
     }
     /* The same raised threshold must reject a forced slab that would have
      * been safe at the default threshold. */
-    if (!slab_make_plan(17, 65536u, 262139u, 16384u, &P)) {
+    if (!slab_make_plan(17, 14, 65536u, 262139u, 16384u, &P)) {
         fprintf(stderr,
                 "slabtest: raised-bkthresh unsafe forced slab was accepted\n");
         return -1;

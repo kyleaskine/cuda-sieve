@@ -2606,7 +2606,8 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
     uint32_t pmax0 = fb_max_td_prime(fbs0);
     uint32_t pmax = pmax1 > pmax0 ? pmax1 : pmax0;
 
-    if (slab_make_plan(cfg->logI, cfg->J, pmax, cfg->slab_j, &plan)) {
+    if (slab_make_plan(cfg->logI, cfg->log_region, cfg->J, pmax,
+                       cfg->slab_j, &plan)) {
         fprintf(stderr,
                 "  pipeline: cannot make a safe slab plan for logI=%d J=%u"
                 " (largest direct-test prime %u, requested --slab-j %u)\n",
@@ -2623,11 +2624,14 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                " --td-record-scalar) -- the pre-finding-77 path, for A/B only\n");
 
     if (plan.enabled) {
-        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->J);
+        const uint32_t perf_jmax = slab_perf_jmax(cfg->logI, cfg->log_region,
+                                                  cfg->J);
         if (!cfg->slab_j && perf_jmax != 0xffffffffu)
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
-                   " (auto <=2^29-position target; safety bounds may reduce it further)\n",
-                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax);
+                   " (auto target %u bucket regions at --region %d;"
+                   " safety bounds may reduce it further)\n",
+                   plan.nslab, plan.nslab == 1 ? "" : "s", plan.jmax,
+                   (unsigned)SLAB_PERF_REGIONS, cfg->log_region);
         else
             printf("  j-slabbing: %u slab%s, up to %u rows/slab"
                    " (<=2^31 local-position safety bound)\n",

@@ -6022,23 +6022,102 @@ capacity is real but bounded: **one extra independent kernel fills it, a third
 does not exist** -- on this card. N=8 needs a 24 GB+ card to test, which is the
 same card the extrapolation below needs anyway.
 
+### The 5090 answers the question the item was chartered to ask
+
+Same binary sources, same job, same geometry, `GPU_ARCH=native CF_LMAX=3`
+(which cannot touch `k_fill_atomic`), rented 5090, 2026-09-01.
+
+| card | single 4608 | wide 9216 | best concurrent | saturates at | vs best single |
+|---|---:|---:|---:|---|---:|
+| RTX 5070, 48 SM, 12 GB | 13.63 | 12.73 | **11.53** (N=2) | N=2 | 9.4% |
+| RTX 5090, 170 SM, 32 GB | 8.42 | 8.04 | **5.83** (N=4) | N=4 | **27.4%** |
+
+5090 concurrent/serial: **0.7654 at N=2, 0.6959 at N=4, 0.6957 at N=8** -- it
+saturates at four streams where the 5070 saturates at two, and N=8 reproduces
+N=4 to 0.1% (5.827 against 5.832 ms per workspace). **The number of streams a
+card wants is a property of the card**, not a constant.
+
+**The mechanism is now unambiguous, because only fill fails to scale:**
+
+| stage, 5070 -> 5090 | | ratio |
+|---|---|---:|
+| transform | 1.936 -> 0.514 ms | **3.77x** |
+| apply | 21.827 -> 6.080 ms | **3.59x** |
+| fill, one kernel | 13.63 -> 8.42 ms | **1.62x** |
+| fill, concurrent | 11.53 -> 5.83 ms | **1.98x** |
+
+Transform and apply both track the SM ratio (170/48 = 3.54x). Fill returns
+1.62x for 3.54x the SMs, and concurrency lifts it to 1.98x -- roughly 40% of
+the way to the 2.67x nameplate bandwidth ratio (1792 / 672 GB/s). **The
+plateau was never a device limit.** It is one kernel failing to keep a wide
+card busy, which is what `waves per SM = 1.00` and 26.5% idle SM cycles said.
+
+This also retires the standing puzzle in the "Measured" section of STATUS: "the
+5090 has 3.5x the SMs of a 5070 and returns far less than that on fill" now has
+a cause and a partial remedy, rather than a list of refuted hypotheses.
+
 ### What it is worth, stated honestly
 
-Best single-kernel per workspace is 12.73 ms (9216 blocks); concurrent is 11.53.
-That is **9.4% off fill** at the operating point. Fill is 13.6 of this
-benchmark's 37.3 ms sieve chain and the sieve chain is 61.97 of arm A's 97.46
-ms/q wall (finding 83), i.e. fill is ~23% of wall, so the ceiling on a 5070 is
-roughly **2% of wall** -- against a production change that needs a second bucket
-array (+1.37 GB here) and a restructured per-q loop.
+**On the 5070 it is not worth building.** Best single-kernel per workspace is
+12.73 ms (9216 blocks) against concurrent 11.53 -- 9.4% off fill, and fill is
+~23% of wall there, so roughly **2% of wall**.
 
-**That is not the reason to care.** The reason is the card this predicts for:
-the 5090 returns only 1.16x on fill for 3.5x the SMs and the 4090 is slower than
-a 5070 outright. If a single kernel leaves 16% idle on the NARROWEST card in the
-set, the idle fraction on a wide one should be much larger, and concurrency is
-the only lever that reaches it. **Re-run this on a 4090 and a 5090 before
-costing any production work** -- that is a two-command check on a rented box and
-it decides whether wide cards are a poor fit for this workload or merely
-underfed.
+**On the 5090 it is a different proposition, and the pipeline run settles the
+wall-clock share.** 2,000 q of the same c183 band at `I15e`, `--cofactor`,
+both sides:
+
+| stage | 5070 | 5090 | ratio |
+|---|---:|---:|---:|
+| wall clock per q | 97.46 | **44.19** | 2.21x |
+| transform + plattice | 3.108 | 0.928 | 3.35x |
+| apply | 32.898 | 9.453 | **3.48x** |
+| **fill** | 25.962 | **15.607** | **1.66x** |
+| resieve + scatter | 8.997 | 5.964 | 1.51x |
+| TD + classify | 14.51 | 7.84 | 1.85x |
+| cofactorisation | 12.88 | 5.89 | 2.19x |
+
+**Apply and transform scale with the SM count (3.54x). Fill returns 1.66x.**
+Because everything else scaled and fill did not, fill's share of wall *grows*
+with the card: **26.6% on the 5070, 35.3% on the 5090.**
+
+At the measured 27.4% cut against the best single-kernel configuration, that is
+**4.28 ms of 44.19 = 9.7% of wall** on a 5090 (10.8% against the shipped 4608
+default). That is a production-sized number, and it is the one this item needed.
+
+**A second stage is now visible in the same shape:** `resieve + scatter` scales
+1.51x, worse than fill, and is 5.96 ms = 13.5% of the 5090's wall. It is
+bucket-structured work like fill. Nobody has looked at it under this lens; it
+is not part of this item, but it is the next place to look.
+
+### The anomaly geometry makes the effect BIGGER
+
+`c147` at `--logI 14 --J 8192` -- the geometry where the 4090 came out 1.80x
+slower than a 5070 -- on the 5090, N=4:
+
+```
+CONCURRENT 4 x 4608, 4 streams :  6.451 ms  =  1.613 ms per workspace
+SERIAL     4 x 4608, one stream: 10.798 ms  =  2.699
+WIDE       1 x 18432            :  2.677 ms
+concurrent/serial 0.5975
+```
+
+**39.7% off fill**, against 27.4% at the larger `c183 I15e` geometry. The
+underfeeding gets WORSE as the per-kernel work gets smaller -- 8,192 regions
+here against 32,768 -- which is the regime small jobs and heavily slabbed
+geometries live in. A wide card running a small geometry is the worst case for
+one kernel, and the best case for this change.
+
+**The prediction that motivated this held.** It was: if one kernel leaves 15%
+idle on the narrowest card, a wide card should show more. It shows twice as
+much, and it wants twice the streams. **Wide cards are underfed, not poorly
+suited** -- which is the opposite of what the flat rel/J between a 5070 and a
+5090 (finding 47) implied, and it means the per-joule case for the wide card
+was being made against a handicapped configuration.
+
+**Still worth running on a 4090**, which is the remaining anomaly: it is 1.80x
+SLOWER at fill than a 5070 despite 1.5x the bandwidth, and this result predicts
+it should recover a large fraction of that under concurrency. If it does not,
+Ada has a second mechanism that Blackwell does not.
 
 ### Which pairing production would use
 

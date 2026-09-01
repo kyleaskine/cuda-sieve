@@ -714,6 +714,13 @@ typedef struct {
  * the practical ceiling is memory, not this constant -- 2 and 4 fit a 12 GB
  * card at the I15e/I16 geometries, 8 does not. */
 #define FILL_STREAMS_MAX     8
+/* A startup fill-block autotuner was built and REMOVED on 2026-09-01. The fill
+ * grid stays a constant per run: FILL_BLOCKS_DEFAULT, or whatever
+ * --fill-blocks says, fixed for the whole band. What was learned -- why a
+ * single-q ladder cannot predict band performance, the calibrated stability
+ * and margin guards it needed, and the in-band design that would work -- is in
+ * STATUS.md item 2. Read that before rebuilding it: the failure was in the
+ * measurement regime, not in the code. */
 /* k_apply's block size. APPLY_THREADS_MAX is NOT a taste limit: it is the first
  * argument of k_apply's __launch_bounds__, which is a hard ceiling -- a launch
  * with more threads per block fails outright. Keep these three in step with the

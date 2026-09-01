@@ -1309,19 +1309,80 @@ absent from every document in the repo.
    0.840; the drift correction is worth about one point and the spread fell
    from +-1.5% to +-0.2%.
 
-   **Worth ~2% of wall on a 5070** -- 9.4% off fill against the best
-   single-kernel configuration, and fill is ~23% of wall at this geometry --
-   against a production change costing a second bucket array (+1.37 GB) and a
-   restructured per-q loop. **Do not build it for that.**
+   **THE 5090 RAN THE SAME DAY AND CHANGES THE RECOMMENDATION.** Rented card,
+   same job and geometry:
 
-   **The next step is a 4090 and a 5090, not code.** This item exists because
-   the 4090 is 1.80x slower at fill than a 5070 with 1.5x its bandwidth and the
-   5090 returns 1.16x for 3.5x the SMs. If one kernel leaves 16% idle on the
-   narrowest card, the wide cards should show much more -- and that is what
-   decides whether they are a poor fit for this workload or merely underfed.
-   Two commands on a rented box. **If it does pay, the two SIDES of one q are
-   the cheaper pairing than two q**: they already share the factor bases and
-   run sequentially through one bucket allocation today.
+   | card | best single | best concurrent | saturates | gain |
+   |---|---:|---:|---|---:|
+   | 5070, 48 SM | 12.73 ms | **11.53** (N=2) | N=2 | 9.4% |
+   | 5090, 170 SM | 8.04 ms | **5.83** (N=4) | N=4 | **27.4%** |
+
+   **Only fill fails to scale with the card**: transform 3.77x and apply 3.59x
+   across the two cards against an SM ratio of 3.54x, while fill returns 1.62x
+   on one kernel and 1.98x under concurrency. So the plateau is one kernel
+   failing to feed a wide card, not a device limit -- and the number of streams
+   a card wants is a **per-card quantity** (2 here, 4 there, with N=8 matching
+   N=4 to 0.1%), which makes it item 2's kind of problem.
+
+   **Worth ~2% of wall on a 5070 -- do not build it for that. Worth 9.7% of
+   wall on a 5090, measured in the pipeline, and that is the case for building
+   it.** A 2,000-q band on the rented card gives wall 44.19 ms/q against the
+   5070's 97.46, with apply scaling 3.48x, transform 3.35x and **fill only
+   1.66x** -- so fill's share of wall *grows* with the card, 26.6% -> 35.3%,
+   and a 27.4% cut is 4.28 ms of 44.19.
+
+   It is also a conclusion about hardware, not just code: **wide cards are
+   underfed, not poorly suited**, so the flat rel/J between a 5070 and a 5090
+   (finding 47) was measured against a handicapped configuration and should be
+   re-taken once this ships.
+
+   **The effect grows as the geometry shrinks.** At `c147 I14 J8192` -- 8,192
+   regions against c183's 32,768 -- the 5090 gives concurrent/serial **0.5975**
+   and 39.7% off fill, against 27.4% at the larger geometry. Small jobs and
+   heavily slabbed geometries are the best case for this change, not the worst.
+
+   **A second stage has the same shape.** `resieve + scatter` scales **1.51x**
+   across the two cards, worse than fill, and is 13.5% of the 5090's wall. It
+   is bucket-structured work and nobody has looked at it under this lens. Not
+   part of this item; the next place to look.
+
+   **OPEN TODO -- one more rented card, before any production design.**
+   Both data points are Blackwell (48 SM -> 2 streams, 170 SM -> 4), so nothing
+   says whether an autotuner can PREDICT the stream count from device
+   properties or has to measure it. A third architecture settles it.
+
+   *Pick on price, not model.* A **3090** (GA102, 82 SM) is the best value: a
+   third architecture, an SM count between the two we have, an existing 3090
+   datapoint in the corpus to cross-check, and `GPU_ARCH=native` builds sm_86
+   in ~15 s against sm_120's 277 s. An **L40/L40S** (AD102, 142 SM) is the next
+   best -- same silicon family as the 4090 and it re-uses finding 72's L40.
+   A **4090** adds the historical anomaly (1.80x SLOWER at fill than a 5070
+   despite 1.5x the bandwidth) but is not required: that table was taken at 256
+   threads before the 4608 default, finding 52 already showed that axis
+   manufactures artifacts, and closing it properly needs a fresh 5070 baseline
+   too -- which is free, locally.
+
+   ```sh
+   make GPU_ARCH=native CF_LMAX=3 -j$(nproc) bench && make fbgen
+   ./fbgen --poly input.job --maxbits 15 --threads $(nproc) --out c183.fb1
+   for N in 2 4 8; do ./bench --poly input.job --fb1 c183.fb1        --logI 15 --J 16384 --reps 20 --fill-streams $N; done
+   ./bench --pipeline --cofactor --poly input.job --fb1 c183.fb1        --logI 15 --J 16384 --qrange 190000000: --nq 2000        --relations g.rels --log g.log --log-every 60
+   ```
+
+   Wanted from it: `concurrent/serial` at each N, the N where per-workspace
+   time stops falling, and the pipeline `band of` stage breakdown so fill's
+   share of wall is known for that card. `CF_LMAX=3` is valid -- c183's
+   `mfba 92` is under the 96-bit ceiling and the cofactor width cannot touch
+   `k_fill_atomic`. `ncu` is blocked on Vast.ai (three boxes now), so do not
+   plan on a profile.
+
+   If Ada does NOT recover under concurrency the way Blackwell did, it has a
+   second mechanism and that changes the design before anyone writes it. **When it is built, the two SIDES of one q are the
+   cheaper pairing than two q**: they already share the factor bases and run
+   sequentially through one bucket allocation today. Note the production gain
+   is not the benchmark gain -- the pipeline number needs a pipeline run, and
+   real special-q do not march their bucket frontiers in lockstep the way this
+   benchmark's identical workspaces do (finding 84's caveat).
 
    *Original statement of the item follows.* Two independent fill workspaces,
    two q or two sides in separate streams, sweep 1/2/4. This is the decisive test for
@@ -1361,7 +1422,140 @@ absent from every document in the repo.
    predictable from `nregion` alone — so a candidate geometry can be priced from
    the model or from counters, without running trial fills for it.
 
-   `--fill-threads` is done; the autotuner is not.
+   **BUILT 2026-09-01: the block axis and the region/slab coupling fix.**
+
+   - `slab_perf_jmax` now takes `log_region` and targets **32,768 bucket
+     regions** rather than `2^29` positions, deriving rows as
+     `(SLAB_PERF_REGIONS << log_region) / I`. Arithmetically identical at the
+     default `--region 14`, which is why every pre-existing `slabtest` row is
+     unchanged; three new rows pin region 12/13/15, all of which returned the
+     region-14 answer before. That closes the Known-defects entry.
+   - **`--fill-blocks` autotune -- built, then DEFAULTED OFF the same day when
+     it was measured against a band (see below).** Times the ladder
+     `{1152, 2304, 4608, 9216, 18432}` on the first special-q's real data,
+     three reps, keeps the minimum. `--fill-autotune` forces it on for
+     experiments; **an explicit `--fill-blocks` disables it** -- a knob the
+     operator set must not be silently overridden. The choice goes to stdout
+     and to the run log, and the log distinguishes `chosen-by-ladder` from
+     `kept-default-or-refused` so a guard firing is visible.
+     Repeating the fill is safe on slab 0 including SLABBED, because
+     `k_fill_atomic` reads `walk_cur` and writes `walk_next` and the host swaps
+     only after the slab, so every trial reads the same input.
+
+   **Two guards, both learned by accident the same day.** The first run of the
+   tune fired while a GGNFS sieve client had the GPU at 96% and **picked 1152
+   over the 4608 default** -- a choice that would then have stood for the whole
+   multi-hour band, on evidence that was pure scheduling noise.
+
+   - **Unstable-device guard:** if any ladder point's slowest rep exceeds its
+     fastest by **>10%**, the device is busy, no timing means anything, and the
+     tune abandons and keeps the default, printing the observed spread. The
+     threshold is calibrated, not guessed: 1.05 was the first value and it sat
+     *inside* natural jitter -- an idle 5070 prints spreads of 2.1-6.6% -- so
+     one run in three discarded a real result, while the case it must catch ran
+     at ~2x inflation. The observed spread is printed on every outcome so the
+     next person recalibrates from data.
+   - **Margin guard:** the winner must beat the default by >3% to be adopted.
+     4608 is a *measured* value (finding 76), not an arbitrary start, and a
+     tune that switches on a 1% difference is picking noise.
+
+   This is the same lesson as finding 53 in a new place: **a number measured on
+   a contended box is not a number.** A startup autotune is exactly where that
+   bites hardest, because one bad instant sets a parameter for hours.
+
+   **VERIFIED 2026-09-01, and guard 1 was exercised for real.** A 1,000-q c183
+   I15e band on the new binary emitted 42,184 relations and **every one of them
+   appears in finding 83's arm A file** (`comm -23` of the sorted sets: 0
+   lines). That one check clears three things at once -- the slab region-count
+   fix is behaviour-preserving, the autotune is output-neutral, and the binary
+   is sound despite two overlapping `make` runs having touched the tree.
+
+   The run went in deliberately against a GGNFS sieve client holding the GPU at
+   97%, and the guard did its job:
+
+   ```
+   fill autotune, on this q:  1152:28.73  2304:27.34  4608:27.09
+                              9216:23.90  18432:24.49
+     -> keeping 4608: reps disagree by >5%, the device is busy
+   ```
+
+   Note what an unguarded tuner would have taken from that: 9216 looks like a
+   12% win. It is scheduling noise, and the run would have carried it for the
+   whole band. **That transcript is from the 1.05 build** -- the message format
+   and threshold both changed afterwards -- so it is evidence that the guard
+   concept works, not that the shipped 1.10 constant has fired in anger. It has
+   not; the contended case is ~2x inflation and clears 1.10 by a wide margin on
+   arithmetic, but nobody has re-run it.
+
+   **THE TUNER AS BUILT DOES NOT WORK -- MEASURED 2026-09-01, DO NOT SHIP IT.**
+   On an idle 5070 it reproducibly picks 18432 (12.57-12.67 ms, 4/4 runs) over
+   the 4608 default, an apparent 8.5% win. Against a real 200-q band, three
+   reps each, spread 0.18%:
+
+   | `--fill-blocks` | band fill | vs default |
+   |---:|---|---:|
+   | 4608 (default) | 26.035 / 26.048 / 26.081 | -- |
+   | **9216** | **25.505 / 25.507 / 25.461** | **-2.1%** |
+   | 18432 (the tuner's pick) | 26.116 / 26.100 / 26.080 | **+0.2%** |
+
+   **The tuner picks the worst of the three** -- 2.4% behind the right answer
+   and 0.2% behind doing nothing.
+
+   **Cause: the ladder measures the wrong regime.** It runs repeated fills of
+   ONE lattice back-to-back, which is steady-state and cache-warm. A band gives
+   every q a freshly transformed `plat` and fills it ONCE. The proxy does not
+   predict the target, and the single-q numbers are internally consistent
+   (4/4 runs agree) while being wrong about production -- which is the most
+   dangerous shape a measurement can have.
+
+   **This also puts the 4608 default itself in question.** It came from finding
+   76's *standalone benchmark* sweep, i.e. the same repeated-fill-of-one-lattice
+   regime. Here the band prefers 9216 by 2.1%. Whether 4608 is right for the
+   jobs it was measured on is now an open question, and the check is cheap:
+   `--fill-blocks` sweeps at `--nq 200`, three reps, comparing the band's own
+   `fill` line rather than a benchmark's.
+
+   **A third failure, 2026-09-01, after the warm-up fix.** With the spread now
+   printed on every outcome, two runs in three abort with a **130x spread**
+   (`reps disagree by 12936.3%`) on a completely idle card, while every printed
+   per-rung minimum is a normal 12-15 ms -- so one REP of some rung took ~1.9
+   seconds. Not contention, not jitter: a stall inside the event window that
+   the earlier build simply could not see. Unverified hypothesis: an
+   asynchronous side-0 transform still in flight when the ladder starts, so a
+   trial queues behind it.
+
+   **Disposition: delete the ladder harness, keep the guards and the flags.**
+   Three distinct failures in one session -- wrong regime, wrong answer against
+   a band, intermittent multi-second outlier -- each surfaced by fixing the
+   last. That is a design to rebuild, not to patch, and ~95 lines of
+   permanently-disabled code inside the per-q loop is a standing cost to every
+   future reader of `run_pipeline_impl`. What is worth keeping is the part that
+   was validated: the two guard constants and their calibration, the
+   distinction between `chosen-by-ladder` and `kept-default-or-refused` in the
+   run log, and the rule that an explicit `--fill-blocks` always wins.
+
+   **The redesign, if this is taken up again:** tune IN-BAND. Run the first N q
+   of the band at each candidate grid -- 20 q per candidate is ~100 q against a
+   50,000-q work unit, i.e. free -- and compare the band-average fill each
+   produced. That measures exactly the quantity being optimised, needs no
+   proxy, and the guards built today (unstable-device, margin) carry over
+   unchanged. The code is on the branch and the flags work; only the
+   measurement regime is wrong.
+
+   Keep `--no-fill-autotune`-equivalent behaviour until then: **the default
+   must stay off, or ship 9216-vs-4608 as a measured constant instead.**
+
+   **`nregion` is NOT addressed and cannot be, by this design.** The bucket
+   array sizing, `k_apply`'s shared memory and the slab plan all derive from
+   `log_region`, so it must be chosen BEFORE allocation -- a predict-then-
+   allocate design, not measure-then-use -- and it cannot be judged on fill
+   alone, since it trades against apply in opposite directions (+52% apply at
+   region 13). Finding 81's traffic model is the way in. Still open.
+
+   The **stream count** (item 1) is a third per-card axis and belongs here once
+   item 1 ships: 2 on a 5070, 4 on a 5090, N=8 matching N=4 to 0.1%.
+
+   `--fill-threads` is done; the `nregion` autotuner is not.
    Sweep both axes, since holding one fixed is how the old default was reached.
    Opt-in for the standalone benchmark, where reproducibility is the point;
    default-on is defensible for `--pipeline`, where a per-job knee cannot be
@@ -1869,6 +2063,26 @@ absent from every document in the repo.
    inverse per prime, each time. ~15–20 s of startup on snfs236. Irrelevant to
    a multi-day run, worth fixing before anything that restarts the process in a
    loop (parameter sweeps, `cofcheck`).
+
+   **PROMOTED 2026-09-01 -- the distributed client is that loop.** Read
+   `~/code/ggnfs-distributed`: `sieve_executor.c` builds a fresh `bench`
+   command per work unit and runs it as a child process, so **every work unit
+   pays a full process startup**. What IS cached is factor-base *generation* --
+   `client.c` builds the `--fb1` file once per job and passes the path -- so
+   this item is not about regenerating the base. It is about what a fresh
+   process does with the cached file: the throwaway `fb1` parse (under
+   `--sq-side 0` only) and `rfb_build` running twice over `rlim` (always).
+
+   Work units are 50,000 q, **about 15 minutes** on the job class the client
+   runs (~18-24 ms/q; c183 would be 81 min, but that is not what it sieves).
+   So the question is what fraction of ~900 s the startup is. The 15-20 s
+   figure above was measured on **snfs236**, a bigger base than the client's
+   jobs, so it is an upper bound rather than the number -- **unmeasured for the
+   job class that actually pays it.** Measure it before scheduling the work:
+   time a `--nq 1` run against a `--nq 50000` run on a client job and take the
+   difference. If it is anywhere near 15 s it is ~2% of every unit on every
+   client forever, which beats the fill autotune above and is pure waste rather
+   than a tuning trade.
 
    **Re-measure before taking this (2026-09-01).** In-process factor-base
    generation landed 2026-08-24, so with `--fb1` omitted the throwaway first

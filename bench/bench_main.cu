@@ -132,7 +132,9 @@ static void usage(void)
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
 "  --slab-j N       pipeline: force at most N j rows per slab; 0/omitted =\n"
 "                   automatic. At >=2^30 total positions, auto targets\n"
-"                   <=2^29 positions/slab; smaller areas are not split for\n"
+"                   32768 bucket regions/slab -- 2^29 positions at the\n"
+"                   default --region 14, and it moves with --region; an area\n"
+"                   already inside one such slab is not split for\n"
 "                   performance alone\n"
 "  --relations F    write complete relations here (GGNFS/msieve format)\n"
 "  --cofactor       split the cofactors INLINE, in a cross-q device queue;\n"
@@ -872,9 +874,9 @@ static int bench_main_impl(int argc, char **argv)
      * (finding 8); leaving those as defaults meant the commands in RESULTS
      * reproduced a path nobody would ship. */
     cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
-    cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC;
+    cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC; cfg.fill_streams = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
-    cfg.fill_streams = 0;
+
     cfg.reps = 3; cfg.verify = 0;
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;

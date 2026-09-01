@@ -536,6 +536,16 @@ cd bench
     --target-rels 300 --geom 15,16384 --geom 15,32768
 ```
 
+**`--width` is a q-INTERVAL WIDTH, not a count of special-q.** The default
+`--width 2000` sieves a 2,000-*integer*-wide window, which at the default
+`--qmin 20` holds `2000 / ln(2e7)` ~= **119 (q, rho) pairs** -- so the default
+5-point run sieves about **600 pairs in total**, not 10,000. On the c183 at
+`15e` (97.46 ms/pair, finding 83) that is ~58 s of sieving plus ~15-20 s of
+per-geometry startup: **about a minute and a half**. Reading "5 points x 2000"
+as 10,000 special-q over-estimates the run by 17x, and the same misreading in
+reverse makes a real band look impossibly fast. Widen `--width` to buy
+precision; it is the knob that costs time.
+
 **`--qmin`, `--qmax` and `--target-rels` are in millions.** That run sieves
 `[2e7, 2e8)` and reports where 3e8 relations are met. Fractions work
 (`--qmin 2.5`), and a value that still looks like an absolute count is
