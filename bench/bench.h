@@ -692,15 +692,38 @@ typedef struct {
  * resident warps put more concurrent traffic on the constrained resource. The
  * 50% ceiling is benign; do not "fix" it.
  *
+ * CONFIRMED IN-BAND 2026-09-02 (finding 85). The retune above swept --nq 10;
+ * the same sweep at --nq 200, arms interleaved, n=3, gives the SAME RANKING:
+ *
+ *   blocks   2304     4608     9216    18432
+ *   fill    102.34    99.87   102.20   103.49  ms/q, in-band
+ *
+ * NOTE the 1152 arm was NOT re-run in-band -- its 8.6% deficit above stands on
+ * the --nq 10 sweep alone. Only the ranking reproduces; absolute fill sits
+ * 1.4-2.4% above August on every arm (ambient: 152.8 W board against 133.5 W),
+ * and that drift is not uniform -- the 4608-vs-9216 gap was 0.84% in August
+ * and 1.70% in September at an identical protocol. Rankings are robust here;
+ * margins are not, which is why STATUS item 2 will not let a tuner act on one.
+ *
+ * Arms non-overlapping (4608's worst rep 100.104 against 9216's best 102.032).
+ * --nq 10 is a real band -- ten distinct q, each freshly transformed and
+ * filled once -- so this default was never measured in the repeat-fill regime
+ * that broke the deleted autotuner.
+ *
  * KNOWN LIMIT OF THIS RETUNE. 1152 was validated on three cards (5070, 4090,
  * 5090); 4608 is measured on a 5070 only, and only on c194. The c147 shapes
  * are nearly flat across an 8x block range but do not agree on direction:
  * unslabbed prefers MORE blocks (-2.9% at 9216, still improving), slabbed
- * prefers 1152 (+0.8% at 4608, small but ~2.7 sigma). No mechanism explains
- * why two geometries over the same factor base disagree, so no formula is
- * offered. This is a better default for the I16 production class, not a
- * universal optimum -- which is the argument for the startup autotuner in
- * STATUS item 2, not against it.
+ * prefers 1152 (+0.8% at 4608, small but ~2.7 sigma). c183/I15e, unslabbed,
+ * prefers 9216 by 2.4% in-band and puts 4608 at the BOTTOM of four arms
+ * (finding 85: last outright at --nq 10; in-band tied with 18432 for last,
+ * 26.438 against 26.443, inside a 1.46-3.35% spread) -- consistent in
+ * direction with c147-unslabbed. No mechanism explains why two
+ * geometries over the same factor base disagree, so no formula is offered.
+ * This is a better default for the I16 production class, not a universal
+ * optimum -- which is the argument for the startup autotuner in STATUS item 2,
+ * not against it. Do NOT swap in 9216: it wins c183/I15e and loses c194/I16 by
+ * 2.3%, which just moves the loss onto the production class.
  *
  * Applies to k_fill_atomic, the shipping path, and to nothing else by default.
  * k_fill_l1 takes an explicit --fill-blocks but defaults to FILL_L1_BLOCKS
@@ -717,10 +740,16 @@ typedef struct {
 /* A startup fill-block autotuner was built and REMOVED on 2026-09-01. The fill
  * grid stays a constant per run: FILL_BLOCKS_DEFAULT, or whatever
  * --fill-blocks says, fixed for the whole band. What was learned -- why a
- * single-q ladder cannot predict band performance, the calibrated stability
- * and margin guards it needed, and the in-band design that would work -- is in
- * STATUS.md item 2. Read that before rebuilding it: the failure was in the
- * measurement regime, not in the code. */
+ * repeated-fill ladder cannot predict band performance, the calibrated
+ * stability and margin guards it needed, and the in-band design that would
+ * work -- is in STATUS.md item 2. Read that before rebuilding it: the failure
+ * was in the measurement regime, not in the code.
+ *
+ * Diagnosis pinned 2026-09-02 (finding 85): it is the REPEAT-FILL structure,
+ * not the sample count. On the same job and geometry the ladder got wrong, a
+ * 10-q band picks the in-band winner, and 15 of 16 interleaved reps rank the
+ * axis correctly on their own. Interleave the candidates and 10 q each is
+ * enough. */
 /* k_apply's block size. APPLY_THREADS_MAX is NOT a taste limit: it is the first
  * argument of k_apply's __launch_bounds__, which is a hard ceiling -- a launch
  * with more threads per block fails outright. Keep these three in step with the

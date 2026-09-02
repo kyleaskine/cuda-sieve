@@ -6140,3 +6140,164 @@ N x 42 B/entry from distinct addresses, no shared-read advantage) and does
 **not** predict how two real special-q interleave. That needs the production
 pipeline, and it is a reason to re-measure there before shipping, not a reason
 to doubt the 0.849.
+
+## Finding 85 — the `--fill-blocks` default is confirmed in-band on c194, and the ladder's WRONG-ANSWER failure is pinned to its repeat-fill regime rather than to sample count: a 10-q band ranks the axis correctly on both jobs
+
+**Date:** 2026-09-02, RTX 5070, **card idle but the CPU busy throughout** (see
+the spread discussion below — this matters, and not uniformly). One binary,
+`57480cd`. Arms `{2304, 4608, 9216, 18432}` interleaved *within* each rep so
+drift hits all four equally. Decision metric is the pipeline's own `fill` line,
+which is `cudaEventElapsedTime(ev[1], ev[2])` (`pipeline.cuh:566`) with no host
+sync inside the window.
+
+STATUS item 2 left two questions open. This settles both.
+
+### 1. Is 4608 right for the job it was chosen on? Yes.
+
+`oracle/c194.job` + `c194.roots1.m16`, `--logI 16 --J 32768
+--qrange 80000023: `, i.e. finding 76's configuration. Slabbed, 4 slabs.
+
+| `--fill-blocks` | in-band `--nq 200`, n=3 | spread | `--nq 10`, n=4 | spread |
+|---:|---:|---:|---:|---:|
+| 2304 | 102.343 | 0.72% | 103.233 | 0.67% |
+| **4608 (shipped)** | **99.872** | 0.57% | **100.535** | 0.92% |
+| 9216 | 102.200 | 0.28% | 102.277 | 1.71% |
+| 18432 | 103.492 | 0.18% | 103.653 | 1.04% |
+
+**4608 wins both regimes and the arms do not overlap**: in-band its worst rep
+(100.104) beats the runner-up's best (102.032) by 1.9 ms. Margin over 9216 is
+2.3% in-band. The full *ranking* is also identical across regimes —
+`4608 < 9216 < 2304 < 18432`.
+
+Finding 76's `--nq 10` sweep therefore predicted the in-band optimum exactly.
+**The "4608 is unvalidated in-band" worry in item 2 is closed: it is validated.**
+
+Absolute fill is above finding 76's August numbers on every arm, but **not
+uniformly**: +1.37% (2304), +1.54% (4608), +2.43% (9216), +1.75% (18432).
+Ambient explains the level — this box drew 152.8 W board in September against
+133.5 W in August at the same curve — but not the spread across arms.
+
+**That non-uniformity is the strongest caveat in this finding, and it bounds
+what any single tune is worth.** Between two runs of the *identical* `--nq 10`
+protocol on the same card, job and geometry, the 4608-vs-9216 gap went from
+**0.84% in August to 1.70% in September** — a factor of two. Rankings held both
+times, so the ordering is robust; the *margin* is not. Any tuner that compares
+its measured margin against a threshold is comparing a quantity that has been
+observed to double run-to-run.
+
+### 2. Was the ladder's failure about sample count, or about its regime? Its regime.
+
+This is the controlled version of the question. `oracle/input.job` +
+`c183.fb1`, `--logI 15 --J 16384 --maxbits 15 --qrange 190000000: ` —
+unslabbed: area `2^29` against a split trigger of
+`(SLAB_PERF_REGIONS << log_region) * 2`, which is `2^30` **at the default
+`--region 14` only** — stating that trigger as an absolute `2^30` is precisely
+the bug finding 79 fixed (`slab.h:64-69`), so replaying this configuration at
+`--region 12` would slab it. **The same job,
+geometry and axis on which the deleted ladder picked 18432 and the band wanted
+9216.**
+
+| `--fill-blocks` | in-band `--nq 200`, n=4 | spread | `--nq 10`, n=5 | spread |
+|---:|---:|---:|---:|---:|
+| 2304 | 26.097 | 2.34% | 25.960 | 3.19% |
+| 4608 (shipped) | 26.438 | 3.35% | 26.456 | 3.97% |
+| **9216** | **25.799** | 2.35% | **25.301** | 4.09% |
+| 18432 | 26.443 | 1.46% | 25.946 | 1.68% |
+
+**Both regimes pick 9216**, reproducing yesterday's independent band result
+(2.4% here against 2.1% then). The 10-q band gets the right answer on the very
+case the ladder got wrong.
+
+**Two limits on that, both load-bearing for the tuner design.** First, only
+*first place* agrees here: `--nq 10` ranks 9216 < 18432 < 2304 < 4608 while
+in-band ranks 9216 < 2304 < 4608 < 18432. The full-ranking agreement in the
+c194 table is a c194 result, not a general one. Second, the **margin** the two
+regimes report differs by ~1.8x — 4.37% at `--nq 10` against 2.42% in-band —
+and on c194 it goes the other way (1.70% against 2.28%). A short band is a
+reliable *ranker* and an unreliable *estimator of effect size*.
+
+That eliminates sample count as the explanation and leaves the ladder's own
+structure — repeated fills of ONE lattice, back-to-back, cache-warm — as the
+cause. Item 2 hypothesised exactly this; it is now supported by a controlled
+comparison rather than by inference. **A short band is not a bad measurement.
+A repeat-fill proxy is.**
+
+Note also that 4608, the shipped default, is at the bottom of the four arms on
+this job: **last outright at `--nq 10`, and in-band indistinguishable from
+18432 for last** (26.438 against 26.443 — a 0.02% gap, far inside these arms'
+1.46-3.35% spreads). It is not third-and-comfortable; it is tied for worst.
+That is not a defect: finding 76 established the
+optimum is geometry-dependent, and c194/I16 is the production class the default
+serves. It is a reason to tune per geometry, not to move the constant.
+
+### Interleaving is doing the heavy lifting, and that is the design lesson
+
+Ranking every rep individually — 16 interleaved reps across two jobs and two
+regimes — **15 of 16 picked the in-band winner outright.** The one miss (c183,
+in-band, rep 4) took 2304 over 9216 by 0.05 ms, 0.19%, between the two best
+arms.
+
+Single reps rank correctly despite within-arm spreads of up to 4.09% because
+interleaving cancels correlated drift: whatever the host or the clocks are
+doing during a rep, all four arms see it. **A tuner that interleaves its
+candidates needs far fewer reps than one that runs each candidate to
+completion in turn.** The redesign in item 2 — first N q of the band at each
+candidate grid — is validated at N=10, half the 20 it proposed.
+
+### Contention hit the small geometry and not the large one
+
+Within-arm spreads across **both** regimes were **0.18–1.71% on c194** and
+**1.46–4.09% on c183**, on the same busy box in the same session. Yesterday's
+idle-box c183 band measured 0.18%, so contention inflated c183 by **8x to
+23x** — and the worst of those (4.09%) is 9216 at `--nq 10`, an arm a tuner
+would rely on.
+
+**The mechanism is NOT established, and the obvious explanation does not
+survive its own arithmetic.** The tempting story is finding 4's: host work per
+q is roughly fixed while GPU work is not, so a small geometry is more exposed
+(c183/I15e runs 26 ms of fill and 104 ms of wall per q; c194/I16 runs 100 ms
+and 385 ms, a 3.8x ratio). And the fill event window is genuinely not pure
+kernel time — `ev[1]` is recorded, then two `cudaMemset`s and the launch are
+issued (`pipeline.cuh:536-542`), so a host stall between them lands inside the
+measurement.
+
+But that window is entered **once per side per slab**
+(`pipe_side_sieve_slab`, called at `pipeline.cuh:1744,1748`), so slabbed c194
+has 8 host-issued windows per q against unslabbed c183's 2. A 4x increase in
+exposure against a 3.8x increase in GPU work per window roughly cancels, and
+the ratio argument predicts no difference at all. The observation is solid;
+the causal story is not. **Do not use it to justify skipping an idle box.**
+
+**Operationally, as an observation rather than a rule:** `fill` was
+contention-tolerant on c194/I16 and contention-sensitive on c183/I15e in this
+session. On c183 the effect being measured (2.4%) was smaller than a single
+arm's spread (3.35%); only interleaving made it readable. Since the mechanism
+is unresolved, treat this as "measured on these two geometries", not as a
+property that transfers to a third.
+
+### Method note, and a correction to how this was framed
+
+The framing that opened this session — "the shipped default came from the same
+regime that produced yesterday's wrong answers" — was wrong, and worth
+recording because it nearly aimed the experiment at the wrong target. Finding
+76's sweep used `--nq 10`, which is a *band*: ten distinct special-q, each with
+a freshly transformed `plat`, each filled once. The ladder ran one lattice
+repeatedly in-process. Those differ in kind, not in length, and the tables
+above show the length axis was never the problem.
+
+### Output-equivalence evidence — weaker than byte-identity, and incomplete
+
+**No byte-identity check was run in this experiment.** What was captured is
+`COMPLETE RELATIONS/q`, identical across all four arms within each regime on
+c183 (7.410 in-band, 6.200 at `--nq 10`). Equal relation counts are much weaker
+than equal relations.
+
+The c194 column was lost to a bad field extraction, so **the in-band c194 arms
+— the ones carrying the "do not move the constant" conclusion — have no
+output-equivalence evidence from this run at all.** The fallback is finding
+76's byte-identity check on c194, which was taken at `--nq 10`; since this
+finding's whole point is that regimes can differ, that fallback is an argument
+by analogy rather than a check. `k_fill_atomic`'s output is block-count-
+invariant by construction (a pure grid-stride over the same primes), which is
+why this is a documentation gap rather than a suspected defect — but it should
+be closed the next time these arms are run.

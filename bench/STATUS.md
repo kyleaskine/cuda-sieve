@@ -1397,7 +1397,18 @@ absent from every document in the repo.
    two architectures predict differently — Blackwell's flatness fitting "idle
    capacity" and Ada's degradation not. That distinction is gone: at 32 threads
    all three cards flatten, so one prediction covers them all.
-2. **Startup fill autotune. STRONGER CASE 2026-08-25 (finding 76).** The
+2. **Startup fill autotune. LADDER BUILT AND DELETED 2026-09-01; the DEFAULT
+   CONFIRMED IN-BAND and the ladder's WRONG-ANSWER failure pinned to its
+   repeat-fill regime 2026-09-02 (finding 85).** Finding 85 addressed two of
+   the three recorded failures -- wrong regime and (as a rival explanation)
+   sample count. **The third is untouched:** the intermittent ~1.9 s stall
+   inside the fill event window remains unexplained, and the redesign below
+   measures that same window, so it inherits the outlier. The redesign's
+   *measurement regime* is validated; the design as a whole is not, and the
+   guard constants below need re-deriving before anyone builds it.
+   `nregion` remains the untouched axis.
+
+   **STRONGER CASE 2026-08-25 (finding 76).** The
    two-axis sweep that item warned about has now been run on the production
    shape, and it moved the block default 1152 -> 4608 (**fill -8.6%, wall
    -5.7%** on c194). It also showed why one constant cannot serve: c147
@@ -1508,12 +1519,37 @@ absent from every document in the repo.
    (4/4 runs agree) while being wrong about production -- which is the most
    dangerous shape a measurement can have.
 
-   **This also puts the 4608 default itself in question.** It came from finding
-   76's *standalone benchmark* sweep, i.e. the same repeated-fill-of-one-lattice
-   regime. Here the band prefers 9216 by 2.1%. Whether 4608 is right for the
-   jobs it was measured on is now an open question, and the check is cheap:
-   `--fill-blocks` sweeps at `--nq 200`, three reps, comparing the band's own
-   `fill` line rather than a benchmark's.
+   **CONFIRMED 2026-09-02 by controlled comparison -- finding 85.** The rival
+   explanation was sample count: maybe any short measurement is unreliable.
+   It is not. On **the same job, geometry and axis the ladder got wrong**
+   (c183/I15e), a 10-q band picks **9216** -- the in-band answer -- while the
+   ladder picked 18432. Sample count is exonerated and the repeat-fill
+   structure is the cause. **A short band is not a bad measurement; a
+   repeat-fill proxy is.**
+
+   **The 4608 default is CONFIRMED IN-BAND, 2026-09-02 (finding 85).** The
+   check this paragraph asked for was run: `--fill-blocks` swept at `--nq 200`,
+   arms interleaved, on finding 76's own c194/I16 configuration.
+
+   | arm | in-band fill, n=3 | `--nq 10`, n=4 |
+   |---:|---:|---:|
+   | 2304 | 102.343 | 103.233 |
+   | **4608** | **99.872** | **100.535** |
+   | 9216 | 102.200 | 102.277 |
+   | 18432 | 103.492 | 103.653 |
+
+   4608 wins both, arms non-overlapping (its worst rep beats the runner-up's
+   best by 1.9 ms), and the whole *ranking* is identical across regimes. So
+   finding 76's `--nq 10` sweep was never in the ladder's regime -- `--nq 10`
+   is a real band with ten distinct q, each freshly transformed and filled
+   once. **Do not move the constant.**
+
+   What remains true is that the optimum is geometry-dependent: c183/I15e
+   prefers 9216 by 2.4%, and 4608 sits at the bottom of the four arms there --
+   last outright at `--nq 10`, and in-band tied with 18432 for last (26.438
+   against 26.443, a 0.02% gap inside a 1.46-3.35% spread). That is an
+   argument for tuning per geometry, which is this item, not for a different
+   hardcode.
 
    **A third failure, 2026-09-01, after the warm-up fix.** With the spread now
    printed on every outcome, two runs in three abort with a **130x spread**
@@ -1539,11 +1575,98 @@ absent from every document in the repo.
    50,000-q work unit, i.e. free -- and compare the band-average fill each
    produced. That measures exactly the quantity being optimised, needs no
    proxy, and the guards built today (unstable-device, margin) carry over
-   unchanged. The code is on the branch and the flags work; only the
-   measurement regime is wrong.
+   unchanged.
+
+   **The ladder code exists in NO ref.** It was written and deleted between
+   commits, so `git grep` finds it on no branch and there is nothing to rebase
+   -- verified 2026-09-02 across every ref (`main`, `greg/main`, `greg/slab`,
+   `origin/main`, `origin/fix/windows-review`). An earlier sentence here said
+   "the code is on the branch and the flags work"; that was wrong and is
+   withdrawn. This item's prose is the only surviving record, which is why it
+   is written at the length it is.
+
+   **Finding 85 validates the measurement regime and sharpens it, but it also
+   breaks two of the constants this design was going to reuse. Read all five
+   points before building.**
+
+   - **N=10 is enough TO RANK.** A 10-q band picked the in-band winner on both
+     jobs and reproduced the full four-arm ranking on c194.
+   - **N=10 is NOT enough to size the effect**, and the design depends on that
+     more than on ranking. c183 reports a 4.37% margin at `--nq 10` against
+     2.42% in-band; c194 reports 1.70% against 2.28%. Errors in both
+     directions, up to ~1.8x.
+   - **INTERLEAVE the candidates, and the rep count collapses.** Ranking each
+     rep on its own, **15 of 16 interleaved reps** across two jobs and two
+     regimes picked the in-band winner outright; the single miss took 2304
+     over 9216 by 0.19%, between the two best arms. This held despite
+     within-arm spreads up to 4.09%, because whatever the host and clocks do
+     during a rep, all candidates see it. A tuner that runs each candidate to
+     completion in turn cannot borrow this and needs many more reps.
+   - **THE >3% MARGIN GUARD MUST BE RE-DERIVED -- as written it refuses every
+     win this tuner exists to capture.** Both real margins finding 85 measured
+     are *below* the threshold: 2.42% in-band on c183 and 2.28% on c194. The
+     guard was calibrated against the ladder's fictitious 8.5% and 12%
+     readings, not against true in-band effect sizes, which live at 2-3%.
+     Lowering it is not simply safe either: finding 85 saw the same margin
+     double run-to-run under an identical protocol (0.84% -> 1.70% in August
+     vs September on c194 at `--nq 10`), so a 2% threshold against a
+     10-q estimate is inside the noise it must reject. **This is the open
+     design problem, and it is not a constant to guess -- it needs the
+     margin's own reproducibility measured on an idle box.**
+   - **THE >10% UNSTABLE-DEVICE GUARD GOES INERT at 2 reps.** Slowest-vs-
+     fastest over two samples is a single pairwise difference with no power to
+     detect anything. Worse, it would not fire even with more: every spread
+     finding 85 measured on a *contended* box tops out at 4.09%, comfortably
+     under 10% -- and c183 under contention is exactly the case the caveat
+     below calls unreadable without interleaving. The threshold was calibrated
+     against the ladder's ~2x inflation and does not transfer to in-band
+     spreads. Re-derive it too, or replace it with an idle-box precondition.
+
+   **The shape, stated precisely** -- the earlier one-line version was
+   ambiguous in a way that matters:
+
+   - The grid is **five rungs** `{1152, 2304, 4608, 9216, 18432}`, not the four
+     finding 85 swept. Do not drop 1152: it is c147-slabbed's measured optimum
+     (finding 76), so a four-rung grid cannot find the winner on one of the
+     three documented geometries.
+   - `for rep in 1..2, for candidate in grid, sieve the SAME 10 q`. Every
+     candidate must see identical lattices, because finding 85's 15-of-16
+     single-rep result is *paired on q* -- give each candidate its own 10 q and
+     the pairing that cancels drift is gone, and that result does not transfer.
+   - That is 2 x 5 x 10 = **100 q**, matching this item's original estimate;
+     the "~80 q" figure that stood here assumed the four-rung grid.
+   - **Two consequences of re-sieving the same q that are NOT yet measured.**
+     (a) Relations from tune passes must be suppressed or deduplicated, or the
+     band emits each of those q 10 times. (b) Re-sieving one lattice
+     repeatedly is structurally closer to the ladder than a normal band is:
+     each pass does its own transform, so it is not the ladder, but L2 is warm
+     from the previous candidate's fill of the *same* lattice. Whether that
+     warmth biases the comparison is untested, and it is the first thing to
+     check when building this.
 
    Keep `--no-fill-autotune`-equivalent behaviour until then: **the default
-   must stay off, or ship 9216-vs-4608 as a measured constant instead.**
+   must stay off.** The "or ship 9216 instead" alternative that stood here is
+   withdrawn -- finding 85 shows 9216 is right for c183/I15e and wrong for
+   c194/I16 by 2.3%, so swapping the constant just moves the loss to the
+   production class.
+
+   **Contention caveat for whoever builds this** (finding 85). Across both
+   regimes on the same busy box, within-arm spreads were **0.18-1.71% on
+   c194/I16** and **1.46-4.09% on c183/I15e**, against an idle-box figure of
+   0.18% -- so contention inflated the small geometry **8x to 23x** and left
+   the large one comparatively alone. On c183 the effect being measured (2.4%)
+   was smaller than one arm's spread (3.35%); only interleaving made it
+   readable.
+
+   **The mechanism for that difference is NOT established.** The natural story
+   -- host work per q is fixed while GPU work is not, and the fill event window
+   includes two `cudaMemset`s and the launch (`pipeline.cuh:536-542`) so host
+   stalls land inside it -- fails its own arithmetic: that window is entered
+   once per side per slab, so slabbed c194 has 8 host-issued windows per q
+   against unslabbed c183's 2, and the 4x exposure roughly cancels the 3.8x
+   GPU-work ratio. **So do not treat "large geometry is contention-tolerant"
+   as a property that transfers.** Tune on an idle box, or measure the spread
+   on the geometry in front of you.
 
    **`nregion` is NOT addressed and cannot be, by this design.** The bucket
    array sizing, `k_apply`'s shared memory and the slab plan all derive from
