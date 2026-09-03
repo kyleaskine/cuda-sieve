@@ -699,11 +699,13 @@ typedef struct {
  *   fill    102.34    99.87   102.20   103.49  ms/q, in-band
  *
  * NOTE the 1152 arm was NOT re-run in-band -- its 8.6% deficit above stands on
- * the --nq 10 sweep alone. Only the ranking reproduces; absolute fill sits
- * 1.4-2.4% above August on every arm (ambient: 152.8 W board against 133.5 W),
- * and that drift is not uniform -- the 4608-vs-9216 gap was 0.84% in August
- * and 1.70% in September at an identical protocol. Rankings are robust here;
- * margins are not, which is why STATUS item 2 will not let a tuner act on one.
+ * the --nq 10 sweep alone. Only the RANKING reproduces. Against the in-band
+ * table here the 4608-vs-9216 gap is 2.28%; against September's own --nq 10
+ * sweep (103.233 / 100.535 / 102.277 / 103.653, in RESULTS finding 85, not
+ * repeated here) it is 1.70% where August measured 0.84% at an identical
+ * protocol -- so the margin doubled run-to-run while the ordering held.
+ * Rankings are robust; margins are not, which is why STATUS item 2 will not
+ * let a tuner act on one.
  *
  * Arms non-overlapping (4608's worst rep 100.104 against 9216's best 102.032).
  * --nq 10 is a real band -- ten distinct q, each freshly transformed and

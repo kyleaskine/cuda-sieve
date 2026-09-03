@@ -6258,11 +6258,11 @@ q is roughly fixed while GPU work is not, so a small geometry is more exposed
 (c183/I15e runs 26 ms of fill and 104 ms of wall per q; c194/I16 runs 100 ms
 and 385 ms, a 3.8x ratio). And the fill event window is genuinely not pure
 kernel time — `ev[1]` is recorded, then two `cudaMemset`s and the launch are
-issued (`pipeline.cuh:536-542`), so a host stall between them lands inside the
+issued (`pipeline.cuh:554-560`), so a host stall between them lands inside the
 measurement.
 
 But that window is entered **once per side per slab**
-(`pipe_side_sieve_slab`, called at `pipeline.cuh:1744,1748`), so slabbed c194
+(`pipe_side_sieve_slab`, called at `pipeline.cuh:1790,1794`), so slabbed c194
 has 8 host-issued windows per q against unslabbed c183's 2. A 4x increase in
 exposure against a 3.8x increase in GPU work per window roughly cancels, and
 the ratio argument predicts no difference at all. The observation is solid;
@@ -6301,3 +6301,579 @@ by analogy rather than a check. `k_fill_atomic`'s output is block-count-
 invariant by construction (a pure grid-stride over the same primes), which is
 why this is a documentation gap rather than a suspected defect — but it should
 be closed the next time these arms are run.
+
+## Finding 86 — item 9's two defects no longer exist in the pipeline path, and startup on the client's job class is 1.9 s
+
+**Date:** 2026-09-02, RTX 5070, idle box, commit `57480cd` + doc edits.
+Whole-process wall timed with `date +%s.%N` around `./bench --pipeline
+--cofactor`, `--nq 1` against `--nq 21`, three reps, first rep discarded as
+cold page cache (the c194 factor base is a 205 MB file).
+
+Item 9 asserted two specific defects and estimated 15-20 s of startup on
+snfs236, and was **promoted 2026-09-01** on the reasoning that the distributed
+client spawns a fresh `bench` per work unit and so pays them every ~15 minutes.
+Both assertions are stale.
+
+### The code: one parse, one `rfb_build`
+
+In a `--pipeline` run the whole factor-base setup lives inside
+`if (cfg.pipeline) {` (`bench_main.cu:1873-2871`), and inside it:
+
+The `fb1` load is a **three-way** branch (`:2638-2660`), and `--fb1` is an
+alias for `--cadofb` (`:1079`), so the runs measured here — and the
+distributed client, which passes an explicit `--fb1` — take the first arm:
+
+| branch | what | taken here |
+|---|---|---|
+| `cfg.cadofb` | `fb_load_cado(...)` `:2640` — fills logp internally (`fb_cado.c:449-465`) | **yes** |
+| `fbpath_set` | `fb_load(...)` `:2645` + `fb_fill_logp(&fb1)` `:2646`, legacy `--fb` | no |
+| else | `afb_build_gpu(...)` `:2656`, in-process GPU generation | no |
+
+and then, unconditionally:
+
+| what | where | times |
+|---|---|---:|
+| `rfb_build(&POLY, rlim, ...)` | `:2726` | 1 |
+| `fb_fill_logp(&fb0)` | `:2727` | 1 |
+
+**No factor base is loaded anywhere before line 1873**, so the "throwaway first
+parse that used to supply the q list" is gone — the `used to` in item 9's own
+wording turns out to be the whole story.
+
+The second `rfb_build` at `:2889` is real but unreachable here: it sits in the
+`else` of `if (cfg.side == 1)` (`:2876`), a **sibling** of the pipeline branch
+at the same brace depth, i.e. the standalone non-pipeline path. It is not a
+second call in one run; it is the same call in the other run mode.
+
+### The measurement agrees, including the part that would have shown the defect
+
+Fitting `T(n) = S + n*p` from the two points:
+
+| config | `T(1)` | `T(21)` | fitted per-q | **startup `S`** | of a 900 s work unit |
+|---|---:|---:|---:|---:|---:|
+| c183, `--sq-side 1` | 2.003 s | 3.930 s | 96.4 ms | **1.91 s** | 0.21% |
+| c183, `--sq-side 0` | 1.978 s | 3.847 s | 93.5 ms | **1.88 s** | 0.21% |
+| c194, `--sq-side 1` | 3.710 s | 8.952 s | 262 ms | **~3.45 s** | 0.38% |
+
+The c183 fit is tight and self-checking: reps reproduce to 4 ms at `--nq 1` and
+21 ms at `--nq 21`, and the fitted 96.4 ms/q lands on the band's own
+97.5 ms/q.
+
+**The `--sq-side` pair is the direct test.** Item 9's dead parse was specific
+to `--sq-side 0`, so that column should have been the expensive one. It is
+0.022 s *cheaper*. That is not "noise" — reps reproduce to 4 ms at `T(1)`, so
+22 ms is outside the rep spread, and with n=2 per point after discarding the
+cold rep there is no uncertainty on `S` to quote. It is **immaterial**: both
+values are ~1.9 s and the sign is the wrong way for the defect. There is no
+asymmetry to remove.
+
+**And the pair was run on c183 only.** Item 9's cost was described as scaling
+with factor-base size, so an asymmetry would show most strongly on c194's
+`rlim` 160M — the arm not run. The closure rests on the code reading, which is
+independent of base size; the `--sq-side` pair corroborates it on one job
+rather than establishing it on all.
+
+**c194's numbers are approximate.** Its `T(21)` spans 8.19-11.10 s across three
+reps, so the fitted 262 ms/q disagrees with the band's 385 ms/q and the fit is
+not trustworthy. What survives is a floor from the reproducible `T(1)`:
+startup is ~3.3-3.5 s. Enough to bound the item; not a number to quote further.
+
+### Disposition
+
+Startup grows with the factor-base bounds, not with ms/q — c183 (`rlim` 67.1M)
+pays 1.91 s and c194 (`rlim` 160M) ~3.45 s. It is **not** proportional: 2.39x
+the `rlim` buys 1.81x the startup, so there is a large `rlim`-independent
+intercept (CUDA context creation, allocations) that two points cannot
+separate from the slope. Only monotonicity is needed here, and it holds: the
+client's job class is *smaller* than c183, so it pays **at most ~1.9 s of a
+~900 s work unit, 0.2%**.
+
+The 15-20 s figure was measured on **snfs236, which was not re-measured
+here** — nothing in this finding refutes it for that base, and an
+snfs236-class job should be timed rather than assumed. What it is not is a
+number the client pays: its base is far larger than anything the client
+sieves. **Item 9 is closed: the defects are gone and the residual on the
+client's job class is 0.2-0.4%.** Nothing here is worth engineering.
+
+**Method note.** This item survived in the list for weeks describing code that
+had been restructured underneath it, and was *promoted* on that stale reading.
+The measurement took eight minutes; the code reading that made sense of it took
+about the same. Both were cheaper than the promotion.
+
+## Finding 87 — item 0's last hole closed: the matched CPU control at q=130M gives 2.90x time and 2.77x whole-box relations per joule, both sides measured this session
+
+**Date:** 2026-09-02, RTX 5070 + 9800X3D, idle box, GPU and CPU never running
+together. Whole-box watts on the UPS, monitors (45 W) subtracted throughout.
+
+Finding 71 ran GPU probes at 50M / 130M / 190M and matched CPU controls at 50M
+and 190M only. Finding 83 closed two of the three remaining holes. **This
+closes the third.**
+
+### The row
+
+| q = 130M | GPU | CPU, 16 workers | advantage |
+|---|---:|---:|---:|
+| wall ms/pair | 103.13 | 298.98 | **2.90x** |
+| unique rel/pair | 46.095 | 45.927 | 1.0037 |
+| whole box, at the wall | 252.5 W | 240 W | |
+| J/pair | 26.04 | 71.76 | 2.76x |
+| **J per unique relation** | **0.5649** | **1.5624** | **2.77x** |
+
+Yield agrees to **0.37%**; our dedup is 1.0004 (461,143 raw, 460,952 unique).
+The CPU band ran 10,053 pairs against the GPU's 10,000 — the width formula
+`10000 * ln q` overshoots the GPU's actual span by ~5%, as it does for the 50M
+and 190M controls, and both columns are normalised per pair.
+
+Against finding 83's `2^15 x 2^14` row (**3.09x / 2.89x** at 190M), 130M sits
+slightly lower, which is the direction finding 71's mechanism predicts: GGNFS
+truncates its base at q, so at 130M it still sieves only 97% of the base and at
+190M all of it. The CPU control now shows that drift directly —
+**271.95 -> 298.98 -> 301.47 ms/pair** across 50M / 130M / 190M while its yield
+falls **46.44 -> 45.93 -> 41.95**.
+
+### The August GPU probe was re-run, and the reason it seemed necessary was wrong
+
+`q130M.log` (2026-08-20) ran gate scale **1.2750/1.9250** against September arm
+A's **1.2500/1.9000**, and `fill=1152` against today's 4608. Pairing it with a
+September CPU control looked unsafe, so it was re-run on the current binary
+with arm A's exact flags.
+
+**The gate difference turned out not to be one.** Scale is a byte-scale
+representation choice; the quantity that gates is the derived allowance, and
+that is **93.57 against 93.60**. The two runs returned 461,144 / 460,953
+(August) and 461,143 / 460,952 (September) — one relation apart in 461,143. The
+re-run cost 17 minutes and converted an assumption into a check.
+
+### A REAL 7.33 ms/q REGRESSION — ENVIRONMENTAL, not our code (finding 88)
+
+**Corrected 2026-09-02, same day.** This section first claimed the accounting
+boundary had moved between August and September. It has not. That claim came
+from computing August's unaccounted as `wall - sieve - td` = 15.23 ms, which
+silently dropped three line items the breakdown prints. Both runs wrote a full
+breakdown to `.stdout`; reading them settles it:
+
+| stage | Aug `4b581b33` | Sep `57480cd` | delta |
+|---|---:|---:|---:|
+| transform + plattice | 3.123 | 3.268 | +0.15 |
+| fill | 28.131 | 26.106 | **-2.03** |
+| apply | 40.987 | 33.731 | **-7.26** |
+| **sieve, both sides** | 72.24 | 63.11 | -9.13 |
+| intersect + gcd | 0.416 | 0.412 | -0.00 |
+| host per-q | 1.046 | 1.143 | +0.10 |
+| TD + classify, wall | 14.49 | 15.99 | +1.50 |
+| cofactorisation, in-loop flushes | 13.27 | 14.66 | +1.39 |
+| **unaccounted** | **0.50** | **7.83** | **+7.33** |
+| **wall** | **101.96** | **103.13** | **+1.17** |
+
+The deltas sum to +1.18 against a +1.17 wall change, so the table closes and
+nothing moved between buckets.
+
+**What actually happened is that two real wins were eaten.** `apply` is 17.7%
+faster and `fill` 7.2% faster -- 9.3 ms/q of genuine improvement, the fill
+retune and the apply work -- and every millisecond of it was consumed by
+**+7.33 ms of unaccounted wall**, plus 1.50 on TD and 1.39 on cofactor flushes.
+
+`unaccounted` is `acc_wall - acc_sieve - acc_isect - acc_host - acc_td -
+tm.join - tm.cofac` (`pipeline.cuh:2452-2454`), i.e. wall that no timer in the
+breakdown sees. It went from **0.50 ms to 7.83 ms/q, a 15x increase worth 7.1%
+of wall**, and that is the whole of the `acc/wall` drop from 0.967 to 0.878.
+
+**RESOLVED THE SAME DAY -- see finding 88.** The bisect exonerated every
+commit: rebuilding `4b581b33`, the exact commit the August probe was built
+from, reproduces `unaccounted` 0.50 -> **7.86** with no source change at all.
+The variable is **environmental**, narrowed to the 2026-08-27 `apt upgrade`;
+the CUDA toolkit line and the Windows driver are both ruled out by direct
+test. It costs ~10.6 ms/q, and it has been masking 9.44 ms/q of real
+apply+fill work.
+
+The thermal hypothesis below is **withdrawn**; finding 88 closes the
+August-to-September arithmetic to 0.01 ms without it.
+
+### One unexplained discrepancy, which does not touch the row
+
+Whole wall went **101.96 -> 103.13 (+1.1%)** at 130M while at 190M it went
+**100.95 -> 97.46 (-3.5%)** — opposite directions for the same binary pair.
+
+**Explained by finding 88: an environmental penalty of ~10.6 ms/q from the
+2026-08-27 upgrade, partly offset by our own 9.44 ms/q of apply+fill work.** At 190M
+the kernel win is larger and wall improves; at 130M it is smaller and wall
+worsens. The rest of this section records what was ruled out first, and the
+thermal suspicion it ends on is superseded.
+
+It is not contention: today's host load ran **1.27-1.71** against August's
+**1.93-2.35**, so today was the quieter box.
+
+**It is not a clock or voltage difference either — checked 2026-09-02.** The
+question was raised directly (was the card undervolted in August?) and the
+answer is yes: finding 61 applied the 950 mV curve on **2026-08-17**, three
+days before the August probes, and finding 71's header records those probes as
+undervolted. The board draw confirms it independently — finding 61 measured
+stock at **195.2 W** and the 950 mV curve at **140.5 W**, and every August
+probe sits at a mean of **138.3-141.0 W** (q50M / q130M / q190M), nowhere near
+stock. September's runs mean **147.0-150.8 W** on the same curve.
+
+So both sides of this comparison are undervolted and the remaining suspect is
+thermal — 147-150 W today against 140-143 W in August, the September ambient
+finding 83 already flagged — but that is a hypothesis, not a measurement.
+
+*(Unrelated but adjacent: anything measured BEFORE 2026-08-17 does need
+finding 61's +6.7% ms/pair correction before comparison. That boundary is
+three days earlier than this one and does not touch these runs.)* It does not affect the verdict
+row, whose two sides were both measured today.
+
+### What item 0 has left
+
+Nothing on this axis. Three probes, three matched controls, both rectangles,
+metered watts on both sides. The remaining caveat is finding 83's: quote the
+board draw alongside any rel/J, because the same curve drew 133.5 W in August
+and 147-152.8 W in September.
+
+## Finding 88 — the 7.33 ms/q "regression" is ENVIRONMENTAL, not our code: it survives a rebuild of the August commit. Narrowed to the 2026-08-27 system upgrade; the CUDA 13.2/13.3 toolkit line is RULED OUT
+
+**Date:** 2026-09-02, RTX 5070, idle box. c183 `oracle/input.job`, `--logI 15
+--qrange 130000000: `, the item-0 130M geometry.
+
+Finding 87 recorded a +7.33 ms/q blowup in `unaccounted` between the August and
+September 130M runs and set out to bisect it. **The bisect exonerates every
+commit** -- that part is solid and is what this finding is for. The *cause* is
+still open; an earlier version of this finding named the CUDA 13.2 -> 13.3
+toolkit and that has since been refuted by direct test (see "What is ruled
+out").
+
+### The decisive test: one commit, rebuilt today
+
+`4b581b33` is the exact commit the August probe was built from. Rebuilt and
+re-run today, unchanged:
+
+| `4b581b33` | runtime | nq | wall | sieve | td | **unaccounted** |
+|---|---|---:|---:|---:|---:|---:|
+| 2026-08-20 | **13.2** | 10000 | 102.01 | 72.24 | 14.49 | **0.50** |
+| 2026-09-02 | **13.3** | 200 | 113.45 | 73.14 | 16.59 | **7.86** |
+
+Same source, same box, same card, same undervolt curve. `unaccounted` is
+band-length insensitive (HEAD gives 7.96 at nq=200 against 7.83 at nq=10000),
+so **+7.36 ms/q of pure GPU idle** is exact. Wall carries a ~0.82 ms nq
+artifact, measured the same way, giving a penalty of **~10.6 ms/q, +10.4%**.
+
+**This is the load-bearing result: nothing we wrote caused it.** The same
+source that measured 0.50 in August measures 7.86 today.
+
+### What is RULED OUT
+
+**The CUDA toolkit line, 13.2 vs 13.3.** Tested directly by building HEAD
+against both (`make NVCC=/usr/local/cuda-13.2/bin/nvcc`; `CUDART_LINK ?= static`
+at `Makefile:217`, so the runtime is baked in at build time):
+
+| HEAD, c183/130M, `--nq 200` | wall | sieve | **unaccounted** |
+|---|---:|---:|---:|
+| CUDA **13.3** | 104.01 | 63.74 | **7.96** |
+| CUDA **13.2** | 102.58 | 63.21 | **7.87** |
+
+The toolkit line is worth ~1.4 ms of wall and **nothing** of the idle. An
+earlier version of this finding attributed the whole regression to
+13.2 -> 13.3, reasoning from it being the one difference that could be named
+rather than from an isolated variable. **That attribution is withdrawn.**
+
+**The Windows driver / WSL passthrough.** Every real binary in
+`/usr/lib/wsl/lib` -- `libcuda.so` (187,984 B), `libnvidia-ml.so.1`,
+`nvidia-smi` -- is dated **2026-07-22**, a month before either session. The
+only 2026-08-27 entries there are two symlinks of 15 and 20 bytes plus the
+directory mtime, created by that day's `ldconfig`. Independently: the August
+logs already reported `driver 13.3`, so the driver already spoke that API
+before the Windows-side toolkit install; and a newer driver has been available
+since 2026-08-26 that is still not installed (the box runs 610.88 from July).
+
+### What it is NARROWED to
+
+`/var/log/dpkg.log` shows a broad `apt upgrade` on **2026-08-27 17:51**, between
+the August probes and the September runs. It installed CUDA 13.3, bumped the
+13.2 line (cudart 13.2.75 -> 13.2.86, compiler 13.2.1 -> 13.2.2), **and
+upgraded 59 non-CUDA packages** including apparmor, PAM, OpenSSL, Python and
+iproute2.
+
+So "CUDA 13.3" was merely the most visible item in a system-wide upgrade. Note
+that the toolkit test above compares two *post-upgrade* toolkits against each
+other, which is why they agree -- the 13.2 on the box today is **not** the
+13.2.75 that produced the August numbers.
+
+**CUDA IS NOW FULLY ELIMINATED.** The August-era `libcudart_static.a`
+(13.2.75-1, byte-different from 13.2.86) was fetched from NVIDIA's repo,
+extracted without installing, and linked through a symlink-farm shadow
+toolkit:
+
+| static `libcudart` linked into HEAD | `unaccounted` |
+|---|---:|
+| **13.2.75** -- the one August actually used | **7.83** |
+| 13.2.86 | 7.87 |
+| 13.3.29 | 7.96 |
+| *August's own measurement* | *0.50* |
+
+Linking the exact runtime August ran changes nothing. Not the toolkit, not the
+static runtime, not the driver. The trigger is elsewhere in the 08-27 upgrade
+(59 non-CUDA packages: apparmor, PAM, OpenSSL, Python, snapd, `wsl-setup`,
+procps) or outside apt entirely. No microcode, kernel image or libc6 was
+touched, and the CPU mitigation set is unremarkable for Zen 5.
+
+### An assumption of this finding is WRONG: `unaccounted` is not simply GPU idle
+
+An Nsight Systems trace (`--trace=cuda`, 6 q, steady state after dropping the
+first third) says:
+
+| | |
+|---|---:|
+| GPU kernel-busy fraction of span | **97.6%** |
+| total inter-kernel gap | **3.44 ms/q** |
+| `unaccounted` on the same geometry | 7.83 ms/q |
+
+**The GPU is 97.6% busy, and the gaps do not add up to `unaccounted`.** Some of
+that 7.83 ms is therefore device work falling OUTSIDE the event brackets, not
+the GPU waiting. Every statement in this finding calling `unaccounted` "GPU
+idle" is an assumption that this trace does not support -- treat the quantity
+as *wall not attributed to a bracketed stage* and nothing more. (Profiling
+also inflated the run to ~141 ms/q against 103 unprofiled, so the 3.44 is not
+directly comparable either; what the trace ranks reliably is which transitions
+dominate, not their absolute size.)
+
+**The gap ranking, steady state:**
+
+| transition | ms/q |
+|---|---:|
+| `k_transform` -> `k_fill_atomic` | **0.800** |
+| `k_cof_enqueue` -> `k_transform` | 0.524 |
+| `k_transform` -> `k_transform` | 0.487 |
+| `k_scatter_sel` -> `k_gather_ab` | 0.271 |
+| `k_apply` -> `k_intersect_compact` | 0.204 |
+
+**The top entry is the `cudaEventSynchronize(S->ev[1])` bubble** described
+below, now measured rather than inferred from a diff. It is a real and bounded
+win, independent of whatever caused the 08-27 regression.
+
+### The bisect, and why it pointed nowhere
+
+Every commit built TODAY lands in the same band regardless of its content:
+
+| commit | what it is | unaccounted |
+|---|---|---:|
+| `4b581b33` | the August baseline itself | **7.86** |
+| `0c412a2` | Windows code-review fixes | 7.73 |
+| `899f19b` | one `setvbuf` argument | 7.77 |
+| `556a631` | the >31-bit / slab architecture | 9.03 |
+| `9398fff` | slab cleanups | 8.71 |
+| `57480cd` | HEAD | 7.96 |
+
+`4b581b33` and `899f19b` differ by **118 lines**: a `.gitignore` block, a
+`setvbuf` size argument, and a deleted `wintest.bat`. Nothing that can touch
+sieve performance — and they measured 0.50 and 7.77 before the rebuild, 7.86
+and 7.77 after it.
+
+**Two methodological errors are worth recording, because both cost time.**
+
+1. **The bisect was mis-framed: `4b581b33` is NOT an ancestor of HEAD.** It is
+   the tip of a side branch whose Windows commits were re-applied onto
+   mainline as different SHAs (`040953d` -> `899f19b`, `9175cb1` -> `0c412a2`).
+   `git log 4b581b33..HEAD` therefore lists commits that are not "between" the
+   two states in any useful sense. Check ancestry with
+   `git merge-base --is-ancestor` BEFORE bisecting.
+2. **A mechanism was proposed from a diff before the data supported it.**
+   `556a631` does add a `cudaEventSynchronize(S->ev[1])` between the transform
+   and the fill, splitting a single async chain into two synced halves, and
+   that IS a real GPU bubble invisible to every timer. But `899f19b` predates
+   it, still has the old single-sync structure, and is equally "bad" -- so the
+   sync cannot be this regression. **It remains a genuine inefficiency worth
+   fixing on its own** (the sync exists only to read `t_transform`, and
+   deferring that read to after `ev[3]`'s sync would remove it), just not this
+   one.
+
+### What it means for everything measured across the boundary
+
+At **matched runtime and matched nq**, our own work between the two commits is
+worth **9.44 ms/q** (113.45 -> 104.01, -8.3%) -- the apply and fill
+improvements, real and previously invisible. The whole August-to-September
+picture closes to 0.01 ms:
+
+```
+102.01  August, pre-upgrade
++10.62  the 2026-08-27 environmental change (cause still open)
+ -9.44  our apply + fill work
+------
+103.19  September, post-upgrade   (measured: 103.19)
+```
+
+**This also explains finding 87's unexplained sign flip.** Two forces of
+similar magnitude pulling opposite ways: at 190M the kernel win (72.56 ->
+61.97, 10.6 ms) exceeds the environmental penalty and wall improves 3.5 ms; at 130M
+the win is 9.13 against ~10.6 and wall worsens 1.17 ms. Same mechanism, sign
+set by which term is larger. Nothing thermal is needed, and the thermal
+hypothesis recorded in finding 87 is withdrawn.
+
+**Confounded, and needing a caveat rather than a re-run:** any timing compared
+across 2026-08-20 -> 2026-09-01, which includes finding 83's attribution of the
+190M speedup to our work. The *verdict rows themselves are unaffected* --
+finding 83's and finding 87's GPU and CPU arms were each measured within one
+session on one runtime.
+
+### Not diagnosed
+
+**Where the 7.4 ms goes is unknown**, and per the section above it is NOT
+simply GPU idle -- treat it as wall not attributed to a bracketed stage. The
+instrument that can rank the inter-kernel component is **Nsight Systems**
+(gaps *between* kernels), not `ncu` (what happens *inside* one); finding 89
+records that Nsight ranks reliably but cannot quantify. At ~10% of wall this is worth more than
+every item on the open list except item 1. Item 19 carries the plan.
+
+**A note on how this was nearly mis-closed.** Two attributions were made and
+withdrawn in one session: first thermal (finding 87), then CUDA 13.2 -> 13.3
+(this finding). Both were reached the same way -- by naming the most visible
+difference between two sessions rather than by isolating a variable. The one
+claim that has survived every test is the one backed by a controlled
+experiment: **rebuild the August commit and the regression reappears.** Prefer
+that shape of evidence here; the environment on 2026-08-27 changed in at least
+61 ways and any of them can be named plausibly.
+
+## Finding 89 — two serialisation fixes in the per-q path: -1.40 ms/q (-1.36%), relations unchanged. And a reminder that un-interleaved A/B doubled the apparent win
+
+**Date:** 2026-09-02, RTX 5070, idle box (owner away, nothing else running).
+c183 `oracle/input.job`, `--logI 15 --qrange 130000000: --nq 200`. Both arms
+built from the same source tree with the same toolkit; only the two changes
+below differ.
+
+Finding 88 left the code exonerated for the 08-27 environmental regression but
+identified one thing we own: `k_transform -> k_fill_atomic` was the largest
+inter-kernel gap in the Nsight trace. Fixing it exposed a second serialisation
+point behind it.
+
+### Fix 1 — the transform event sync existed only to read a timer
+
+`pipe_side_prepare_q` ended with `cudaEventRecord(ev[1])` +
+`cudaEventSynchronize(ev[1])` + `*t_transform = time_kernel(ev[0], ev[1])`.
+Nothing after that sync touches device data: it is `cudaGetLastError`, an
+elapsed-time read, and five host `free()`s. So the block bought nothing except
+the timer, and cost a drained GPU while the host prepared the other side and
+the TD tables.
+
+The transform end moved to a **dedicated `ev[4]`** -- `pipe_side_sieve_slab`
+re-records `ev[1]` once per slab and would clobber a shared one -- and the
+elapsed time is now read after the slab loop, where the `ev[3]` sync has
+already guaranteed `ev[4]` completed. Same events, same subtraction, same
+number: `transform + plattice` reads 3.304 against 3.305 across the change.
+
+### Fix 2 — which exposed that the H2D uploads were the real block
+
+Fix 1 alone moved 2.83 ms/q out of `unaccounted` and put **2.04 ms of it into
+`host per-q`** (1.179 -> 3.220). The time had not gone away; it had become
+visible. `*t_host` is computed at `pipeline.cuh:525`, *after* four
+**synchronous** `cudaMemcpy` H2D calls. A synchronous copy on the legacy
+default stream cannot begin until prior stream work drains, so once the event
+sync no longer drained it, side 0's uploads blocked on side 1's still-running
+transform -- and that wait was charged to host time.
+
+Those four, plus the equivalent in `pipe_td_small`, became
+`cudaMemcpyAsync`. **Safe on two independently checked grounds:** the source
+buffers are already pinned (`cudaHostAlloc`, `pipe_side_init`), and they are
+only rewritten by the next q's call, by which point the stream has provably
+drained -- each side's copy is queued before its transform, and
+`pipe_side_sieve_slab` synchronises on `ev[3]` after apply. A comment at each
+site records that the second condition is load-bearing.
+
+### Result: interleaved A/B, four paired reps
+
+| | PRE | POST | delta |
+|---|---:|---:|---:|
+| wall/q (COMPLETE) | 102.57 | 101.17 | **-1.40 ms (-1.36%)** |
+| host per-q | 1.150 | 0.833 | -0.317 |
+| `unaccounted` | 7.80 | 6.67 | -1.14 |
+
+Per-pair wall deltas -1.45 / -1.51 / -1.38 / -1.25; **every pair favours the
+fix and the arms do not overlap.**
+
+**Correctness gate:** 9,053 relations from a 200-q band, and `comm -23` against
+finding 87's pre-fix 10,000-q reference returns **0** -- every relation
+produced is present in the reference. Run twice, once after each fix.
+
+### Method note: the un-interleaved measurement was wrong by 2x
+
+Run as three PRE reps followed by three POST reps, the same comparison gave
+**-2.8 ms/q**. The PRE arm was drifting downward across its own reps
+(103.48 -> 103.12 -> 102.52) as the box settled after a compile, and running
+one arm to completion before the other credited that drift to the fix.
+Interleaving removes it and gives -1.40.
+
+This is finding 85's lesson arriving from the other direction: there,
+interleaving let *one* rep rank four candidates correctly; here, failing to
+interleave doubled a two-arm result. **Interleave, even when the box is idle
+and the arms look stable.**
+
+### A defect this introduced, found in review the same day and fixed
+
+The async uploads' safety argument -- "only rewritten by the NEXT q's call, by
+which point the stream has drained" -- **was false on the `PIPE_Q_SKIP`
+path**. The four `cudaMemcpyAsync` are issued at `pipeline.cuh:424-430`; the
+norm-width check raises `PIPE_Q_SKIP` at `:497`, *after* them; and
+`run_pipeline_impl` `continue`s on a skip without entering the slab loop, so
+`cudaEventSynchronize(ev[3])` never runs. Up to `PIPE_SKIP_MAX` (100)
+consecutive skips could queue with no synchronisation at all, and the next q
+rewrites the pinned staging buffers underneath them. Side 1's `k_transform` is
+left in flight on the same path, so an execution fault there would have been
+reported against the *next* q's first CUDA call.
+
+Today's consequence was benign -- the next stream-ordered copy is the same size
+and overwrites the torn data, so device state ends correct -- but that is luck,
+not design, and the comment instructed future maintainers to rely on a
+precondition that did not hold.
+
+**Fixed** with a `cudaStreamSynchronize(0)` at the skip site, which drains both
+the uploads and the in-flight transform; skips are rare and capped, so the cost
+is irrelevant. The comment at the upload site now names *both* draining paths
+and says a new early return between them needs the same treatment.
+
+Two smaller hardenings from the same review: the deferred `time_kernel` reads
+now `cudaEventSynchronize` on `ev[4]` first -- no-ops today, since the slab
+loop's `ev[3]` sync already covers them, but `time_kernel`
+(`bench_kernels.cu:869`) discards `cudaEventElapsedTime`'s status, so a
+not-ready event would silently report 0 ms *and* latch `cudaErrorNotReady` for
+the next unrelated `cudaGetLastError` to report as fatal. And
+`pipe_side_prepare_q`'s `float *t_transform` out-parameter, which after this
+change only ever wrote `0.0f`, is gone.
+
+**NOT verified at runtime.** No gate in the repo exercises `PIPE_Q_SKIP`:
+c183's norms are ~197 bits and AS276's fit 384, so nothing available skips
+under a 12-limb build. To exercise it, `make BN_LIMBS=6` (192 bits, permitted
+by the Makefile's `4 6 8 10 12 14 16` filter) and run any c183 band -- most q
+will skip. Worth adding as a standing gate; the path is now load-bearing for
+the async uploads' safety.
+
+### Confirmed on the timeline
+
+A post-fix Nsight trace against finding 88's pre-fix one, same geometry:
+
+| transition | pre-fix | post-fix |
+|---|---:|---:|
+| `k_transform -> k_fill_atomic` | 0.800 | **0.120** |
+| `k_transform -> k_transform` | 0.487 | *out of the top 8* |
+| GPU kernel-busy | 97.6% | **98.2%** |
+| total inter-kernel gap | 3.44 ms/q | **2.42 ms/q** |
+
+The new largest gap is `k_cof_enqueue -> k_transform` at 0.583 ms/q -- the q
+boundary, where the host runs per-q preparation.
+
+### What is left, and why the trace does NOT answer it
+
+`unaccounted` is still **6.67 ms/q**, ~6.6% of wall, the residue of finding
+88's environmental regression. These two fixes are ours and were worth taking
+regardless; they do not touch it.
+
+**Nsight cannot quantify it, only rank it.** Including memcpy and memset
+activity (separate CUPTI tables from kernels -- an earlier gap count that
+omitted them was measuring the wrong thing) the steady-state GPU is **98.5%
+busy with 2.06 ms/q idle**. But the profiled run costs **134.8 ms/q against
+~101 unprofiled**: CUPTI inflates device time about 46%, roughly 1.2 ms per
+kernel across ~35 kernels per q. **That distortion is larger than the quantity
+being measured**, so 2.06 ms/q does not transfer to an unprofiled run and must
+not be quoted as the true idle.
+
+What would answer it is a whole-q event bracket -- record one event before the
+first GPU operation of a q and one after the last, and compare that span
+against the sum of the stage device times. The difference is true idle,
+measured without a profiler in the loop. That is measurement scaffolding in
+the production path and is left for the owner to approve rather than added
+alongside two functional changes.

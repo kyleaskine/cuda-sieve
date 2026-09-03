@@ -1013,19 +1013,34 @@ where the standalone gain is largest (16.7%).
   pair is now flagged in place in `normscan.c`; re-derive from a fresh survey
   before tightening the rule.
 
-- **LATENT 2026-08-26 — `SLAB_PERF_TARGET_LOG2` is silently coupled to
-  `log_region` (finding 79).** `slab_perf_jmax` (slab.h:69) computes
+- **NO GATE EXERCISES `PIPE_Q_SKIP` — noted 2026-09-02.** The norm-width skip
+  path is now load-bearing: finding 89's async H2D uploads depend on it
+  carrying its own `cudaStreamSynchronize`, because it never reaches the slab
+  loop's `ev[3]` sync. Nothing in the repo triggers it — c183's norms are
+  ~197 bits and AS276's fit inside 384 — so the fix is reasoned and compiled
+  but **not run**. Repro for a gate: `make BN_LIMBS=6` (192 bits, allowed by
+  the Makefile's `4 6 8 10 12 14 16` filter) and sieve any c183 band; most q
+  will skip. Cheap to add and it covers a path that is otherwise only ever
+  taken in production by the jobs we cannot sieve.
+
+- **FIXED 2026-09-01 (shipped in `57480cd`) — the slab target was silently
+  coupled to `log_region` (finding 79).** `slab_perf_jmax` computed
   `rows = 2^29 / I` with no reference to `cfg->log_region`, but the quantity
-  the target actually tunes is the **bucket region count** (32,768), not the
-  slab area. Verified: auto planning picks 8192 rows at `--region` 14, 13 and
-  12 alike, so moving the region leaves the slab target wrong by the same
-  factor — **+28.4% fill at region 13, +68.3% at region 12**. Not a live
-  regression: `--region` defaults to 14, production never moves it, and moving
-  it loses on `complete` anyway (`k_apply` is one block per region: +52% and
-  +157%). The fix is to express the constant as a region count and derive
-  `rows = (SLAB_PERF_REGIONS << log_region) / I`, which is behaviour-preserving
-  at the default. **Not built** — take it with the autotune work (item 2)
-  rather than on its own.
+  the target tunes is the **bucket region count** (32,768), not the slab area.
+  Auto planning picked 8192 rows at `--region` 14, 13 and 12 alike, leaving the
+  target wrong by the same factor — **+28.4% fill at region 13, +68.3% at
+  region 12**. Never a live regression: `--region` defaults to 14 and
+  production never moves it.
+
+  **Both halves are now region-relative**, which is the part worth noting —
+  the cap became `rows = (SLAB_PERF_REGIONS << log_region) / I` *and* the split
+  trigger became `area < target * 2`, where it had been left as an absolute
+  `2^30`. Fixing only the cap would have left an area of `2^29` at
+  `--region 12` never splitting, i.e. 131,072 regions in one slab: the exact
+  shape finding 79 measured at +68.3% fill. `slabtest` pins regions 12/13/15,
+  the trigger in both directions, and out-of-range rejection on the auto and
+  forced paths. Behaviour-preserving at the default; see item 2 and the policy
+  block in `slab.h`.
 
 - **FIXED 2026-08-18 — non-primitive relations at small q (finding 68).**
   `k_intersect_compact` filtered on `gcd(i,j) == 1` and assumed that made
@@ -1160,10 +1175,42 @@ absent from every document in the repo.
    `k_apply`'s launch bounds and the warp recorder are all performance-only on
    a real job.
 
-   **Still open:** no CPU control at 130M. And ambient now matters -- the same
-   950 mV curve drew 133.5 W board in August and 152.8 W in September heat, so
-   a rel/J figure is comparable across sessions only with its board draw quoted
-   alongside.
+   **THE LAST HOLE IS CLOSED, 2026-09-02 (finding 87).** The matched CPU
+   control at 130M was run, and the GPU arm re-run the same day so both sides
+   are current:
+
+   | q = 130M | GPU | CPU, 16 workers | advantage |
+   |---|---:|---:|---:|
+   | wall ms/pair | 103.13 | 298.98 | **2.90x** |
+   | unique rel/pair | 46.095 | 45.927 | 1.0037 |
+   | whole box | 252.5 W | 240 W | |
+   | **J per unique relation** | **0.5649** | **1.5624** | **2.77x** |
+
+   Yield agrees to 0.37%. **Item 0 now has three probes and three matched
+   controls**, plus both rectangles from finding 83. The margin's q-dependence
+   is visible on the CPU side directly: 271.95 -> 298.98 -> 301.47 ms/pair
+   across 50M / 130M / 190M as GGNFS's truncated base grows toward the full
+   one, with yield falling 46.44 -> 45.93 -> 41.95.
+
+   Two cautions from that session, both recorded in finding 87:
+
+   - **The August-to-September wall differences are ENVIRONMENTAL, not our
+     code -- finding 88, and it is now item 19.** Rebuilding `4b581b33`, the
+     exact commit August was built from, reproduces `unaccounted`
+     0.50 -> 7.86 ms/q with no source change. **The CUDA toolkit line is RULED
+     OUT** -- linking August's own cudart 13.2.75 gives 7.83, against 7.87 at
+     13.2.86 and 7.96 at 13.3.29 -- as is the Windows driver. It is narrowed to
+     the broad `apt upgrade` of 2026-08-27. The environmental penalty is
+     ~10.6 ms/q and has been masking **9.44 ms/q of real apply+fill work**;
+     the picture closes to 0.01 ms: `102.01 + 10.62 - 9.44 = 103.19`.
+   - **Cross-session timing comparisons spanning 2026-08-20 -> 2026-09-01 are
+     confounded**, including finding 83's attribution of the 190M speedup to
+     our work. **The verdict rows themselves are fine** -- each arm was
+     measured within one session on one runtime.
+
+   Ambient still matters: the same 950 mV curve drew 133.5 W board in August
+   and 147-152.8 W in September heat, so a rel/J figure is comparable across
+   sessions only with its board draw quoted alongside.
 
    *Original statement of the item follows.* The question the
    project was chartered to answer — unique relations/sec/watt on the **c183**
@@ -1440,15 +1487,42 @@ absent from every document in the repo.
      `(SLAB_PERF_REGIONS << log_region) / I`. Arithmetically identical at the
      default `--region 14`, which is why every pre-existing `slabtest` row is
      unchanged; three new rows pin region 12/13/15, all of which returned the
-     region-14 answer before. That closes the Known-defects entry.
+     region-14 answer before.
+   - **The split TRIGGER moved too, and that is the half that changes
+     behaviour.** It had been left as an absolute `2^30` while the target went
+     region-relative; it is now `area < target * 2`. Fixing only the cap would
+     have left an area of `2^29` at `--region 12` never splitting -- 131,072
+     regions in one slab, the shape finding 79 measured at +68.3% fill. Four
+     `slabtest` assertions cover it in both directions. The `* 2` is deliberate
+     hysteresis, not a bug; `slab.h`'s policy block now says so in three
+     places, because a reviewer proposed "correcting" it to `area < target`
+     and `slabtest` caught that.
+   - **Upward consequence, documented 2026-09-02:** holding the region count
+     fixed means the slab AREA scales with region size, so `--region 15` now
+     auto-plans a `2^30` slab where the old absolute target gave `2^29`, and
+     region 16 gives `2^31`. Peak bucket memory follows. Intended policy, but a
+     `--region 16` run that fit before may not now.
+   - **Out-of-range `log_region` now fails on the FORCED path too**
+     (2026-09-02). The only range check lived in `slab_perf_jmax`, which
+     `forced_j != 0` never reaches, so `slab_make_plan` accepted any region
+     there and silently ignored it. `bench_main.cu` validated independently, so
+     nothing shipped wrong; the header's contract is now enforced. That closes
+     the Known-defects entry.
    - **`--fill-blocks` autotune -- built, then DEFAULTED OFF the same day when
      it was measured against a band (see below).** Times the ladder
      `{1152, 2304, 4608, 9216, 18432}` on the first special-q's real data,
-     three reps, keeps the minimum. `--fill-autotune` forces it on for
-     experiments; **an explicit `--fill-blocks` disables it** -- a knob the
-     operator set must not be silently overridden. The choice goes to stdout
-     and to the run log, and the log distinguishes `chosen-by-ladder` from
-     `kept-default-or-refused` so a guard firing is visible.
+     three reps, keeping the minimum. `--fill-autotune` forced it on for
+     experiments; **an explicit `--fill-blocks` disabled it** -- a knob the
+     operator set must not be silently overridden. The choice went to stdout
+     and to the run log, and the log distinguished `chosen-by-ladder` from
+     `kept-default-or-refused` so a guard firing was visible.
+
+     **All of that is past tense: NONE of it exists in the tree.** The deletion
+     took the flags with the harness, so `--fill-autotune`, `chosen-by-ladder`
+     and `kept-default-or-refused` appear in this file and nowhere else. Where
+     the disposition below says "keep the guards and the flags", read it as
+     *keep the design decisions on record* -- which is what this prose is.
+     There is no flag to find and nothing to re-enable.
      Repeating the fill is safe on slab 0 including SLABBED, because
      `k_fill_atomic` reads `walk_cur` and writes `walk_next` and the host swaps
      only after the slab, so every trial reads the same input.
@@ -1660,7 +1734,7 @@ absent from every document in the repo.
 
    **The mechanism for that difference is NOT established.** The natural story
    -- host work per q is fixed while GPU work is not, and the fill event window
-   includes two `cudaMemset`s and the launch (`pipeline.cuh:536-542`) so host
+   includes two `cudaMemset`s and the launch (`pipeline.cuh:554-560`) so host
    stalls land inside it -- fails its own arithmetic: that window is entered
    once per side per slab, so slabbed c194 has 8 host-issued windows per q
    against unslabbed c183's 2, and the 4x exposure roughly cancels the 3.8x
@@ -2178,40 +2252,50 @@ absent from every document in the repo.
    and work status are consolidated in **"Current size limits and j-slabbing"**
    above; that section is canonical rather than duplicating a moving design
    here.
-9. **Dead factor-base parses under `--sq-side 0`.** `fb1` is loaded and
-   `fb_fill_logp`'d purely as the throwaway first parse that used to supply the
-   q list, but under `sq_side 0` the band comes from the rational base instead
-   and `fb1` is untouched until the derivation frees and reloads it. Separately
-   `rfb_build` runs twice over `rlim` — a full sieve to 134.2M plus a modular
-   inverse per prime, each time. ~15–20 s of startup on snfs236. Irrelevant to
-   a multi-day run, worth fixing before anything that restarts the process in a
-   loop (parameter sweeps, `cofcheck`).
+9. **Dead factor-base parses under `--sq-side 0` -- CLOSED 2026-09-02,
+   finding 86: BOTH DEFECTS ARE STALE and startup on the client's job class is
+   1.9 s.** (The 15-20 s snfs236 figure was not re-measured and is not
+   refuted; it is simply not a number the client pays.)
 
-   **PROMOTED 2026-09-01 -- the distributed client is that loop.** Read
-   `~/code/ggnfs-distributed`: `sieve_executor.c` builds a fresh `bench`
-   command per work unit and runs it as a child process, so **every work unit
-   pays a full process startup**. What IS cached is factor-base *generation* --
-   `client.c` builds the `--fb1` file once per job and passes the path -- so
-   this item is not about regenerating the base. It is about what a fresh
-   process does with the cached file: the throwaway `fb1` parse (under
-   `--sq-side 0` only) and `rfb_build` running twice over `rlim` (always).
+   The item described code that had been restructured underneath it, and was
+   promoted on that stale reading. In a `--pipeline` run everything lives in
+   `if (cfg.pipeline) {` (`bench_main.cu:1873-2871`) and inside it `fb1` is
+   loaded once (`:2640`/`:2645`), `fb_fill_logp`'d once (`:2646`), and
+   `rfb_build` is called **once** (`:2726`).
 
-   Work units are 50,000 q, **about 15 minutes** on the job class the client
-   runs (~18-24 ms/q; c183 would be 81 min, but that is not what it sieves).
-   So the question is what fraction of ~900 s the startup is. The 15-20 s
-   figure above was measured on **snfs236**, a bigger base than the client's
-   jobs, so it is an upper bound rather than the number -- **unmeasured for the
-   job class that actually pays it.** Measure it before scheduling the work:
-   time a `--nq 1` run against a `--nq 50000` run on a client job and take the
-   difference. If it is anywhere near 15 s it is ~2% of every unit on every
-   client forever, which beats the fill autotune above and is pure waste rather
-   than a tuning trade.
+   - **The throwaway `fb1` parse is gone.** No factor base is loaded anywhere
+     before line 1873. The item's own "used to supply the q list" was the
+     whole story.
+   - **`rfb_build` does not run twice.** The second call at `:2889` is in the
+     `else` of `if (cfg.side == 1)` (`:2876`) -- a *sibling* of the pipeline
+     branch, i.e. the standalone path. Same call, other run mode.
 
-   **Re-measure before taking this (2026-09-01).** In-process factor-base
-   generation landed 2026-08-24, so with `--fb1` omitted the throwaway first
-   pass may now cost a GPU *generation* rather than a file parse. The ~15-20 s
-   figure above was measured on the file path and has not been retaken under
-   either mode; the doubled `rfb_build` over `rlim` is untouched either way.
+   Measured, `T(n) = S + n*p` from `--nq 1` against `--nq 21`, reps agreeing
+   to 4-21 ms, fitted per-q landing on the band's own 97.5 ms/q:
+
+   | config | startup | of a 900 s work unit |
+   |---|---:|---:|
+   | c183, `--sq-side 1` | **1.91 s** | 0.21% |
+   | c183, `--sq-side 0` | **1.88 s** | 0.21% |
+   | c194, `--sq-side 1` | ~3.45 s | 0.38% |
+
+   The `--sq-side` pair is the direct test: the dead parse was specific to
+   side 0, so that row should have been the expensive one, and it is 0.03 s
+   cheaper. Startup scales with `rlim`, not with ms/q, and the client's job
+   class has a smaller base than c183 -- so it pays **at most ~1.9 s of ~900 s,
+   0.2%**. The 15-20 s figure was snfs236, a bigger base than the client ever
+   sieves.
+
+   **Nothing to build.** The 2%-of-every-unit-forever case that motivated the
+   promotion does not exist.
+
+   Two things this leaves open, neither worth scheduling on its own:
+   `--fb1`-omitted runs now do in-process GPU factor-base *generation*
+   (landed 2026-08-24) and were not timed here, though `client.c` passes an
+   explicit `--fb1` so the client never takes that path; and c194's `T(21)`
+   spans 8.19-11.10 s across reps, so its ~3.45 s is a bound rather than a
+   measurement.
+
 10. **GPU power-limit sweep — MEASURED 2026-08-17 (finding 61); a floor, not
     a knee.** The premise was that consumer cards ship past their efficiency
     knee and a 60–80% cap buys 15–30% rel/J. **The sieve is not power-limited
@@ -2869,3 +2953,84 @@ absent from every document in the repo.
     weighed against the risk of rewriting the hot dense path before anyone
     starts. **Build it only if item 8's geometry measurement forces slabs below
     16.**
+19. **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
+    2026-09-02 (finding 88). Worth more than every open item except 1.**
+
+    Rebuilding `4b581b33` -- the exact commit August was built from --
+    unchanged, today, reproduces `unaccounted` **0.50 -> 7.86 ms/q**:
+    **+7.36 ms/q of GPU idle** (band-length insensitive, so exact) and
+    **~10.6 ms/q of wall, +10.4%** at c183/I15e. **Our code is exonerated.**
+
+    **Ruled out by direct test:** the CUDA 13.2/13.3 toolkit line (HEAD built
+    against each gives unaccounted 7.87 and 7.96 -- worth ~1.4 ms of wall and
+    none of the idle), and the Windows driver / WSL passthrough (every real
+    binary in `/usr/lib/wsl/lib` is dated 2026-07-22, and the driver available
+    since 2026-08-26 is still not installed).
+
+    **Narrowed to the `apt upgrade` of 2026-08-27 17:51**, which installed
+    CUDA 13.3, bumped the 13.2 line (cudart 13.2.75 -> 13.2.86) *and* upgraded
+    59 non-CUDA packages. The toolkit test above compares two POST-upgrade
+    toolkits, which is why it came out flat.
+
+    It has been masking real work: at matched runtime our apply+fill
+    improvements are worth **9.44 ms/q**, which is why the two nearly cancelled
+    and why 130M and 190M disagreed in sign.
+
+    **What is NOT known: where inside the runtime it goes.** It is GPU idle
+    spread across the per-q launch sequence, so the candidates are launch
+    overhead and default-stream semantics. **The instrument is Nsight Systems**
+    -- gaps BETWEEN kernels -- not `ncu`, which profiles what happens inside
+    one and would show nine healthy kernels and no gap.
+
+    Steps, in order:
+
+    **DONE 2026-09-02, both negative on the cause but positive on a fix:**
+
+    - **CUDA fully eliminated.** HEAD linked against the August-era
+      `libcudart_static.a` (13.2.75-1, extracted from the .deb via a
+      symlink-farm shadow toolkit, nothing installed) gives `unaccounted`
+      **7.83** -- against 7.87 at 13.2.86 and 7.96 at 13.3.29. The exact
+      runtime August ran reproduces today's number, not August's.
+    - **`unaccounted` is NOT simply GPU idle.** An Nsight Systems trace puts
+      the GPU at **97.6% kernel-busy** with total inter-kernel gap
+      **3.44 ms/q**, well under the 7.83. Part of that quantity is device work
+      outside the event brackets. Read it as "wall not attributed to a
+      bracketed stage", and do not repeat the idle framing.
+
+    What remains, in order:
+
+    1. **DONE 2026-09-02 (finding 89): both serialisation points fixed,
+       -1.40 ms/q (-1.36%), relations unchanged.** The `ev[1]` transform sync
+       existed only to read a timer, so the transform end moved to a dedicated
+       `ev[4]` read after the slab loop. That exposed a second block behind it
+       -- four synchronous H2D `cudaMemcpy` calls that, once the GPU was no
+       longer drained, waited on the other side's in-flight transform -- now
+       `cudaMemcpyAsync` from the already-pinned staging buffers. Measured
+       interleaved, four paired reps, every pair favouring the fix.
+    2. **Attribute the remaining `unaccounted`, still 6.67 ms/q (~6.6% of
+       wall).** This is the residue of the 08-27 regression; the fixes above
+       do not touch it. **Nsight will NOT answer this** -- it ranks gaps
+       reliably (that is how step 1 was found and confirmed) but inflates
+       device time ~46%, more than the quantity being measured, so its
+       "2.06 ms/q idle" does not transfer to an unprofiled run.
+       **The instrument that would work:** bracket the WHOLE per-q GPU
+       sequence with two events and compare that span against the sum of the
+       stage device times; the difference is true idle, with no profiler in
+       the loop. That is measurement scaffolding in the production path --
+       cheap, but it needs the owner's sign-off rather than being bundled with
+       functional changes.
+    3. Only then chase the 08-27 trigger, if the attribution points at
+       something a package could plausibly have changed.
+    4. If the attribution lands on per-launch overhead, the standing candidate
+       is **CUDA graphs** (item 4.2): capture the fixed per-q sequence once and
+       replay it, attacking launch count and latency directly. The other
+       candidate that used to sit here -- the mid-sequence transform sync --
+       was removed by finding 89 and is no longer available as a lever.
+
+    **The separate inefficiency found while chasing this is now FIXED**
+    (finding 89, above). `556a631` had split the per-q chain so that
+    `pipe_side_prepare_q` blocked on the transform purely to read a timer,
+    where the pre-slab code queued transform -> fill -> apply asynchronously
+    with one sync at `ev[3]`. It was never finding 88's regression -- commits
+    predating the split measure just as bad -- but it was ours and it is gone.
+

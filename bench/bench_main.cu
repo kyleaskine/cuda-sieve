@@ -131,11 +131,12 @@ static void usage(void)
 "  --logI N         log2 of sieve width I      [15]   (gnfs-lasieve4I14e -> 14)\n"
 "  --J N            sieve height J             [2^(logI-1), CADO's convention]\n"
 "  --slab-j N       pipeline: force at most N j rows per slab; 0/omitted =\n"
-"                   automatic. At >=2^30 total positions, auto targets\n"
-"                   32768 bucket regions/slab -- 2^29 positions at the\n"
-"                   default --region 14, and it moves with --region; an area\n"
-"                   already inside one such slab is not split for\n"
-"                   performance alone\n"
+"                   automatic. Auto targets 32768 bucket regions/slab, so BOTH\n"
+"                   the cap and the split trigger move with --region: at the\n"
+"                   default --region 14 the cap is 2^29 positions and the\n"
+"                   trigger 2^30, at --region 12 they are 2^27 and 2^28. An\n"
+"                   area below TWICE the target is not split for performance\n"
+"                   alone (deliberate hysteresis)\n"
 "  --relations F    write complete relations here (GGNFS/msieve format)\n"
 "  --cofactor       split the cofactors INLINE, in a cross-q device queue;\n"
 "                   --relations then holds every relation, not just TD's\n"
@@ -1310,7 +1311,7 @@ static int bench_main_impl(int argc, char **argv)
      * `(uint64_t)1 << n` says what was meant and costs nothing. */
     /* Bound log_region before ANY 1u << log_region: the shift is undefined for
      * >= 32 and UBSan flags --region 32 on the old ordering. */
-    if (cfg.log_region < 1 || cfg.log_region > 30) {
+    if (!slab_region_ok(cfg.log_region)) {
         fprintf(stderr, "--region must be in [1,30] (got %d)\n", cfg.log_region);
         return 1;
     }

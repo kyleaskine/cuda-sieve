@@ -154,7 +154,10 @@ typedef struct {
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
     uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
-    cudaEvent_t ev[4];
+    /* ev[0..3] are the transform/fill/apply boundaries. ev[4] is the
+     * transform END, kept separate because pipe_side_sieve_slab re-records
+     * ev[1] once per slab and would clobber it. */
+    cudaEvent_t ev[5];
 } pside_t;
 
 static void pside_free(pside_t *S)
@@ -169,7 +172,7 @@ static void pside_free(pside_t *S)
     if (S->hsrt) cudaFreeHost(S->hsrt);
     if (S->hsg)  cudaFreeHost(S->hsg);
     if (S->hslp) cudaFreeHost(S->hslp);
-    for (int k = 0; k < 4; k++) if (S->ev[k]) cudaEventDestroy(S->ev[k]);
+    for (int k = 0; k < 5; k++) if (S->ev[k]) cudaEventDestroy(S->ev[k]);
     memset(S, 0, sizeof(*S));
 }
 
@@ -300,7 +303,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nlost, 8));
-    for (int k = 0; k < 4; k++) SIDE_INIT_CK(cudaEventCreate(&S->ev[k]));
+    for (int k = 0; k < 5; k++) SIDE_INIT_CK(cudaEventCreate(&S->ev[k]));
     rc = 0;
 
 done:
@@ -340,8 +343,7 @@ template <bool SLABBED>
 static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                                const qlat_t *L, const poly_t *POLY,
                                const bench_cfg_t *cfg, int side, double scale,
-                               int blocks, pside_t *S, float *t_transform,
-                               double *t_host)
+                               int blocks, pside_t *S, double *t_host)
 {
     uint32_t *idx = NULL, *tp = NULL, *trt = NULL, *tg = NULL;
     uint16_t *tlp = NULL;
@@ -404,14 +406,31 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         S->nblk = S->nwrp = 0;
         for (uint32_t i = 0; i < k && hsp[i] < SS_BLOCK_CUT; i++) S->nblk = i + 1;
         for (uint32_t i = 0; i < k && hsp[i] < SS_WARP_CUT; i++) S->nwrp = i + 1;
-        PERQ_CK(cudaMemcpy(S->sp, hsp, (size_t)k * sizeof(*hsp),
-                           cudaMemcpyHostToDevice));
-        PERQ_CK(cudaMemcpy(S->srt, hsrt, (size_t)k * sizeof(*hsrt),
-                           cudaMemcpyHostToDevice));
-        PERQ_CK(cudaMemcpy(S->sg, hsg, (size_t)k * sizeof(*hsg),
-                           cudaMemcpyHostToDevice));
-        PERQ_CK(cudaMemcpy(S->slp, hslp, (size_t)k * sizeof(*hslp),
-                           cudaMemcpyHostToDevice));
+        /* ASYNC on purpose. A synchronous cudaMemcpy on the legacy default
+         * stream cannot begin until prior stream work drains, so once the
+         * transform sync was removed from the end of this function these four
+         * copies became the new serialisation point: side 0's uploads blocked
+         * on side 1's still-running transform, and the wait was charged to
+         * `host per-q` (measured: 1.179 -> 3.220 ms/q). Async keeps the host
+         * running ahead and issuing the next launch.
+         *
+         * Safe because hsp/hsrt/hsg/hslp are PINNED (cudaHostAlloc, see
+         * pipe_side_init) and are only rewritten by the NEXT q's call, by
+         * which point the stream has drained. TWO paths provide that drain and
+         * BOTH are load-bearing: the normal one ends in the slab loop's
+         * cudaEventSynchronize(ev[3]), and the PIPE_Q_SKIP path -- which never
+         * reaches the slab loop -- carries its own cudaStreamSynchronize for
+         * exactly this reason (see the skip site below). A new early return
+         * added between here and the slab loop needs the same treatment, or
+         * these must go back to synchronous. */
+        PERQ_CK(cudaMemcpyAsync(S->sp, hsp, (size_t)k * sizeof(*hsp),
+                                cudaMemcpyHostToDevice, 0));
+        PERQ_CK(cudaMemcpyAsync(S->srt, hsrt, (size_t)k * sizeof(*hsrt),
+                                cudaMemcpyHostToDevice, 0));
+        PERQ_CK(cudaMemcpyAsync(S->sg, hsg, (size_t)k * sizeof(*hsg),
+                                cudaMemcpyHostToDevice, 0));
+        PERQ_CK(cudaMemcpyAsync(S->slp, hslp, (size_t)k * sizeof(*hslp),
+                                cudaMemcpyHostToDevice, 0));
     }
 
     /* Side 0's norms are G(x) = Y1*x + Y0, a degree-1 form. run_bench gets
@@ -477,6 +496,16 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                 else
                     runlog_warn("     no supported BN_LIMBS is wide enough"
                                 " (the maximum is 16, i.e. 512 bits)");
+                /* DRAIN BEFORE SKIPPING. This path does NOT reach the slab
+                 * loop -- run_pipeline_impl `continue`s on PIPE_Q_SKIP -- so
+                 * nothing downstream will synchronise. Two things are left in
+                 * flight without this: the four cudaMemcpyAsync uploads above,
+                 * whose pinned source buffers the NEXT q rewrites, and (when
+                 * side 0 raises the skip) side 1's k_transform, whose
+                 * execution errors would otherwise be reported against the
+                 * next q's first CUDA call. Skips are rare and capped at
+                 * PIPE_SKIP_MAX, so the cost here is irrelevant. */
+                PERQ_CK(cudaStreamSynchronize(0));
                 rc = PIPE_Q_SKIP;
                 goto done;
             }
@@ -501,10 +530,24 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
     k_transform<SLABBED><<<blocks, cfg->threads>>>(S->primes, S->roots, S->plat, fb->n,
         cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1,
         S->d_nproj, S->d_nlost, S->walk_cur);
-    PERQ_CK(cudaEventRecord(S->ev[1]));
-    PERQ_CK(cudaEventSynchronize(S->ev[1]));
+    PERQ_CK(cudaEventRecord(S->ev[4]));
+    /* NO SYNCHRONIZE HERE. This function used to block on the transform purely
+     * to read t_transform, and nothing after that read touches device data --
+     * it is cudaGetLastError, an elapsed-time read and five host free()s. The
+     * block cost a measured 0.800 ms/q of GPU idle at the
+     * k_transform -> k_fill_atomic boundary plus 0.487 at
+     * k_transform -> k_transform (RESULTS finding 88's gap ranking), because
+     * the card drained while the host prepared the other side and the TD
+     * tables. The elapsed time is now read after the slab loop, where the
+     * ev[3] sync has already guaranteed ev[4] completed.
+     *
+     * cudaGetLastError still catches launch-configuration failures, which is
+     * what it was for. An error raised DURING execution now surfaces at the
+     * next sync, inside pipe_side_sieve_slab -- normal async CUDA practice. */
     PERQ_CK(cudaGetLastError());
-    *t_transform = time_kernel(S->ev[0], S->ev[1]);
+    /* The transform time is NOT produced here any more. ev[0] and ev[4] are
+     * left for run_pipeline_impl to subtract after the slab loop, which is
+     * the only place they are known to be complete. */
     rc = 0;
 
 done:
@@ -802,8 +845,12 @@ static int pipe_td_small(pipe_td_t *C, int side, const fb_t *fbs,
     if (!C->nsmcap[side]) { C->nsm[side] = 0; return 0; }
     C->nsm[side] = td_fill_small(fbs, L, logI, C->h_sm[side]);
     if (!C->nsm[side]) return -1;
-    CK(cudaMemcpy(C->d_sm[side], C->h_sm[side],
-                  (size_t)C->nsm[side] * sizeof(tdsmall_t), cudaMemcpyHostToDevice));
+    /* Async for the same reason as the four uploads in pipe_side_prepare_q,
+     * and safe on the same grounds: h_sm is pinned and the stream drains
+     * every q. */
+    CK(cudaMemcpyAsync(C->d_sm[side], C->h_sm[side],
+                       (size_t)C->nsm[side] * sizeof(tdsmall_t),
+                       cudaMemcpyHostToDevice, 0));
     return 0;
 }
 
@@ -1690,11 +1737,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * the side has already been printed by the side that raised it. */
             const int p1 = pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
                                                         cfg->scale, blocks, &S1,
-                                                        &ts1[0], &th1);
+                                                        &th1);
             const int p0 = (p1 != 0) ? p1
                          : pipe_side_prepare_q<SLABBED>(fb0, fbs0, &Lq, POLY, cfg, 0,
                                                         cfg->scale0, blocks, &S0,
-                                                        &ts0[0], &th0);
+                                                        &th0);
             if (p1 == PIPE_Q_SKIP || p0 == PIPE_Q_SKIP) {
                 if (++nqskip >= (unsigned long long)PIPE_SKIP_MAX) {
                     /* A POLICY STOP, NOT A CRASH. Falling out with rc = -1
@@ -1909,6 +1956,23 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
         }
         if (rc) break;
+        /* Deferred from pipe_side_prepare_q, which no longer blocks on the
+         * transform. The slab loop above ended with cudaEventSynchronize on
+         * each side's ev[3], and ev[4] precedes ev[3] in stream order, so both
+         * are complete here. Same events, same subtraction, same reported
+         * number -- only the moment of reading moved. */
+        /* These synchronise on events the slab loop's ev[3] has already
+         * covered, so they are no-ops costing microseconds -- but they make
+         * the read structurally safe instead of dependent on a guarantee
+         * established in another function. time_kernel discards
+         * cudaEventElapsedTime's status (bench_kernels.cu:869), so a
+         * not-ready event would silently report 0 ms AND latch
+         * cudaErrorNotReady for the next unrelated cudaGetLastError to
+         * report as fatal. Do not remove these to save the microseconds. */
+        PIPE_CK(cudaEventSynchronize(S1.ev[4]));
+        PIPE_CK(cudaEventSynchronize(S0.ev[4]));
+        ts1[0] = time_kernel(S1.ev[0], S1.ev[4]);
+        ts0[0] = time_kernel(S0.ev[0], S0.ev[4]);
         /* This is the original pre-slabbing invariant: an entire special-q
          * with no two-sided survivors is suspicious and remains fatal. Empty
          * individual slabs are allowed; only their sum is tested here. */

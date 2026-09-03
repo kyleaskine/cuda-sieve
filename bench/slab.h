@@ -27,8 +27,17 @@ typedef struct {
  * number of those groups. For logI >= 8 every complete j row already does. */
 #define SLAB_TD_GROUP_POS 256u
 
-/* Performance policy: once a full sieve reaches 2^30 positions, auto mode
- * caps the slab.
+/* Performance policy: once a full sieve reaches TWICE the region target, auto
+ * mode caps the slab. Both halves are region-relative -- at the default
+ * --region 14 that trigger is 2^30 positions and the cap is 2^29, but at
+ * --region 12 they are 2^28 and 2^27. Do not restate either as an absolute.
+ *
+ * NOTE THE UPWARD DIRECTION, added 2026-09-02. Holding the region COUNT fixed
+ * means the slab AREA scales with the region size, so raising --region raises
+ * the auto slab and with it peak bucket memory: 2x at region 15 and 4x at
+ * region 16 against what the old absolute 2^29 target produced. That is the
+ * intended consequence of the policy, not a regression -- but a --region 16
+ * run that fit before may now need 4x the bucket allocation.
  *
  * THE TARGET IS A BUCKET-REGION COUNT, NOT AN AREA (finding 79, 2026-08-26).
  * `fill` is minimised at a fixed number of bucket regions, so the optimal slab
@@ -94,22 +103,33 @@ static inline uint32_t slab_area_jmax(int logI)
     return (uint32_t)(((uint64_t)1 << 31) >> logI);
 }
 
+/* The one definition of a valid bucket-region exponent. Three sites test it
+ * -- slab_perf_jmax, slab_make_plan and bench_main.cu's argument validator --
+ * and three hand-copied `1..30` comparisons is the shape the finding-79 bug
+ * came from. Keep them in step through this. */
+static inline int slab_region_ok(int log_region)
+{
+    return log_region >= 1 && log_region <= 30;
+}
+
 /* Return the auto-mode performance cap in rows. UINT32_MAX means the geometry
- * already fits one target-sized slab and should not be split for performance
- * alone. If a single row exceeds the target -- SLAB_PERF_REGIONS << log_region
- * positions, so 2^29 at the default --region 14 but 2^27 at region 12 -- one
- * row is the smallest representable slab and the correctness caps still
- * apply. */
+ * already fits INSIDE THE HYSTERESIS BAND -- an area below *two* target-sized
+ * slabs -- and should not be split for performance alone. If a single row
+ * exceeds the target -- SLAB_PERF_REGIONS << log_region positions, so 2^29 at
+ * the default --region 14 but 2^27 at region 12 -- one row is the smallest
+ * representable slab and the correctness caps still apply. */
 static inline uint32_t slab_perf_jmax(int logI, int log_region, uint32_t J)
 {
     uint64_t I, area, rows;
     if (logI < 0 || logI > 30 || !J) return 0;
-    if (log_region < 1 || log_region > 30) return 0;
+    if (!slab_region_ok(log_region)) return 0;
     I = (uint64_t)1 << logI;
     area = I * (uint64_t)J;
     /* Target a region COUNT; the area follows from log_region, and so does
-     * the split trigger -- an area at or below one target-sized slab needs no
-     * splitting for performance. */
+     * the split trigger. The gate is deliberately at TWO targets, not one:
+     * see the hysteresis paragraph in the policy block above before
+     * "correcting" it to `area < target`. An area of 1.9 targets stays
+     * unsplit on purpose. */
     {
         const uint64_t target = ((uint64_t)SLAB_PERF_REGIONS) << log_region;
         if (area < target * 2u) return 0xffffffffu;   /* the hysteresis */
@@ -150,6 +170,11 @@ static inline int slab_make_plan(int logI, int log_region, uint32_t J,
     uint32_t amax, tmax, perf_jmax, jmax, quantum;
     uint64_t n;
     if (!P || !J) return -1;
+    /* Validate the region on BOTH paths. It is unused when forced_j != 0, but
+     * the parameter is part of this function's contract and a caller passing
+     * a bogus region deserves a failure rather than a plan that silently
+     * ignored one of its arguments. */
+    if (!slab_region_ok(log_region)) return -1;
     quantum = slab_row_quantum(logI);
     if (!quantum || !slab_rows_shape_ok(logI, J)) return -1;
     amax = slab_area_jmax(logI);

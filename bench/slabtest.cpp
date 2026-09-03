@@ -38,6 +38,10 @@ static int check_plan(void)
          * fill +28.4% at region 13 and +68.3% at region 12. */
         {16,13, 16384u, 65535u, 0u,      4096u, 4u}, /* 2^28/slab */
         {16,12, 16384u, 65535u, 0u,      2048u, 8u}, /* 2^27/slab */
+        /* Region 15 doubles the slab AREA against the old absolute 2^29
+         * target -- the region COUNT is what is held at 32768. Peak bucket
+         * memory follows the area, so this row pins a 2x growth that is
+         * intended policy, not a regression. Region 16 would be 4x. */
         {16,15, 32768u, 65535u, 0u,     16384u, 2u}, /* 2^30/slab */
     };
     for (unsigned k = 0; k < sizeof(v)/sizeof(v[0]); k++) {
@@ -78,6 +82,16 @@ static int check_plan(void)
     if (!slab_make_plan(16, 0,  16384u, 65535u, 0u, &P) ||
         !slab_make_plan(16, 31, 16384u, 65535u, 0u, &P)) {
         fprintf(stderr, "slabtest: log_region out of range must fail the plan\n");
+        return -1;
+    }
+    /* The same on the FORCED path, where log_region is unused. It was accepted
+     * there until 2026-09-02 because the only range check lived in
+     * slab_perf_jmax, which the forced branch never reaches -- so this row
+     * covers a branch the two above cannot. */
+    if (!slab_make_plan(16, 0,  16384u, 65535u, 8192u, &P) ||
+        !slab_make_plan(16, 31, 16384u, 65535u, 8192u, &P)) {
+        fprintf(stderr, "slabtest: log_region out of range must fail a FORCED"
+                        " plan too\n");
         return -1;
     }
     /* The trigger scales with the target and keeps its factor of two. At
