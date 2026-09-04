@@ -193,9 +193,16 @@ If a host's tasks all report the same card, read the task's stderr first:
   does not consider this a GPU app version. That is a project-side plan class
   or `<coproc>` declaration to fix; no application change can work around it.
 
-This integration does not yet add checkpoint files. BOINC can suspend and
-resume a live process, but a process that exits and is restarted begins the
-current band again.
+This integration reports progress but does not use BOINC's checkpoint API.
+`bench_boinc_fraction_done` (`boinc_support.cpp:276`) calls `boinc_fraction_done`
+on a ~1 s cadence, so the client's progress bar is live; what is never called is
+`boinc_time_to_checkpoint`/`boinc_checkpoint_completed`, so BOINC's *scheduler*
+still treats a restart as starting over. The application's **own** sidecar checkpointing is
+live and independent of that: a task that exits and is restarted recovers from
+the `.part` and its sidecar rather than re-sieving the band, subject to the
+staging-identity gate described under "Relations, candidate files and
+checkpoints" below. On Windows, note that a `TerminateProcess` stop cannot
+write one on the way out — use `--stop-file` for a clean stop there.
 
 ## Repository map
 

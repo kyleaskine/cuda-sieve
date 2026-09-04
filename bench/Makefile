@@ -405,7 +405,7 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 clean:
 	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck
+.PHONY: all clean check ckptcheck stopcheck cofcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
@@ -463,6 +463,21 @@ fbgencheck: fbgen
 # remain runnable on build hosts with no NVIDIA device.
 fbgpucheck: fbgen fbgen_gpu
 	./fbgpucheck.sh
+
+# The PIPE_Q_SKIP gate: a special-q too wide for this build's exact-norm type is
+# passed over and the band continues. Needs a CARD, so it is deliberately NOT in
+# `check` -- same reason fbgpucheck is not.
+#
+# Needs `normscan` as well as `bench`: the jobs are generated to overflow THIS
+# build's width, and normscan is the oracle that says the construction landed.
+#
+# RUN IT AT `make BN_LIMBS=4`. Above 128 bits it skips itself with an
+# explanation rather than failing: a job that overflows a wider type has norms
+# too large to yield survivors at bounds a gate can afford, and a survivor-less
+# special-q is fatal by design (pipeline.cuh:2018). The path it covers is
+# width-independent, so one width is enough.
+skipcheck: bench normscan
+	./skipcheck.sh
 
 sqgencheck: sqgentest
 	./sqgentest

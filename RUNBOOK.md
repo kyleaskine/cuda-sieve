@@ -220,6 +220,26 @@ narrower one on any job the narrower one could run, so widening is safe to ship
 mid-project. Cost measured on AS276: +0.45 ms on a 90 ms special-q, and
 `sizeof(bn_t)` 32 -> 48 bytes per survivor and per candidate.
 
+**Read the side in the warning — it names the cause.** Each skip prints
+`exact side-N degree-D norm may require ... bits`. Side 1 is the algebraic form
+and side 0 the degree-1 rational one `G = Y1*x + Y0`, and *which one overflows
+is a property of the job, not a constant*. A side-1 skip is telling you about
+the algebraic degree and the sieve area; a side-0 skip is telling you about the
+size of `Y0`, and no change of geometry will help much, because side 0 gains
+only ~1 bit per logI step against side 1's ~5. `normscan` now prints the same
+split up front (`per side:` and `over N bits: side1 only / side0 only / both`),
+so the cause is visible before any work unit goes out. Measured examples in
+finding 93: the c194 quintic is algebraic-driven by 79–91 bits, while a degree-4
+SNFS with `Y0 ~ 2^171` is rational-driven by 73 — both entirely ordinary jobs.
+
+**A capped band resumes, but slowly.** `nqskip` is not checkpointed, so a run
+that stops at `PIPE_SKIP_MAX` writes a checkpoint and the next invocation starts
+counting again — advancing roughly `PIPE_SKIP_MAX` special-q per run and
+producing no relations while it does. That is progress, not a deadlock, but it
+is not a way to finish a band: it means the build is too narrow, and the answer
+is still a rebuild. `make skipcheck` (needs a card, and a build at
+`BN_LIMBS=4`) is the gate over all of this.
+
 The p-lattice **increments** are 64-bit, and were so even when positions were
 still 32-bit. This is required for correctness: realistic large factor-base
 primes can produce a reduced `(j << logI) +/- i` increment above `2^32`.
@@ -962,7 +982,7 @@ derived, on stdout, including when `--blocks` overrides it:
 
 ```
 grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
-grid: 1152 x 32 for fill (absolute, not per SM)
+grid: 4608 x 32 for fill (absolute, not per SM)
 ```
 
 **Check that line first**, and check it names the card you meant. The SM count
@@ -982,12 +1002,17 @@ fails and the task errors out. Use `--device`, or the client's own
 `cc_config.xml` `<exclude_gpu>`, instead.
 
 **Fill has its own grid AND its own block width, and neither scales with the
-card.** `--blocks` is 6 per SM; fill instead uses a fixed **1152 blocks of 32
-threads** (`--fill-blocks` / `--fill-threads` to override). A 48-SM 5070, a
-128-SM 4090 and a 170-SM 5090 all reach the knee at that same absolute
-geometry. Above it every card is flat, so overshooting is nearly free; below it
-the cost is steep (288 blocks is 15–38% worse), so undershoot is the expensive
-mistake.
+card.** `--blocks` is 6 per SM; fill instead uses a fixed **4608 blocks of 32
+threads** (`--fill-blocks` / `--fill-threads` to override). Above the knee every
+card is flat, so overshooting is nearly free; below it the cost is steep (288
+blocks is 15–38% worse), so undershoot is the expensive mistake.
+
+**The default was 1152 until finding 76 retuned it to 4608** on the c194
+production shape (fill −8.6%, wall −5.7%). Read the two numbers with different
+confidence: the "same absolute knee on a 48-SM 5070, a 128-SM 4090 and a 170-SM
+5090" result was measured **at 1152**, and 4608 was swept **on a 5070 only**.
+So the cross-card claim has not been re-established at the shipped default —
+which is one reason the banner prints the number.
 
 **`--fill-threads` is separate from `--threads` on purpose.** Fill wants many
 narrow blocks; transform, intersect, TD, resieve and the cofactor kernels are

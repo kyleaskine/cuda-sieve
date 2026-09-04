@@ -137,6 +137,9 @@ static void usage(void)
 "                   trigger 2^30, at --region 12 they are 2^27 and 2^28. An\n"
 "                   area below TWICE the target is not split for performance\n"
 "                   alone (deliberate hysteresis)\n"
+"  --qspan          pipeline: report each q's GPU-timeline span, which\n"
+"                   splits `unaccounted` into host-with-no-GPU-work-in-\n"
+"                   flight and idle between stages (STATUS item 19)\n"
 "  --relations F    write complete relations here (GGNFS/msieve format)\n"
 "  --cofactor       split the cofactors INLINE, in a cross-q device queue;\n"
 "                   --relations then holds every relation, not just TD's\n"
@@ -876,6 +879,7 @@ static int bench_main_impl(int argc, char **argv)
      * reproduced a path nobody would ship. */
     cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC; cfg.fill_streams = 0;
+    cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
     cfg.reps = 3; cfg.verify = 0;
@@ -1004,6 +1008,7 @@ static int bench_main_impl(int argc, char **argv)
             if (parse_int_range_arg("--fill-threads", argv[++i], 0,
                                     1024, &cfg.fill_threads)) return 1;
         }
+        else if (!strcmp(argv[i], "--qspan")) { cfg.qspan = 1; }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
@@ -1857,7 +1862,7 @@ static int bench_main_impl(int argc, char **argv)
         static const char *pipeline_only[] = {
             "--target-rels", "--lambda0", "--lambda1", "--sq-side",
             "--restart", "--stop-file", "--log", "--log-every",
-            "--slab-j", NULL
+            "--slab-j", "--qspan", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)

@@ -514,6 +514,10 @@ typedef struct {
      * given N times the blocks. 0/1 = today's single-workspace behaviour.
      * Costs a full bucket array per workspace, so N is memory-bound. */
     int      fill_streams;  /* 0/1 = off; 2..FILL_STREAMS_MAX = concurrency test */
+    /* --qspan: bracket each special-q's GPU work with two events and report
+     * the span, splitting `unaccounted` into host-with-no-GPU-work versus
+     * idle-between-stages. Diagnostic; STATUS item 19 step 2. */
+    int      qspan;         /* 0 = off */
     int      reps;          /* timing repetitions */
     int      verify;        /* run CPU cross-check */
     /* ---- Path 2 ---- */

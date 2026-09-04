@@ -732,8 +732,12 @@ discriminant is the large-prime count, not `lpb`. Measured cheapest-saturating
 config for each, both swept from below: c183 `lpb 32/mfb 92` 30.83 -> 15.38
 ms/q (2.00x), AS276 `lpb 35/mfb 101` 332.63 -> 123.22 (2.70x). Full sweep over
 `lpb 29-36` in RESULTS finding 70; guidance in RUNBOOK "Method: ECM for 3LP,
-rho for 2LP". Making it the default is a shipped-behaviour change and has
-**not** been made.
+rho for 2LP". *(This paragraph used to close by saying making it the default
+"has not been made". That predated the header above it and contradicted it:
+`cfg.cof_ecm = COF_METHOD_AUTO` is the default at `bench_main.cu:924` and
+resolves per side at 425-426. Corrected 2026-09-03 -- the `COF_METHOD_RHO` at
+`bench_main.cu:926` is a pre-resolution initial value, not a default, and has
+misled at least one reader into the opposite conclusion as well.)*
 
 *(An earlier version of finding 70 reported 15-18x. That was wrong: rho had
 been priced at an over-large budget rather than swept from below — the same
@@ -998,6 +1002,31 @@ where the standalone gain is largest (16.7%).
 
 ## Known defects
 
+- **ENV 2026-09-03 — `nvidia-smi` segfaulted until WSL was restarted
+  (RESOLVED 2026-09-04), and the driver API moved 13.3 -> 13.4.** For one
+  session `nvidia-smi` exited 139 (SIGSEGV, core dumped) with no output, from
+  the WSL-injected binary at `/usr/lib/wsl/lib/nvidia-smi`. **Cause: a Windows
+  display-driver update landed underneath a running WSL session**, leaving the
+  injected user-mode libraries out of step with the new KMD. `wsl --shutdown`
+  and a restart cleared it -- 2026-09-04 it exits 0 and reports `NVIDIA-SMI
+  615.65.06 / KMD 616.56 / CUDA UMD 13.4`. **Restart WSL after any Windows
+  driver update** before trusting, or filing, anything measured here.
+
+  **CUDA execution was unaffected throughout** -- a direct runtime probe
+  returned `count=1`, `dev0=NVIDIA GeForce RTX 5070 SM=48 cc=12.0`, no error --
+  so this only ever blocked *monitoring* (clocks, temperature, power, the
+  underclock check item 0's energy work relies on), never sieving. Do not read
+  an `nvidia-smi` failure as "no GPU available": exercise the runtime before
+  concluding that, which an outside review of this repo did not, and wrongly
+  declined the GPU suite over.
+
+  **The timing consequence outlives the segfault.** The probe reports driver
+  API 13040 against runtime 13030, so **timings from 2026-09-03 on are not
+  comparable to findings 87-91's numbers**; interleaved A/B against a fresh
+  same-session baseline is still valid, cross-day absolute comparison is not.
+  A fresh confound for item 19, not a resolution of it -- item 19's magnitude
+  already swung 2.83 <-> 6.67 ms/q overnight *before* this driver change.
+
 - **DOC 2026-09-01 — `normscan.c`'s calibration numbers for the 2,1139+ octic
   do not reproduce.** The comment at `normscan.c:256` justifies the `4 + 4*beta`
   margin with "(98 bits clear, beta 5.0)" — while the same comment block,
@@ -1082,10 +1111,20 @@ where the standalone gain is largest (16.7%).
   which is what finding 63 needed — but at I ≤ 1024. The x packing
   `i + I/2 + (j << logI)` is a uint32 and only gets tight in the untested
   logI 11–16 range, so a `pl_make`/`pl_next` bug specific to a large logI would
-  still ship. The blocker is `verify_cpu.c:35`: `check_one` sorts its reference
-  with an insertion sort, so at logI 15 the reference is ~16k entries and the
-  gate would cost ~2.7e8 comparisons per (p, root). Replacing that sort is what
-  would let the gate reach the geometry it is about.
+  still ship. **CORRECTED 2026-09-03 (finding 92): there is no blocker, and
+  this entry used to name the wrong one.** It said the insertion sort at
+  `verify_cpu.c:33` costs ~2.7e8 comparisons per (p, root) at logI 15.
+  Measured: **zero** inner-loop swaps at logI 10, 14, 15 and 16, and 28 ms for
+  all four widths at 24 primes x 5 roots each. `verify_walk` starts at
+  `p = I + 1`, so there is at most one hit per j row, so `ref` is already
+  sorted on emission and the sort is linear. The fix is to add `{15, 32768}`
+  and `{16, 32768}` to `walk_cases[]` (`bench_main.cu:546`) — a table edit,
+  no sort work. **The real ceiling is `uint32_t xmax = I * J`
+  (`verify_cpu.c:18`):** logI=16 x J=32768 = 2^31 is the last shape that fits
+  and J=65536 wraps, which is `verify_walk_slabs`' 64-bit territory, not this
+  gate's. Comment the table when extending it. (This stale diagnosis was read
+  off this entry and repeated by an outside reviewer, which is the cost of
+  leaving a wrong mechanism in a defect list.)
 - **`k_fill_l1` (twolevel path) has never been swept** at any geometry. It
   takes an explicit `--fill-blocks` but defaults to its own 144 × 512, because
   the 1152 × 32 result was measured on `k_fill_atomic` — a different kernel
@@ -1111,6 +1150,45 @@ where the standalone gain is largest (16.7%).
 survive; if work is worth returning to, it belongs here. Two lists drifted
 apart once already — items 7–9 below existed only in a chat session and were
 absent from every document in the repo.
+
+### NOW / NEXT — agreed 2026-09-03
+
+The numbered list below is the full record and contains many *closed* items;
+this block is the short open-only view. Order is by what is actually blocking,
+not by size.
+
+| # | do | needs | state |
+|---|---|---|---|
+| 1 | Add and run a `PIPE_Q_SKIP` gate | local GPU, minutes | **DONE 2026-09-04** — `skipcheck.sh` + `make skipcheck`, 4 cases, all pass at `BN_LIMBS=4`. Finding 93. The planned recipe (`BN_LIMBS=6` + a c183/c194 band) could **not** have worked: it skips 100% of q, so the band never sieves and "does the band survive a skip" is untestable |
+| 2 | Three doc fixes: RUNBOOK fill grid, README BOINC checkpoint, STATUS rho/ECM | nothing | **DONE 2026-09-03** |
+| 3 | Extend `walk_cases[]` to `{15,32768}` and `{16,32768}`; comment the `uint32_t xmax` ceiling | nothing | **not started** — finding 92: a table edit, no sort work |
+| 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **new, open** — finding 93 case D: a resume *does* advance (q=15001793 → 15003097) but produces zero relations per run. Not a deadlock; possibly still wrong under BOINC |
+| 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **not started** — item 1 below, the largest open item |
+| 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
+
+**On (5), why both arms in one session.** Card-hours are the scarce resource
+and `resieve + scatter` is the same bucket-structured shape as fill: finding
+84's cross-card table has fill at 1.66x and resieve at 1.51x against an SM
+ratio of 3.54x, while transform (3.35x) and apply (3.48x) scale fine. So
+resieve is the second-best candidate on the only evidence there is. It is
+**not** ahead of fill: fill is 35.3% of the 5090's wall with a **measured**
+27.4% cut (9.7% of wall), resieve is 13.5% of wall with **no** concurrency
+measurement at all. Rank by evidence, not by implementation cost.
+
+**On (6).** The barrier keeps `k_cof_enqueue`'s device work inside the
+host-timed `tm.cofac` bucket. Removing it could overlap only the small enqueue
+tail against later host preparation -- it cannot reclaim the 0.583 ms
+`k_cof_enqueue -> k_transform` gap, which *starts* after that kernel finishes
+and is the q boundary with the GPU already empty. Not worth disturbing the
+accounting.
+
+**Provenance.** Items 1-4 and 6 came out of an outside review of this repo on
+2026-09-03 and two rounds of correction. The review was right about the three
+stale doc lines and about `PIPE_Q_SKIP`; it initially ranked resieve above
+fill and proposed removing the enqueue barrier, and withdrew both. Its
+`qsort` proposal and the first rebuttal of it were *both* wrong -- see
+finding 92.
 
 0. **The verdict band — RUN 2026-08-20, finding 71. 2.99x time and 2.94x
    whole-box relations per joule, every term measured on this box in one
@@ -1946,17 +2024,48 @@ absent from every document in the repo.
    53 holds the canonical table** — do not copy it here; it has drifted once
    already.
 
-   1. **Overlap the prep with GPU execution.** Both prep terms depend only on
+   1. **Overlap the prep with GPU execution. PROMOTED then RESIZED
+      2026-09-03.** Finding 90 measured `unaccounted` as host time with nothing
+      in flight on the GPU and promoted this item; **finding 91 then attributed
+      that time by region and cut this item's value roughly in half.**
+
+      **The premise as written is worth 0.03 ms/q.** "q+1's host work can run
+      during q's kernels" names q generation, `qsel_validate`, checkpointing
+      and `qlat_build` -- all of which happen before any GPU op is issued, and
+      together they cost **0.03 ms/q**. Hiding them buys nothing.
+
+      **And the real target is only ~0.5 ms/q (~0.5%) -- PARKED 2026-09-03.**
+      The 1.89 ms of prep is not exposed: `prepare_q(side 0)` runs while
+      transform 1 executes and `td_prepare_q` runs while transform 0 does, both
+      already hidden under the 3.27 ms of asynchronous transform that finding
+      89 unblocked. Only `prepare_q(side 1)` runs with the GPU drained, because
+      the previous q ended synchronised. **Finding 89's async-transform change
+      already collected most of what this item was for.**
+
+      Half a percent does not justify doubling the host staging buffers,
+      splitting `prepare_q` into compute and upload phases, and peeking the
+      generator ahead of the checkpoint and stop-file logic. **Parked; item 4.2
+      is the larger remaining host-side win at 1.56 ms/q**, and it too is
+      parked for now (owner's call, both are ~1-2% combined).
+
+      Both prep terms depend only on
       the q-lattice, not on any GPU result, so q+1's host work can run during
       q's kernels. This is double-buffering, **not threading**: 1.166 ms of
       prep against ~20.7 ms of GPU work per q fits entirely inside the GPU's
       shadow with 18× room to spare, so perfect overlap takes it to *zero* on
-      the critical path. Threading the same work would reach maybe 0.4 ms with
+      the critical path. **(That 1.166 ms is a c147 figure and the argument is
+      SUPERSEDED -- finding 91 measured the prep at 1.89 ms on c183/I15e and
+      showed most of it is ALREADY in the shadow. The prep does fit; it is
+      already there. Read the 2026-09-03 note at the head of this item, not
+      this paragraph, for the item's size.)** Threading the same work would reach maybe 0.4 ms with
       four threads and leave it *on* the critical path — strictly worse, for
       more code and a synchronisation problem we do not currently have.
    2. **CUDA graphs for the per-q kernel sequence.** `unaccounted` is
       wall-minus-device inside TD/classify: the CPU issuing launches and
-      waiting on syncs. Overlap cannot help — it is interleaved with GPU
+      waiting on syncs. **(Finding 90 measured `unaccounted` at the band level
+      as host time with nothing in flight on the GPU, and finding 91 could not
+      quantify how much is launch overhead -- so this sub-item's size is
+      unknown, not the 1.56 ms briefly claimed on 2026-09-03. Parked.)** Overlap cannot help — it is interleaved with GPU
       execution by nature — and it is the term that grew **443%** under load,
       so it is what makes the box fragile. The per-q sequence is fixed, so it
       can be captured once and replayed.
@@ -3007,21 +3116,49 @@ absent from every document in the repo.
        longer drained, waited on the other side's in-flight transform -- now
        `cudaMemcpyAsync` from the already-pinned staging buffers. Measured
        interleaved, four paired reps, every pair favouring the fix.
-    2. **Attribute the remaining `unaccounted`, still 6.67 ms/q (~6.6% of
-       wall).** This is the residue of the 08-27 regression; the fixes above
-       do not touch it. **Nsight will NOT answer this** -- it ranks gaps
-       reliably (that is how step 1 was found and confirmed) but inflates
-       device time ~46%, more than the quantity being measured, so its
-       "2.06 ms/q idle" does not transfer to an unprofiled run.
-       **The instrument that would work:** bracket the WHOLE per-q GPU
-       sequence with two events and compare that span against the sum of the
-       stage device times; the difference is true idle, with no profiler in
-       the loop. That is measurement scaffolding in the production path --
-       cheap, but it needs the owner's sign-off rather than being bundled with
-       functional changes.
-    3. Only then chase the 08-27 trigger, if the attribution points at
+    2. **ANSWERED 2026-09-03 (finding 90): `unaccounted` is HOST time with the
+       GPU idle, not GPU inefficiency.** The whole-q event bracket was built as
+       **`--qspan`** (runtime flag, off by default, pipeline-only, does not
+       perturb: wall 95.94 off against 96.14 on). It reports the GPU-timeline
+       span of each q, and `unaccounted` **moves with** `wall - span` rep by rep
+       (3.37/2.93, 3.45/2.96, 4.14/3.42 -- including the rep where both rise),
+       which is what establishes the quantity is host-side.
+
+       **Do NOT quote `wall - span`'s magnitude.** Finding 91 records that it
+       cannot be reconciled with the region timers -- prologue 0.03 and tail
+       0.00 are the only host regions outside the bracket, so a 4.48 ms gap
+       should be impossible. The DIRECTION is established; the SIZE is not. The
+       trustworthy half is the region table, which sums to the host clock
+       within 0.01 ms/q.
+
+       **The residue is a host problem, but item 4.1 is not the fix** -- see
+       step 5. Finding 91 showed its prep is already hidden.
+
+    3. **The magnitude is NOT stable across days, which re-scopes this item.**
+       Identical commit, box and command: `unaccounted` was **6.67 ms/q on
+       09-02 afternoon and 2.83 on 09-03 morning**, with `sieve` unchanged at
+       63.2-63.7 throughout. A quantity that swings 2.4x overnight is not a
+       regression to bisect -- and that is why finding 88's bisect found every
+       commit equally bad; they shared one afternoon's host conditions.
+       **Do not close this item on finding 90**: 0.50 -> 2.83 is still 5.7x and
+       may exceed day-to-day variance, and the 08-27 upgrade remains a real
+       coincidence in time. What is needed now is to characterise the variance
+       (CPU frequency/thermal state, WSL scheduling, Windows host activity --
+       none measured) rather than to hunt a commit.
+    4. Only then chase the 08-27 trigger, if the attribution points at
        something a package could plausibly have changed.
-    4. If the attribution lands on per-launch overhead, the standing candidate
+    5. **Item 4.1 is NOT the fix, and is parked.** Finding 91 showed its prep
+       is already hidden under the asynchronous transform that finding 89
+       unblocked, leaving ~0.5 ms/q exposed. The "1.166 ms fits in the shadow"
+       argument in item 4 predates that and is superseded: the prep does fit,
+       but it is already there.
+    6. **Per-launch overhead is real but UNQUANTIFIED.** The 1.56 ms/q figure
+       once here came from a slab-loop sub-split that code review found unsound
+       -- its window included the `k_intersect_compact` launch and a blocking
+       GPU wait -- and which has been removed; see finding 91. What survives is
+       finding 89's Nsight ranking putting the largest remaining gaps in the
+       fill/apply region. **PARKED 2026-09-03 with item 4.1** -- 1.5% and 0.5% respectively do not justify
+       restructuring the per-q loop now. The standing candidate for it
        is **CUDA graphs** (item 4.2): capture the fixed per-q sequence once and
        replay it, attacking launch count and latency directly. The other
        candidate that used to sit here -- the mid-sequence transform sync --

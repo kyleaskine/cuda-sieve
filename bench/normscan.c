@@ -135,6 +135,14 @@ int main(int argc, char **argv)
     double *v = NULL;
     long n = 0;
     double nprime_tried = 0, nroot = 0;
+    /* Which SIDE drives the width, tracked separately from v[] (which holds
+     * the max of the two and so cannot answer it). This is not cosmetic: side 0
+     * is the degree-1 form G = Y1*x + Y0 and side 1 the degree-d one, and which
+     * dominates decides which side raises the skip in pipe_side_prepare_q --
+     * which checks side 1 FIRST and short-circuits. A band whose width is
+     * driven by side 0 skips on a code path a side-1-driven band never enters. */
+    double mx0 = 0, mx1 = 0;
+    long n0drv = 0, over0 = 0, over1 = 0, overboth = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -197,6 +205,12 @@ int main(int argc, char **argv)
                 norm_setup(&N0, &P0, &L, logI, (uint32_t)J, 1.0, side == 0);
                 b1 = norm_exact_bound_bits(&N1);
                 b0 = norm_exact_bound_bits(&N0);
+                if (b1 > mx1) mx1 = b1;
+                if (b0 > mx0) mx0 = b0;
+                if (b0 > b1) n0drv++;
+                if (b0 > limit && b1 > limit) overboth++;
+                else if (b0 > limit) over0++;
+                else if (b1 > limit) over1++;
                 v[n++] = (b1 > b0) ? b1 : b0;
                 nroot++;
             }
@@ -232,13 +246,28 @@ int main(int argc, char **argv)
                n, N, rpp);
         printf("  exact norm bits: median %.1f  99%% %.1f  99.9%% %.1f  sample max %.2f\n",
                v[n / 2], v[(long)(n * 0.99)], v[(long)(n * 0.999)], v[n - 1]);
-        if (over)
+        /* PER-SIDE, because "rebuild wider" is the same advice either way but
+         * the cause is not: a side-1-driven band is telling you about the
+         * algebraic degree and the sieve area, a side-0-driven one about the
+         * size of Y0. Unconditional -- a reader who does not need it loses one
+         * line, and a reader who needs it has no other way to get it short of
+         * rebuilding the tool. Above the over-limit branch so that branch stays
+         * a single if/else rather than two that have to be kept in sync. */
+        printf("  per side: max side1 (deg %d) %.2f  max side0 (deg 1) %.2f"
+               "  -- side 0 larger on %ld of %ld\n",
+               P.deg, mx1, mx0, n0drv, n);
+        if (over) {
             printf("  %ld of %ld sampled exceed %d bits  ->  ~%.0f of the band\n",
                    over, n, limit, (double)over / (double)n * N);
-        else
+            /* WHICH side crossed decides which skip path a band takes:
+             * pipe_side_prepare_q checks side 1 first and short-circuits. */
+            printf("  over %d bits: side1 only %ld, side0 only %ld, both %ld\n",
+                   limit, over1, over0, overboth);
+        } else {
             printf("  0 of %ld sampled exceed %d bits (an unseen rate up to %.1e,"
                    " i.e. ~%.0f of the band, is still consistent with that)\n",
                    n, limit, 3.0 / (double)n, 3.0 / (double)n * N);
+        }
         if (normscan_project(v, (int)n, N, &proj, &u, &m, &beta))
             printf("  projected band maximum %.1f bits"
                    " (exponential tail, scale %.2f bits, %d points above %.1f)\n",

@@ -1329,6 +1329,27 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * derived, not accumulated separately, so the printed total and its three
      * children cannot drift apart. */
     double acc_tr = 0, acc_fi = 0, acc_ap = 0;
+    /* --qspan (item 19 step 2): the GPU-timeline span of one special-q, from
+     * before its first GPU operation to after its last. `unaccounted` is
+     * wall minus the bracketed stages and has twice been mis-read as "GPU
+     * idle"; this splits it for real. wall - qspan is host time with no GPU
+     * work in flight; qspan - (sum of stage device times) is idle BETWEEN
+     * those stages. Off by default: two cudaEventRecords per q behind a
+     * branch, so the cost when off is nothing and the shipping binary can
+     * produce the number without a rebuild. */
+    double acc_qspan = 0, acc_hspan = 0;   /* host clock over the SAME bracket */
+    /* Host time from the top of the per-q body to the first call that issues
+     * GPU work, i.e. the prologue item 4.1 proposes to hide in the previous
+     * q's shadow: q selection, root validation, checkpointing and the
+     * q-lattice build. Everything after this point already has its own
+     * counter (`host per-q`, `host: small-prime tables`). */
+    double acc_prologue = 0;
+    /* Wall time of each region of the per-q body, to attribute the ~2 ms that
+     * is neither the prologue nor any existing host counter. Compare each
+     * against the device work it contains: sieve+TD+cofactor for the slab
+     * loop, nothing for prep/tdprep/tail. */
+    double acc_prep = 0, acc_tdprep = 0, acc_slab = 0, acc_tail = 0;
+    cudaEvent_t qspan0 = NULL, qspan1 = NULL;
     double acc_td = 0, t_verify = 0, cofac_tail = 0;
     unsigned long long acc_surv = 0, acc_cand = 0, acc_rel = 0;
     FILE *fr = NULL, *fc = NULL;
@@ -1379,6 +1400,18 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
     memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
 #define PIPE_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto done; } } while (0)
+    /* --qspan's events are created HERE, not with their accumulators above,
+     * because both validation gates return -1 without passing through `done:`
+     * and would leak them. The comment at those gates states the rule: nothing
+     * creates CUDA state before they run. Creating them after PIPE_CK exists
+     * also means a failure unwinds through `done:` like every other resource,
+     * and cudaEventCreate is no longer the first CUDA call in the process --
+     * so a refused factor base prints its refusal without paying for context
+     * initialisation first. */
+    if (cfg->qspan) {
+        PIPE_CK(cudaEventCreate(&qspan0));
+        PIPE_CK(cudaEventCreate(&qspan1));
+    }
     PIPE_CK(cudaEventCreate(&ea));
     PIPE_CK(cudaEventCreate(&eb));
 
@@ -1601,6 +1634,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         qlat_t Lq;
         float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
+        double hspan0 = 0, hreg = 0, prologue_q = 0;
+        if (cfg->qspan) { hspan0 = host_ms(); PIPE_CK(cudaEventRecord(qspan0)); }
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
         uint64_t side_surv1 = 0, side_surv0 = 0;
         uint32_t cofgate_found[2] = {0, 0};
@@ -1735,6 +1770,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * for side 1's fault. A SKIP short-circuits too -- one side being
              * unfittable is enough to pass over the q, and the warning naming
              * the side has already been printed by the side that raised it. */
+            if (cfg->qspan) {
+                prologue_q = host_ms() - hspan0;
+                hreg = host_ms();
+            }
             const int p1 = pipe_side_prepare_q<SLABBED>(fb1, fbs1, &Lq, POLY, cfg, 1,
                                                         cfg->scale, blocks, &S1,
                                                         &th1);
@@ -1767,6 +1806,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 }
                 continue;              /* next q; nqdone is not incremented */
             }
+            if (cfg->qspan) { acc_prep += host_ms() - hreg; hreg = host_ms(); }
             if (p1 < 0 || p0 < 0 || pipe_td_prepare_q(&C, fbs1, fbs0, &Lq, cfg, &tm)) {
                 rc = -1; break;
             }
@@ -1779,6 +1819,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* Only the area-dependent part lives inside this loop. For
          * SLABBED=false slab_plan has exactly one entry and if constexpr
          * removes every continuation-state operation from device code. */
+        if (cfg->qspan) { acc_tdprep += host_ms() - hreg; hreg = host_ms(); }
         for (uint32_t slab = 0; slab < slab_plan->nslab; slab++) {
             const uint32_t j_base = slab_jbase_at(slab_plan, slab);
             const uint32_t J_here = slab_rows_at(slab_plan, cfg->J, slab);
@@ -1955,6 +1996,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 }
             }
         }
+        if (cfg->qspan) { acc_slab += host_ms() - hreg; hreg = host_ms(); }
         if (rc) break;
         /* Deferred from pipe_side_prepare_q, which no longer blocks on the
          * transform. The slab loop above ended with cudaEventSynchronize on
@@ -2007,6 +2049,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         acc_tr += ts1[0] + ts0[0];
         acc_fi += ts1[1] + ts0[1];
         acc_ap += ts1[2] + ts0[2];
+        if (cfg->qspan) {
+            /* Every readback in this q has already synchronised, so this is a
+             * no-op drain; it is here so the elapsed read below cannot see a
+             * not-ready event (time_kernel discards the status). */
+            acc_tail += host_ms() - hreg;   /* already inside if (qspan) */
+            PIPE_CK(cudaEventRecord(qspan1));
+            acc_hspan += host_ms() - hspan0;   /* host clock, before the sync */
+            /* Only now, on a q that actually completed -- every other region
+             * timer accumulates here too, and N is nqdone. Charging a SKIPPED
+             * q's prologue would break the reconciliation silently. */
+            acc_prologue += prologue_q;
+            PIPE_CK(cudaEventSynchronize(qspan1));
+            acc_qspan += time_kernel(qspan0, qspan1);
+        }
         acc_isect += tis; acc_host += th1 + th0;
         acc_wall += host_ms() - qwall - tv;
         acc_surv += hn; acc_cand += ncand; acc_rel += nrel;   /* host path only */
@@ -2418,6 +2474,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  (first-q reconstruction gate: %.1f ms, excluded below)\n",
                    t_verify);
         printf("  %-34s %8.2f ms\n", "wall clock per q", acc_wall / N);
+        if (cfg->qspan) {
+            printf("  %-34s %8.2f ms   <- --qspan\n",
+                   "  GPU span of one q", acc_qspan / N);
+            printf("  %-34s %8.2f ms\n",
+                   "    host clock, same bracket", acc_hspan / N);
+            printf("  %-34s %8.2f ms\n",
+                   "    of which: prologue (pre-GPU)",
+                   acc_prologue / N);
+            printf("  %-34s %8.2f ms\n", "    region: prepare_q, both sides",
+                   acc_prep / N);
+            printf("  %-34s %8.2f ms\n", "    region: td_prepare_q",
+                   acc_tdprep / N);
+            printf("  %-34s %8.2f ms\n", "    region: slab loop, all stages",
+                   acc_slab / N);
+            printf("  %-34s %8.2f ms\n", "    region: tail to accumulation",
+                   acc_tail / N);
+            printf("  %-34s %8.2f ms\n",
+                   "    host, nothing in flight",
+                   acc_wall / N - acc_qspan / N);
+        }
         printf("  %-34s %8.2f ms\n", "  sieve, both sides", acc_sieve / N);
         printf("  %-34s %8.3f ms\n", "    transform + plattice", acc_tr / N);
         printf("  %-34s %8.3f ms\n", "    fill", acc_fi / N);
@@ -2657,6 +2733,8 @@ done:
     cudaFree(d_two); cudaFree(d_n); cudaFree(d_pre);
     if (ea) cudaEventDestroy(ea);
     if (eb) cudaEventDestroy(eb);
+    if (qspan0) cudaEventDestroy(qspan0);
+    if (qspan1) cudaEventDestroy(qspan1);
     return rc;
 }
 

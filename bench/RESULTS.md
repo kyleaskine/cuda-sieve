@@ -6877,3 +6877,471 @@ against the sum of the stage device times. The difference is true idle,
 measured without a profiler in the loop. That is measurement scaffolding in
 the production path and is left for the owner to approve rather than added
 alongside two functional changes.
+
+## Finding 90 — `unaccounted` is HOST time with the GPU idle, not GPU inefficiency. True inter-stage idle is 1.3 ms/q. And the quantity swings 2.9 <-> 6.7 ms/q day to day on identical code
+
+**Date:** 2026-09-03, RTX 5070, idle box, commit `fe26885` plus the `--qspan`
+instrument. c183, `--logI 15 --qrange 130000000: --nq 200`.
+
+Item 19 step 2 asked what the residual `unaccounted` actually is. Findings 87
+and 88 each guessed and each was wrong -- first an accounting artifact, then
+GPU idle. This measures it.
+
+### The instrument
+
+`--qspan` (off by default, pipeline-only) brackets each special-q's GPU work
+with two events: one recorded before its first GPU operation, one after its
+last, then read after a no-op sync. `wall - span` is host time with **nothing
+in flight on the GPU**; `span - (sum of device stages)` is idle **between**
+those stages.
+
+**It does not perturb what it measures**, checked interleaved, three pairs:
+wall 95.94 ms/q with the flag off against 96.14 with it on (+0.2%, inside
+run-to-run spread), `unaccounted` 2.83 against 2.86. Two `cudaEventRecord`s
+behind a branch, and the shipping binary can produce the number with no
+rebuild -- which is exactly what was missing when finding 88 needed to compare
+against August.
+
+### The answer
+
+| rep | wall | GPU span | host, nothing in flight | `unaccounted` |
+|---|---:|---:|---:|---:|
+| 1 | 92.39 | 89.02 | 3.37 | 2.93 |
+| 2 | 91.78 | 88.33 | 3.45 | 2.96 |
+| 3 | 92.58 | 88.44 | **4.14** | **3.42** |
+
+**`unaccounted` tracks host-with-nothing-in-flight rep by rep**, including
+rep 3 where both rise together. It is host time, not GPU time.
+
+**Cross-checked on a second, independent clock**, because the first reading of
+this instrument was nearly wrong. `qspan0` is recorded at the top of the per-q
+body and `qspan1` five lines before the wall measurement, so the bracket spans
+essentially the whole body -- which made `wall - span` of ~4 ms look like a
+bracketing artifact rather than a result. Timing the *host* clock across the
+identical bracket settles it:
+
+| | ms/q |
+|---|---:|
+| wall | 92.46 |
+| host clock, same bracket | **92.54** |
+| GPU-timeline span (events) | 88.50 |
+| difference | **3.96** |
+
+The host clock matches wall, so the bracket is not the problem. The event pair
+reads 4 ms shorter because **an event queued to an IDLE stream is not
+timestamped until the engine next has work** -- it effectively stamps at the
+first real GPU operation of the q. So the pair measures first-GPU-activity to
+last, and the residue is host time with nothing in flight, which is what this
+finding claims. Both numbers are printed under `--qspan` so the next reader can
+see the agreement rather than trust the inference.
+
+The GPU side, from rep 1: `span 89.02 - sieve 63.49 - isect 0.42 - TD device
+14.49 - cofactor 9.27 = **1.35 ms/q**` of idle between stages, stable at
+1.22-1.35 across the three. That is the entire GPU-side inefficiency at this
+geometry, and it is small -- consistent with finding 89's post-fix Nsight gap
+total of 2.42 ms/q under ~46% profiling inflation.
+
+**So the residue is a HOST problem, and the fix already has an item number:
+4.1, double-buffering the per-q host prep into the GPU's shadow.** Item 19's
+remaining work and item 4.1 are the same problem reached from two directions.
+
+### The magnitude is not stable across days, and that reframes item 19
+
+Same commit, same box, same command, no code change between them:
+
+| | wall/q | `unaccounted` |
+|---|---:|---:|
+| 2026-09-02 afternoon | 101.2 | **6.67** |
+| 2026-09-03 morning | 95.9 | **2.83** |
+| 2026-08-20 (pre-upgrade) | 102.0 | **0.50** |
+
+`sieve` is unchanged throughout (63.2-63.7), so the kernels are doing the same
+work at the same speed; only the host-side term moves. **A quantity that swings
+2.4x overnight is not a persistent regression to bisect**, which is what item
+19 has been treating it as, and it explains why finding 88's bisect found every
+commit equally "bad" -- they were all measured in one afternoon's host
+conditions.
+
+**What this does NOT establish:** why the host term varies. Candidates are
+CPU frequency/thermal state, WSL scheduling, and Windows-side host activity;
+none is measured. Note the 08-27 upgrade remains a real coincidence in time
+with the August-to-September step, and 0.50 -> 2.83 is still a 5.7x rise that
+day-to-day variance alone may not cover. **Do not close item 19 on this
+finding**; it re-scopes the target from "find the regression" to "reduce host
+time with the GPU idle, and characterise its variance".
+
+### Method note
+
+Three attributions for this quantity have now been proposed and withdrawn --
+accounting artifact, GPU idle, CUDA runtime -- each from reasoning about a
+difference rather than measuring the quantity. The instrument that settled it
+took about twenty lines and one build. It should have been built first.
+
+## Finding 91 — where the per-q host time actually is: item 4.1's stated premise is worth 0.03 ms/q, its real target is 1.9, and the rest belongs to item 4.2
+
+**Date:** 2026-09-03, RTX 5070, idle box. c183, `--logI 15
+--qrange 130000000: --nq 200 --qspan`, with the per-q body instrumented by
+region.
+
+Finding 90 measured `unaccounted` as host time with nothing in flight on the
+GPU (3.9-4.5 ms/q) and promoted item 4.1 on the strength of it. This attributes
+that time, and **item 4.1's premise as written does not survive.**
+
+### The regions close to the host clock
+
+| region of the per-q body | ms/q |
+|---|---:|
+| prologue -- q select, root validate, checkpoint, lattice build | **0.03** |
+| `prepare_q`, both sides | 1.03 |
+| `td_prepare_q` | 0.86 |
+| slab loop (everything else) | 92.42 |
+| tail to accumulation | 0.00 |
+| **sum** | **94.34** |
+| host clock over the same bracket | **94.35** |
+
+Item 4.1 says "q+1's host work can run during q's kernels", naming the per-q
+tables and staging. **The work before any GPU op is issued is 0.03 ms/q** --
+q generation, `qsel_validate`, checkpointing and `qlat_build` together. Hiding
+it buys nothing.
+
+### Inside the slab loop
+
+**WITHDRAWN, same day, in code review.** A sub-split of the slab loop was
+measured and reported here as `sieve_slab` 67.27 / TD 15.82 / cofactor 9.21,
+and two conclusions were drawn from it. **Both were unsound and the
+instrumentation has been removed:**
+
+- The window labelled "`pipe_side_sieve_slab` calls" also contained three
+  `cudaMemset`s, the `k_intersect_compact` launch, a **blocking**
+  `cudaEventSynchronize`, `cudaGetLastError` and a synchronous D2H copy. So
+  "67.27 of wall against 63-64 of transform+fill+apply" compared the wrong
+  things: `acc_isect` and a GPU-wait are inside the 67.27 and absent from the
+  63-64. A GPU-wait is not recoverable idle at all.
+- The window labelled "cofactor + candidates" also contained the per-candidate
+  join loop (`tm.join`) and `pipe_td_advance_small`. Its apparent equality with
+  `tm.cofac` held only because `tm.join` is ~0 at this geometry, so the
+  "per-candidate host loop is innocent" verdict does not generalise to a
+  survivor-dense or slabbed band.
+- The split was also simply **wrong for any run with more than one slab**: the
+  cursor was re-armed inside the loop but accumulated only after it exited, so
+  slab 0's cofactor region was charged to the sieve column. The measurements
+  above were taken unslabbed (c183 at `2^29`, one slab), which is the only
+  reason they were self-consistent.
+
+**No number in this finding attributes time to launch overhead any more.** The
+sound part is the top-level region table, which reconciles with the host clock;
+the sub-split is gone.
+
+### The decomposition, and which item owns each part
+
+| | ms/q | owner |
+|---|---:|---|
+| prep in `prepare_q` + `td_prepare_q` | 1.89 *of which most is already hidden* | item 4.1 |
+| GPU idle around the fill/apply launches | **1.56** | **item 4.2**, CUDA graphs |
+| prologue | 0.03 | nothing to do |
+| residual / overlap ambiguity | ~1.0 | unattributed |
+
+**CORRECTION, same day, before any of this was built.** The 1.89 ms is NOT all
+exposed, and item 4.1 is much smaller than this table first implied. The per-q
+order is:
+
+1. `prepare_q(side 1)` -- tables, uploads, **launches transform 1**
+2. `prepare_q(side 0)` -- runs while transform 1 executes
+3. `td_prepare_q` -- runs while transform 0 executes
+4. slab loop
+
+The two transforms are 3.27 ms of device work launched asynchronously (finding
+89 removed the sync that used to block here), and steps 2-3 are ~1.4 ms of host
+work running underneath them. **They are already overlapped.** Only step 1 runs
+with the GPU genuinely drained, because the previous q ended synchronised.
+
+**So item 4.1's ceiling is side 1's prepare alone, roughly 0.5 ms/q (~0.5%)**,
+not 1.89. Finding 89's async-transform change already collected most of what
+item 4.1 was going to.
+
+**Item 4.2's size is now UNQUANTIFIED.** The 1.56 ms/q figure came from the
+withdrawn sub-split and should not be quoted. What survives is directional:
+finding 89's Nsight ranking puts the largest remaining inter-kernel gaps in the
+fill/apply region, so launch overhead is real -- but how much of the ~4 ms is
+launch overhead versus GPU-wait versus prep is no longer measured.
+
+**A caution on the arithmetic.** The transform is launched asynchronously in
+`prepare_q` and executes during `td_prepare_q` and the start of the slab loop,
+so device time straddles the region boundaries and the 1.89 / 1.56 split
+carries roughly +/-0.5 ms of overlap ambiguity. The ordering of the two terms
+is robust; their exact ratio is not.
+
+### An unreconciled number -- do not quote `wall - span`
+
+`wall - span` reads 4.48 ms/q, but the region timers put the prologue at 0.03
+and the tail at 0.00, and those two are the only host regions outside the event
+bracket. Under any model of the event timestamps the author could construct,
+those cannot both be true. **The region timers are the trustworthy half** --
+they sum to the host clock within 0.01 ms/q -- and every conclusion above rests
+on them. The span figure locates *that* there is host time with the GPU idle;
+its magnitude is not reconciled and should not be cited until it is.
+
+### Disposition, 2026-09-03: BOTH 4.1 AND 4.2 PARKED
+
+At ~0.5% and ~1.5% respectively, neither justifies restructuring the production
+per-q loop right now (owner's call). The measurements stand and the instrument
+stays behind `--qspan`, so picking either up later starts from data rather than
+from a fresh investigation.
+
+### Method note
+
+Four measurements were needed to get here -- whole-q span, host-clock
+cross-check, prologue timer, region split -- and each one refuted a plausible
+guess: that `unaccounted` was an accounting artifact, that it was GPU idle,
+that it was the CUDA runtime, that it was the per-candidate host loop. The
+per-region instrument is ~15 lines behind the existing `--qspan` flag and
+should be the first thing reached for next time, not the fifth.
+
+## Finding 92 — the dense walk gate's logI=10 ceiling is NOT the insertion sort. The sort is already linear at every width, and extending the gate to the deployed logI=15/16 is a table edit
+
+**Date:** 2026-09-03. CPU only, no GPU, no card time.
+
+An outside review of the repo proposed replacing the insertion sort at
+`verify_cpu.c:33` on the grounds that its quadratic cost is what caps
+`walk_cases[]` (`bench_main.cu:546`) at `logI=10, J=1024`, well below the
+deployed logI=14-16. The reasoning is plausible from the source and it is
+wrong, in a way worth recording because both the review and a first rebuttal
+of it got the mechanism wrong in opposite directions.
+
+### The rebuttal that was also wrong
+
+The first counter-argument was that a dense reference is O(I*J/p) in *memory*
+as well as time -- ~195M entries and 780 MB at logI=16 -- so no sort would make
+it practical. That assumed a small prime. **`verify_walk` never selects one:**
+it starts at `p = I + 1` (`verify_cpu.c:202`), because primes just above I are
+where the Franke-Kleinjung reduction has work to do. The allocation formula at
+`verify_cpu.c:19` is `(xmax/p + J + 16) * 4`, which for p > I is under 2J
+words -- 256 KiB at logI=16, not 780 MB.
+
+### What the sort actually costs
+
+For p > I there is **at most one lattice hit per j row** (if `base < I/2` fires
+the ascending loop, then `base >= p - I/2 > I/2` is needed for the descending
+one, which contradicts it). The outer loop walks j ascending and each row
+contributes a strictly larger `x`, so `ref` is **already sorted on emission**
+and insertion sort's inner `while` never executes. The comment at
+`verify_cpu.c:33` -- "each j-group is unsorted" -- describes the p < I case
+this gate never enters.
+
+Replicating the generation and sort exactly, counting inner-loop swaps, over
+`verify_walk`'s own prime selection (24 primes from I+1, 5 roots each):
+
+| case | nref/case | alloc | insertion-sort swaps |
+|---|---:|---:|---:|
+| logI=10 J=1024 | 872 | 7.7 KB | **0** |
+| logI=14 J=8192 | 8,068 | 65 KB | **0** |
+| logI=15 J=32768 | 32,549 | 261 KB | **0** |
+| logI=16 J=32768 | 32,696 | 262 KB | **0** |
+
+All four cases, 24 primes x 5 roots each: **28 ms total**. (That is generation
+plus sort; the `pl_next` walk it feeds is another O(nref) ~32K steps per case
+and cannot move the result.)
+
+### So the action is smaller than either party thought
+
+Add `{15, 32768}` and `{16, 32768}` to `walk_cases[]`. No sort work. The
+`qsort` change would be correct but buys nothing at the widths this gate runs.
+
+**The real ceiling is `uint32_t xmax = I * J` (`verify_cpu.c:18`).** logI=16 x
+J=32768 = 2^31 is the last shape that fits; logI=16 x J=65536 wraps. That is
+exactly the 32-bit boundary the slab path exists to cross, and it is
+`verify_walk_slabs`' territory (64-bit oracle, `verify_cpu.c:221`), not this
+gate's. Worth a comment on the table so nobody adds a case that silently wraps.
+
+### Method note
+
+The measurement is 40 lines of standalone C that copies `check_one`'s
+generation verbatim and counts swaps. Both wrong answers here came from
+reading the source and reasoning about asymptotics; the right one came from
+running it. Neither party needed the GPU, the repo's build, or ten minutes.
+
+---
+
+## Finding 93 — `PIPE_Q_SKIP` now has a gate, and which side raises the skip is a property of the JOB. The side-0 branch is live code on real polynomials, and the planned test setup could not have reached it
+
+Date 2026-09-04. Build `BN_LIMBS=4` on the 5070; `normscan`/`sidebits`
+measurements are CPU-only and width-independent.
+
+### The planned setup cannot test the path
+
+The agreed step 1 was "`make BN_LIMBS=6` plus any c183/c194 band, where most q
+will skip". Most q do skip — **all of them do** — and that is the problem. The
+c194 side-1 exact-norm bound is very tightly clustered:
+
+| judged width | fraction of 20000 sampled q that overflow |
+|---|---|
+| 192 bits (`BN_LIMBS=6`) | 100% |
+| 220 | 100% |
+| 225 | 89% |
+| 232 | 34% |
+| 235 | 0.85% |
+| 256 bits (`BN_LIMBS=8`) | 0% |
+
+Every sample lands between ~220 and 235.33 bits at logI 14. **No legal
+`BN_LIMBS` produces a mixed band on this job**: 6 skips everything, 8 skips
+nothing. A band that skips 100% of its q never sieves, so it cannot test the
+one thing the path is for — that the band *survives* a skip and continues.
+
+### Which side skips is a property of the job, and it decides which code runs
+
+`pipe_side_prepare_q` checks **side 1 first and short-circuits** (`pipeline.cuh`,
+the `p1 != 0` guard on the `p0` call). So side 0 raises the skip only on a job
+whose *rational* bound is the larger one — and the side-0 path is the one with
+the load-bearing drain, because side 1 has by then launched `k_transform` and
+four `cudaMemcpyAsync` uploads out of pinned buffers that the next q rewrites,
+with nothing downstream to synchronise.
+
+On the two jobs this repo had been reasoning from, that path is unreachable:
+
+| job | max algebraic | max rational | rational larger on |
+|---|---|---|---|
+| c194 quintic, logI 14 | 235.33 | 144.26 | 0 of 40000 |
+| 2,1139+ octic, logI 15, skew 1..10^6 | 280.66–344.53 | 156.75–168.34 | 0 of 5000 |
+
+Both are algebraic-dominant by 61–141 bits, at every skew and geometry tested.
+A gate built on either would have left the side-0 branch, and its drain,
+completely unexercised.
+
+### It is live code: two real SNFS polynomials, measured at logI 14
+
+Supplied by Kyle, and both would really be sieved at logI 14:
+
+**`40457117852617043370139^11-1`**, quintic, difficulty 226.07, skew 1.47253,
+c5..c0 = 1 1 -4 -3 3 1, Y1 = -40457117852617043370139, Y0 ≈ 2^150.20.
+
+> algebraic 165.41 bits, rational 181.89 — **rational larger on 4000 of 4000.**
+> But no legal width isolates side 0: at 128 bits *both* sides cross (so side 1
+> skips first) and by 192 neither does. Its side-0-only window is 172–180 bits,
+> which is not a multiple of 64.
+
+**`3132056929538285020802183644638793612181421933816103^5-1`**, quartic,
+difficulty 205.98, skew 1.92366, c4..c0 = 1 1 1 1 1, Y1 = -1, Y0 ≈ 2^171.07.
+
+> algebraic 133.52 bits, rational 203.80 — a **70-bit gap** — and at
+> `BN_LIMBS=6` `normscan` reports `over 192 bits: side1 only 0, side0 only
+> 20000, both 0` (logI 14, 20000 samples, one run).
+> **This one fires the side-0 path at a legal build width.**
+
+So the branch is not dead and the drain comment is justified. c194 and 2,1139+
+simply both sit on the far side of the crossover — degree 8 with m = 2^134 is
+algebraic-dominant, degree 4 with m = 2^171 is not.
+
+The dependence is orderly. For SNFS forms `x^d + 1` with `Y0 = -2^m`, percent of
+2000 (q,rho) where the rational bound is the larger one:
+
+| m \ d | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|
+| 2^100 | 100% | 0% | 0% | 0% | 0% |
+| 2^120 | 100% | 47% | 0% | 0% | 0% |
+| 2^140 | 100% | 50% | 30% | 0% | 0% |
+| 2^160 | 100% | 71% | 99% | 0% | 0% |
+| 2^200 | 100% | 100% | 100% | 50% | 58% |
+
+(at logI 15; at logI 14 the algebraic side is ~5 bits per step weaker and the
+boundary moves out — d=6/m=2^140 reads 89% there, not 30%. **Quote these with
+their geometry**, and prefer the real polynomials above to this idealised
+family, which has unit coefficients and Y1 = 1.)
+
+### The gate
+
+`skipcheck.sh`, plus a `skipcheck` Makefile target. **Not in `check`** — it
+needs a card, same as `fbgpucheck`. It generates its jobs rather than checking
+one in, because which side a fixed job skips on depends on the build width, and
+the default has already moved 8 → 12 once. `normscan` is the oracle that says
+the construction landed; both families are genuine SNFS polynomials with `n` set
+to `F(Y0,Y1)` exactly, so `F(Y0,Y1) == 0 mod n` holds by construction.
+
+All cases pass at `BN_LIMBS=4`:
+
+| case | what it holds | result |
+|---|---|---|
+| A | side-1 skips fire, band keeps sieving | 16 skips, **102 q sieved** |
+| A | summary count == warnings printed | 16 == 16 |
+| A | each skip names the width to rebuild at | yes |
+| B | side-0 skips fire after side 1's transform + uploads | 12 skips, **104 q sieved** |
+| B | no CUDA error attributed to the next q | none |
+| C | `PIPE_SKIP_MAX` is a clean stop, not a failure | exit 0, not `FAILED` |
+| C | cap warning and checkpoint written | `resume at q=15001793` |
+| D | what a resume actually does | reported, not asserted |
+
+### D: a capped band resumes and advances, ~`PIPE_SKIP_MAX` q per run
+
+`nqskip` is not checkpointed, so a resumed band starts counting from zero. The
+worry was that `pipe_try_checkpoint` is called with `cur` — the q that *raised*
+the cap, not the last one sieved — so a resume might return to the same q and
+never advance. **It does advance:** q=15001793 → q=15003097 across two capped
+runs, ~100 skipped q per invocation, zero relations. Pathological under BOINC
+(each work unit burns a slot for nothing) but not a deadlock. Left as a policy
+question, not a gate assertion.
+
+### It is a `BN_LIMBS=4` gate, and the reason is sievability, not squeamishness
+
+The first cut claimed "covers 4..8". A code review flagged that the side-1
+exponent search was anchored at a constant `2` while side 0's scaled with the
+limit, capping the reachable side-1 bound near 145 bits — so the gate silently
+worked only at `BN_LIMBS=4` and would have failed hard at 6 and 8 with "no
+side-1 exponent found". **That was correct**, and it was a defect I had spotted
+myself earlier in the session and then lost track of. Both starts now scale;
+verified offline at 128/192/256, where side 1 lands at exponent 21/84/149,
+tracking `LIMIT-107` exactly.
+
+Fixing the search then exposed the real wall, which is deeper:
+
+- `pipeline.cuh:2018` makes a special-q with **no two-sided survivors fatal**,
+  by design ("an entire special-q with no two-sided survivors is suspicious and
+  remains fatal"). So a generated job must actually yield relations, not merely
+  overflow.
+- A job that overflows 256 bits on one side carries **~375 bits of norm across
+  the two**. At toy bounds (lim 2e6, lpb 26) that yields no survivors and the
+  band dies — measured at `BN_LIMBS=8`: `pipeline: no survivors at this q` →
+  `band FAILED after 0 generated q`. At bounds that would yield (lim 5e7),
+  factor-base generation alone ran past **3.5 minutes without reaching the
+  sieve**. That is not a gate.
+- An earlier degenerate attempt loaded all the magnitude into `c4`, so at
+  `c4 = 2^149` the other terms flushed to zero and bench refused with
+  `1 normalised term(s) flushed to zero -- terms are unbalanced`. Balancing the
+  form (`2^k·(x^4+1)`, and `Y1` scaled with `Y0`) removed the warning but not
+  the survivor problem.
+
+At 128 bits the whole gate costs about a minute: total norms ~250 bits, which
+`lim 2e6 / lpb 26` sieves happily — 81169 relations over 114 q, measured.
+
+**The path under test is width-independent** — `continue` without advancing
+`nqdone`, the drain, the cap, the checkpoint — so covering it at one width
+covers it. The width only decides whether a skipping job can be built and
+sieved. Above 128 bits the gate now skips itself with that explanation rather
+than reporting a failure against code that is fine.
+
+Separately, and independent of cost: `poly_t` holds Y0, Y1 and each coefficient
+as an exact decimal string in an 80-byte field — trial division factors the
+exact `F(a,b)`, not its logarithm — so no job file can carry
+`|Y0| >= 10^79 ~ 2^262`. `poly_load` refuses it by name (`Y0 must be a complete
+finite integer shorter than 80 bytes`) rather than truncating, which is the
+right behaviour and was checked. That caps any side-0 skip near **293 bits**
+however much time one is willing to spend.
+
+### `normscan` now reports which side drives the width
+
+It computed `max(b0, b1)` and printed only that, so it could say "rebuild
+wider" but never which side to blame — and that is exactly what decides which
+skip path a job takes. It now also prints per-side maxima and the over-limit
+split (`side1 only / side0 only / both`). Additive lines only; `testsieve.sh`
+greps `REFUSE|WARNING` and the exit code, both unchanged.
+
+### Method notes
+
+Two mistakes worth keeping, both caught by measurement rather than review:
+
+- **Tune where you run.** The first cut picked its exponents from a survey of
+  the whole 15M–225M band, then sieved 2000 q at the bottom of it. The skip rate
+  varies with q: it wanted ~47 skips and got 4.
+- **`normscan --windows` overlaps on a short band.** Each of the 40 windows
+  starts at its own `q0` but runs to `qmax`, so on a narrow range they re-sample
+  each other — 2336 "samples" from a range holding 118 (q,rho). `--windows 1`
+  enumerates exactly what the band will sieve. Harmless for the wide bands the
+  tool was written for, misleading for anything short.
