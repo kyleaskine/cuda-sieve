@@ -953,6 +953,7 @@ static int bench_main_impl(int argc, char **argv)
     int qrange_set = 0, rho_set = 0;
 
     for (int i = 1; i < argc; i++) {
+        int parsed = 1;
         if (!strcmp(argv[i], "--fb") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--fb", argv[++i], &fbpath)) return 1;
             fbpath_set = 1;
@@ -1099,7 +1100,14 @@ static int bench_main_impl(int argc, char **argv)
         else if (!strcmp(argv[i], "--ab-resieve")) cfg.ab_resieve = 1;
         else if (!strcmp(argv[i], "--resieve-sweep")) cfg.resieve_sweep = 1;
         else if (!strcmp(argv[i], "--pipeline")) cfg.pipeline = 1;
-        else if (!strcmp(argv[i], "--no-td-verify")) cfg.td_verify = 0;
+        else parsed = 0;
+
+        /* MSVC counts a long else-if chain toward its C1061 block-nesting
+         * limit.  Keep the option parser in two independent chains so the
+         * native Windows build has ample nesting headroom. */
+        if (parsed) continue;
+
+        if (!strcmp(argv[i], "--no-td-verify")) cfg.td_verify = 0;
         /* strtol, not atoi: atoi("rational") is 0, which is a LEGAL value here,
          * so a typo would silently configure the wrong side instead of being
          * rejected. Every other numeric flag in this parser avoids atoi for
