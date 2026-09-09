@@ -551,6 +551,18 @@ with `I` rather than `J` is not a trade — both effects come from the same plac
 16` carries only 26 more ideals than `--maxbits 15` on this job, so the whole
 geometry difference is the bucket array.
 
+**`--fill-concurrent` needs the bucket array TWICE.** The two sides share one
+allocation *because* they sieve back to back; the flag overlaps them on two
+streams, and a second array is its entire cost. Size it as `2 x bucket + the
+rest`, and note that the bullet above — "the bucket array is sized by the larger
+side, so raising the smaller side's lim is nearly free" — **stops holding under
+the flag**: both sides carry a full-size array. The run refuses at startup with
+the two figures if the second one does not fit, so a geometry that is close will
+tell you rather than fail mid-band. It is off by default, and on a 48 SM card it
+is worth about 2% of wall (`bench/RESULTS.md` finding 94) — which is to say, do
+not turn it on here. It exists for wide cards, where one fill kernel cannot feed
+the device.
+
 **Do not size a job from an aborted startup.** The startup table lists only the
 bucket array, factor bases, bitmaps, trial-division context and cofactor queue
 — roughly 2.2 GB of the 3.63 GB above at 15e — and per-q buffers grow on demand

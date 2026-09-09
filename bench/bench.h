@@ -581,6 +581,17 @@ typedef struct {
      * given N times the blocks. 0/1 = today's single-workspace behaviour.
      * Costs a full bucket array per workspace, so N is memory-bound. */
     int      fill_streams;  /* 0/1 = off; 2..FILL_STREAMS_MAX = concurrency test */
+    /* Item 1 in the PIPELINE: sieve the two sides of a slab concurrently on
+     * two streams instead of back to back. Where --fill-streams measures the
+     * saturation question on N synthetic lockstep workspaces, this is the
+     * production form of it -- and the concurrency unit is the SIDE, so it is
+     * N=2 and cannot reach the N=4 a 170-SM card wanted (finding 84).
+     *
+     * It costs a SECOND BUCKET ARRAY: the sides share one today precisely
+     * because they run sequentially, so overlapping them is exactly what that
+     * sharing forbids. Off by default, and refused with a message rather than
+     * silently when the second array does not fit. */
+    int      fill_concurrent; /* 0 = sides run back to back (default) */
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */

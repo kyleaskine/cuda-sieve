@@ -1168,7 +1168,7 @@ not by size.
 | 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
 | 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
-| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **not started** — item 1 below, the largest open item |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **THE CODE IS NOW BUILT AND OUTPUT-IDENTICAL, 2026-09-09** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. What still needs the card is the *number* — the 5070 cannot show it |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
@@ -1474,6 +1474,37 @@ finding 92.
    across the two cards, worse than fill, and is 13.5% of the 5090's wall. It
    is bucket-structured work and nobody has looked at it under this lens. Not
    part of this item; the next place to look.
+
+   **BUILT IN THE PIPELINE 2026-09-09 (finding 94): `--fill-concurrent`, and
+   the concurrency unit is the SIDE.** `--fill-streams` measured N synthetic
+   lockstep workspaces; the production form of the same question is the two
+   sides of a slab, which have their own factor bases and their own plat
+   distributions. They ran back to back only because they SHARE ONE BUCKET
+   ARRAY, so the flag's whole cost is a second one -- allocated after all other
+   setup (checking free memory beside the first array passes on memory the
+   factor bases have not claimed yet, and the run then dies at the next
+   `cudaMalloc`), and refused rather than silently downgraded.
+
+   **Output identity is the gate, and it holds**: six bands on the c183 --
+   unslabbed and 2-slab, three interleaved pairs -- are byte-identical between
+   the arms (`md5 b6318c7a...`, 1,596 relations; the slabbed pair 943), and
+   `--check-relations` rebuilds 1,596 of 1,596 norms exactly. `make check`
+   passes.
+
+   **Two things this cannot settle, and the honest read of the 5070 numbers.**
+   On an IDLE card the sieve stage falls 2.3-4.6% (three pairs of three) but
+   wall moves only -1.85% / -2.46% / +0.16% -- one pair of three is a wash, and
+   the mean of -1.4% sits inside this box's own day-to-day variance (item 19).
+   **That is item 1's own ~2% projection for a 5070, met, and it is not a
+   reason to deploy the flag here.** An earlier set of pairs read -3.3% and
+   should not be quoted: the card was carrying foreign load, which is exactly
+   the condition that flatters a concurrency arm.
+
+   And the unit caps the ceiling: **two sides is N=2**, while the 5090 wanted
+   N=4 and gave N=2 no separate row. Reaching N=4 means multiple q in flight,
+   which doubles per-q state rather than one array. So the rental measures what
+   N=2 is worth on a wide card; it does not measure the 27.4% figure, which was
+   an N=4 number.
 
    **OPEN TODO -- one more rented card, before any production design.**
    Both data points are Blackwell (48 SM -> 2 streams, 170 SM -> 4), so nothing

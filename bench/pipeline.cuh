@@ -176,7 +176,7 @@ typedef struct {
     uint32_t *d_nsurv, *d_nproj;
     unsigned long long *d_nlost;
     /* ev[0..3] are the transform/fill/apply boundaries. ev[4] is the
-     * transform END, kept separate because pipe_side_sieve_slab re-records
+     * transform END, kept separate because pipe_side_sieve_issue re-records
      * ev[1] once per slab and would clobber it. */
     cudaEvent_t ev[5];
 } pside_t;
@@ -647,7 +647,7 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
      *
      * cudaGetLastError still catches launch-configuration failures, which is
      * what it was for. An error raised DURING execution now surfaces at the
-     * next sync, inside pipe_side_sieve_slab -- normal async CUDA practice. */
+     * next sync, inside pipe_side_sieve_join -- normal async CUDA practice. */
     PERQ_CK(cudaGetLastError());
     /* The transform time is NOT produced here any more. ev[0] and ev[4] are
      * left for run_pipeline_impl to subtract after the slab loop, which is
@@ -660,35 +660,74 @@ done:
     return rc;
 }
 
-/* Area-dependent work for one side and one slab. The bucket array is passed
- * in and REUSED between sides. SLABBED=false compiles to the pre-slab fill and
- * apply kernels; no walk-state read/write or global-j adjustment survives. */
+/* The per-side bucket workspace. The two sides share ONE allocation today
+ * precisely because they run back to back; `--fill-concurrent` gives each its
+ * own so the two fills can overlap, and that second array is the entire cost
+ * of the option. See run_pipeline_impl's admission check.
+ *
+ * `stream` is 0 -- the legacy default stream -- in serial mode, which is what
+ * keeps that path identical to the pre-split code: every launch below stays on
+ * the stream it was always on, in the order it was always in. */
+typedef struct {
+    uint8_t     *bucket;
+    uint32_t    *cursor;
+    uint32_t    *overflow;
+    uint32_t     cap;
+    cudaStream_t stream;        /* 0 = legacy default stream */
+} pbkt_t;
+
+/* Area-dependent work for one side and one slab, ISSUED but not awaited.
+ * SLABBED=false compiles to the pre-slab fill and apply kernels; no walk-state
+ * read/write or global-j adjustment survives.
+ *
+ * Split into issue/join so the caller picks the order:
+ *
+ *   serial      issue(1) join(1) issue(0) join(0)    -- unchanged behaviour
+ *   concurrent  issue(1) issue(0) join(1) join(0)
+ *
+ * NOTHING MAY TOUCH THE LEGACY DEFAULT STREAM BETWEEN THE TWO ISSUES in the
+ * concurrent order. The side streams are created BLOCKING, so a default-stream
+ * operation slipped in between would implicitly synchronise with side 1 and
+ * quietly serialise the one thing the option exists to do -- while still
+ * emitting correct relations, so no output gate would catch it. That is also
+ * why the memsets below became cudaMemsetAsync ON THE SIDE'S STREAM: the
+ * synchronous form runs on the default stream and would do exactly that. */
 template <bool SLABBED>
-static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
-                                int side, uint32_t xmax, uint32_t j_base,
-                                uint8_t *d_bucket, uint32_t *d_cursor,
-                                uint32_t cap, uint32_t *d_overflow,
-                                int fblocks, int fthreads, pside_t *S,
-                                float *t_fill, float *t_apply)
+static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
+                                 int side, uint32_t xmax, uint32_t j_base,
+                                 const pbkt_t *bk, int fblocks, int fthreads,
+                                 pside_t *S)
 {
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
     const uint32_t nbitword = xmax >> 5;
     const int athr = cfg->apply_threads ? cfg->apply_threads : 512;
+    const cudaStream_t st = bk->stream;
     int rc = -1;
 
 #define SLAB_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     /* Preserve the pre-slab timing boundary: fill includes clearing the bucket
      * cursors/overflow counter, just as pipe_side_perq did. */
     wd_phase(side ? "slab.fill.side1" : "slab.fill.side0");
-    SLAB_CK(cudaEventRecord(S->ev[1]));
-    SLAB_CK(cudaMemset(d_cursor, 0, (size_t)nregion * 4));
-    SLAB_CK(cudaMemset(d_overflow, 0, 4));
-    k_fill_atomic<4, SLABBED><<<fblocks, fthreads>>>(
+    /* k_fill_atomic reads S->plat and S->walk_cur, which k_transform wrote on
+     * the LEGACY DEFAULT STREAM in pipe_side_prepare_q. On a blocking stream
+     * that ordering is implicit and free -- and it is also ambient: compiling
+     * with `--default-stream per-thread`, or ever creating these with
+     * cudaStreamNonBlocking, removes it silently and lets fill race the
+     * transform for uninitialised plattices. The failure would be wrong log
+     * sums in the CONCURRENT arm only, which the serial-vs-concurrent identity
+     * gate is the one test that could catch and the serial gates could not.
+     * Wait on the transform's own end event instead, so the dependency is
+     * stated rather than inherited. Costs nothing on stream 0. */
+    if (st) SLAB_CK(cudaStreamWaitEvent(st, S->ev[4], 0));
+    SLAB_CK(cudaEventRecord(S->ev[1], st));
+    SLAB_CK(cudaMemsetAsync(bk->cursor, 0, (size_t)nregion * 4, st));
+    SLAB_CK(cudaMemsetAsync(bk->overflow, 0, 4, st));
+    k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
         S->plat, S->slice, fb->n, xmax, cfg->logI, log_region,
-        d_cursor, d_bucket, cap, d_overflow, S->walk_cur, S->walk_next);
-    SLAB_CK(cudaEventRecord(S->ev[2]));
-    SLAB_CK(cudaMemset(S->d_nsurv, 0, 4));
+        bk->cursor, bk->bucket, bk->cap, bk->overflow, S->walk_cur, S->walk_next);
+    SLAB_CK(cudaEventRecord(S->ev[2], st));
+    SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
     /* Provably redundant on every production geometry: k_apply's warp-ballot
      * path stores every word of the slab bitmap unconditionally, and this
      * function has both inputs its guard tests (log_region and athr, above), so
@@ -701,17 +740,50 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
      * k_apply's launch-shape condition in a second place, where it can rot out
      * of sync with the kernel's, and the payoff is 0.16%. Revisit if the clear
      * ever shows up in a profile. */
-    SLAB_CK(cudaMemset(S->survbits, 0, (size_t)nbitword * 4));
+    SLAB_CK(cudaMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
-    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem>>>(
-        (const uint32_t *)d_bucket, d_cursor, cap, cfg->logI, log_region,
+    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem, st>>>(
+        (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
         S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
         S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
         S->sp, S->srt, S->sg, S->slp, S->smag,
         S->nsmall, S->nblk, S->nwrp,
         0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, j_base);
-    SLAB_CK(cudaEventRecord(S->ev[3]));
-    wd_phase(side ? "slab.sync.side1" : "slab.sync.side0");
+    SLAB_CK(cudaEventRecord(S->ev[3], st));
+    rc = 0;
+done:
+#undef SLAB_CK
+    return rc;
+}
+
+/* Await a slab issued above and classify it. Returns 0 = usable, 1 = SOFT
+ * (skip this slab, the band lives), -1 = a real device/API failure.
+ *
+ * The D2H reads are ordinary synchronous copies. On THIS side's stream ev[3]
+ * has already been awaited, so an async copy would buy nothing but a second
+ * sync. Note what that means in the concurrent order, because it is not what
+ * the sync-per-side reading suggests: join(1) runs while side 0 is still
+ * executing, and a synchronous cudaMemcpy on the legacy default stream
+ * implicitly synchronises with every blocking stream -- so join(1) does not
+ * return until side 0 has finished either. Harmless today (both sides were
+ * issued before either join, so the overlap has already happened by then) but
+ * it is a whole-device barrier sitting inside a function documented as
+ * per-side. Anyone reordering the joins, adding a third concurrency unit, or
+ * making these streams non-blocking must re-derive it rather than trust the
+ * name. */
+static int pipe_side_sieve_join(int side, const pbkt_t *bk, pside_t *S,
+                                float *t_fill, float *t_apply,
+                                int concurrent_join)
+{
+    int rc = -1;
+#define SLAB_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
+    /* Under --fill-concurrent all four fill/apply phases above are async
+     * ISSUES that flash past in microseconds, and the run then parks here for
+     * the duration of BOTH sides' work -- so naming this side would tell an
+     * operator (and --watchdog-kill) that side 1 is stuck when it may well be
+     * side 0's k_apply. Name what is actually being awaited. */
+    wd_phase(concurrent_join ? "slab.sync.both"
+                             : (side ? "slab.sync.side1" : "slab.sync.side0"));
     SLAB_CK(cudaEventSynchronize(S->ev[3]));
     SLAB_CK(cudaGetLastError());
     *t_fill  = time_kernel(S->ev[1], S->ev[2]);
@@ -719,7 +791,7 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaMemcpy(&S->nsurv, S->d_nsurv, 4, cudaMemcpyDeviceToHost));
     {
         uint32_t hov = 0;
-        SLAB_CK(cudaMemcpy(&hov, d_overflow, 4, cudaMemcpyDeviceToHost));
+        SLAB_CK(cudaMemcpy(&hov, bk->overflow, 4, cudaMemcpyDeviceToHost));
         if (hov) {
             /* SOFT failure: rc = 1, not -1. Dropped bucket records can only
              * LOWER a position's log sum, so an overflow costs survivors it
@@ -732,10 +804,14 @@ static int pipe_side_sieve_slab(const fb_t *fb, const bench_cfg_t *cfg,
              * Rate-limited: under BOINC stderr is uploaded, and a band that
              * overflows on many q would otherwise ship thousands of identical
              * lines. The end-of-band summary carries the true total. */
-            /* File scope, not a static local: this function is a TEMPLATE,
-             * and a static local in a template is per-instantiation, so the
-             * documented budget of 8 was really 8 per SLABBED specialisation
-             * (16 in a binary carrying both). */
+            /* The budget is ONE PER PROCESS, which is why the counter is at
+             * file scope (line ~352) and not a static local here. It was
+             * originally file scope because this code lived in a template and
+             * a static local in a template is per-instantiation -- 8 per
+             * SLABBED specialisation, 16 in a binary carrying both. That
+             * reason is gone now that the overflow branch sits in a
+             * non-template function; the budget being process-wide is not.
+             * Do not "simplify" it back to a static local. */
             if (g_warned_bucket_ovf < 8)
                 runlog_warn("  side %d: bucket array OVERFLOWED by %u records"
                             " -- slab skipped%s", side, hov,
@@ -1514,13 +1590,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     double vram_prev = 0;
     size_t need = 0;
     uint32_t *d_cursor = NULL, *d_overflow = NULL, *d_two = NULL;
+    /* Second bucket workspace, allocated only under --fill-concurrent. The
+     * two sides share one today because they run back to back; overlapping
+     * them is exactly what that sharing forbids. */
+    uint8_t  *d_bucket_c = NULL;
+    uint32_t *d_cursor_c = NULL, *d_overflow_c = NULL;
+    cudaStream_t st_side[2] = { 0, 0 };
+    int concurrent = 0;         /* the option as GRANTED, not as requested */
+    pbkt_t bk1, bk0;
     uint32_t *d_n = NULL;
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0, bound1 = 0, bound0 = 0;
     /* Slabs abandoned to a soft failure (bucket overflow, or trial division
      * this slab cannot be trusted). Counted rather than fatal: see
-     * pipe_side_sieve_slab. Reported at end of band so the rate-limited
+     * pipe_side_sieve_join. Reported at end of band so the rate-limited
      * per-slab warnings do not have to carry the total. */
     unsigned long long nslab_skipped = 0;
     /* Of nslab_skipped, those dropped for untrustworthy trial division
@@ -1538,6 +1622,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * derived, not accumulated separately, so the printed total and its three
      * children cannot drift apart. */
     double acc_tr = 0, acc_fi = 0, acc_ap = 0;
+    /* --fill-concurrent only: fill and apply are still measured PER SIDE, and
+     * under concurrency those two spans OVERLAP, so their sum exceeds the wall
+     * time the pair actually took. Left uncorrected the band report showed
+     * `sieve, both sides` at 95 ms inside a 79 ms q and `unaccounted` at
+     * -41 ms. Accumulate what the overlap was worth and subtract it from the
+     * stage total, so the printed sieve figure stays a wall quantity and the
+     * per-side children still add up visibly to it plus this. Zero when the
+     * flag is off, so the serial report is unchanged to the last digit. */
+    double acc_ovl = 0;
     /* --qspan (item 19 step 2): the GPU-timeline span of one special-q, from
      * before its first GPU operation to after its last. `unaccounted` is
      * wall minus the bracketed stages and has twice been mis-read as "GPU
@@ -1747,7 +1840,74 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                    cfg->cof_limbs0, cfg->cof_limbs))
         { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
+    /* --fill-concurrent's admission check, deliberately LAST.
+     *
+     * It ran beside the first bucket array at first, and that was wrong: the
+     * factor bases, bitmaps, trial-division context and cofactor queue had not
+     * been allocated yet, so the check passed on free memory that was already
+     * spoken for and the run died at the next cudaMalloc instead. Here the
+     * remainder is real. The 512 MB margin then only has to cover the per-q
+     * buffers that grow on demand afterwards, measured at ~0.12 GB at 15e --
+     * the same margin the first bucket array uses, for the same reason.
+     *
+     * The second array is deliberately the same `cap` rather than one derived
+     * from side 0's own est: a smaller cap for the smaller side would change
+     * where k_fill_atomic overflows, which changes which records are dropped,
+     * which changes the relations. Sizing each side to its own est is a real
+     * saving and a SEPARATE change -- it cannot ride along inside one whose
+     * gate is output identity.
+     *
+     * REFUSED, NOT SILENTLY DROPPED. An operator who passed the flag and got a
+     * serial run would quote the timings as concurrent. Same rule as the
+     * harness_only list in bench_main. */
+    if (cfg->fill_concurrent) {
+        /* Charge the cursor array too, not just the bucket. It is small
+         * against the margin, but this check exists precisely so the run
+         * refuses cleanly instead of dying at the next cudaMalloc, and a
+         * check that does not count what the next four lines allocate is
+         * the same bug in miniature. */
+        const size_t need2 = need + (size_t)nregion_alloc * 4 + 4;
+        size_t f2 = 0, t2 = 0;
+        PIPE_CK(cudaMemGetInfo(&f2, &t2));
+        if (need2 + 512u * 1024 * 1024 > f2) {
+            fprintf(stderr,
+                    "  pipeline: --fill-concurrent needs a second bucket array"
+                    " of %.2f GB and only %.2f GB is free after setup.\n"
+                    "  Drop the flag, or lower the area (J, then logI).\n",
+                    need2 / 1073741824.0, f2 / 1073741824.0);
+            rc = -1;
+            goto done;
+        }
+        PIPE_CK(cudaMalloc(&d_bucket_c, need));
+        PIPE_CK(cudaMalloc(&d_cursor_c, (size_t)nregion_alloc * 4));
+        PIPE_CK(cudaMalloc(&d_overflow_c, 4));
+        PIPE_CK(cudaStreamCreate(&st_side[0]));
+        PIPE_CK(cudaStreamCreate(&st_side[1]));
+        concurrent = 1;
+        printf("  --fill-concurrent: a SECOND bucket array (%.2f GB), the two"
+               " sides on two streams\n", need / 1073741824.0);
+        printf("  NOTE: per-side fill/apply times now OVERLAP; the band report"
+               " subtracts the overlap\n");
+        VRAM_MARK("second bucket array");
+    }
 #undef VRAM_MARK
+
+    /* Serial mode points BOTH sides at the one workspace on the legacy default
+     * stream, which is what the two sides have always shared -- so the slab
+     * loop below runs the identical sequence of launches on the identical
+     * stream as before the issue/join split. Concurrent mode gives side 0 the
+     * second array and each side its own stream. */
+    bk1.bucket = d_bucket; bk1.cursor = d_cursor;
+    bk1.overflow = d_overflow; bk1.cap = cap;
+    bk1.stream = concurrent ? st_side[1] : 0;
+    if (concurrent) {
+        bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
+        bk0.overflow = d_overflow_c; bk0.cap = cap;
+        bk0.stream = st_side[0];
+    } else {
+        bk0 = bk1;
+        bk0.stream = 0;
+    }
 
     if (cfg->relations && cfg->candidates &&
         !strcmp(cfg->relations, cfg->candidates)) {
@@ -1892,6 +2052,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * numerator that includes lost q by a denominator that excludes them,
          * and the `unaccounted` residual can go negative. */
         const double     acc_td_q0 = acc_td;
+        const double     acc_ovl_q0 = acc_ovl;
         const pipe_tm_t  tm_q0     = tm;
         if (cfg->qspan) { hspan0 = host_ms(); PIPE_CK(cudaEventRecord(qspan0)); }
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
@@ -2215,15 +2376,74 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * the band cannot continue past. Short-circuit || is kept: if
              * side 1 is unusable there is no point sieving side 0, and the
              * skip below means neither side's survbits are ever read. */
-            int sv1 = pipe_side_sieve_slab<SLABBED>(fb1, cfg, 1, xmax, j_base,
-                                               d_bucket, d_cursor, cap,
-                                               d_overflow, fblocks, fthreads,
-                                               &S1, &sf1, &sa1);
-            int sv0 = sv1 ? 0
-                    : pipe_side_sieve_slab<SLABBED>(fb0, cfg, 0, xmax, j_base,
-                                               d_bucket, d_cursor, cap,
-                                               d_overflow, fblocks, fthreads,
-                                               &S0, &sf0, &sa0);
+            int sv1, sv0 = 0;
+            if (concurrent) {
+                /* Both sides go to the device before either is awaited, and
+                 * NOTHING between the two issues may touch the legacy default
+                 * stream -- see pipe_side_sieve_issue. The short-circuit below
+                 * is therefore gone in this arm: side 0 has already been
+                 * issued by the time side 1's overflow is known. That costs a
+                 * wasted side-0 slab on the rare soft skip and buys the thing
+                 * the option exists for.
+                 *
+                 * It also makes S0's walk state current on that path, where
+                 * the serial arm leaves it stale -- but the `break` below
+                 * abandons the whole q either way, so no later slab reads it
+                 * and the two arms stay behaviourally identical. Do not use
+                 * this to turn that break into a continue: it would be correct
+                 * HERE and wrong in the serial arm, which is exactly the kind
+                 * of divergence output identity cannot catch. */
+                int i1 = pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1, xmax,
+                                               j_base, &bk1, fblocks, fthreads,
+                                               &S1);
+                int i0 = i1 ? -1
+                       : pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax,
+                                               j_base, &bk0, fblocks, fthreads,
+                                               &S0);
+                /* A failed ISSUE leaves launches in flight with nobody to
+                 * await them, and `done:` below frees the bucket array they
+                 * are writing into. Drain before unwinding. */
+                if (i1 || i0) { cudaDeviceSynchronize(); rc = -1; break; }
+                sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, concurrent);
+                sv0 = pipe_side_sieve_join(0, &bk0, &S0, &sf0, &sa0, concurrent);
+                /* NOTHING collapses sv0 into sv1 here, and an earlier
+                 * `if (sv1 > 0 && sv0 > 0) sv0 = 0;` was dead code: below,
+                 * sv0 is read only by `sv1 < 0 || sv0 < 0` and
+                 * `sv1 > 0 || sv0 > 0`, and with sv1 > 0 both already take the
+                 * branch they would take anyway. Skipped slabs are counted per
+                 * q, never per side.
+                 *
+                 * What DOES differ between the arms is stderr, not control
+                 * flow: a slab where both sides overflow calls runlog_warn
+                 * twice here and once in the serial arm, so the rate-limit
+                 * budget of 8 is reached after 4 such slabs rather than 8 and
+                 * the "further overflows summarised" line lands on a different
+                 * slab. The end-of-band total is unaffected, and two lines
+                 * naming two sides is arguably the more useful report -- but it
+                 * is a real divergence that the relations-identity gate cannot
+                 * see, so it is recorded rather than papered over. */
+            } else {
+                sv1 = pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1, xmax, j_base,
+                                               &bk1, fblocks, fthreads, &S1);
+                if (!sv1)
+                    sv1 = pipe_side_sieve_join(1, &bk1, &S1, &sf1, &sa1, concurrent);
+                if (!sv1) {
+                    sv0 = pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax,
+                                               j_base, &bk0, fblocks, fthreads,
+                                               &S0);
+                    if (!sv0)
+                        sv0 = pipe_side_sieve_join(0, &bk0, &S0, &sf0, &sa0, concurrent);
+                }
+                /* The SAME hazard as the concurrent arm's, and it is NOT
+                 * ruled out by joining side 1 before side 0 is issued: an
+                 * issue that fails does so at one of the four API calls
+                 * AFTER k_fill_atomic is already launched, so it returns -1
+                 * with a kernel writing the bucket array and its join
+                 * skipped. Then `done:` cudaFrees that array underneath it.
+                 * -1 only; a soft skip (+1) has been through join and has
+                 * already synchronised. */
+                if (sv1 < 0 || sv0 < 0) cudaDeviceSynchronize();
+            }
             if (sv1 < 0 || sv0 < 0) { rc = -1; break; }
             if (sv1 > 0 || sv0 > 0) {
                 /* Skipped BEFORE the intersect/TD/emit below, so nothing from
@@ -2253,6 +2473,29 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
             ts1[1] += sf1; ts1[2] += sa1;
             ts0[1] += sf0; ts0[2] += sa0;
+            if (concurrent) {
+                /* The overlap the two sides actually achieved, measured on one
+                 * origin. Both side streams are released by the same
+                 * default-stream fence, so WHICH ev[1] the GPU stamps first is
+                 * launch noise, not the issue order -- an earlier version
+                 * assumed side 1 always started first and then clamped each
+                 * slab's result at zero, which keeps every over-estimate and
+                 * discards the matching under-estimates. That is a biased
+                 * estimator, and it biases the reported sieve stage LOW.
+                 *
+                 * Take S1.ev[1] as the origin and let d1 carry the sign: side 1
+                 * spans [0, sf1+sa1], side 0 spans [d1, d1+sf0+sa0], and the
+                 * pair spans from the earlier start to the later end. The one
+                 * extra driver read is d1, which is genuinely new information;
+                 * side 1's own end is sf1+sa1, already in hand from join. */
+                const double d1 = time_kernel(S1.ev[1], S0.ev[1]);
+                const double e1 = (double)sf1 + sa1;
+                const double e0 = d1 + sf0 + sa0;
+                const double span = (e1 > e0 ? e1 : e0) - (d1 < 0 ? d1 : 0);
+                /* Signed, and accumulated signed: the clamp belongs once at
+                 * print time, not per slab. */
+                acc_ovl += (double)sf1 + sa1 + sf0 + sa0 - span;
+            }
             side_surv1 += S1.nsurv; side_surv0 += S0.nsurv;
 
             wd_phase("slab.intersect");
@@ -2437,9 +2680,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * cudaEventSynchronize on each side's ev[3], so ev[4] (earlier in
          * stream order) was complete for free. That argument is DEAD: a slab
          * that soft-skips on side 1 short-circuits side 0 entirely
-         * (`sv1 ? 0 : pipe_side_sieve_slab(...)`), so S0.ev[3] is not
-         * recorded for that slab, and a q whose every slab skips that way
-         * reaches here having never synchronised side 0 at all. The explicit
+         * (the serial arm joins side 1 before side 0 is issued at all), so
+         * S0.ev[3] is not recorded for that slab, and a q whose every slab
+         * skips that way reaches here having never synchronised side 0.
+         * --fill-concurrent does issue both, but that arm must not be the
+         * reason this is safe either -- the flag is off by default. The explicit
          * ev[4] synchronises below are what make this safe now -- they are
          * load-bearing, not the belt-and-braces the next comment calls them.
          * Do not reinstate the ev[3] reasoning. */
@@ -2471,10 +2716,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 rc = -1; break;
             }
             nq_lost++;
-            /* Roll back the two accumulators this q already charged; every
-             * other region timer is either held in a local above or added
-             * after this point. */
+            /* Roll back the accumulators this q already charged. The others
+             * are either held in a local above (ts1/ts0, so acc_fi and acc_ap
+             * never see this q) or added after this point.
+             *
+             * acc_ovl BELONGS HERE and was missed when it was added: it is
+             * banked per slab inside the loop, while the fill and apply times
+             * it corrects are banked per q below and are dropped on this path.
+             * Left in, a q that reached here would subtract an overlap from a
+             * sieve total that was never charged the matching per-side time --
+             * understating `sieve, both sides` and overstating `unaccounted`,
+             * which is the un-reconcilable stage total finding 94 exists to
+             * forbid. Any future band-level accumulator written inside the
+             * slab loop has to be added here too. */
             acc_td = acc_td_q0;
+            acc_ovl = acc_ovl_q0;
             tm     = tm_q0;
             continue;              /* next q; nqdone is not incremented */
         }
@@ -2712,7 +2968,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     + tm.resieve + tm.td + tm.classify + tm.compact + tm.record;
                 const double denom = acc_wall - tm.cofac;
                 const double accwall = denom > 0.0
-                    ? (acc_tr + acc_fi + acc_ap + acc_isect + devsum) / denom
+                    ? (acc_tr + acc_fi + acc_ap - (acc_ovl > 0 ? acc_ovl : 0)
+                       + acc_isect + devsum) / denom
                     : 0.0;
                 char gpu[48] = "gpu=n/a", pwr[32] = "board=n/a";
                 char eta_s[32] = "eta=--";
@@ -3033,7 +3290,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const double N = nqdone;
         const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td
                             + tm.classify + tm.compact + tm.record) / N;
-        const double acc_sieve = acc_tr + acc_fi + acc_ap;
+        /* Clamped ONCE, here. Per-slab clamping biased the estimator (see the
+         * accumulate site); a negative band total would mean the pair took
+         * longer than the sum of its parts, which is launch noise and is not
+         * credited. */
+        const double ovl_pr = acc_ovl > 0 ? acc_ovl : 0;
+        const double acc_sieve = acc_tr + acc_fi + acc_ap - ovl_pr;
         printf("\n\n  --- band of %u special-q ---\n", nqdone);
         if (t_verify > 0)
             printf("  (first-q reconstruction gate: %.1f ms, excluded below)\n",
@@ -3063,6 +3325,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  %-34s %8.3f ms\n", "    transform + plattice", acc_tr / N);
         printf("  %-34s %8.3f ms\n", "    fill", acc_fi / N);
         printf("  %-34s %8.3f ms\n", "    apply", acc_ap / N);
+        if (ovl_pr > 0)
+            printf("  %-34s %8.3f ms   <- --fill-concurrent\n",
+                   "    less: sides overlapped", -ovl_pr / N);
         printf("  %-34s %8.3f ms\n", "  intersect + gcd", acc_isect / N);
         printf("  %-34s %8.3f ms\n", "  host per-q (sieve tables, staging)",
                acc_host / N);
@@ -3330,6 +3595,9 @@ done:
     cofq_free(&Q, &QO);
     pside_free(&S1); pside_free(&S0);
     cudaFree(d_bucket); cudaFree(d_cursor); cudaFree(d_overflow);
+    cudaFree(d_bucket_c); cudaFree(d_cursor_c); cudaFree(d_overflow_c);
+    if (st_side[0]) cudaStreamDestroy(st_side[0]);
+    if (st_side[1]) cudaStreamDestroy(st_side[1]);
     cudaFree(d_two); cudaFree(d_n); cudaFree(d_pre);
     if (ea) cudaEventDestroy(ea);
     if (eb) cudaEventDestroy(eb);

@@ -275,6 +275,9 @@ static void usage(void)
 "                   against the same N issued serially and against 1 kernel\n"
 "                   at N x the blocks. 0/1 = off [0]. Costs a bucket array\n"
 "                   per workspace (item 1)\n"
+"  --fill-concurrent  --pipeline only; sieve the two sides of a slab on two\n"
+"                   streams instead of back to back. Costs a second bucket\n"
+"                   array and is refused if it does not fit [off]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -1072,6 +1075,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                                     1024, &cfg.fill_threads)) return 1;
         }
         else if (!strcmp(argv[i], "--qspan")) { cfg.qspan = 1; }
+        else if (!strcmp(argv[i], "--fill-concurrent")) { cfg.fill_concurrent = 1; }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
                                     FILL_STREAMS_MAX, &cfg.fill_streams)) return 1;
@@ -1999,7 +2003,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
              * still freeze forever. --watchdog itself is NOT here; its
              * reporting works in any mode. */
             "--watchdog-kill",
-            "--slab-j", "--qspan", NULL
+            "--slab-j", "--qspan", "--fill-concurrent", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)

@@ -7345,3 +7345,187 @@ Two mistakes worth keeping, both caught by measurement rather than review:
   each other — 2336 "samples" from a range holding 118 (q,rho). `--windows 1`
   enumerates exactly what the band will sieve. Harmless for the wide bands the
   tool was written for, misleading for anything short.
+
+## Finding 94 — concurrent fill lands in the pipeline as a per-SIDE option, output-identical over six bands. The 5070 meets item 1's own ~2% projection and that is not a deployment case; the flag's value is that the rental now costs no development
+
+`--fill-streams` (finding 84) measured the saturation question on **N synthetic
+workspaces marching in lockstep**, and said in its own comment that it "does NOT
+predict how two real q interleave. That needs the pipeline." This is the
+pipeline form of it, built 2026-09-09.
+
+### The concurrency unit is the side, and that is forced by the memory
+
+Per slab the pipeline runs side 1's fill+apply, then side 0's, **on one shared
+bucket array** — `pipe_side_sieve_slab` took `d_bucket`/`d_cursor` as arguments
+precisely because the two sides take turns with them. So overlapping the sides
+is exactly what the sharing forbids, and the whole cost of the option is a
+second bucket array. The function is now split into `pipe_side_sieve_issue`
+(launches, no sync) and `pipe_side_sieve_join` (awaits, classifies), so the
+caller picks the order:
+
+    serial      issue(1) join(1) issue(0) join(0)     -- unchanged
+    concurrent  issue(1) issue(0) join(1) join(0)
+
+Both sides keep their own `pbkt_t` workspace and their own stream. In serial
+mode both point at the one array on the legacy default stream, which is what
+keeps that path identical to the pre-split code — same launches, same stream,
+same order.
+
+**Nothing may touch the legacy default stream between the two issues.** The side
+streams are created blocking, so a default-stream operation slipped in between
+implicitly synchronises with side 1 and quietly serialises the arm — *while
+still emitting correct relations*, so no output gate would catch it. That is
+also why the four `cudaMemset` calls became `cudaMemsetAsync` on the side's
+stream: the synchronous form runs on the default stream and would do exactly
+that.
+
+### Output identity is the gate, and it holds
+
+| band | geometry | relations | arms agree |
+|---|---|---|---|
+| q 120000053, single | `2^15 x 2^14` | 37 | md5 `60644c99...` |
+| q 120000000-500, x3 pairs | `2^15 x 2^14`, unslabbed | 1,596 | md5 `b6318c7a...`, all 6 files |
+| q 120000000-200 | `2^15 x 2^15`, **2 slabs** | 943 | md5 `b79b42ed...` |
+
+`--check-relations` rebuilds **1,596 of 1,596** norms exactly on the concurrent
+output. `make check` passes (one earlier `cofcheck` exit 255 did not reproduce
+and was foreign GPU load — the same binary passed `cofcheck.sh` standalone
+minutes later).
+
+The slabbed band matters more than its size suggests: it is the path where the
+walk-continuation state is advanced per slab, and where a soft skip must
+abandon the whole q rather than `continue`. The concurrent arm issues side 0
+before side 1's overflow is known, so it *does* leave S0's walk state current
+where the serial arm leaves it stale — but both arms `break`, so no later slab
+reads it and the two stay behaviourally identical. **Do not use that to turn the
+break into a continue:** it would be correct in one arm and wrong in the other,
+which is the one class of divergence output identity cannot catch.
+
+### The 5070 numbers, and why the first set should not be quoted
+
+Three interleaved pairs on an **idle** card:
+
+| pair | sieve stage | wall |
+|---|---:|---:|
+| 1 | −4.61% | −1.85% |
+| 2 | −4.48% | −2.46% |
+| 3 | −2.33% | +0.16% |
+
+Every pair favours concurrent on the sieve stage; **one of three is a wash at
+the wall**, and the −1.4% mean sits inside this box's own day-to-day variance
+(item 19). **This is item 1's own "~2% of wall on a 5070 — do not build it for
+that", met.** It is not a case for deploying the flag on this card.
+
+**An earlier set of pairs read −3.28% and is withdrawn.** Those ran with a
+foreign process on the card, which is precisely the condition that flatters a
+concurrency arm: a contended device has idle SMs to sell. The idle-card numbers
+are the ones that count, and they are the smaller ones. Same lesson as finding
+84's arm-order correction, from the other direction.
+
+### The accounting broke first, and the broken version is instructive
+
+The first working build reported `sieve, both sides 95.08 ms` inside a
+**79.38 ms** q, with `unaccounted` at **−41.22 ms**. Nothing was wrong with the
+sieving: fill and apply are still measured per side, and under concurrency those
+two spans *overlap*, so their sum exceeds the wall time the pair took. Each
+side's kernel is genuinely slower (they share the SMs) while the pair finishes
+sooner — which is the effect, stated backwards.
+
+The band report now accumulates the overlap explicitly, as
+`(sf1+sa1+sf0+sa0) − span` where `span` runs from side 1's `ev[1]` to whichever
+`ev[3]` landed later, and subtracts it from the stage total:
+
+          fill                             41.295 ms
+          apply                            48.805 ms
+          less: sides overlapped          -39.966 ms   <- --fill-concurrent
+        ...
+        unaccounted                         -0.51 ms
+      GPU-accounted / wall (excl cofac)     0.992
+
+The children still visibly add to the parent, and `unaccounted` returns to its
+normal fraction of a millisecond. Zero when the flag is off, so the serial
+report is unchanged to the last digit. **This is findings 90/91's rule applied
+to a new quantity**: a stage total that cannot be reconciled with the wall clock
+is not a measurement, and shipping one would have poisoned the rental it exists
+to inform.
+
+### The admission check has to run last, and one branch is still untriggered
+
+Checking free memory beside the *first* bucket array passes on memory the factor
+bases, bitmaps, trial-division context and cofactor queue have not claimed yet —
+the run then dies at the next `cudaMalloc` instead of refusing cleanly. Measured
+at 16e it admitted a 4.83 GB second array with 1.08 GB left and fell over
+immediately. The check now runs after all one-time setup, where the remainder is
+real; the 512 MB margin then only covers the per-q buffers that grow on demand,
+**measured at 0.12 GB at 15e** (free 8.64 GB after setup, 8.52 GB at steady
+state).
+
+**The refusal branch itself has not been made to fire on this box, and WDDM is
+why.** Two attempts to starve the card with a second `bench` holding 3-4 GB were
+both admitted anyway: under WSL those allocations are evictable, exactly as the
+RUNBOOK's VRAM section says, so the card cannot be reliably starved from inside
+it. The branch is a direct copy of the long-tested first-array check three lines
+above it and its *placement* is verified from the log ordering (the banner now
+prints after the by-stage table, not before it), but it is untriggered. Fire it
+on the rental, where the second array against a fixed budget is a one-line test.
+
+### An xhigh review the same day, and the three things it caught that mattered
+
+Fourteen findings; the substantive ones were all in the *accounting and the
+unwind paths*, not in the sieving — the relations were byte-identical before and
+after every fix below.
+
+- **`acc_ovl` was not rolled back on the `nq_lost` path.** A q whose every slab
+  soft-skips rolls back `acc_td` and `tm` and `continue`s without incrementing
+  `nqdone`; `ts1`/`ts0` are locals so `acc_fi`/`acc_ap` never see it. `acc_ovl`
+  is banked *per slab* inside the loop, so it survived the rollback and
+  subtracted an overlap from a sieve total never charged the matching per-side
+  time. That is the same un-reconcilable stage total this finding is about,
+  reintroduced by the fix for it, on a rarer path. The rollback's comment
+  ("every other region timer is either held in a local above or added after
+  this point") had become false and now says what the rule is.
+- **The transform → fill dependency was ambient, not structural.** `k_transform`
+  writes `plat`/`walk_cur` on the legacy default stream; `k_fill_atomic` reads
+  them on a side stream. Only the *blocking* property of `cudaStreamCreate`
+  ordered them. `--default-stream per-thread` in `NVCC_FLAGS`, or one
+  `cudaStreamNonBlocking`, removes that silently — and the failure would be
+  wrong log sums **in the concurrent arm only**, which no serial gate can see.
+  Now an explicit `cudaStreamWaitEvent(st, S->ev[4])`, free on stream 0.
+- **The second bucket array was invisible to the by-stage memory table**, because
+  `#undef VRAM_MARK` sat above the admission block — while the RUNBOOK
+  paragraph added by this same change tells an operator to size a concurrent job
+  as `2 x bucket + the rest`, and the paragraph after it points at that table as
+  the authority. It now prints (`second bucket array 1.38 GB`), and steady state
+  moves 3.39 → 4.77 GB, which is exactly one array.
+
+Also fixed: the per-slab clamp on the overlap made it a **biased** estimator
+(both side streams are released by the same fence, so which `ev[1]` lands first
+is launch noise; keeping every over-estimate and dropping the under-estimates
+biases the reported sieve stage low) — it is now measured from a signed origin
+and clamped once at print time. The serial arm got the same `cudaDeviceSynchronize`
+the concurrent arm had: an `issue` that fails does so *after* `k_fill_atomic` is
+launched, so joining side 1 before side 0 is issued does not rule the hazard out,
+and the comment claiming it did was wrong. `slab.sync.side1` is now
+`slab.sync.both` under the flag, because all four fill/apply phases are async
+issues that flash past and the run parks on the sync for the duration of *both*
+sides — so a hang was being attributed to side 1 whatever was actually stuck.
+
+Two were rejected. A `if (sv1 > 0 && sv0 > 0) sv0 = 0;` collapse was correctly
+called **dead code** and removed — but the real divergence it claimed to fix is
+that a both-sides-overflow slab warns twice, spending the rate-limit budget of 8
+in 4 slabs; that is recorded in place rather than papered over, since two lines
+naming two sides is the better report. And the proposal to measure the sieve
+stage as a span in *both* arms and delete the correction term does not hold:
+in the serial arm the host time inside `join(1)` falls between side 1's `ev[3]`
+and side 0's `ev[1]`, so a span would **not** equal today's sum and the serial
+report would change — which is the one thing this change may not do.
+
+### Unrelated, found on the way: 16e at `--region 16` does not start on a 12 GB card
+
+`--logI 16 --J 32768 --region 16` (a `2^31` single slab, 4.83 GB bucket array)
+fails at the factor-bases allocation with 5.92 GB free. **It fails identically
+with and without `--fill-concurrent`**, so it is pre-existing and not this
+change; it is recorded here only because the flag's memory testing is what
+walked into it. Item 2's 2026-09-02 note — "a `--region 16` run that fit before
+may not now", once the region count rather than the area became the target — is
+the likely explanation and this is a datapoint for it.
