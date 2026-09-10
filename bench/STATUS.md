@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-01.**
+is not current. **Last updated 2026-09-10.**
 
 ## Architecture
 
@@ -1168,7 +1168,7 @@ not by size.
 | 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
 | 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
-| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **THE CODE IS NOW BUILT AND OUTPUT-IDENTICAL, 2026-09-09** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. What still needs the card is the *number* — the 5070 cannot show it |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **THE CODE IS NOW BUILT AND OUTPUT-IDENTICAL, 2026-09-09** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. What still needs the card is the *number* — the 5070 cannot show it. **The whole session is now one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
@@ -1500,11 +1500,29 @@ finding 92.
    should not be quoted: the card was carrying foreign load, which is exactly
    the condition that flatters a concurrency arm.
 
-   And the unit caps the ceiling: **two sides is N=2**, while the 5090 wanted
-   N=4 and gave N=2 no separate row. Reaching N=4 means multiple q in flight,
-   which doubles per-q state rather than one array. So the rental measures what
-   N=2 is worth on a wide card; it does not measure the 27.4% figure, which was
-   an N=4 number.
+   And the unit caps the ceiling: **two sides is N=2**, while the 5090
+   saturated at N=4. Reaching N=4 means multiple q in flight, which doubles
+   per-q state rather than one array. So the rental measures what N=2 is worth
+   on a wide card; it does not measure the 27.4% figure, which was an N=4
+   number.
+
+   **N=2 on the 5090 is already measured synthetically, so the rental has a
+   prediction to falsify rather than a blank to fill.** Finding 84 records
+   `concurrent/serial` **0.7654 at N=2** against 0.6959 at N=4 — 23.5% off fill
+   relative to the shipped single-kernel default (8.42 → 6.44 ms per workspace).
+   Fill is **35.3% of the 5090's wall**, so full realisation is **8.3% of wall**.
+   The 5070 realises **0.70** of its own synthetic prediction in the pipeline
+   (4.33% predicted, **3.01% measured 2026-09-10** on the rental's own band and
+   protocol), which puts the 5090 at **~5.8%**. Pre-registered bracket:
+   **5.8% to 8.3%**, above the ~4% at which the flag is worth shipping on wide
+   cards. Below ~3% instead, side-level concurrency is finished and the question
+   becomes whether multiple q in flight (the N=4 shape) earns the per-q state.
+
+   **Read it on rel/J, not only on wall.** The same six 5070 arms give +1.96%
+   relations/s for +1.63% board watts — **+0.3% relations per joule**, i.e. the
+   wall win very nearly cancels at the metric item 0 grades on. A busier card
+   draws more. `rental5090.sh` prints both, and a wide card with more headroom to
+   sell may sell more of it at full price. Finding 94.
 
    **OPEN TODO -- one more rented card, before any production design.**
    Both data points are Blackwell (48 SM -> 2 streams, 170 SM -> 4), so nothing
@@ -1516,6 +1534,16 @@ finding 92.
    datapoint in the corpus to cross-check, and `GPU_ARCH=native` builds sm_86
    in ~15 s against sm_120's 277 s. An **L40/L40S** (AD102, 142 SM) is the next
    best -- same silicon family as the 4090 and it re-uses finding 72's L40.
+   A **3060** (GA106, 28 SM) is NOT a substitute, however cheap: it is
+   narrower than the narrowest card in the corpus, so it extrapolates below the
+   measured range instead of interpolating inside it, and the only prediction it
+   can test is "N=2 at the floor" — which 48 SM already says. Its value is a
+   different question this project does care about: **rel/J on volunteer-class
+   hardware.** The grading metric is relations per joule, the distribution story
+   is BOINC, and the modal volunteer GPU is an xx60 at ~170 W, not a 5090. There
+   is no Ampere rel/J point and no mid-range point at all. Buy it for that and
+   for the sm_86 build check, bank the `--fill-streams` sweep as a cheap floor
+   datapoint, and do not let it retire this item.
    A **4090** adds the historical anomaly (1.80x SLOWER at fill than a 5070
    despite 1.5x the bandwidth) but is not required: that table was taken at 256
    threads before the 4608 default, finding 52 already showed that axis
@@ -1523,11 +1551,19 @@ finding 92.
    too -- which is free, locally.
 
    ```sh
-   make GPU_ARCH=native CF_LMAX=3 -j$(nproc) bench && make fbgen
-   ./fbgen --poly input.job --maxbits 15 --threads $(nproc) --out c183.fb1
-   for N in 2 4 8; do ./bench --poly input.job --fb1 c183.fb1        --logI 15 --J 16384 --reps 20 --fill-streams $N; done
-   ./bench --pipeline --cofactor --poly input.job --fb1 c183.fb1        --logI 15 --J 16384 --qrange 190000000: --nq 2000        --relations g.rels --log g.log --log-every 60
+   git clone ... && cd cuda-sieve && bench/rental5090.sh          # ~35 min
    ```
+
+   `bench/rental5090.sh` is the whole protocol and replaces the loose commands
+   this item used to carry: build (`GPU_ARCH=native CF_LMAX=3`, ~5 min at
+   sm_120), factor base, **identity gate as an abort** (unslabbed and slabbed,
+   both arms, byte-compare — every number after it is meaningless if the arms
+   differ), three **interleaved** band pairs with the arm order alternating
+   inside the pair as well as between them, the c147 `I14/J8192` arm, the
+   `--fill-streams` sweep at N=1/2/4/8, and the refusal-branch recipe. Phases
+   are selectable (`bench/rental5090.sh out band c147`) so a session that gets
+   cut short still leaves the earlier ones usable, and `NQ=20` shrinks the bands
+   for a dry run. It prints a parsed summary at the end.
 
    Wanted from it: `concurrent/serial` at each N, the N where per-workspace
    time stops falling, and the pipeline `band of` stage breakdown so fill's

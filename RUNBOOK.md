@@ -559,8 +559,10 @@ side, so raising the smaller side's lim is nearly free" — **stops holding unde
 the flag**: both sides carry a full-size array. The run refuses at startup with
 the two figures if the second one does not fit, so a geometry that is close will
 tell you rather than fail mid-band. It is off by default, and on a 48 SM card it
-is worth about 2% of wall (`bench/RESULTS.md` finding 94) — which is to say, do
-not turn it on here. It exists for wide cards, where one fill kernel cannot feed
+is worth **1.4% to 3.0% of wall depending on the band** — quote the band with
+the number (`bench/RESULTS.md` finding 94) — for **no measurable gain in
+relations per joule**, because the busier card draws proportionally more. Which
+is to say: do not turn it on here. It exists for wide cards, where one fill kernel cannot feed
 the device.
 
 **Do not size a job from an aborted startup.** The startup table lists only the

@@ -928,7 +928,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     const char *fbpath = "../oracle/input.job.afb.0";
     int fbpath_set = 0;
     const char *polypath = "../oracle/c183.poly";
-    bench_cfg_t cfg;
+    /* Zero-initialised so a field whose explicit default below is ever
+     * forgotten reads 0 rather than stack garbage -- --fill-concurrent was
+     * exactly that omission. The explicit defaults still stand: this is a
+     * floor, not the configuration of record. */
+    bench_cfg_t cfg = {0};
     uint64_t q = 120000011ull;          /* prime, mid-range of [50M,190M] */
     uint32_t bkthresh = 0, fbbound = 0;
     int fbbound_set = 0, scale_set = 0;
@@ -944,6 +948,15 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * reproduced a path nobody would ship. */
     cfg.logI = 15; cfg.J = 16384; cfg.slab_j = 0; cfg.log_region = 14;
     cfg.record_bytes = 4; cfg.fill_mode = FILL_ATOMIC; cfg.fill_streams = 0;
+    /* Every field gets its default HERE; the zero-init above is only a floor.
+     * This one was omitted when the flag landed, and before the zero-init that
+     * left --fill-concurrent reading indeterminate stack memory: a nonzero byte
+     * in that slot silently allocates a second bucket array and sieves
+     * concurrently on a run that never asked for it, which is precisely the
+     * "quoted as something it was not" defect the refusal path exists to
+     * prevent. Non-deterministic across builds, so it passes locally and fires
+     * on a rented card. */
+    cfg.fill_concurrent = 0;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 

@@ -1566,6 +1566,18 @@ static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
 
 /* ---- the whole per-q pipeline ------------------------------------------ */
 
+/* The overlap credit --fill-concurrent earns, clamped once and read through
+ * here by BOTH consumers. A negative band total would mean the pair took longer
+ * than the sum of its parts, which is launch noise and is not credited. The
+ * running `acc/wall=` runlog record and the band summary's
+ * `GPU-accounted / wall` are the running and final forms of one ratio (see the
+ * note at the runlog site); spelling the clamp out at each of them let the two
+ * drift the moment the policy changed. */
+static inline double pipe_ovl_credit(double acc_ovl)
+{
+    return acc_ovl > 0 ? acc_ovl : 0;
+}
+
 template <bool SLABBED>
 static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                              const fb_t *fb0, const fb_t *fbs0,
@@ -1711,6 +1723,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     memset(&C, 0, sizeof C); memset(&tm, 0, sizeof tm);
     memset(&Q, 0, sizeof Q); memset(&QO, 0, sizeof QO);
 #define PIPE_CK(x) do { if (CUDA_CHECKED(x)) { rc = -1; goto done; } } while (0)
+/* Headroom left for the per-q buffers that grow on demand after all
+ * one-time setup -- measured at 0.12 GB at 15e (finding 94). ONE constant:
+ * both bucket arrays are checked against it, and a margin that applied to
+ * only one of them would reinstate the bug the second check exists to fix. */
+#define PIPE_VRAM_MARGIN (512u * 1024u * 1024u)
     /* --qspan's events are created HERE, not with their accumulators above,
      * because both validation gates return -1 without passing through `done:`
      * and would leak them. The comment at those gates states the rule: nothing
@@ -1742,7 +1759,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  bucket array %u x %u x 4 B = %.2f GB, shared by both sides"
                " (%.2f GB free)\n", nregion_alloc, cap, need / 1073741824.0,
                freeB / 1073741824.0);
-        if (need + 512u * 1024 * 1024 > freeB) {
+        if (need + PIPE_VRAM_MARGIN > freeB) {
             fprintf(stderr, "  pipeline: bucket array does not fit\n");
             rc = -1;
             goto done;
@@ -1869,10 +1886,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const size_t need2 = need + (size_t)nregion_alloc * 4 + 4;
         size_t f2 = 0, t2 = 0;
         PIPE_CK(cudaMemGetInfo(&f2, &t2));
-        if (need2 + 512u * 1024 * 1024 > f2) {
+        if (need2 + PIPE_VRAM_MARGIN > f2) {
             fprintf(stderr,
                     "  pipeline: --fill-concurrent needs a second bucket array"
-                    " of %.2f GB and only %.2f GB is free after setup.\n"
+                    " + cursors of %.2f GB and only %.2f GB is free after"
+                    " setup.\n"
                     "  Drop the flag, or lower the area (J, then logI).\n",
                     need2 / 1073741824.0, f2 / 1073741824.0);
             rc = -1;
@@ -1906,6 +1924,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         bk0.stream = st_side[0];
     } else {
         bk0 = bk1;
+        /* Redundant today -- bk1.stream is provably 0 on this branch -- and
+         * kept deliberately: it pins the serial arm to the legacy default
+         * stream at the one place a reader looks to see which side gets which
+         * stream, so a later edit to the ternary above cannot hand the serial
+         * path a side stream by accident. */
         bk0.stream = 0;
     }
 
@@ -2461,12 +2484,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * it as a large prime. Skipping a slab is a yield loss;
                  * carrying stale state into the next one is a bad relation.
                  *
-                 * Advancing the state here instead does NOT work: side 0's
-                 * fill never ran (`sv0 = sv1 ? 0 : ...` short-circuits), so
-                 * S0.walk_next holds the PREVIOUS slab's output and there is
-                 * nothing correct to swap in. Abandoning the rest of the q is
-                 * the cheap, obviously-correct repair; slabs already emitted
-                 * above keep their relations. */
+                 * Advancing the state here instead does NOT work IN THE
+                 * SERIAL ARM: side 0 is issued only under `if (!sv1)`, so on a
+                 * side-1 soft skip its fill never ran and S0.walk_next holds
+                 * the PREVIOUS slab's output -- there is nothing correct to
+                 * swap in. Under --fill-concurrent side 0 IS issued and its
+                 * state IS current, which is why the note at the concurrent
+                 * arm forbids using that to turn this break into a continue:
+                 * the repair would be right in one arm and wrong in the other.
+                 * Abandoning the rest of the q is the cheap, obviously-correct
+                 * repair in both; slabs already emitted keep their relations. */
                 nslab_skipped   += slab_plan->nslab - slab;
                 nslab_skipped_q += slab_plan->nslab - slab;
                 break;
@@ -2488,6 +2515,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * pair spans from the earlier start to the later end. The one
                  * extra driver read is d1, which is genuinely new information;
                  * side 1's own end is sf1+sa1, already in hand from join. */
+                /* Both ev[1] are complete here only because join() synced
+                 * each side's ev[3], which is later in stream order -- a
+                 * guarantee established in ANOTHER function, which is exactly
+                 * what the ev[4] reads after the slab loop refuse to rely on.
+                 * time_kernel discards cudaEventElapsedTime's status, so a
+                 * not-ready event would report 0 ms AND latch cudaErrorNotReady
+                 * for the NEXT slab's cudaGetLastError to report as a fatal
+                 * failure of a healthy side. Both syncs are already satisfied,
+                 * so they cost microseconds; do not remove them. */
+                if (CUDA_CHECKED(cudaEventSynchronize(S1.ev[1])) ||
+                    CUDA_CHECKED(cudaEventSynchronize(S0.ev[1]))) {
+                    rc = -1; break;
+                }
                 const double d1 = time_kernel(S1.ev[1], S0.ev[1]);
                 const double e1 = (double)sf1 + sa1;
                 const double e0 = d1 + sf0 + sa0;
@@ -2537,10 +2577,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                      *
                      * Unlike the bucket-overflow skip above, the continuation
                      * state here is intact and can simply be advanced. That
-                     * skip has to abandon the whole q because side 0's fill
-                     * never ran (`sv0 = sv1 ? 0 : ...` short-circuits), so
-                     * S0.walk_next holds the PREVIOUS slab's output and there
-                     * is nothing correct to swap in. Reaching HERE means
+                     * skip has to abandon the whole q because in the serial arm
+                     * side 0 is issued only under `if (!sv1)`, so its fill
+                     * never ran and S0.walk_next holds the PREVIOUS slab's
+                     * output -- and because the concurrent arm, where it DID
+                     * run, must not diverge from it. Reaching HERE means
                      * sv1 == sv0 == 0: both k_fill_atomic launches completed
                      * and both walk_next buffers are current, so the ordinary
                      * end-of-loop advance is exactly right and the remaining
@@ -2671,7 +2712,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             if (advance_slab(slab, J_here)) { rc = -1; break; }
         }
         if (cfg->qspan) { slab_q   = host_ms() - hreg; hreg = host_ms(); }
-        if (rc) break;
+        if (rc) {
+            /* Same rule as the nq_lost rollback below, on the other exit. This
+             * q's fill and apply times live in ts1/ts0 and are never banked
+             * into acc_fi/acc_ap, but acc_ovl was banked PER SLAB inside the
+             * loop -- and the band summary still prints after a hard failure
+             * (`if (nqdone)` below), so leaving it in would subtract this dead
+             * q's overlap from a sieve total made only of the q that did
+             * complete. Un-reconcilable stage total, finding 94's rule. */
+            acc_ovl = acc_ovl_q0;
+            break;
+        }
         /* Deferred from pipe_side_prepare_q, which no longer blocks on the
          * transform. Same events, same subtraction, same reported number --
          * only the moment of reading moved.
@@ -2968,7 +3019,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     + tm.resieve + tm.td + tm.classify + tm.compact + tm.record;
                 const double denom = acc_wall - tm.cofac;
                 const double accwall = denom > 0.0
-                    ? (acc_tr + acc_fi + acc_ap - (acc_ovl > 0 ? acc_ovl : 0)
+                    ? (acc_tr + acc_fi + acc_ap - pipe_ovl_credit(acc_ovl)
                        + acc_isect + devsum) / denom
                     : 0.0;
                 char gpu[48] = "gpu=n/a", pwr[32] = "board=n/a";
@@ -3290,11 +3341,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const double N = nqdone;
         const double dev = (tm.rank + tm.emit + tm.summary + tm.resieve + tm.td
                             + tm.classify + tm.compact + tm.record) / N;
-        /* Clamped ONCE, here. Per-slab clamping biased the estimator (see the
-         * accumulate site); a negative band total would mean the pair took
-         * longer than the sum of its parts, which is launch noise and is not
-         * credited. */
-        const double ovl_pr = acc_ovl > 0 ? acc_ovl : 0;
+        /* Clamped once, in pipe_ovl_credit -- per-slab clamping biased the
+         * estimator (see the accumulate site). */
+        const double ovl_pr = pipe_ovl_credit(acc_ovl);
         const double acc_sieve = acc_tr + acc_fi + acc_ap - ovl_pr;
         printf("\n\n  --- band of %u special-q ---\n", nqdone);
         if (t_verify > 0)
@@ -3555,6 +3604,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     }
 
 #undef PIPE_CK
+#undef PIPE_VRAM_MARGIN
 done:
     /* BELOW `done:`, not above it, so "always reported" is literally true.
      * Every PIPE_CK failure is `rc = -1; goto done`, so sited above this label

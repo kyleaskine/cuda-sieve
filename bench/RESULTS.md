@@ -7460,14 +7460,37 @@ real; the 512 MB margin then only covers the per-q buffers that grow on demand,
 **measured at 0.12 GB at 15e** (free 8.64 GB after setup, 8.52 GB at steady
 state).
 
-**The refusal branch itself has not been made to fire on this box, and WDDM is
-why.** Two attempts to starve the card with a second `bench` holding 3-4 GB were
-both admitted anyway: under WSL those allocations are evictable, exactly as the
-RUNBOOK's VRAM section says, so the card cannot be reliably starved from inside
-it. The branch is a direct copy of the long-tested first-array check three lines
-above it and its *placement* is verified from the log ordering (the banner now
-prints after the by-stage table, not before it), but it is untriggered. Fire it
-on the rental, where the second array against a fixed budget is a one-line test.
+**FIRED 2026-09-10, on this 12 GB box, and it never needed the rental.** The
+first two attempts starved the card with a second `bench` holding 3-4 GB and were
+both admitted anyway -- under WSL those allocations are evictable, exactly as the
+RUNBOOK's VRAM section says. The hog was the wrong instrument. The right one is a
+**geometry** whose second array does not fit, and the knob is `--slab-j`:
+
+    --logI 16 --J 32768 --region 15 --slab-j 32768     (bucket array 4.87 GB)
+      serial      steady state 10.50 GB of 11.91 GB, band completes
+      concurrent  "--fill-concurrent needs a second bucket array + cursors of
+                   4.87 GB and only 1.43 GB is free after setup"
+
+A clean startup refusal naming both figures, and **it also confirms the check's
+placement is what makes it work**: beside the first array the run would have seen
+5.92 GB free and admitted a 4.87 GB second one, then died at the next
+`cudaMalloc`. After all one-time setup the remainder is 1.43 GB and the refusal
+is correct.
+
+Two things this cost a wrong turn to learn. `--logI` is NOT the knob -- the
+auto-slabber targets ~2^29 positions per slab, so raising `logI` *shrinks* the
+slab and the array with it (2.43 -> 2.16 -> 1.90 GB across logI 16/17/18,
+measured). And `--region` is capped by **shared memory**, not VRAM (see the
+region-16 note below), so a region ladder fails for a reason unrelated to either
+array.
+
+**It cannot be fired on a big card with this job, and that is a property of the
+job, not a gap.** The array scales with slab area, area is capped at `2^31`
+positions by the `uint32_t` offsets, and that ceiling puts the array at ~4.9 GB.
+Two of those is nothing to a 32 GB card. Firing it there would need a much larger
+factor base, not a larger geometry -- so the 12 GB box was the right one, and
+`rental5090.sh` carries the reproducer as an **opt-in** phase rather than
+spending card-hours on a rung that cannot separate there.
 
 ### An xhigh review the same day, and the three things it caught that mattered
 
@@ -7520,12 +7543,99 @@ in the serial arm the host time inside `join(1)` falls between side 1's `ev[3]`
 and side 0's `ev[1]`, so a span would **not** equal today's sum and the serial
 report would change — which is the one thing this change may not do.
 
-### Unrelated, found on the way: 16e at `--region 16` does not start on a 12 GB card
+### A second xhigh review, on the rental protocol, and the one that would have cost the card-hours
+
+**2026-09-10.** Fifteen findings over the commit plus the new
+`bench/rental5090.sh`. Three are worth recording.
+
+- **`cfg.fill_concurrent` had no default, and `bench_cfg_t cfg;` is an
+  uninitialised stack struct.** Every other field is assigned explicitly in the
+  defaults block — including `cfg.fill_streams = 0` on the adjacent line — and
+  this one was missed when the flag landed. A nonzero byte in that slot makes a
+  run that never passed the flag allocate a second bucket array and sieve
+  concurrently, which is exactly the "operator quotes a run as something it was
+  not" defect the refusal path exists to prevent; on a tight card it instead
+  refuses at startup for a flag nobody passed. It is indeterminate across
+  builds, compilers and stack layouts, so **it passes every local test and fires
+  on the rented card** — the one machine where the failure costs money and
+  cannot be reproduced afterwards. Fixed twice over: the default is now set, and
+  `cfg` is zero-initialised so the next omission reads 0 rather than garbage.
+- **The identity gate could not abort.** `rental5090.sh` compared md5 sums
+  without checking either run's exit code or the relation count — and two empty
+  files have the same md5. A `bench` that creates the relations file and then
+  dies (bad `--fb1` path, OOM, a bad `--region`) would have printed
+  `IDENTITY OK` and sent the session on to ~35 minutes of timing arms with no
+  correctness gate behind them at all. The gate now requires a nonzero count on
+  both sides and reports the 5070 reference count beside it.
+- **The refusal ladder's status column conflated three different messages.**
+  `grep -i "second bucket array"` also matches the SUCCESS banner, and
+  `"does not fit"` also matches the FIRST array's refusal — which is precisely
+  the failure the ladder exists to distinguish from the second array's. The PASS
+  criterion was to be read off that column.
+
+Also fixed: `acc_ovl` was rolled back on the `nq_lost` path but not on the
+hard-error `break`, and the band summary still prints after `rc = -1` — the same
+un-reconcilable stage total, on the other exit (the comment now covers both);
+the cross-stream `time_kernel(S1.ev[1], S0.ev[1])` relied on a completion
+guarantee established inside `join`, which is the exact reasoning the ev[4]
+reads three hundred lines below refuse to rely on, and it now syncs explicitly;
+the overlap clamp was spelled out at both the runlog and the summary, which are
+meant to be the running and final forms of one ratio, and is now one
+`pipe_ovl_credit`; the 512 MB margin lived in two admission checks and is now
+one `PIPE_VRAM_MARGIN`; the refusal message charged bucket+cursors while the
+grant message charged bucket only, under the same label; two comments justified
+the correctness-critical `break` by citing `sv0 = sv1 ? 0 : ...`, code this
+change had deleted, and the cited reason is **false in the concurrent arm**,
+where side 0's fill did run; `--nq $((NQ/4))` was 0 for `NQ < 4` and the parser
+refuses `--nq 0`; the c147 arms — the geometry the script itself calls the most
+likely to win — carried no `--log`, so the one arm most worth a rel/J figure
+would have produced none, unrecoverably, after the session ended.
+
+One was declined again. `bk0.stream = 0` in the serial branch is a provable
+no-op, flagged by both reviews. It stays, now with the reason in place: it pins
+the serial arm to the legacy default stream at the one place a reader looks to
+see which side gets which stream, so a later edit to the ternary above cannot
+hand the serial path a side stream by accident. The duplicated admission block
+also stays — the two checks print different things at different points in setup
+— but the margin they share is now a single constant, which was the part of that
+finding that could actually rot.
+
+Identity holds through all of it: the same `6e33c6b8...` / `1604756a...` the
+pre-fix build produced, and `--check-relations` still rebuilds 1,591 of 1,591
+norms exactly. **The md5s are also unchanged between a default build and
+`CF_LMAX=3`**, which confirms empirically what finding 84 asserted — the
+cofactor width cannot touch the relations on this job.
+
+### Unrelated, found on the way: `--region 16` is refused for SHARED MEMORY, not VRAM
 
 `--logI 16 --J 32768 --region 16` (a `2^31` single slab, 4.83 GB bucket array)
-fails at the factor-bases allocation with 5.92 GB free. **It fails identically
-with and without `--fill-concurrent`**, so it is pre-existing and not this
-change; it is recorded here only because the flag's memory testing is what
-walked into it. Item 2's 2026-09-02 note — "a `--region 16` run that fit before
-may not now", once the region count rather than the area became the target — is
-the likely explanation and this is a datapoint for it.
+stops after the bucket-array line with 5.92 GB free. **It fails identically with
+and without `--fill-concurrent`**, so it is pre-existing and not this change.
+
+**The first draft of this section attributed it to the factor-bases allocation
+and to VRAM. Both are wrong, and the correction is worth more than the
+observation.** Forcing a small slab (`--slab-j 8192`) drops the bucket array to
+**1.21 GB with 9.55 GB free** and it fails in exactly the same place. Memory was
+never involved. The real message is there and was missed because it goes to
+**stderr, which is unbuffered, so in a merged stream it lands ahead of the
+block-buffered stdout it appears to follow** — a `tail -3` of the run shows the
+memory table and not the diagnostic:
+
+    apply needs 131200 B of shared memory for 64 padded slices;
+    selected device supports at most 101376 B opt-in per block
+
+`pipe_side_init` computes `(1 << log_region) * 2 + nslice_pow2 * 2` and refuses
+above the device's opt-in limit. At `--region 16` that is 128 KB of region bytes
+alone against the 5070's 99 KB. So **`--region 16` is not a memory question at
+all**: it is unavailable on any card whose opt-in shared memory is under ~128 KB,
+and it *would* run on an A100 or H100 (164 KB). Item 2's "a `--region 16` run
+that fit before may not now" is a different mechanism and this is NOT a datapoint
+for it.
+
+Two consequences beyond the note. `bench/rental5090.sh`'s refusal ladder keeps
+every rung at `--region 15` and grows the array with `logI` instead, because a
+region-16 rung would fail for a reason that has nothing to do with either bucket
+array — and its message column matches the shared-memory refusal explicitly, so
+such a rung cannot read as "no diagnostic". And the general lesson: **when a run
+appears to die silently, check whether the diagnostic was reordered ahead of the
+stdout it belongs after** before concluding there isn't one.
