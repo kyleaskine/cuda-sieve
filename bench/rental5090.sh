@@ -30,6 +30,22 @@ run()  { local n=$1; shift; echo "== $n"; echo "\$ $*" > "$OUT/$n.log"
          "$@" >> "$OUT/$n.log" 2>&1; local rc=$?
          echo "   rc=$rc  ($OUT/$n.log)"; return $rc; }
 
+# Same, but with board power sampled at 5 Hz for the WHOLE arm and averaged.
+# The runlog's own `board=` is ONE instantaneous reading per log tick, and four
+# of them cannot carry an energy comparison: two identical 16e pairs on a 5090
+# disagreed by 6 points of rel/J and straddled zero, purely on that sampling
+# (finding 94). rel/J is the metric this project is graded on, so the timed arms
+# get a real mean. Costs nothing -- nvidia-smi runs on the host.
+runp() { local n=$1
+         nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits \
+             -lms 200 > "$OUT/$n.pw" 2>/dev/null &
+         local pw=$!
+         shift; run "$n" "$@"; local rc=$?
+         kill $pw 2>/dev/null; wait $pw 2>/dev/null
+         awk '{s+=$1;n++} END{if(n)printf "   board %.1f W mean, %d samples\n",s/n,n}' \
+             "$OUT/$n.pw"
+         return $rc; }
+
 # The band arms. Both write relations so the band itself is an identity gate as
 # well as a timing run -- the 500-q gate below is only the cheap early abort.
 BAND="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
@@ -111,9 +127,9 @@ if want band; then
     # Within a pair the arms alternate too: the first arm of a pass runs at the
     # highest boost clocks, which is worth about a point (finding 84).
     for p in 1 2 3; do
-        S_ARM=(run "20-band-serial-$p"     ./bench $BAND --relations "$OUT/b.s.$p.rels"
+        S_ARM=(runp "20-band-serial-$p"     ./bench $BAND --relations "$OUT/b.s.$p.rels"
                --log "$OUT/b.s.$p.log" --log-every 20)
-        C_ARM=(run "21-band-concurrent-$p" ./bench $BAND --relations "$OUT/b.c.$p.rels"
+        C_ARM=(runp "21-band-concurrent-$p" ./bench $BAND --relations "$OUT/b.c.$p.rels"
                --log "$OUT/b.c.$p.log" --log-every 20 --fill-concurrent)
         if [ $((p % 2)) = 1 ]; then "${S_ARM[@]}"; "${C_ARM[@]}"
         else                        "${C_ARM[@]}"; "${S_ARM[@]}"; fi
@@ -130,12 +146,20 @@ if want wide; then
     NQW=$(( NQ/4 > 0 ? NQ/4 : 1 ))     # --nq 0 is refused by the parser
     W="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
        --logI 16 --J 32768 --qrange 190000000: --nq $NQW --restart"
-    run 25-wide-serial     ./bench $W --relations "$OUT/w.s.rels" \
-        --log "$OUT/w.s.log" --log-every 20
-    run 26-wide-concurrent ./bench $W --relations "$OUT/w.c.rels" \
-        --log "$OUT/w.c.log" --log-every 20 --fill-concurrent
+    # THREE interleaved pairs, not one. The 2026-09-10 5090 session ran a single
+    # pair here and it returned the only NEGATIVE rel/J in the whole run (-1.4%,
+    # board +7.3% against wall -5.5%) -- the row that decides deployment, on the
+    # production geometry, measured once. One pair cannot carry that.
+    for p in 1 2 3; do
+        S_ARM=(runp "25-wide-serial-$p"     ./bench $W --relations "$OUT/w.s.$p.rels"
+               --log "$OUT/w.s.$p.log" --log-every 5)
+        C_ARM=(runp "26-wide-concurrent-$p" ./bench $W --relations "$OUT/w.c.$p.rels"
+               --log "$OUT/w.c.$p.log" --log-every 5 --fill-concurrent)
+        if [ $((p % 2)) = 1 ]; then "${S_ARM[@]}"; "${C_ARM[@]}"
+        else                        "${C_ARM[@]}"; "${S_ARM[@]}"; fi
+    done
     grep -h "second bucket array\|device memory, steady state\|REFUS\|refus" \
-        "$OUT/26-wide-concurrent.log" | sed 's/^/   /'
+        "$OUT/26-wide-concurrent-1.log" | sed 's/^/   /'
 fi
 
 # ------------------------------------------- the geometry that should win most
@@ -147,15 +171,15 @@ if want c147; then
        --logI 14 --J 8192 --qrange 120000000: --nq $NQ --restart"
     for p in 1 2; do
         if [ "$p" = 1 ]; then
-            run "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels" \
-                --log "$OUT/c.s.$p.log" --log-every 20
-            run "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels" \
-                --log "$OUT/c.c.$p.log" --log-every 20 --fill-concurrent
+            runp "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels" \
+                --log "$OUT/c.s.$p.log" --log-every 5
+            runp "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels" \
+                --log "$OUT/c.c.$p.log" --log-every 5 --fill-concurrent
         else
-            run "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels" \
-                --log "$OUT/c.c.$p.log" --log-every 20 --fill-concurrent
-            run "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels" \
-                --log "$OUT/c.s.$p.log" --log-every 20
+            runp "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels" \
+                --log "$OUT/c.c.$p.log" --log-every 5 --fill-concurrent
+            runp "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels" \
+                --log "$OUT/c.s.$p.log" --log-every 5
         fi
     done
 fi
@@ -232,7 +256,8 @@ echo "=============================== SUMMARY ==============================="
 for f in "$OUT"/2*.log "$OUT"/3*.log; do
     [ -e "$f" ] || continue
     printf '%-26s ' "$(basename "$f" .log)"
-    awk 'function v(  i){for(i=1;i<=NF;i++) if($i=="ms") return $(i-1); return ""}
+    pw=$(awk '{s+=$1;n++} END{if(n)printf "%.1f",s/n}' "${f%.log}.pw" 2>/dev/null)
+    awk -v pw="${pw:-}" 'function v(  i){for(i=1;i<=NF;i++) if($i=="ms") return $(i-1); return ""}
          /^  wall clock per q  /            {w=v()}
          /^  wall clock per q, COMPLETE/    {W=v()}
          /^    sieve, both sides/           {s=v()}
@@ -241,8 +266,12 @@ for f in "$OUT"/2*.log "$OUT"/3*.log; do
          /^      less: sides overlapped/    {o=v()}
          /^  GPU-accounted . wall/          {g=$NF}
          /^  ALL RELATIONS.q/               {r=$NF}
-         END{printf "wall %8s  cmplt %8s  sieve %8s  fill %8s  apply %8s  ovl %9s  acc %6s  rel/q %s\n",
-             w,W,s,f,a,(o==""?"-":o),g,r}' "$f"
+         END{printf "wall %8s  sieve %8s  fill %8s  ovl %9s  rel/q %6s",
+                    w,s,f,(o==""?"-":o),r
+             if(pw!="" && w!="" && r!="")
+                 printf "  board %6.1fW  J/q %7.3f  rel/J %6.3f", pw, w/1000*pw,
+                        r/(w/1000*pw)
+             printf "\n"}' "$f"
 done
 for f in "$OUT"/4*.log; do
     [ -e "$f" ] || continue
@@ -253,7 +282,7 @@ done
 echo
 echo "power, from the --log sidecars (board= is a SPOT SAMPLE, not an"
 echo "integrated measurement -- treat rel/J here as indicative):"
-for f in "$OUT"/b.?.?.log "$OUT"/w.?.log "$OUT"/c.?.?.log; do
+for f in "$OUT"/b.?.?.log "$OUT"/w.?.?.log "$OUT"/c.?.?.log; do
     [ -e "$f" ] || continue
     printf '  %-16s ' "$(basename "$f" .log)"
     awk '{for(i=1;i<=NF;i++){if($i~/^rel\/s=/){r=substr($i,7)}
@@ -265,7 +294,7 @@ done
 
 echo
 echo "relation counts (all c183 band arms must agree):"
-for f in "$OUT"/b.?.?.rels "$OUT"/w.?.rels "$OUT"/c.?.?.rels; do
+for f in "$OUT"/b.?.?.rels "$OUT"/w.?.?.rels "$OUT"/c.?.?.rels; do
     [ -e "$f" ] || continue
     printf '  %-24s %8s  %s\n' "$(basename "$f")" "$(wc -l < "$f")" \
         "$(md5sum < "$f" | cut -c1-12)"

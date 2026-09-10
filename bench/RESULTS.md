@@ -7543,6 +7543,103 @@ in the serial arm the host time inside `join(1)` falls between side 1's `ev[3]`
 and side 0's `ev[1]`, so a span would **not** equal today's sum and the serial
 report would change — which is the one thing this change may not do.
 
+### THE 5090 ANSWER, 2026-09-10: -7.62% of wall, and the gain is inversely proportional to how well the geometry already feeds the card
+
+Rented RTX 5090 (32 GB, 575 W limit), `bench/rental5090.sh` start to finish,
+native Linux. The pre-registered bracket was **5.8% to 8.3%** and the ship
+threshold ~4%.
+
+| geometry | serial | concurrent | **wall** | sieve stage | rel/J |
+|---|---:|---:|---:|---:|---:|
+| c147 `I14/J8192` | 10.685 | 9.220 | **-13.71%** | -19.38% | (not sampled) |
+| c183 `I15e` (3 pairs) | 38.967 | 35.997 | **-7.62%** | -12.42% | **+5.4%** |
+| c183 `I16/J32768` (1 pair) | 127.08 | 120.16 | **-5.45%** | -7.97% | **-1.4%** |
+
+The three c183 I15e pairs are -7.77 / -6.86 / -8.24%, every one favouring
+concurrent. **The prediction held**: synthetic N=2 is 23.7% off fill, fill is
+39.9% of this card's wall, so full realisation would be 9.43% and the pipeline
+returned 7.62% -- a **realisation of 0.81**, against the 5070's 0.70 on the same
+protocol. The wide card realises MORE of its synthetic gain, not less.
+
+The synthetic sweep reproduces finding 84 to within a quarter of a percent, and
+the two passes agree with each other to 0.3%, which is what says the box was
+idle:
+
+| N | this session (a / b) | finding 84, 2026-09-01 |
+|---:|---|---:|
+| 2 | 0.7630 / 0.7640 | 0.7654 |
+| 4 | 0.6970 / 0.6950 | 0.6959 |
+| 8 | 0.6981 / 0.6978 | 0.6957 |
+
+### The finding nobody predicted: the gain shrinks as the geometry grows
+
+-13.71% at c147 I14, -7.62% at c183 I15e, -5.45% at c183 I16. **Fill's share of
+wall is not the explanation** -- it is 39.9% at I15e and 39.3% at I16, flat. What
+changes is how much work one fill kernel is given: 8,192 regions, then 32,768,
+then a `2^31` slab. The bigger the geometry, the better a single kernel already
+feeds the card, and the less idle capacity the second stream has to sell. Finding
+84 said this about the synthetic arms ("the underfeeding gets WORSE as the
+per-kernel work gets smaller") and predicted it would show in production. It
+does, across a 2.5x range of gain.
+
+**That inverts the usual sizing intuition.** The wide rectangle is cheaper per
+relation and higher-yielding (RUNBOOK), so production wants big geometries -- and
+big geometries are exactly where this flag is worth least. The flag is not a
+free-standing win; it is a *repair for underfeeding*, and it pays in proportion
+to the underfeeding that is left.
+
+### The 16e energy result did not survive its own repeat, and the instrument is why
+
+The first 16e pair read **-1.4% rel/J** and was written up here as the row that
+decides deployment, with an explicit warning not to act on it until it was
+repeated. **It was repeated the same afternoon on the same card and came back
++4.6%.** The claim is withdrawn.
+
+| 16e pair | wall | board | rel/J |
+|---|---:|---:|---:|
+| run 1 | -5.45% | **+7.27%** | **-1.41%** |
+| run 2 | -5.26% | **+0.95%** | **+4.56%** |
+
+**The wall figure is solid and the energy figure was never a measurement.** Two
+independent pairs agree on wall to 0.2 points (pooled **-5.35%**) while the board
+term disagrees by six points and straddles zero. The board readings for the
+*same arm* across the two runs differ by 2.6% (serial, 412.6 vs 423.2 W) and
+3.5% (concurrent, 442.6 vs 427.2 W) — larger than the effect being measured.
+
+The cause is the instrument, and it was named in this file before the run:
+`board=` in the runlog is **one instantaneous reading per log tick**, and the
+16e arm produced four of them. Four spot checks cannot estimate the energy of a
+63-second run to better than several percent, so a 5% question was being asked of
+a 3.5%-noise reading. Finding 83 had already said ambient temperature moves the
+energy number by several percent; this is the same warning arriving as a false
+result.
+
+**Fixed by measuring it properly.** `rental5090.sh` now wraps every timed arm in
+`nvidia-smi --query-gpu=power.draw -lms 200`, averages the whole arm, and reports
+`J/q` and `rel/J` from the measured wall and that mean. On the 5070 at c147 the
+new instrument gives 12 samples per arm and board draw that barely moves
+(190.2 W serial against 190.6 W concurrent, **+0.2%**), so the -5.0% wall passes
+almost undiminished into **+5.1% rel/J**. That is the shape the spot samples were
+too coarse to see, and it makes the 5090's "+7.3% board" in run 1 look like what
+the repeat says it was: noise.
+
+**What this leaves standing.** rel/J tracks wall closely once board draw is
+measured rather than sampled, on both cards and at every geometry tested. The
+"turn it off at 16e" recommendation is **withdrawn**; the honest position is that
+16e gains less than I15e because the geometry already feeds the card better
+(-5.35% against -7.62%), not because it costs energy. A third confirmation with
+the new instrument is cheap and still worth taking.
+
+### Cross-card relation identity, gated for the first time
+
+Every arm on the 5090 is byte-identical to its serial partner, and **identical to
+the RTX 5070's output for the same command**: c183 I15e band `fa63611436ad`
+(83,809 relations), c147 `9f39929a0d0c` (129,237), the identity gate's
+`6e33c6b8...` (1,591) and `1604756a...` (937). Different card, different
+architecture generation of the same family, different CUDA install, native Linux
+against WSL -- same bytes. That was never gated before; `rental5090.sh` prints
+the 5070 md5s beside the run precisely because nobody knew which way it would go.
+
 ### A second xhigh review, on the rental protocol, and the one that would have cost the card-hours
 
 **2026-09-10.** Fifteen findings over the commit plus the new

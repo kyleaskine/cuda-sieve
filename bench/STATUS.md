@@ -1168,7 +1168,7 @@ not by size.
 | 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
 | 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
-| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **THE CODE IS NOW BUILT AND OUTPUT-IDENTICAL, 2026-09-09** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. What still needs the card is the *number* — the 5070 cannot show it. **The whole session is now one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; **+5.4% rel/J** there, but **-1.4% rel/J at the production 16e geometry**, which is now the open question. Finding 94. **The session is one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
@@ -1518,11 +1518,44 @@ finding 92.
    cards. Below ~3% instead, side-level concurrency is finished and the question
    becomes whether multiple q in flight (the N=4 shape) earns the per-q state.
 
-   **Read it on rel/J, not only on wall.** The same six 5070 arms give +1.96%
-   relations/s for +1.63% board watts — **+0.3% relations per joule**, i.e. the
-   wall win very nearly cancels at the metric item 0 grades on. A busier card
-   draws more. `rental5090.sh` prints both, and a wide card with more headroom to
-   sell may sell more of it at full price. Finding 94.
+   **MEASURED 2026-09-10 on a rented 5090: -7.62% of wall**, three interleaved
+   pairs at -7.77 / -6.86 / -8.24%, realisation **0.81** of the synthetic
+   prediction against the 5070's 0.70. The synthetic sweep reproduced finding
+   84's rows to a quarter of a percent and both passes agreed to 0.3%. Every arm
+   byte-identical, **and identical to the 5070's output for the same command** —
+   cross-card relation identity, gated for the first time.
+
+   **Two things the run changed that the plan did not anticipate.** The gain is
+   **inversely proportional to how well the geometry already feeds the card**:
+   -13.71% at c147 I14, -7.62% at c183 I15e, -5.45% at c183 I16, with fill's
+   share of wall flat at ~39% across the last two. The flag is a repair for
+   underfeeding and pays in proportion to the underfeeding left, which means
+   production's preference for wide rectangles works against it. And on rel/J it
+   is **+5.4% at I15e**. A first 16e pair read **-1.4%** and was **withdrawn the
+   same afternoon**: the repeat came back +4.6%, the two board readings for the
+   same arm differ by 3.5%, and four instantaneous `board=` samples cannot
+   estimate a 63-second run's energy. `rental5090.sh` now averages
+   `nvidia-smi -lms 200` over each timed arm instead; with that instrument board
+   draw barely moves (+0.2% on a 5070 at c147) and rel/J tracks wall. **16e gains
+   less than I15e (-5.35% pooled) because the geometry already feeds the card
+   better, not because it costs energy.** Finding 94.
+
+   **THE 3090 IS THE CARD THIS ITEM ACTUALLY ASKED FOR, and it runs the same
+   script unchanged** (`GPU_ARCH=native` builds sm_86 in ~15 s; 24 GB clears the
+   `--fill-streams 8` rung a 12 GB card refuses). GA102, 82 SM, third
+   architecture, and the SM count sits between the two Blackwell points — which
+   is the whole question: 48 SM saturates at N=2, 170 SM at N=4, and **nothing
+   yet says whether an autotuner can PREDICT that from device properties or has
+   to measure it.**
+
+   *Pre-registered, 2026-09-10.* If the stream count follows the SM count, 82 SM
+   should saturate at **N=2 or N=3** with `concurrent/serial` at N=2 around
+   **0.78-0.82** (between the 5070's 0.849 and the 5090's 0.7635). Fill's share of
+   wall should land between 28% and 40%; at ~20% off fill and a ~0.75-0.81
+   realisation that puts `--fill-concurrent` at **~5% of wall** on c183 I15e, and
+   more on c147 I14. **An N=4 saturation on 82 SM, or an N=2 ratio outside
+   0.78-0.82, breaks the predictor and settles the item the other way** — the
+   stream count would have to be measured per device, not derived.
 
    **OPEN TODO -- one more rented card, before any production design.**
    Both data points are Blackwell (48 SM -> 2 streams, 170 SM -> 4), so nothing
