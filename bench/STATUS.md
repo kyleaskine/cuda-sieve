@@ -1168,7 +1168,7 @@ not by size.
 | 3b | Decide whether a capped band should advance faster than ~`PIPE_SKIP_MAX` q per invocation | policy | **DECIDED 2026-09-05: it should not advance at all** — case D's ~100-q-per-run crawl is only pathological while the cap reports SUCCESS. A capped band now exits `BENCH_EXIT_UNSUPPORTED` (3) and reports `BENCH_OUTCOME_UNSUPPORTED`, so a client stops reissuing it to the same app version instead of burning slots on it. Checkpointing `nqskip` would make it fail on the first q rather than the hundredth — cosmetic once the outcome is right, and not done |
 | 3c | Exit outcomes: a finished band, a checkpointed stop and a too-narrow build must not all be `boinc_finish(0)` | nothing | **DONE 2026-09-05, UNTESTED UNDER A CLIENT** — `enum bench_outcome` in `bench.h`, `PIPE_RC_*` out of `run_pipeline`; stop → `boinc_temporary_exit`, cap → `boinc_finish(3)`, and only a completed band reports fraction 1.0. `--stop-file` stays available under a client and now DEFERS (temporary exit) when the file is present at startup instead of erroring — an xhigh review caught that refusing it removed the only clean stop a Windows task has, since the client stops those with `TerminateProcess` (README "use `--stop-file` for a clean stop there"). `skipcheck.sh` case C asserts exit 3 and the named rebuild width. `skipcheck` passes at `BN_LIMBS=4` (cap exits 3, names `make BN_LIMBS=6`); `make check` passes at the default 12. **The `HAVE_BOINC` branch is type-checked only against a stub `boinc_api.h`, never against real BOINC** — no install on this box. Two things need Greg: that `boinc_temporary_exit(int delay, const char *reason, bool is_notice)` still matches upstream, and whether the project wants a specific error convention for "build too narrow" so the scheduler reassigns to a wider app version instead of retrying |
 | 4 | Three-position `--qspan` delay calibration (before first launch, between, after last) | local GPU, idle box | **optional** — settles the unreconciled `wall - span`; frame it as testing event-endpoint/submission semantics, not as perf work |
-| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; **+5.4% rel/J** there, but **-1.4% rel/J at the production 16e geometry**, which is now the open question. Finding 94. **The session is one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
+| 5 | Next rental: **concurrent fill primary, concurrent resieve as a second arm**, interleaved, fresh baseline | rented card (3090/L40S/4090) | **ANSWERED ON A 5090, 2026-09-10: -7.62% of wall** — `--fill-concurrent` sieves the two sides on two streams; finding 94. The rental is now pure measurement rather than development, which is the point: card-hours are the scarce resource and this needed none of them. The number came in at **-7.62% of wall** on c183 I15e (three interleaved pairs, -7.77/-6.86/-8.24), inside the pre-registered 5.8-8.3% bracket and above the ~4% ship threshold; rel/J on the 5090 is **withdrawn** — its only power data is `board=`, now shown to be aliased by tens of percent in either direction. Finding 94. **The session is one script, `bench/rental5090.sh`** (build, factor base, identity gate, three interleaved band pairs, the c147 small-geometry arm, the `--fill-streams` sweep including the N=8 a 12 GB card refuses) — about 35 minutes of card time, smoke-tested end to end on the 5070 2026-09-10 |
 | 6 | Leave `pipeline.cuh:1924`'s `cudaDeviceSynchronize` alone | — | **decided, no action** |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource
@@ -1531,14 +1531,19 @@ finding 92.
    share of wall flat at ~39% across the last two. The flag is a repair for
    underfeeding and pays in proportion to the underfeeding left, which means
    production's preference for wide rectangles works against it. And on rel/J it
-   is **+5.4% at I15e**. A first 16e pair read **-1.4%** and was **withdrawn the
-   same afternoon**: the repeat came back +4.6%, the two board readings for the
-   same arm differ by 3.5%, and four instantaneous `board=` samples cannot
-   estimate a 63-second run's energy. `rental5090.sh` now averages
+   **every 5090 rel/J figure is withdrawn.** They came from `board=`, which is
+   not noisy-but-unbiased but **aliased**: on a 5070 band, nine runlog ticks out
+   of nine read 127-148 W against an integrated median of 215 W, and the bias
+   flips direction between arms and between voltage regimes. The 16e sign flip
+   (-1.4%, then +4.6% on repeat) was never going to resolve by repeating it. `rental5090.sh` now averages
    `nvidia-smi -lms 200` over each timed arm instead; with that instrument board
    draw barely moves (+0.2% on a 5070 at c147) and rel/J tracks wall. **16e gains
    less than I15e (-5.35% pooled) because the geometry already feeds the card
-   better, not because it costs energy.** Finding 94.
+   better, not because it costs energy.** The three-pair confirmation was
+   attempted and **discarded for host contention** — serial arms spread 10% and
+   the two slowest drew the LEAST board power, which is a starved GPU, not a hot
+   one — so 16e still rests on two single pairs and is the one number worth
+   retaking on an idle box. Finding 94.
 
    **THE 3090 IS THE CARD THIS ITEM ACTUALLY ASKED FOR, and it runs the same
    script unchanged** (`GPU_ARCH=native` builds sm_86 in ~15 s; 24 GB clears the
@@ -1548,25 +1553,46 @@ finding 92.
    yet says whether an autotuner can PREDICT that from device properties or has
    to measure it.**
 
-   *Pre-registered, 2026-09-10.* If the stream count follows the SM count, 82 SM
-   should saturate at **N=2 or N=3** with `concurrent/serial` at N=2 around
-   **0.78-0.82** (between the 5070's 0.849 and the 5090's 0.7635). Fill's share of
-   wall should land between 28% and 40%; at ~20% off fill and a ~0.75-0.81
-   realisation that puts `--fill-concurrent` at **~5% of wall** on c183 I15e, and
-   more on c147 I14. **An N=4 saturation on 82 SM, or an N=2 ratio outside
-   0.78-0.82, breaks the predictor and settles the item the other way** — the
-   stream count would have to be measured per device, not derived.
+   *Pre-registered 2026-09-10, and* ***REFUTED THE SAME DAY.*** The prediction was
+   `concurrent/serial` at N=2 in **0.78-0.82**, saturating at N=2 or N=3. The
+   3090 returned **0.8653** (both passes, agreeing to 0.0001) and saturated at
+   **N=2** — outside the band, and **worse than the 48-SM 5070's 0.849**. An
+   82-SM card sits between 48 and 170 on every device property one would reach
+   for and behaves like the small end.
 
-   **OPEN TODO -- one more rented card, before any production design.**
-   Both data points are Blackwell (48 SM -> 2 streams, 170 SM -> 4), so nothing
-   says whether an autotuner can PREDICT the stream count from device
-   properties or has to measure it. A third architecture settles it.
+   **THIS ITEM'S OPEN TODO IS THEREFORE ANSWERED, and expensively: the stream
+   count cannot be derived from device properties. An autotuner has to MEASURE
+   it**, which is a startup cost on every device rather than a table lookup.
 
-   *Pick on price, not model.* A **3090** (GA102, 82 SM) is the best value: a
-   third architecture, an SM count between the two we have, an existing 3090
-   datapoint in the corpus to cross-check, and `GPU_ARCH=native` builds sm_86
-   in ~15 s against sm_120's 277 s. An **L40/L40S** (AD102, 142 SM) is the next
-   best -- same silicon family as the 4090 and it re-uses finding 72's L40.
+   **The anomaly is Ampere's too.** On this session's own control the 3090 is
+   **13% slower at fill than a 5070** while carrying 1.7x the SMs and 1.4x the
+   bandwidth (21.463 against 18.964 ms per workspace) — finding 51's 4090 result
+   reproduced on a second non-Blackwell architecture, on the current binary and
+   the 4608-block default, which retires the caveat that the 4090 table predated
+   finding 76. And concurrency does **not** rescue it: the 3090 recovers 13.5%
+   off fill where the 5090 recovers 23.7%. A design assuming otherwise would have
+   been built on the 5090's number alone.
+
+   *Pipeline, and the geometry law on a third card:* **-6.95% / -3.79% / -1.65%**
+   of wall at c147 I14 / c183 I15e / c183 I16, the same monotone ordering as the
+   5090 at about half the magnitude, with fill's share of wall flat at 38-40%
+   throughout. The realisation of the synthetic prediction is **0.73**, between
+   the 5070's 0.70 and the 5090's 0.81 — **the transfer function held; the input
+   is what broke.** Finding 94.
+
+   **THAT TODO IS CLOSED. Do not rent a third card for it.** It read "one more
+   rented card, before any production design -- both data points are Blackwell,
+   so nothing says whether an autotuner can PREDICT the stream count from device
+   properties. A third architecture settles it." The 3090 was rented and it did
+   settle it: **the stream count cannot be predicted and must be measured.** The
+   buying guide below is kept for the cards it still speaks to, and its 3090
+   recommendation is now spent.
+
+   *If a fourth card is ever bought, pick on price, not model.* A **3090** (GA102, 82 SM) *was* the best value and
+   **has now been run** — see the result above; its recommendation is spent. An
+   **L40/L40S** (AD102, 142 SM) is what is left worth buying: same silicon family
+   as the 4090, it re-uses finding 72's L40, and it would test whether Ada shares
+   the pre-Blackwell fill mechanism that Ampere just demonstrated.
    A **3060** (GA106, 28 SM) is NOT a substitute, however cheap: it is
    narrower than the narrowest card in the corpus, so it extrapolates below the
    measured range instead of interpolating inside it, and the only prediction it
@@ -1605,9 +1631,13 @@ finding 92.
    `k_fill_atomic`. `ncu` is blocked on Vast.ai (three boxes now), so do not
    plan on a profile.
 
-   If Ada does NOT recover under concurrency the way Blackwell did, it has a
-   second mechanism and that changes the design before anyone writes it. **When it is built, the two SIDES of one q are the
-   cheaper pairing than two q**: they already share the factor bases and run
+   **That conditional is half-answered.** It read: "if Ada does NOT recover under
+   concurrency the way Blackwell did, it has a second mechanism and that changes
+   the design." **Ampere does not recover** — the 3090 takes 13.5% off fill where
+   the 5090 takes 23.7%, and it is 13% SLOWER at fill than a 48-SM 5070. So there
+   is a pre-Blackwell mechanism and concurrency is not its remedy. Whether Ada
+   shares it is still open and is what an L40S would answer. **The two SIDES of
+   one q remain the cheaper pairing than two q**: they already share the factor bases and run
    sequentially through one bucket allocation today. Note the production gain
    is not the benchmark gain -- the pipeline number needs a pipeline run, and
    real special-q do not march their bucket frontiers in lockstep the way this

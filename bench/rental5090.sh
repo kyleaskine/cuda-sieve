@@ -21,13 +21,42 @@ PHASES=${*:-build fb ident band wide c147 streams}
 mkdir -p "$OUT" || exit 1
 echo "logs -> $OUT"
 
+# Reusing an OUTDIR is SUPPORTED -- `rental5090.sh out build fb ident` then
+# `rental5090.sh out band` is the documented way to survive a cut-short session.
+# What is not supported is a summary that silently mixes two invocations, which
+# is what globbing by name did on the 5090, 2026-09-10: the previous run's single
+# 16e pair printed beside the new three with nothing to tell them apart. So each
+# invocation records the arms IT ran, and the summary reads that instead of the
+# directory. An earlier fix refused the reuse; that traded a documented
+# capability for a constraint the real fix does not need.
+MANIFEST="$OUT/.arms.$$"
+: > "$MANIFEST"
+
 # NQ is an override for a dry run (NQ=20 bench/rental5090.sh out band) -- the
 # timing bands want the full 2000 or the boost-clock ramp dominates.
 NQ=${NQ:-2000}
 
+# Every timed arm runs unattended for minutes. A GPU that stops responding does
+# NOT look like a hang from outside: CUDA's default sync policy is spin-wait, so
+# the process sits in R at 100% user CPU with zero syscall time while the card
+# reads idle -- which is indistinguishable from healthy compute unless you are
+# watching wall-clock progress. On a 5070, 2026-09-10, that cost 57 minutes and
+# a whole band arm before anyone noticed. The watchdog is OFF by default; arm it
+# here, and let --watchdog-kill (600 s default) end the arm instead of the run.
+# Threshold is generous against the legitimate stalls: a 16e q is ~430 ms on a
+# 3090 and the end-of-band cofactor flush can run into hundreds of ms.
+WD="--watchdog 120 --watchdog-log"
+
+
 want() { case " $PHASES " in *" $1 "*) return 0;; *) return 1;; esac; }
 run()  { local n=$1; shift; echo "== $n"; echo "\$ $*" > "$OUT/$n.log"
          "$@" >> "$OUT/$n.log" 2>&1; local rc=$?
+         # rc and membership both recorded. A --watchdog-kill exit (4) leaves a
+         # TRUNCATED log with no `band of` summary and a truncated .rels, so a
+         # killed arm would otherwise drop out of the summary, out of the spread
+         # check's count, and print a short relation count with no marking --
+         # silently turning three pairs into two.
+         printf '%s %d\n' "$n" "$rc" >> "$MANIFEST"
          echo "   rc=$rc  ($OUT/$n.log)"; return $rc; }
 
 # Same, but with board power sampled at 5 Hz for the WHOLE arm and averaged.
@@ -77,13 +106,15 @@ fi
 # 500 q, both arms, byte-compare. THIS IS THE ABORT: if the arms differ, every
 # number after it is meaningless and the run stops here.
 if want ident; then
+    # The gate runs FIRST and unattended, and everything after it depends on it.
+    # A card that wedges here hangs the session with no report at all.
     G="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
-       --logI 15 --J 16384 --qrange 120000000:120000500 --restart"
+       --logI 15 --J 16384 --qrange 120000000:120000500 --restart $WD $OUT/id.wd"
     run 10-ident-serial     ./bench $G --relations "$OUT/id.s.rels"
     run 11-ident-concurrent ./bench $G --relations "$OUT/id.c.rels" --fill-concurrent
     # And the slabbed path, where walk-continuation state is advanced per slab.
     S="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
-       --logI 15 --J 32768 --qrange 120000000:120000200 --restart"
+       --logI 15 --J 32768 --qrange 120000000:120000200 --restart $WD $OUT/sl.wd"
     run 12-slab-serial      ./bench $S --relations "$OUT/sl.s.rels"
     run 13-slab-concurrent  ./bench $S --relations "$OUT/sl.c.rels" --fill-concurrent
     # Host-only reconstruction gate: every factor divides, is prime, is under
@@ -128,9 +159,9 @@ if want band; then
     # highest boost clocks, which is worth about a point (finding 84).
     for p in 1 2 3; do
         S_ARM=(runp "20-band-serial-$p"     ./bench $BAND --relations "$OUT/b.s.$p.rels"
-               --log "$OUT/b.s.$p.log" --log-every 20)
+               --log "$OUT/b.s.$p.log" --log-every 20 $WD "$OUT/b.s.$p.wd")
         C_ARM=(runp "21-band-concurrent-$p" ./bench $BAND --relations "$OUT/b.c.$p.rels"
-               --log "$OUT/b.c.$p.log" --log-every 20 --fill-concurrent)
+               --log "$OUT/b.c.$p.log" --log-every 20 $WD "$OUT/b.c.$p.wd" --fill-concurrent)
         if [ $((p % 2)) = 1 ]; then "${S_ARM[@]}"; "${C_ARM[@]}"
         else                        "${C_ARM[@]}"; "${S_ARM[@]}"; fi
     done
@@ -152,9 +183,9 @@ if want wide; then
     # production geometry, measured once. One pair cannot carry that.
     for p in 1 2 3; do
         S_ARM=(runp "25-wide-serial-$p"     ./bench $W --relations "$OUT/w.s.$p.rels"
-               --log "$OUT/w.s.$p.log" --log-every 5)
+               --log "$OUT/w.s.$p.log" --log-every 5 $WD "$OUT/w.s.$p.wd")
         C_ARM=(runp "26-wide-concurrent-$p" ./bench $W --relations "$OUT/w.c.$p.rels"
-               --log "$OUT/w.c.$p.log" --log-every 5 --fill-concurrent)
+               --log "$OUT/w.c.$p.log" --log-every 5 $WD "$OUT/w.c.$p.wd" --fill-concurrent)
         if [ $((p % 2)) = 1 ]; then "${S_ARM[@]}"; "${C_ARM[@]}"
         else                        "${C_ARM[@]}"; "${S_ARM[@]}"; fi
     done
@@ -170,17 +201,12 @@ if want c147; then
     C="--pipeline --cofactor --poly ../oracle/c147.job \
        --logI 14 --J 8192 --qrange 120000000: --nq $NQ --restart"
     for p in 1 2; do
-        if [ "$p" = 1 ]; then
-            runp "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels" \
-                --log "$OUT/c.s.$p.log" --log-every 5
-            runp "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels" \
-                --log "$OUT/c.c.$p.log" --log-every 5 --fill-concurrent
-        else
-            runp "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels" \
-                --log "$OUT/c.c.$p.log" --log-every 5 --fill-concurrent
-            runp "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels" \
-                --log "$OUT/c.s.$p.log" --log-every 5
-        fi
+        S_ARM=(runp "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels"
+               --log "$OUT/c.s.$p.log" --log-every 5 $WD "$OUT/c.s.$p.wd")
+        C_ARM=(runp "31-c147-concurrent-$p" ./bench $C --relations "$OUT/c.c.$p.rels"
+               --log "$OUT/c.c.$p.log" --log-every 5 $WD "$OUT/c.c.$p.wd" --fill-concurrent)
+        if [ $((p % 2)) = 1 ]; then "${S_ARM[@]}"; "${C_ARM[@]}"
+        else                        "${C_ARM[@]}"; "${S_ARM[@]}"; fi
     done
 fi
 
@@ -196,7 +222,7 @@ if want streams; then
     for pass in a b; do
         for N in 1 2 4 8; do
             run "40-streams-$N$pass" ./bench --poly ../oracle/input.job \
-                --fb1 ../oracle/c183.fb1 \
+                --fb1 ../oracle/c183.fb1 --watchdog 120 \
                 --logI 15 --J 16384 --reps 20 --fill-streams $N
         done
     done
@@ -253,11 +279,29 @@ fi
 # ------------------------------------------------------------------- summary
 echo
 echo "=============================== SUMMARY ==============================="
-for f in "$OUT"/2*.log "$OUT"/3*.log; do
-    [ -e "$f" ] || continue
-    printf '%-26s ' "$(basename "$f" .log)"
-    pw=$(awk '{s+=$1;n++} END{if(n)printf "%.1f",s/n}' "${f%.log}.pw" 2>/dev/null)
-    awk -v pw="${pw:-}" 'function v(  i){for(i=1;i<=NF;i++) if($i=="ms") return $(i-1); return ""}
+# ONE parser, feeding both the per-arm rows and the spread check below. The two
+# used to carry independent copies of the same `wall clock per q` pattern, so a
+# change to that label would have broken one and left the other quietly matching.
+TAB="$OUT/.summary.$$"; : > "$TAB"
+while read -r n rc; do
+    case "$n" in 2*|3*) ;; *) continue;; esac
+    f="$OUT/$n.log"
+    pw=$(awk '{s+=$1;c++} END{if(c)printf "%.1f",s/c}' "$OUT/$n.pw" 2>/dev/null)
+    printf '%-26s ' "$n"
+    if [ "$rc" != 0 ] || ! grep -q "band of" "$f" 2>/dev/null; then
+        # A killed or crashed arm is REPORTED, not skipped. rc 4 is the watchdog
+        # kill; it exits via a bare _exit() from the watchdog thread with no
+        # stdio flush, so the log is truncated with no `band of` summary and the
+        # .rels is short. Globbing for results made such an arm vanish -- three
+        # pairs quietly became two, and the relation-count list below printed a
+        # short count and a different md5 with nothing to mark it.
+        extra=""
+        [ "$rc" = 4 ] && extra=", WATCHDOG KILL -- see $n.wd"
+        printf '*** NO RESULT (rc=%s%s), excluded from the spread check\n' "$rc" "$extra"
+        continue
+    fi
+    awk -v pw="${pw:-}" -v nm="$n" -v tab="$TAB" \
+        'function v(  i){for(i=1;i<=NF;i++) if($i=="ms") return $(i-1); return ""}
          /^  wall clock per q  /            {w=v()}
          /^  wall clock per q, COMPLETE/    {W=v()}
          /^    sieve, both sides/           {s=v()}
@@ -266,20 +310,44 @@ for f in "$OUT"/2*.log "$OUT"/3*.log; do
          /^      less: sides overlapped/    {o=v()}
          /^  GPU-accounted . wall/          {g=$NF}
          /^  ALL RELATIONS.q/               {r=$NF}
-         END{printf "wall %8s  sieve %8s  fill %8s  ovl %9s  rel/q %6s",
-                    w,s,f,(o==""?"-":o),r
+         END{printf "wall %8s cmplt %8s sieve %8s fill %8s apply %8s ovl %9s acc %5s rel/q %6s",
+                    w,W,s,f,a,(o==""?"-":o),g,r
              if(pw!="" && w!="" && r!="")
-                 printf "  board %6.1fW  J/q %7.3f  rel/J %6.3f", pw, w/1000*pw,
+                 printf "  board %6.1fW J/q %7.3f rel/J %6.3f", pw, w/1000*pw,
                         r/(w/1000*pw)
-             printf "\n"}' "$f"
-done
-for f in "$OUT"/4*.log; do
-    [ -e "$f" ] || continue
-    printf '%-26s ' "$(basename "$f" .log)"
-    grep -i 'fill-streams\|concurrent/serial\|per workspace' "$f" | tail -2 | tr '\n' ' '
-    echo
-done
+             printf "\n"
+             printf "%s %s %s %s\n", nm, w, (g==""?"-":g), (pw==""?"-":pw) >> tab}' "$f"
+done < "$MANIFEST"
+
 echo
+# Spread WITHIN one arm type. Interleaving cancels a monotonic drift such as
+# boost decay; it does not cancel a burst of load landing on one arm.
+#
+# There is deliberately NO pass/fail verdict. The clean runs measured on this
+# project span 0.03% (3090) to 2.62% (a 5070 concurrent group whose outlier arm
+# had a HIGHER acc than its siblings -- a quieter host, not a worse one), so no
+# single constant separates clean from dirty; pipeline.cuh refuses to hardcode a
+# comparable "good" constant for exactly that reason. Printed instead is the
+# spread beside the two columns that identify the MECHANISM, which wall clock
+# alone cannot: acc falls when host time appears with the GPU idle, and board
+# falls when the device is starved rather than throttled. Wall up with watts DOWN
+# is a starved GPU; wall up with watts at the limit is thermal. Compare against
+# your own idle baseline on the same card, job and band length (finding 53).
+echo "spread within each arm type, beside the columns that identify the cause:"
+awk '{g=$1; sub(/-[0-9]+$/,"",g)
+      if($2+0>0){ if(!(g in lo)||$2+0<lo[g])lo[g]=$2+0
+                  if($2+0>hi[g])hi[g]=$2+0; n[g]++ }
+      else bad[g]++
+      if($3!="-")ac[g]=ac[g]" "$3
+      if($4!="-")bd[g]=bd[g]" "$4}
+     END{for(g in n){
+           if(n[g]<2){printf "  %-22s %d usable arm(s), no spread\n",g,n[g];continue}
+           if(lo[g]<=0){printf "  %-22s unparseable wall figures\n",g;continue}
+           printf "  %-22s %7.2f -%7.2f ms  spread %5.2f%%\n      acc%s\n      board%s\n",
+                  g,lo[g],hi[g],100*(hi[g]/lo[g]-1),ac[g],bd[g]}
+         for(g in bad) if(!(g in n)) printf "  %-22s no arm produced a summary\n",g}' "$TAB"
+rm -f "$TAB"
+
 echo "power, from the --log sidecars (board= is a SPOT SAMPLE, not an"
 echo "integrated measurement -- treat rel/J here as indicative):"
 for f in "$OUT"/b.?.?.log "$OUT"/w.?.?.log "$OUT"/c.?.?.log; do
@@ -293,10 +361,22 @@ for f in "$OUT"/b.?.?.log "$OUT"/w.?.?.log "$OUT"/c.?.?.log; do
 done
 
 echo
-echo "relation counts (all c183 band arms must agree):"
-for f in "$OUT"/b.?.?.rels "$OUT"/w.?.?.rels "$OUT"/c.?.?.rels; do
-    [ -e "$f" ] || continue
-    printf '  %-24s %8s  %s\n' "$(basename "$f")" "$(wc -l < "$f")" \
-        "$(md5sum < "$f" | cut -c1-12)"
+echo "relation counts -- every arm of one geometry must agree:"
+# Marked, not merely listed. A watchdog-killed arm leaves a TRUNCATED .rels, so
+# its count is short and its md5 differs; printing that in a bare list next to
+# five correct ones is exactly how a poisoned run gets quoted.
+for pfx in b w c; do
+    set -- "$OUT/$pfx".*.rels; [ -e "$1" ] || continue
+    ref=""
+    for f in "$@"; do
+        h=$(md5sum < "$f" | cut -c1-12); nl=$(wc -l < "$f")
+        [ -n "$ref" ] || { ref=$h; refn=$nl; }
+        if [ "$h" = "$ref" ]; then mark="   "; else mark="***"; fi
+        printf '  %s %-24s %8s  %s\n' "$mark" "$(basename "$f")" "$nl" "$h"
+    done
+    for f in "$@"; do
+        [ "$(md5sum < "$f" | cut -c1-12)" = "$ref" ] || {
+            echo "     *** ARMS DISAGREE for '$pfx' -- this run is not usable"; break; }
+    done
 done
 echo "======================================================================="

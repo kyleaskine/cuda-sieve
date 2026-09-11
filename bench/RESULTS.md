@@ -7627,18 +7627,427 @@ the repeat says it was: noise.
 measured rather than sampled, on both cards and at every geometry tested. The
 "turn it off at 16e" recommendation is **withdrawn**; the honest position is that
 16e gains less than I15e because the geometry already feeds the card better
-(-5.35% against -7.62%), not because it costs energy. A third confirmation with
-the new instrument is cheap and still worth taking.
+(-5.35% against -7.62%), not because it costs energy. **The confirmation run with
+the new instrument was attempted and had to be discarded for host contention --
+see below -- so 16e still rests on two single pairs.**
+
+### The three-pair 16e rerun is DISCARDED, and how the data says so on its own
+
+The repeat was run with other work already restarted on the box. It shows, and
+the useful part is the **signature**, because "the box was busy" is normally only
+knowable from outside the data.
+
+| exec order | arm | wall | board |
+|---|---|---:|---:|
+| 1 | serial | 130.67 | 386.1 |
+| 2 | concurrent | 130.74 | 392.4 |
+| 3 | concurrent | 130.13 | 395.2 |
+| 4 | serial | **142.93** | **377.6** |
+| 5 | serial | **143.74** | **364.5** |
+| 6 | concurrent | 125.61 | 404.6 |
+
+The three serial arms spread **10.00%** against the concurrent arms' 4.08%, and
+the pairwise deltas come out **+0.05% / -8.96% / -12.61%** -- a range so wide it
+cannot be reporting one effect. Every arm is 3-5% slower than the clean singles
+taken hours earlier (serial 126.71/127.08, concurrent 120.05/120.16).
+
+**The mechanism is legible in the board column.** The two slowest serial arms
+have the *lowest* board draw of the six -- 142.93 ms at 377.6 W and 143.74 at
+364.5 W. Thermal throttling or GPU-side contention would raise wall while board
+stayed at or above the limit. Wall up *and* watts down is the host failing to
+feed the device: a starved GPU idles, and an idle GPU draws less. **That pairing
+is the tell**, and it needs both instruments -- the wall clock alone would have
+looked like ordinary variance, and this session only has the board column because
+the sampling fix landed the same afternoon.
+
+**The bias points at the concurrency arm**, which is why this cannot be quietly
+kept: the contention landed on serial arms 2 and 3, and a slowed serial arm
+inflates the measured gain. Finding 94 already withdrew a -3.3% 5070 reading for
+the same reason from the other direction. **Discarded. The 16e figure remains the
+two clean pairs' -5.35%.**
+
+### Three fixes the discarded run paid for
+
+- **`GPU-accounted / wall` was dropped from the summary line** when the power
+  columns were added -- a regression, and precisely the wrong line to lose. It is
+  the run's own contention detector: it falls when host time appears with the GPU
+  idle (findings 90/91). Restored.
+- **A repeatability check per arm GROUP.** Interleaving cancels a monotonic drift
+  such as boost decay; it does **not** cancel a burst of host load landing on one
+  arm, which is what happened here. The summary now prints min/max/spread within
+  each arm type and marks anything over 2% as SUSPECT. On the discarded data it
+  flags `25-wide-serial` at 10.00% immediately.
+- **A reused output directory is now refused.** This rerun wrote into the
+  previous run's directory, so the summary globs picked up that session's single
+  pair and printed it beside the new three with nothing to mark it -- two
+  different experiments in one table.
+
+### THE 3090 REFUTES THE PREDICTOR, 2026-09-10: 82 SM behaves like 48, not like something in between
+
+Rented RTX 3090 (GA102, 82 SM, 24 GB, 290 W limit), the same script, the cleanest
+run of the three: arm spreads **0.03-0.36%** and board draw flat to **0.25%**
+across ~1,100 samples per arm.
+
+**The pre-registration was explicit and it failed.** If the stream count follows
+the SM count, an 82-SM card should have given `concurrent/serial` at N=2 in
+**0.78-0.82** and saturated at N=2 or N=3.
+
+| card | arch | SM | N=2 ratio | saturates |
+|---|---|---:|---:|---|
+| RTX 5070 | Blackwell | 48 | 0.8490 | N=2 |
+| **RTX 3090** | **Ampere** | **82** | **0.8653** | **N=2** |
+| RTX 5090 | Blackwell | 170 | 0.7635 | N=4 |
+
+**0.8653 — outside the band, and WORSE than the 48-SM card's 0.849.** Both passes
+agree to 0.0001, and N=4 (0.8573/0.8569) and N=8 (0.8561/0.8558) are flat against
+N=2, so it saturates at two streams like the narrowest card in the corpus. An
+82-SM part sits between 48 and 170 on every device property one would reach for
+and behaves like the small end on the only one that matters.
+
+**Item 1's open TODO is answered: the stream count cannot be derived from device
+properties. An autotuner has to measure it.** That was the whole reason for a
+third card, and it is the answer that costs the most, because a measured
+autotune is a startup cost on every device rather than a table lookup.
+
+### And the anomaly is Ampere's too, so it is not Ada's alone
+
+This session's own single-kernel control, ms per workspace at c183 I15e:
+
+| card | single 4608 | wide | bandwidth |
+|---|---:|---:|---:|
+| RTX 5070 | 18.964 | 17.741 | 672 GB/s |
+| **RTX 3090** | **21.463** | 20.369 | 936 GB/s |
+| RTX 5090 | 8.527 | 8.115 | 1792 GB/s |
+
+**The 3090 is 13% SLOWER at fill than a 5070** while carrying 1.7x the SMs and
+1.4x the bandwidth. That is finding 51's 4090 anomaly (1.80x slower than a 5070
+at 1.5x the bandwidth) reproduced on a second non-Blackwell architecture, on the
+current binary and the current 4608-block default -- which retires the standing
+caveat that the 4090 table was taken at 256 threads before finding 76 moved the
+default. **Ampere and Ada both show it; both Blackwell parts do not.**
+
+Item 1 asked what to conclude if a non-Blackwell card did not recover under
+concurrency the way Blackwell did. It does not: the 3090 recovers **13.5%** off
+fill where the 5090 recovers **23.7%**. Concurrency is not the remedy for
+whatever the pre-Blackwell mechanism is, and a design that assumed it would be
+was about to be built on the 5090's number alone.
+
+### The pipeline numbers, and the geometry law holding on a third card
+
+| geometry | serial | concurrent | wall | sieve | rel/J | fill share |
+|---|---:|---:|---:|---:|---:|---:|
+| c147 `I14/J8192` | 24.875 | 23.145 | **-6.95%** | -8.78% | **+7.67%** | 39.9% |
+| c183 `I15e` | 110.247 | 106.063 | **-3.79%** | -5.78% | **+3.69%** | 38.7% |
+| c183 `I16/J32768` | 429.707 | 422.613 | **-1.65%** | -2.68% | **+1.68%** | 37.8% |
+
+Same monotone ordering as the 5090 (-13.71 / -7.62 / -5.35) at roughly half the
+magnitude, with fill's share of wall flat at ~38-40% across all three geometries.
+**The gain is not predicted by fill's share of wall; it is predicted by how much
+work one fill kernel is handed.** That law now holds on two architectures.
+
+The pipeline gain came in at -3.79% against a pre-registered ~5%, on the low
+side, which follows directly from the synthetic ratio landing at 0.8653 instead
+of 0.78-0.82. The realisation of the synthetic prediction is
+`0.0379 / (0.135 x 0.387)` = **0.73**, between the 5070's 0.70 and the 5090's
+0.81. **That part of the model is intact**: what broke is the input, not the
+transfer function.
+
+### The 16e energy scare is now definitively dead
+
+Board draw across the 16 arms of this run spans **282.0 to 284.8 W** — a 0.99%
+range — with ~1,100 samples behind each figure. The quantity that decides the A/B
+is tighter still: the **serial-to-concurrent** delta is **+0.25% / 0.00% /
+-0.18%** at I15e / I16 / c147.
+
+That pins rel/J to wall arithmetically. rel/J is the reciprocal of the wall ratio
+divided by the board ratio, so with the board term under a quarter of a percent,
+**wall alone predicts every measured rel/J to within 0.01 points**:
+
+| geometry | wall | board | rel/J predicted | rel/J measured |
+|---|---:|---:|---:|---:|
+| c147 | -6.95% | -0.18% | +7.66% | **+7.67%** |
+| I15e | -3.79% | +0.25% | +3.68% | **+3.69%** |
+| I16 | -1.65% | +0.00% | +1.68% | **+1.68%** |
+
+(An earlier draft of this paragraph said "moved at most 0.25% — 282.0 to 284.8 W"
+and "rel/J tracks wall to within 0.1 points". Both were wrong: 282.0 to 284.8 is
+0.99%, not 0.25% — the 0.25% is the arm-type delta, a different quantity — and
+c147's +7.67 against -6.95 differs by 0.72 points, because a wall *ratio* inverts
+rather than negating. The corrected form above is stronger, not weaker.)
+
+There is no geometry at which overlapping the sides costs energy on this card. The 5090's "-1.4% at 16e" was
+four spot samples and nothing else, exactly as its own repeat suggested.
+
+### Where that leaves relations per joule across the corpus
+
+At c183 I15e, concurrent arm, board draw integrated rather than sampled:
+
+| card | wall/q | board | J/q | **rel/J** |
+|---|---:|---:|---:|---:|
+| RTX 5090 | 35.997 | 405.8* | 14.61 | **2.87** |
+| RTX 3090 | 106.063 | 283.2 | 30.04 | **1.40** |
+
+*the 5090's figure is the **sampled** one.
+
+**SUPERSEDED LATER THE SAME NIGHT, and the reasoning is kept because the error is
+the point.** This paragraph originally read a 2.06x 5090-over-3090 ratio off the
+table above and drew a conclusion about volunteer hardware from it. Both halves
+were unsound: the 5090's row is `board=` data, which the section below shows is
+**aliased by tens of percent in either direction**, so the ratio was built on a
+number that no longer exists. The 5070's row, described here as "missing and
+staying missing", was supplied two hours later by the retaken idle band -- see
+"Two cards with trustworthy energy figures" below, which is the table of record.
+
+What survives: **only the 5070 and 3090 have integrated power**, the comparison
+between those two is sound, and **the 5090 still owes an integrated figure that
+cannot now be taken, because the card is released.** One outstanding measurement,
+not two.
+
+### The runlog's `board=` is ALIASED, not merely noisy — and the bias is ARM-DEPENDENT
+
+**2026-09-10, and it retro-explains every energy surprise in this finding.** The
+5 Hz sampler and the runlog ticks were recorded over the *same* 5070 band arms.
+They do not agree, and the disagreement is not scatter.
+
+| serial arm 2 | |
+|---|---|
+| 5 Hz sampler, 848 samples | min 53.8, **p10 150.7, median 215.1, p90 217.2**, max 218.7 W |
+| the nine runlog ticks | 129.8, 147.8, 135.4, 127.4, 145.2, 133.9, 145.2, 132.3, 141.6 W |
+
+**Nine ticks out of nine landed 70-90 W below the median, and not one came near
+it.** That is not a noisy estimator of 215 W; it is a systematically different
+quantity. The concurrent arm of the same pair behaves quite differently -- ticks
+of 153.7, 203.6, 223.2, 223.1, 225.2, 222.1, 222.2, 222.6 against a median of
+221.9 -- i.e. **straddling** its median, barely biased at all.
+
+So the bias is **arm-dependent**, and it points one way: it makes the SERIAL arm
+look far more efficient than it is. The sidecar table from this very run reads
+serial 2.84-3.47 rel/J against concurrent 2.19-2.47 -- "concurrency is 30% WORSE
+on energy" -- while the integrated figures from the same six arms say
+**2.326 -> 2.360, +1.45% in concurrency's favour.** The sign is inverted.
+
+**This is the mechanism behind the 5090's `-1.4% at 16e`**, which was flagged,
+repeated, and withdrawn as noise. It was not noise. It was this, and the repeat
+disagreed because the aliasing depends on where each arm's tick happens to fall
+relative to its own per-q cycle.
+
+The code was never wrong about it. `pipeline.cuh` says in place that the reading
+is "a spot check that says whether the box was busy, **not a power measurement**"
+and that "a board sensor cannot be promoted to" the metric of record. **The error
+was entirely in the reading of it here**: "spot check" was taken to mean noisy
+but unbiased, and it is neither. `runlog_gpu_watts` is called at a q boundary in
+the band loop, right after the per-q host work, which is exactly when the device
+has drained -- so the tick samples an idle moment on a duty cycle rather than the
+work.
+
+**Every rel/J figure in this finding that came from `board=` is withdrawn**, and
+the three cards' numbers are only comparable where an integrated sampler ran.
+`rental5090.sh` keeps the sidecar column because it is still the right instrument
+for "was the box busy", now labelled as aliased rather than merely indicative.
+
+### The clean 5070 band, and what the contaminated baseline cost
+
+The 5070's original -3.01% was measured with ~5 GB of foreign GPU memory in use
+and the host at load 11. Retaken on an idle box (load 2.3), the same band runs at
+**90.5 ms/q against 131.4** -- the card was 45% slower all morning, at *lower*
+board draw and the same `acc/wall`, which is the signature of another context
+time-slicing the GPU under WDDM rather than of host-CPU starvation.
+
+| | serial | concurrent | wall | rel/J (integrated) |
+|---|---:|---:|---:|---:|
+| morning, contended | 132.72 | 128.72 | -3.01% | -- |
+| **tonight, idle** | **90.547** | **86.647** | **-4.31%** | **2.326 -> 2.360, +1.45%** |
+
+Pairwise the clean run gives -3.14 / -3.70 / **-6.07%**, and the repeatability
+check flags the concurrent group at **2.62%** spread on the strength of that
+third arm (85.27 against 87.17 and 87.50, and its `acc` is 0.931 against 0.914
+and 0.909 -- it genuinely had a quieter host). Excluding that pair the figure is
+**-3.42%**. So the clean-regime gain is *at least* as large as the contended one,
+which is the opposite of the worry that a contended card had flattered the
+concurrency arm -- worth recording, because that worry was reasonable and wrong.
+
+### Two cards with trustworthy energy figures, and the 5070 wins on both axes
+
+| card | SM | wall/q | board (integrated) | **rel/J** |
+|---|---:|---:|---:|---:|
+| **RTX 5070** | 48 | **90.55** | 199.0 W | **2.326** |
+| RTX 3090 | 82 | 110.25 | 283.2 W | **1.345** |
+| RTX 5090 | 170 | 38.97 | *sampled only* | *unusable* |
+
+**A 48-SM 5070 is 22% faster per special-q than an 82-SM 3090 and 1.73x its
+relations per joule**, on the same job, geometry and binary. The fill anomaly
+predicted the first half; the 290 W board limit does the rest. The 5090's row
+cannot be filled without renting it again, because its only power data is the
+aliased kind -- **and the card is already released.** That is the direct cost of
+having trusted `board=` for one session.
+
+### The reboot dropped the undervolt, so today's earlier 5070 numbers are OFF-CONVENTION
+
+`STATUS.md` records that **this box has been undervolted since 2026-08-17** and
+that every timing taken after that date is ~6.7% slower than one taken before it
+(finding 61). The reboot cleared it and it was not reapplied until tonight.
+**So every 5070 figure in this finding above -- the morning's -3.01%, the clean
+-4.31%, `rel/J 2.326` -- was taken at STOCK, which is not this box's documented
+configuration.** That is finding 61's own warning arriving in reverse: it exists
+so a post-undervolt measurement is not read as a regression, and here a *stock*
+measurement was about to be read as the corpus baseline.
+
+The canonical 5070 row is the undervolted one below.
+
+### The undervolt, measured properly, and it confirms finding 61
+
+Finding 61 characterised the undervolt from sampled power. This is the same
+change measured with the integrated sampler, on a different band, three
+interleaved pairs, both arm groups passing the repeatability check (1.69% and
+1.62%):
+
+| | finding 61 (2026-08-17) | **tonight, integrated** |
+|---|---|---|
+| throughput cost | -6.7% | **-5.10%** |
+| board draw | -28% | **-29.57%** (199.0 -> 140.1 W) |
+| board figure | ~140 W | **140.1 W** |
+| whole-box rel/J | +14.6% | **+17.09%** |
+
+An independent re-derivation on a different job and a better instrument, landing
+within a point or two on every term. **Finding 61 stands, and its board figure is
+exact.**
+
+Stated for the grading metric: **the undervolt buys 35.1% board rel/J, or 17.1%
+whole-box, for 5.1% of wall clock.** Nothing else measured in this finding comes
+close -- `--fill-concurrent`'s whole-box gain is 2.5%, an order of magnitude
+smaller for a far larger change.
+
+### The concurrency gain SURVIVES the undervolt, and the undervolted pairs are the cleanest A/B of the session
+
+| regime | pairwise wall delta | mean |
+|---|---|---:|
+| stock | -3.14% / -3.70% / **-6.07%** (third flagged, 2.62% group spread) | -4.31% |
+| **undervolted** | **-3.78% / -3.72% / -3.68%** | **-3.73%** |
+
+Three pairs inside **0.1 points of each other** — tighter than anything else in
+this finding, on either card. The open question was whether the flag's benefit is
+partly an artifact of running at stock voltage, since concurrency works by
+selling idle SM capacity and undervolting lowers the ceiling. **It is not:**
+-3.73% undervolted against -3.42% for the two unflagged stock pairs. The honest
+5070 figure is **~-3.7%** in both regimes, and the stock -6.07% pair was the
+outlier its own check flagged.
+
+### Priced on the metric of record, concurrency is worth MORE than board-only says
+
+Host draw on this box is ~115 W with the sieve's own core (item 6), and it is
+approximately *fixed* — so a change that saves wall-clock time amortises it over
+less host energy, while a change that only lowers board watts does not.
+
+| | board rel/J | **whole-box rel/J** |
+|---|---:|---:|
+| stock, `--fill-concurrent` | +1.44% | **+2.54%** |
+| undervolted, `--fill-concurrent` | +0.92% | **+2.23%** |
+| undervolt itself | +35.10% | **+17.09%** |
+
+**The two changes are mispriced in opposite directions by board-only power.** It
+under-prices concurrency (which buys time at slightly higher watts) by roughly
+half, and over-prices the undervolt (which buys watts at a small time cost) by
+roughly double. Every `--fill-concurrent` rel/J figure in this finding is
+board-only and is therefore a *lower* bound on the metric that decides the
+project.
+
+### The aliasing reverses direction under the undervolt, which settles what it is
+
+At stock the runlog under-read the **serial** arm (ticks 127-148 W against a
+215 W median) and tracked the concurrent arm well. Undervolted it is the other
+way round: the **concurrent** arm's ticks read 90.0-92.4 W against an integrated
+144.2 W -- a 37% under-read -- while serial's 119.5-133.7 W sit much closer to
+its 140.1 W. Read from the sidecar alone, tonight's undervolted run says
+concurrency is worth **+50% rel/J**; the integrated figure says **+0.92%**.
+
+So the bias is not a property of either arm. It is aliasing against whatever the
+per-q duty cycle happens to be, and it can err by tens of percent **in either
+direction**. That retires the last defence of the sidecar column as an energy
+instrument, and it is why the 5090's 16e sign flip was never going to resolve by
+repeating it.
+
+### A third xhigh review, on the harness, and the four that mattered
+
+**2026-09-10.** Fifteen findings against `rental5090.sh` and the two docs. The
+docs are this project's memory, so their errors cost more than the script's.
+
+- **The reused-OUTDIR refusal broke the phase-by-phase workflow its own header
+  documents.** `00-env.log` is written unconditionally on every invocation, so
+  the directory is never empty after a first run -- which means
+  `rental5090.sh out build fb ident` followed by `rental5090.sh out band`, the
+  exact recipe STATUS gives for surviving a cut-short session, aborted with
+  exit 1. The guard also patched the symptom its own comment identified: the
+  defect was that **the summary globs by name**, not that the directory was
+  reused. Each invocation now records the arms it ran and the summary reads that
+  manifest, which restores the workflow and fixes the mixing properly.
+- **The watchdog was armed and then never inspected.** `--watchdog-kill` exits
+  `BENCH_EXIT_STALLED` through a bare `_exit()` from the watchdog thread with no
+  stdio flush, so a killed arm leaves a **truncated log with no `band of`
+  summary** and a **truncated `.rels`**. Globbing for results made that arm
+  vanish: three pairs silently became two, the spread check's `n` dropped, and
+  the relation list printed the short count and the wrong md5 in a bare list
+  beside five correct ones. Arms and their exit codes are now recorded, a
+  non-zero rc prints `*** NO RESULT`, and the relation list marks disagreement
+  instead of listing it. **The fix for the silent hang had a silent failure mode
+  of its own.**
+- **The watchdog was also not armed on the phase that gates everything.** The
+  ident phase runs first, unattended, and every later number is meaningless
+  without it; a card wedging there hung the session with no report. Armed, along
+  with the streams sweep in its report-only form (`--watchdog-kill` is
+  pipeline-only, `--watchdog` alone is legal outside it).
+- **The `>2%` SUSPECT verdict sits inside the clean range this very finding
+  reports** -- clean groups at 0.03%, 1.62%, 1.69%, and a 2.62% group whose
+  outlier arm had a *higher* `acc` than its siblings, i.e. a quieter host rather
+  than a worse one. One constant separates nothing, and `pipeline.cuh` refuses to
+  hardcode a comparable "good" number for exactly that reason. Worse, the
+  message named a mechanism -- "a burst of host load" -- that a wall-clock-only
+  check **cannot** distinguish from thermal throttling, contradicting this
+  finding's own two-instrument diagnosis three sections above. The verdict is
+  gone; the spread now prints beside `acc` and `board`, which are what identify
+  the cause, and both were already computed and unused.
+
+Also fixed: the restored-`acc` bullet above was **incomplete** -- the same
+regression dropped `cmplt` and `apply`, both still assigned in the awk and never
+printed, and `cmplt` is the only column carrying the end-of-band cofactor flush,
+i.e. the only total wall figure; the spread check carried a **second copy** of
+the summary's `wall clock per q` parser, so a label change would have broken one
+and left the other quietly matching (one parser now feeds both); the spread awk
+divided by `lo` with no zero guard, reachable from a log torn mid-line by that
+unflushed `_exit()`, and reported an all-arms-failed group as "1 arm, no spread";
+and the c147 phase duplicated four near-identical invocations where the
+`S_ARM`/`C_ARM` alternation used by band and wide says the same thing once.
+
+**Four doc errors, all of them the kind that outlive the session.** STATUS still
+carried "OPEN TODO -- one more rented card ... a third architecture settles it"
+twelve lines below the new text declaring it answered, with the 3090 buying guide
+intact underneath -- a reader scrolling to the TODO rents a second 3090. Its
+status table still quoted `+5.4% / -1.4% rel/J` from `board=` after this finding
+withdrew every such figure. This file claimed the 5070's integrated row "stays
+missing" two sections before supplying it. And the `2.06x per joule` conclusion
+rested on a withdrawn 5090 number while mixing serial and concurrent arms between
+two tables, so "the 3090's rel/J" had two answers. All four are corrected in
+place with the original text quoted, because a retraction that deletes the claim
+teaches nothing.
+
+Two arithmetic slips went with them: "board moved at most 0.25% -- 282.0 to
+284.8 W" (that range is 0.99%; 0.25% was the arm-type delta, a different
+quantity), and "rel/J tracks wall to within 0.1 points" (c147's +7.67 against
+-6.95 differs by 0.72, because a wall *ratio* inverts rather than negating). The
+corrected statement is stronger: rel/J is the reciprocal of the wall ratio
+divided by the board ratio, and with the board term under a quarter of a percent,
+**wall alone predicts every measured rel/J to within 0.01 points.**
 
 ### Cross-card relation identity, gated for the first time
 
-Every arm on the 5090 is byte-identical to its serial partner, and **identical to
-the RTX 5070's output for the same command**: c183 I15e band `fa63611436ad`
+Every arm on the 5090 **and on the 3090** is byte-identical to its serial
+partner, and identical to the RTX 5070's output for the same command: c183 I15e band `fa63611436ad`
 (83,809 relations), c147 `9f39929a0d0c` (129,237), the identity gate's
 `6e33c6b8...` (1,591) and `1604756a...` (937). Different card, different
 architecture generation of the same family, different CUDA install, native Linux
-against WSL -- same bytes. That was never gated before; `rental5090.sh` prints
-the 5070 md5s beside the run precisely because nobody knew which way it would go.
+against WSL -- same bytes. **The 3090 then made it three architectures**: Ampere
+`sm_86` reproduces every one of those md5s, including the 16e band's
+`9e688c00c977`. That was never gated before; `rental5090.sh` prints the 5070 md5s
+beside the run precisely because nobody knew which way it would go.
 
 ### A second xhigh review, on the rental protocol, and the one that would have cost the card-hours
 
