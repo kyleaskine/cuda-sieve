@@ -37,12 +37,31 @@ CXX       ?= g++
 # finding 75); its opt-in per-block shared-memory LIMIT is still queried from
 # the selected device at runtime rather than hardcoded, but the three-block
 # occupancy target it now carries is not. sm_75 still compiles with ptxas
-# warning that .minnctapersm is out of range on every fill kernel -- k_fill_l1
-# and k_fill_l2 specifically, confirmed on real Turing hardware 2026-09-09
-# (STATUS.md item 15). k_apply does NOT trip that warning on either Turing or
-# Pascal, measured on real GTX 1080 and RTX 2080 Ti hardware the same day --
-# so the tuning floor turned out not to bite the kernel that is actually in
-# the production pipeline. sm_61 and sm_75 are QUALIFIED on real hardware
+# warning that .minnctapersm is out of range -- on k_fill_l1, k_fill_l2 AND
+# k_apply (STATUS.md item 15).
+#
+# CORRECTED 2026-09-12. An earlier version of this comment said k_apply does
+# NOT trip that warning on either Turing or Pascal, citing real GTX 1080 and
+# RTX 2080 Ti hardware 2026-09-09. The PASCAL half is right; the TURING half
+# is wrong. Compiling bench_kernels.cu for sm_75 alone emits 12 of these
+# warnings, NINE of them k_apply template instantiations, under BOTH nvcc
+# 13.4 and nvcc 12.8.93 -- 12.8.93 being the toolkit the original claim was
+# measured under, so this is not a toolchain difference. The arithmetic says
+# it has to: __launch_bounds__(512, 3) asks for 1536 resident threads/SM and
+# Turing caps at 1024. sm_86/89 permit exactly 1536, which is why every other
+# target in the default list is silent.
+#
+# The Pascal half is worth keeping for the reason behind it: sm_61 emits NO
+# .minnctapersm warning at all -- not even on the fill kernels -- because
+# Pascal's 2048 threads/SM clears the 1536 target outright.
+#
+# What the warning costs is the occupancy HINT, not correctness: ptxas drops
+# .minnctapersm and schedules k_apply on its own heuristic. sm_75's
+# correctness qualification below is unaffected -- but sm_75 is NOT
+# occupancy-tuned, and what k_apply's Turing throughput is without the
+# annotation has never been measured.
+#
+# sm_61 and sm_75 are QUALIFIED on real hardware
 # (STATUS.md item 15: correctness-matched against the RTX 3090/4090, same
 # relation counts, same split/dead/stuck candidates); sm_50/52/60/70 below are
 # NOT -- added because nvcc accepts them, not because a card confirmed them.

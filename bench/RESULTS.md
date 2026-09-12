@@ -8299,3 +8299,92 @@ array — and its message column matches the shared-memory refusal explicitly, s
 such a rung cannot read as "no diagnostic". And the general lesson: **when a run
 appears to die silently, check whether the diagnostic was reordered ahead of the
 stdout it belongs after** before concluding there isn't one.
+
+
+## Finding 95 — cofactor chunking is output-identical at the BYTE level, and its auto mode costs the 5070 0.72% of wall, not the ~20% the 3090 table appears to project. The floor is what makes the difference, and it is doing its job
+
+Greg's `--cof-chunk` (merge `a84998f`, 2026-09-11) slices a cofactor round
+across several launches on the RECORD axis so no single launch can outrun a
+slow device's GPU watchdog. Two things needed checking on real hardware: that
+it cannot change a result, and what auto mode costs the card we actually run.
+
+Measured 2026-09-12 on the RTX 5070 (48 SMs, 12 GB, CUDA 13.4, 7-target fat
+build), `oracle/c183`.
+
+### Output identity: byte-identical, which is stronger than the gate asserts
+
+`cofcheck.sh` passed **51 of 51** cases. But its `expect_rel` pins relation
+COUNTS, and a count is not an identity -- so the claim was tested directly:
+
+    ./bench --pipeline --cadofb ../oracle/c183.fb1 --poly ../oracle/c183.poly \
+            --qrange 120000000:120002000 --nq 300 --cofactor --cof-chunk <N>
+
+| `--cof-chunk` | relations | bytes | md5 |
+|---|---:|---:|---|
+| 131072 (one launch) | 5245 | 769,448 | identical |
+| 0 (auto, 2 launches) | 5245 | 769,448 | identical |
+| 4096 (32 launches) | 5245 | 769,448 | identical |
+
+**One distinct hash across all three.** On the golden single q (120000053) the
+same holds across `{0, 131072, 16384, 4096, 512}` x `{rho, ECM}` -- ten
+configurations, 37 relations each, with `512` genuinely running four launches
+per round rather than one. Greg's argument for the record axis (every record's
+`mz_split` is independent and untouched by the slicing) is confirmed
+empirically, not just structurally.
+
+### What auto costs this card: +1.86% of the cofactor stage, +0.72% of wall
+
+The 5070's floor is `blocks * threads` = 48 SMs x 6 = 288 blocks x 256 =
+**73,728**, against a flush of **130,031** records. Auto therefore opens at
+73,728 -- two launches per round -- and PARKS there: the flush stage runs
+~1.5 s, far above the 250 ms halve threshold, so it never doubles, and the
+floor stops it halving. It reports exactly once per band:
+
+    cofactor chunk: 73728 records/launch, 2 launches per round over 130031 records (auto)
+
+Paired A/B, n=5, arms alternated:
+
+| | pinned `131072` | auto (73,728 x2) | delta |
+|---|---:|---:|---:|
+| cofactor device time / q | 15.660 ms (sd 0.098) | 15.952 ms (sd 0.050) | **+1.86%** |
+| wall clock / q, COMPLETE | 89.43 ms | 90.08 ms | **+0.72%** |
+
+Auto was slower in all five pairs, so the effect is real; it is simply small.
+
+### THE CORRECTION, and it is the part worth keeping: the floor separates free from costly, and 65536 on a 3090 was never the free case
+
+An earlier reading of this merge projected roughly a **20%** cofactor-stage
+penalty for auto on the 5070, by carrying across the RTX 3090 table in
+`cofac.cuh`'s `cof_chunk_floor` comment (chunk 65536 = +21.7%). **That
+extrapolation was wrong by an order of magnitude, and the reason is the floor
+itself.**
+
+The 3090's floor is 82 SMs x 6 x 256 = **125,952**. Lay its own measurements
+against that:
+
+| 3090 chunk | vs unchunked | position relative to its 125,952 floor |
+|---|---:|---|
+| 131072 | +0.5% | **at or above** the floor |
+| 65536 | +21.7% | below |
+| 32768 | +50.7% | below |
+| 16384 | +150.7% | far below |
+
+The floor cleanly partitions that table: at or above it, chunking is free;
+below it, the cost is threads idling with no record to work on. The +21.7%
+datapoint is a measurement of the regime **the floor exists to prevent**, and
+auto can never select it. On the 5070 auto picks 73,728, which IS the floor --
+exactly one record per thread, the designed-free point -- and the measured
++1.86% is what "free" costs in practice there.
+
+So the mechanism flagged as a risk is real (auto does park at the floor for a
+whole band, and on this card the floor is below the flush so it never reaches
+one launch), but the magnitude was mis-derived. **Do not quote the 3090's
+below-floor numbers as a projection for a card whose auto slice sits at its
+own floor.**
+
+### Recommendation
+
+Leave `--cof-chunk` on auto. 0.72% of wall buys watchdog protection for the
+slower volunteer hardware the BOINC build targets, which is the entire point
+of the change. `--cof-chunk 131072` recovers the fraction on a dedicated run
+and is measured indistinguishable from the pre-merge single-launch path.

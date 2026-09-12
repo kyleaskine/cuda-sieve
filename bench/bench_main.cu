@@ -234,13 +234,15 @@ static void usage(void)
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
 "                   [6 for --cofac; 4 for --pipeline --cofactor]\n"
 "  --cof-budget N   rho iterations in the first round\n"
+"                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
 "  --cof-chunk N    cofactor records per launch; 0 = auto [0], sized from the\n"
 "                   device and the measured stage time, never below one record\n"
 "                   per thread. Splits a round across several launches so a\n"
 "                   slow device cannot exceed its GPU watchdog mid-kernel. A\n"
 "                   positive value pins it; any value >= the batch is one\n"
-"                   launch. Results are identical whatever it is set to\n"
-"                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
+"                   launch. Results are identical whatever it is set to.\n"
+"                   Auto-steering is --pipeline only; under --cofac a value\n"
+"                   pins the slice and 0 means one launch per round\n"
 "  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
 "                   while tuned stage 2 is near rho at matched yield\n"
 "  --ecm-b1 N       ECM stage-1 bound                              [1000]\n"
@@ -512,6 +514,20 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
     }
     if (cfg->cof_rounds < 1 || cfg->cof_rounds > 24) {
         fprintf(stderr, "pipeline cof-rounds %d: must be 1..24\n", cfg->cof_rounds);
+        bad = 1;
+    }
+    /* A pinned slice below one full block is never what anyone means: the
+     * grid is blocks x threads, so a chunk under `threads` leaves all but one
+     * block with nothing to do AND multiplies the launch count by the same
+     * factor it shrinks the slice. --cof-chunk 1 is 131072 launches per round
+     * per side, hundreds of times a band -- an effective hang with no
+     * diagnostic, which is exactly the failure this file's other validators
+     * exist to turn into a message. 0 stays AUTO and is not a small value. */
+    if (cfg->cof_chunk && cfg->cof_chunk < (uint32_t)cfg->threads) {
+        fprintf(stderr, "--cof-chunk %u: must be 0 (auto) or at least"
+                " --threads (%d); a slice below one block idles the grid and"
+                " multiplies the launch count\n",
+                cfg->cof_chunk, cfg->threads);
         bad = 1;
     }
     /* Validate each method's knobs whenever ANY side uses it. Keyed on the
@@ -1214,7 +1230,15 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
         else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
-        else if (!strcmp(argv[i], "--cof-chunk") && i + 1 < argc) { cfg.cof_chunk = (uint32_t)strtoul(argv[++i], 0, 10); }
+        else if (!strcmp(argv[i], "--cof-chunk") && i + 1 < argc) {
+            /* Through the shared parser, not a bare strtoul: strtoul maps
+             * "abc" and "-1" to 0 and 4294967295 silently, and 0 is AUTO --
+             * so a typo became a mode rather than a message. */
+            int v;
+            if (parse_int_range_arg("--cof-chunk", argv[++i], 0, INT_MAX, &v))
+                return 1;
+            cfg.cof_chunk = (uint32_t)v;
+        }
         else if (!strcmp(argv[i], "--cof-ecm")) cfg.cof_ecm = COF_METHOD_ECM;
         else if (!strcmp(argv[i], "--cof-rho")) cfg.cof_ecm = COF_METHOD_RHO;
         /* Deriving is now unconditional, so this is accepted and ignored
@@ -2007,7 +2031,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                          cfg.blocks ? cfg.blocks : 48 * 6, cfg.threads,
                          cfg.cof_meth0, cfg.cof_meth1, cfg.ecm_b1,
                          cfg.ecm_b2, cfg.ecm_curves,
-                         cfg.cof_limbs0, cfg.cof_limbs) ? 1 : 0;
+                         cfg.cof_limbs0, cfg.cof_limbs,
+                         cfg.cof_chunk) ? 1 : 0;
     }
 
     /* Only the pipeline reads these, so outside it they were silent no-ops --

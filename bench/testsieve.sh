@@ -375,7 +375,7 @@ for geom in "${GEOMS[@]}"; do SEEN_LOGI[${geom%%,*}]=1; done
 # NEITHER SETTING RUNS `make`, and the advice it prints instead has to name the
 # arch THIS TREE was built for. An earlier version had --fb-backend gpu build
 # the binary: a bare `make fbgen_gpu` parses the Makefile with the default
-# GPU_ARCH=all, and the $(shell ...) at Makefile:201 rewrites .arch.stamp at
+# GPU_ARCH=all, and the $(shell ...) guarding ARCH_STAMP rewrites .arch.stamp at
 # parse time -- every CUDA object depends on that stamp, so a tree built
 # `make GPU_ARCH=native bench` was silently invalidated and the operator paid
 # for a full fat rebuild on their next make.

@@ -2729,7 +2729,8 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                          uint32_t lpb0, uint32_t lim1, uint32_t lpb1,
                          int rounds, uint32_t budget, int blocks, int threads,
                          int meth0, int meth1, uint32_t ecm_b1, uint32_t ecm_b2,
-                         uint32_t ecm_curves, int limbs0, int limbs1)
+                         uint32_t ecm_curves, int limbs0, int limbs1,
+                         uint32_t chunk)
 {
     FILE *f = fopen(path, "rb");
     uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
@@ -2881,11 +2882,19 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     sched.method = meth0; sched.rounds = rounds; sched.budget = budget;
     sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
     sched.d_s2mask = d_s2mask; sched.s2vmin = s2vmin; sched.s2nv = s2nv;
-    /* One launch per round here -- UINT32_MAX, i.e. "larger than any batch",
-     * not 0: cf_sched_t's chunk is a concrete count with no sentinel value.
-     * This path is a host-driven batch tool, not the BOINC pipeline, so it is
-     * not what a volunteer's watchdog sees. */
-    sched.chunk = 0xffffffffu;
+    /* cf_sched_t's chunk is a concrete count with no sentinel, so cfg's 0
+     * becomes UINT32_MAX -- "larger than any batch", i.e. one launch per
+     * round, which is what this path has always done.
+     *
+     * An EXPLICIT --cof-chunk is honoured here. It used to be dropped while
+     * `--help` advertised the flag unconditionally, which is the one thing a
+     * flag must never do. What is NOT offered here is the AUTO sizing: that
+     * steers on per-flush device time BETWEEN flushes, and this path has no
+     * flush loop to steer across. A host-driven batch tool is admittedly not
+     * where a volunteer's watchdog bites -- but a batch run on a Windows box
+     * with a display attached faces the same TDR, so the escape hatch is
+     * worth honouring rather than ignoring. */
+    sched.chunk = chunk ? chunk : 0xffffffffu;
     if (cf_run_side_dyn(limbs0, j0, n0, lim0, lpb0, st0, fac0, nf0,
                         blocks, threads, 1, &ms0, &sched, "rational")) return -1;
     for (uint32_t k = 0; k < n0; k++) {

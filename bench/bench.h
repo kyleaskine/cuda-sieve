@@ -1002,7 +1002,8 @@ int check_relations_sample(const char *path, const poly_t *poly, uint32_t lpb0,
 int run_cofac(const char *path, const char *out, uint32_t lim0, uint32_t lpb0,
               uint32_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
               int blocks, int threads, int meth0, int meth1, uint32_t ecm_b1,
-              uint32_t ecm_b2, uint32_t ecm_curves, int limbs0, int limbs1);
+              uint32_t ecm_b2, uint32_t ecm_curves, int limbs0, int limbs1,
+              uint32_t chunk);
 
 int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
               const poly_t *P, const bench_cfg_t *cfg);

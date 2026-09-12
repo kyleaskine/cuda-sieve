@@ -62,6 +62,18 @@ expect_rel "trial division only"            7
 # suite green, which is the opposite of what a golden case is for.
 expect_rel "rho, inline queue"             37 --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536
 expect_rel "ECM, inline queue"             37 --cofactor --cof-ecm --ecm-b1 2000 --ecm-curves 48
+# --cof-chunk, both methods. WITHOUT these the multi-launch path is untested by
+# this entire suite: one q queues ~2000 records against an auto floor of
+# blocks*threads (73,728 on a 5070, 196,608 on a 4090), so `step` collapses to
+# a single slice and every case above runs the pre-chunking code path. 256
+# forces ~8 launches per round, so a wrong slice bound, a record dropped at a
+# boundary, or an off-by-one in k_cofac's `hi` shows up as a changed count here
+# rather than only on a slow volunteer card. The expectation is the SAME 37:
+# chunking splits the record list and cannot change a result, which is the
+# entire claim the flag rests on.
+expect_rel "rho, chunked launches"         37 --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --cof-chunk 256
+expect_rel "ECM, chunked launches"         37 --cofactor --cof-ecm --ecm-b1 2000 --ecm-curves 48 --cof-chunk 256
+expect_refused "chunk below one block"     --cofactor --cof-rho --cof-chunk 1
 # --cof-rounds 2 pinned: the default became 4 on 2026-08-19, and at 4 rounds
 # stage 1 alone (64 curves) finds the relation this control exists to show
 # stage 2 finding. The case tests stage 2, so it must hold the curve budget

@@ -2977,6 +2977,63 @@ finding 92.
     **cannot explain a wrong relation** — it wedges rather than corrupts, which
     is consistent with a long history of msieve never rejecting a relation from
     this card.
+
+    **12e. The OTHER watchdog -- the DEVICE's, not ours -- MERGED 2026-09-11,
+    MEASURED 2026-09-12 (RESULTS finding 95).** 12d is a host thread watching
+    for a stall. This is the opposite direction: the HOST OS killing a kernel
+    that runs too long. Windows' display watchdog (TDR) terminates a kernel at
+    ~2 s by default, surfacing as `cudaErrorLaunchTimeout`; AMD's reports the
+    vaguer "unspecified launch failure". Both were seen in the field on slower
+    volunteer hardware. A cofactor round's duration is set by its parameters
+    (rho runs `budget << r` iterations, ECM runs `curves` curves, both over
+    every selected record), so a slow enough device crosses the limit on a
+    launch a fast one completes comfortably.
+
+    `--cof-chunk` (Greg, in `cofac.cuh`) slices a round across several launches
+    on the RECORD axis, which is the only axis that cannot change a result --
+    each record's `mz_split` is independent and untouched. 0 = AUTO, sized from
+    the device: the slice floor is `blocks * threads`, one record per thread.
+
+    Verified on the 5070 2026-09-12: relation files are BYTE-IDENTICAL across
+    `--cof-chunk` 131072 / 0 / 4096 (one md5, 769,448 bytes, 5245 relations
+    over a 300-q band), and `cofcheck.sh` passes 51 of 51. Auto costs **+1.86%
+    of the cofactor stage and +0.72% of wall** on this card, where the floor
+    (73,728) sits below the flush (130,031) so auto parks at two launches per
+    round for the whole band. **An earlier reading of this projected ~20% by
+    carrying across the RTX 3090 numbers in `cofac.cuh`; that was wrong by an
+    order of magnitude. The 3090's floor is 125,952, and its table's +21.7%
+    datapoint is at chunk 65,536 -- BELOW that floor, the regime the floor
+    exists to prevent and which auto cannot select. Its 131,072 datapoint is
+    at or above the floor and costs +0.5%, which is the one that actually
+    establishes the floor works.** Finding 95 has the full partition.
+    Recommendation: leave it on auto.
+
+    **What chunking CANNOT bound, in two forms -- the floor is one record, and
+    one record's work is whatever its parameters say.** `cofac.cuh` documents
+    the ECM form: a large enough `--ecm-b2` makes a single record's stage 2
+    exceed a watchdog no matter how the list is sliced. `cofq_init` warns above
+    20,000 giant steps/curve; the derived default is ~194-500, and the
+    configuration known to kill gfx1103 is `--ecm-b1 400000` (~320,000 steps).
+
+    The RHO form is not documented there and is worth stating (found in review
+    2026-09-12). Slices are cut against the batch `n`, but each round compacts
+    the survivors into the low indices, so once the live count falls below the
+    slice the whole round lands in `[0, step)` and the remaining slices launch
+    empty -- `k_cofac`'s own comment concedes this ("what the later rounds
+    mostly do"). Those late rounds carry `budget << r`, the LONGEST per-thread
+    work in the flush, and they are the ones that end up unsplit. Slicing
+    harder cannot help: below one record per thread the launch duration stops
+    falling and only idle threads are added.
+
+    This is a real limit on the protection, not a defect in it. At the
+    pipeline default of 4 rounds it still cuts the peak launch roughly in half
+    on a small device (round 0 unchunked is ~15 records x `budget`; chunked,
+    1 x `budget`; round 3 is 1 x `budget << 3`, which is below the unchunked
+    round 0). It would stop helping at 6 rounds -- the `--cofac` default,
+    which does not auto-chunk anyway. **So `--cof-chunk` bounds the FIRST
+    rounds well and the last rounds not at all**, and a device that still trips
+    its watchdog should be given fewer rounds or a smaller budget, not a
+    smaller chunk.
 13. **Validate the BOINC GPU assignment — CLOSED 2026-08-17.** Greg Childers,
     who reported the original failure (every task on a multi-GPU host landing
     on device 0), reviewed and signed off on the assignment change, and a BOINC
@@ -3076,23 +3133,204 @@ finding 92.
     identical side-0/side-1 split/dead/stuck counts) -- correctness, not just
     "it ran".
 
-    **The Turing warning this item worried about turned out to name the
-    wrong kernel.** `k_fill_l1`/`k_fill_l2` DO trip
-    `ptxas warning: ... .minnctapersm will be ignored` on real sm_75 hardware,
-    exactly as this note predicted -- but `k_apply` does not, on EITHER
-    Pascal or Turing. That distinction matters because `k_fill_l1`/`k_fill_l2`
-    are the two-level fill kernels, reachable only through the benchmark
-    harness's `--fill-mode twolevel` (refused outright under `--pipeline`,
-    and already measured 2.7x slower than the shipping `k_fill_atomic` path --
-    see item 1). `k_apply` is the kernel actually in the production pipeline,
-    and it produced zero occupancy warnings and zero wrong output on both
-    real devices. The GTX 1080 run separately confirmed the same thing on
-    Pascal (no warning there either) with no `-Xptxas -v` cross-check on
-    either card, so "why" is still a plausible read (Pascal's 2048 max
-    resident threads/SM and Turing's 1024 are both apparently enough headroom
-    for `k_apply`'s three-block target where the wider fill kernels are not),
-    not a measurement -- but "does it happen" is now settled by hardware on
-    both architectures, and it does not.
+    **The Turing warning: this item's 2026-09-09 note named the wrong kernel,
+    and the correction is the opposite of what it claimed. CORRECTED
+    2026-09-12.** `k_fill_l1`/`k_fill_l2` DO trip
+    `ptxas warning: ... .minnctapersm will be ignored` on sm_75, exactly as
+    this note originally predicted. The 2026-09-09 note then added that
+    `k_apply` does NOT trip it on either Pascal or Turing. **That is wrong on
+    Turing.** Compiling `bench_kernels.cu` for sm_75 alone emits TWELVE such
+    warnings, and NINE of them are `k_apply` template instantiations
+    (`k_apply<8,...>` and `k_apply<16,...>`); only three are fill kernels.
+    Reproduced identically under nvcc 13.4 and nvcc 12.8.93 -- 12.8.93 being
+    the very toolkit the original claim was measured under, so this is not a
+    toolchain difference and not a CUDA 13 regression.
+
+    **The Pascal half of the claim stands, and is stronger than stated:**
+    sm_61 emits NO `.minnctapersm` warning at all, not even on
+    `k_fill_l1`/`k_fill_l2`.
+
+    **The mechanism was already in this item, and it predicts the warning the
+    note said did not happen.** `__launch_bounds__(512, 3)` asks for 1536
+    resident threads/SM. Pascal allows 2048 -- clears it, hence silence on
+    sm_61. Turing allows 1024 -- cannot satisfy it, hence the warning on
+    sm_75. sm_86/89 permit exactly 1536, which is why the rest of
+    `GPU_ARCH_all` is silent. The superseded note reasoned that "Pascal's 2048
+    max resident threads/SM and Turing's 1024 are both apparently enough
+    headroom for `k_apply`'s three-block target"; 1024 < 1536, so that
+    sentence contradicted itself and should have been the tell. The likely
+    origin of the error is that the 2026-09-09 hardware runs confirmed sm_75
+    *ran correctly* and that was read as the warning not firing -- but this is
+    a compile-time ptxas diagnostic, so a runtime test cannot observe it
+    either way.
+
+    **What this does and does not change.** It does NOT touch the correctness
+    qualification above: the relation counts, the byte-identical `fb1`, and
+    the ~52 `cofcheck.sh` cases all still stand, and `.minnctapersm` is an
+    occupancy hint that ptxas discards while still generating correct code.
+    What it changes is the claim that "the tuning floor turned out not to bite
+    the kernel that is actually in the production pipeline" -- it does bite
+    it, on Turing. `k_apply` runs on sm_75 without its three-block occupancy
+    target, and **nobody has measured what that costs.** sm_75 is in the
+    default fat binary as a CORRECTNESS-qualified target, not a tuned one.
+    Measuring `k_apply` throughput on real Turing with and without the
+    annotation is the open question this leaves behind; `-Xptxas -v` on an
+    sm_75 build would at least report the occupancy ptxas settled on.
+
+    **THE UNFINISHED HALF OF THE "LET THE BLACKWELL VALUE FLOAT" ITEM.
+    DRAFTED 2026-09-12. NOT IMPLEMENTED, NOT MEASURED.** The shared-memory
+    opt-in limit was the half that got fixed (`c2c4104`, 2026-08-21, above):
+    it is queried per device at `bench_kernels.cu:69` and applied at
+    `pipeline.cuh:1824`, and no `101376` literal survives in code. The
+    OCCUPANCY TARGET is the half that did not. `__launch_bounds__(512, 3)`
+    is still written literally at three sites -- `k_apply`
+    (`bench_kernels.cu:453`), `k_fill_l1` (`:720`), `k_fill_l2` (`:831`) --
+    and asks for 3 x 512 = 1536 resident threads/SM, an Ampere-consumer
+    number. There is no `__CUDA_ARCH__` in that file today.
+
+    **Max threads/SM is a property of COMPUTE CAPABILITY, not of a product
+    line.** Derived 2026-09-12 by compiling a probe kernel at
+    `__launch_bounds__(512, N)` for N = 1..4 against each target and recording
+    which N ptxas rejects. Cross-checked on both toolchains: nvcc 13.4 gives
+    an identical verdict on all six archs it accepts (sm_75/80/86/89/90/120);
+    sm_61 is nvcc 12.8.93 only, since CUDA 13 rejects that arch outright:
+
+    | target | max N at 512 thr/blk | max threads/SM | trips the warning? |
+    |---|---:|---:|---|
+    | sm_61 Pascal | >= 4 | 2048 | no -- clears 1536 outright |
+    | **sm_75 Turing** | **2** | **1024** | **YES -- 12 warnings, 9 of them k_apply** |
+    | sm_80 A100 | >= 4 | 2048 | no |
+    | sm_86 / sm_89 / sm_120 | 3 | 1536 | no -- permits exactly 1536 |
+    | sm_90 Hopper | >= 4 | 2048 | no |
+
+    Note that "Ampere" is NOT a unit: sm_80 (2048) and sm_86 (1536) disagree
+    on this very number, and on the shared-memory side sm_86 (99 KB) and
+    sm_87 Orin (163 KB) disagree too. Only `sm_XX` can be keyed off. Within
+    one compute capability the value IS uniform, so every sm_86 part
+    (3090/3080/A10) is 1536 and every sm_75 part (2080 Ti/T4/Quadro RTX) is
+    1024.
+
+    **`GPU_ARCH=<CC>` DOES NOT SUBSTITUTE FOR THE FIX, and assuming it does
+    is the trap here.** `GPU_ARCH=75` is this project's equivalent of
+    msieve's `CUDA=75` (both emit a single
+    `-gencode arch=compute_75,code=sm_75`), but `__launch_bounds__` lives in
+    the SOURCE, not the build. A single-`-gencode` sm_75 compile was measured
+    2026-09-12 and emits the SAME 12 warnings, 9 of them `k_apply`, as the
+    fat build does. Narrowing the target list buys smaller binaries and
+    faster builds and nothing at all here.
+
+    **A Makefile `-D` cannot do it either, for the build that ships.** The
+    default fat binary compiles one source once per `-gencode`, and all of
+    those passes share one set of `-D` flags, so a define cannot differ per
+    target. It would work only for single-arch builds -- exactly the ones
+    that do not need it. `__CUDA_ARCH__` is the mechanism, because nvcc
+    defines it per device-compilation pass; it covers the fat and single-arch
+    builds with one lever and cannot fall out of step with the target the way
+    an operator-supplied `-D` would:
+
+        #if   __CUDA_ARCH__ == 750
+        #  define APPLY_MINBLK 2      /* Turing: 1024 thr/SM */
+        #elif __CUDA_ARCH__ >= 800
+        #  define APPLY_MINBLK 3      /* 1536 thr/SM */
+        #else
+        #  define APPLY_MINBLK 4      /* Pascal/Volta: 2048 thr/SM */
+        #endif
+
+    **BUT THE ANNOTATION ALONE BUYS NO OCCUPANCY ON TURING -- SHARED MEMORY
+    BINDS FIRST.** `k_apply` sizes shared memory as
+    `(1 << log_region) * 2 + nslice_pow2 * 2`, so at the shipping default
+    `--region 14` that is ~33 KB/block against Turing's 64 KB per SM:
+
+    | region | smem/block | blocks/SM by smem | by threads | actual | occupancy |
+    |---|---:|---:|---:|---:|---:|
+    | 13 | ~17 KB | 3 | 2 | **2** | **100%** |
+    | 14 (default) | ~33 KB | **1** | 2 | **1** | **50%** |
+    | 15 | ~65 KB | 0 | 2 | -- | will not launch |
+
+    So `__launch_bounds__(512, 2)` on sm_75 makes the hint HONEST -- ptxas
+    stops discarding `.minnctapersm` -- but does not make a second block
+    resident, because there is no 66 KB to put it in. The configuration that
+    actually reaches 100% on Turing is `APPLY_MINBLK 2` TOGETHER WITH
+    `--region 13`. That second half needs no build machinery at all: region
+    is already a runtime flag and the device's compute capability is already
+    read, so it is an arch-aware DEFAULT, not a portability change.
+
+    **MEASURED 2026-09-12, AND IT COLLAPSES THE EXPERIMENT: THE ANNOTATION
+    CHANGE IS COSMETIC.** `-Xptxas -v` was the free step and it answered the
+    question outright -- no card needed. Compiling `bench_kernels.cu` for
+    sm_75 twice, once as shipped (`minblk 3`, hint discarded) and once with
+    `k_apply` alone patched to `minblk 2` (hint honoured), gives BYTE-IDENTICAL
+    register allocation across all nine `k_apply` instantiations:
+
+    | instantiation | minblk 3 | minblk 2 | delta |
+    |---|---:|---:|---:|
+    | `<16,0,0,0>` / `<16,1,0,0>` / `<8,0,0,0>` / `<8,1,0,0>` | 26 | 26 | 0 |
+    | `<16,0,1,0>` / `<16,1,1,0>` / `<16,1,1,1>` | 35 | 35 | 0 |
+    | `<8,0,1,0>` / `<8,1,1,0>` | 36 | 36 | 0 |
+
+    `minblk 2` does silence all nine `k_apply` warnings (12 -> 3, the
+    remaining three being the fill kernels), but it changes no generated code
+    whatsoever. **So the `__CUDA_ARCH__` fix buys build hygiene and an honest
+    hint -- not throughput.** Anyone expecting a speedup from it should stop
+    here.
+
+    **WHY, and it is the register file that settles it.** The production
+    instantiation `k_apply<16,1,1,1>` uses 35 registers. At 512 threads/block
+    on Turing (65,536 registers, 1024 threads and 64 KB shared per SM):
+
+    | limiter | arithmetic | blocks/SM |
+    |---|---|---:|
+    | registers | 65536 / (512 x 35) = 3.66 | 3 |
+    | threads | 1024 / 512 | 2 |
+    | **shared memory @ region 14** | **64 KB / ~33 KB** | **1 <- BINDS** |
+
+    Registers were never the constraint -- ptxas settled on 35, slack enough
+    for three blocks, more than Turing's own thread cap allows. That is why
+    discarding `.minnctapersm` costs nothing in codegen, and why forcing it
+    back changes nothing. Note this also does not match the prediction at
+    `bench_kernels.cu:417` that ptxas "otherwise settles on 45-46 registers";
+    that figure is for dropping the annotation entirely, whereas `.maxntid`
+    (512) survives here even when `.minnctapersm` does not.
+
+    **THE ONLY REAL LEVER ON TURING IS `--region`, AND IT REMAINS
+    UNMEASURED.** Shared memory is the binding constraint at every region, so
+    region is the one axis that can move occupancy: region 13 (~17 KB) admits
+    3 blocks by smem, the thread cap takes it to 2, and 2 x 512 = 1024 is
+    100% of Turing. The open questions are now only two, and both need a
+    card:
+
+    1. Whether region 13's occupancy gain survives the extra passes per slab
+       it costs. Could easily be a wash.
+    2. Whether `k_apply` at 50% occupancy is occupancy-bound on Turing at
+       all. If it is latency- or bandwidth-bound, region 13 wins nothing
+       either.
+
+    The rental target is **Turing (20x0 / 2080 Ti / T4) ONLY**. Pascal (10x0,
+    sm_61) is NOT affected -- it clears 1536 outright and emits no warning at
+    all, so a 10x0 rental measures nothing for this item. sm_61 also cannot
+    join the default fat binary under CUDA 13 regardless (`GPU_ARCH=full`,
+    CUDA <= 12.8, above). The run is now a **1 x 2, not a 2 x 2**: `--region
+    14` vs `--region 13` on stock `minblk 3`, since the annotation axis is
+    measured inert. Use the c183 band from the 2026-09-09 qualification so
+    relation counts stay comparable, and report as % of apply-stage time AND
+    % of wall, since apply is only part of the band.
+
+    **The two halves now have different cases.** The `__CUDA_ARCH__`
+    annotation change is measured to be codegen-neutral, so it carries no
+    performance risk and no performance reward: it removes nine warnings from
+    every sm_75 build and makes the hint honest. Judge it as build hygiene.
+    Its one real cost is coupling -- it would be the first `__CUDA_ARCH__`
+    conditional in `bench_kernels.cu`, and `APPLY_THREADS_MAX`
+    (`bench.h:856`) is host-side validation of the same `512`, enforcing a
+    hard CLI ceiling on `--apply-threads`, so the two must stay in step.
+
+    The arch-aware `--region` default is the half that could actually pay,
+    and the half nobody has measured. It needs no build machinery at all
+    (region is already a runtime flag and the compute capability is already
+    read), but it is a real behaviour change on a target that is
+    correctness-qualified and in nobody's production fleet. A few percent
+    does not justify carrying an arch-special default; a large win on cards
+    volunteers actually still run might.
 
     **`GPU_ARCH_all` UPDATED 2026-09-09: sm_75 added.** `sm_75` is now in the
     default fat binary (both `Makefile` and `build_windows.bat`) alongside
