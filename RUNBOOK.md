@@ -558,12 +558,36 @@ rest`, and note that the bullet above — "the bucket array is sized by the larg
 side, so raising the smaller side's lim is nearly free" — **stops holding under
 the flag**: both sides carry a full-size array. The run refuses at startup with
 the two figures if the second one does not fit, so a geometry that is close will
-tell you rather than fail mid-band. It is off by default, and on a 48 SM card it
-is worth **1.4% to 3.0% of wall depending on the band** — quote the band with
-the number (`bench/RESULTS.md` finding 94) — for **no measurable gain in
-relations per joule**, because the busier card draws proportionally more. Which
-is to say: do not turn it on here. It exists for wide cards, where one fill kernel cannot feed
-the device.
+tell you rather than fail mid-band. It is off by default. Measured on three cards
+(`bench/RESULTS.md` finding 94), at c183 `I15e` with board draw integrated over
+each arm:
+
+| card | wall | board | relations per joule |
+|---|---:|---:|---:|
+| RTX 5070, 48 SM, stock | **-4.3%** | +3.0% | **+1.4%** |
+| RTX 5070, 48 SM, undervolted | **-3.7%** | +2.9% | **+0.9%** |
+| RTX 3090, 82 SM | **-3.8%** | +0.25% | **+3.7%** |
+| RTX 5090, 170 SM | **-7.6%** | not measured | not measured |
+
+(The 5070 appears twice because this box's undervolt state changes all three
+columns; an earlier version of this table had one 5070 row pairing the
+undervolted wall figure with the stock board and rel/J figures, which does not
+close arithmetically -- `(1/0.963)/1.030` is +0.8%, not +1.4%.)
+
+**The gain grows as the geometry shrinks** — on a 5090, -13.7% at c147
+`I14/J8192` against -5.4% at c183 `I16` — because the flag repairs *underfeeding*,
+and a big rectangle already feeds the card well. So it is worth most where one
+fill kernel is handed least work, which is the opposite of the geometry
+production prefers. Quote the card and the geometry with any figure from it.
+
+**On relations per joule it is positive but small**, and how small depends on
+the card: overlapping the sides raises board draw ~3% on a 5070 and 0.25% on a
+3090, and that term eats most of the 5070's wall gain and almost none of the
+3090's. **An earlier version of this paragraph said the flag buys "no
+measurable gain in relations per joule, because the busier card draws
+proportionally more." That was read off the runlog's `board=` column, which is
+aliased, and it is withdrawn** — see finding 94. Turn the flag on if you want the
+wall clock; the energy case is real but thin.
 
 **Do not size a job from an aborted startup.** The startup table lists only the
 bucket array, factor bases, bitmaps, trial-division context and cofactor queue

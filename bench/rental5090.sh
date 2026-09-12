@@ -15,9 +15,29 @@
 set -u
 cd "$(dirname "$0")" || exit 1   # the Makefile and the binaries live here
 
+# $1 is the OUTDIR, never a phase. `rental5090.sh band` used to create a
+# directory called "band" and then run the FULL default protocol, because the
+# shift left $# at 0 and PHASES fell back to its default -- ~35 minutes of card
+# time, on the one resource this script exists to conserve.
+# ONE list. It was three -- the usage comment, the default PHASES, and a
+# hand-maintained guard -- so a phase added without touching all three brought
+# back the 35-minute bug verbatim, and a typo ("bnad") took the same path.
+ALL_PHASES="build fb ident band wide c147 streams refuse"
 OUT=${1:-rental-$(date +%Y%m%d-%H%M%S)}
+case " $ALL_PHASES " in
+    *" ${1:-} "*)
+        echo "first argument is the OUTPUT DIRECTORY, not a phase."
+        echo "you probably meant:  bench/rental5090.sh <outdir> $*"
+        exit 2;;
+esac
 shift 2>/dev/null
 PHASES=${*:-build fb ident band wide c147 streams}
+# And every named phase is validated against the same list, so a typo costs a
+# message rather than a silently skipped arm.
+for _p in $PHASES; do
+    case " $ALL_PHASES " in *" $_p "*) ;;
+        *) echo "unknown phase '$_p'; known: $ALL_PHASES"; exit 2;; esac
+done
 mkdir -p "$OUT" || exit 1
 echo "logs -> $OUT"
 
@@ -29,7 +49,12 @@ echo "logs -> $OUT"
 # invocation records the arms IT ran, and the summary reads that instead of the
 # directory. An earlier fix refused the reuse; that traded a documented
 # capability for a constraint the real fix does not need.
-MANIFEST="$OUT/.arms.$$"
+# Named per invocation and KEPT, not deleted after the summary: it is the only
+# record in OUTDIR distinguishing a watchdog kill (rc 4) from a clean arm, and
+# the summary that carries the same information scrolls past on an unattended
+# session. An earlier version deleted it on the success path and leaked one file
+# per aborted run on every other path -- exactly backwards.
+MANIFEST="$OUT/arms.$(date +%H%M%S).$$"
 : > "$MANIFEST"
 
 # NQ is an override for a dry run (NQ=20 bench/rental5090.sh out band) -- the
@@ -46,6 +71,12 @@ NQ=${NQ:-2000}
 # Threshold is generous against the legitimate stalls: a 16e q is ~430 ms on a
 # 3090 and the end-of-band cofactor flush can run into hundreds of ms.
 WD="--watchdog 120 --watchdog-log"
+
+# NOTE THE LIMIT: `wd_arm_kill()` has one call site, on entering the band loop,
+# and `--watchdog-kill` is in bench_main's pipeline_only list. So the KILL exists
+# only under --pipeline. The --fill-streams sweep takes `--watchdog 120` alone,
+# which reports a stall to stderr and does not end the arm -- a card wedging in
+# k_fill_atomic there still spins forever. Watch the run, or kill it by hand.
 
 
 want() { case " $PHASES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -65,20 +96,72 @@ run()  { local n=$1; shift; echo "== $n"; echo "\$ $*" > "$OUT/$n.log"
 # disagreed by 6 points of rel/J and straddled zero, purely on that sampling
 # (finding 94). rel/J is the metric this project is graded on, so the timed arms
 # get a real mean. Costs nothing -- nvidia-smi runs on the host.
+# -i $DEV, because nvidia-smi with no device emits ONE LINE PER GPU PER SAMPLE.
+# On a 2x or 4x rental the sieving card's ~380 W would be averaged with idle
+# siblings' ~20 W and the mean would collapse toward idle -- halving J/q and
+# inflating rel/J, silently, with a healthy-looking sample count. This is the
+# instrument that replaced board= precisely because board= was biased.
+# Both the sampler and the sieve are pinned to the SAME ordinal. Pinning only
+# nvidia-smi moved the failure rather than closing it: CUDA renumbers ordinals
+# under CUDA_VISIBLE_DEVICES independently of NVML, so bench could sieve on
+# physical card 2 at ~380 W while the sampler read NVML index 0 at ~20 W --
+# rel/J inflated ~19x, with a full and healthy-looking sample count.
+DEV=${DEV:-0}
+DEVFLAG="--device $DEV"
 runp() { local n=$1
-         nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits \
-             -lms 200 > "$OUT/$n.pw" 2>/dev/null &
+         nvidia-smi -i "$DEV" --query-gpu=power.draw \
+             --format=csv,noheader,nounits -lms 200 > "$OUT/$n.pw" 2>/dev/null &
          local pw=$!
          shift; run "$n" "$@"; local rc=$?
          kill $pw 2>/dev/null; wait $pw 2>/dev/null
-         awk '{s+=$1;n++} END{if(n)printf "   board %.1f W mean, %d samples\n",s/n,n}' \
-             "$OUT/$n.pw"
+         pw_mean "$n" | sed 's/^/   board /'
          return $rc; }
+
+# The window brackets the whole PROCESS; the figure we want covers the BAND.
+# Factor-base load (a 115 MB fb1, or a full GPU regeneration when --fb1 is
+# omitted), the resume scan and teardown all run at near-idle draw and would
+# pull the mean down 15-25% -- by a DIFFERENT amount per geometry, which would
+# corrupt exactly the cross-geometry comparison the geometry law rests on. The
+# band and its cofactor tail are the LAST thing the process does, so take the
+# final `wall clock per q, COMPLETE x nq` seconds' worth of samples.
+pw_mean() {
+    local n=$1 f="$OUT/$1.log" p="$OUT/$1.pw"
+    [ -s "$p" ] || return 0
+    awk -v pwf="$p" '
+        function v(  i){for(i=1;i<=NF;i++) if($i=="ms") return $(i-1); return ""}
+        /--- band of [0-9]+ special-q ---/ {nq=$4}
+        /^  wall clock per q, COMPLETE/    {ms=v()}
+        END{
+            keep = (nq>0 && ms>0) ? int(nq*ms/1000/0.2)+1 : 0
+            tot=0; cnt=0
+            while ((getline line < pwf) > 0) { a[++cnt]=line+0 }
+            scoped = (keep>0 && keep<cnt)
+            from = scoped ? cnt-keep+1 : 1
+            for (i=from;i<=cnt;i++) { tot+=a[i]; used++ }
+            # A log with no band header (a watchdog kill exits through a bare
+            # _exit() with no stdio flush) leaves nq and ms empty, and a short
+            # dry run makes keep exceed the sample count. Both fall back to the
+            # whole-process mean, which is the DILUTED figure -- say so, rather
+            # than labelling it "band only" and quietly undoing the fix.
+            if (used) printf "%.1f W mean over %d of %d samples (%s)\n",
+                             tot/used, used, cnt,
+                             scoped ? "band only" : "WHOLE PROCESS, diluted"
+        }' "$f"
+}
 
 # The band arms. Both write relations so the band itself is an identity gate as
 # well as a timing run -- the 500-q gate below is only the cheap early abort.
+# --maxbits 15 is PINNED, not left to default. bench sets `maxbits = logI` when
+# the flag is absent, and maxbits drives the RATIONAL factor base build -- so the
+# logI 16 wide arms would silently build rational powers to 2^16 against an
+# algebraic file generated at maxbits 15, while the logI 15 band arms built to
+# 2^15. The serial/concurrent A/B inside each geometry survives that, but the
+# CROSS-geometry claim -- "16e gains less than I15e because the geometry already
+# feeds the card better" -- would be confounded by a differently sized rational
+# FB. Pinning it makes the geometry the only variable.
+MAXB="--maxbits 15"
 BAND="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
-      --logI 15 --J 16384 --qrange 190000000: --nq $NQ --restart"
+      --logI 15 --J 16384 --qrange 190000000: --nq $NQ --restart $MAXB $DEVFLAG"
 
 # ---------------------------------------------------------------- environment
 { date -u; echo; git -C .. rev-parse HEAD; git -C .. status --short; echo
@@ -125,7 +208,16 @@ if want ident; then
     # file and then dies would have reported IDENTITY OK and sent the session on
     # to ~35 minutes of timing arms with no correctness gate behind them. Require
     # a nonzero count on both sides, and the reference count where we have one.
+    # rc is checked, not just md5. `--check-relations` is the ONLY gate that can
+    # see a wrong relation: the two arms are byte-identical by construction, so
+    # md5 equality holds just as well when both are wrong. Its rc was discarded,
+    # and a failed reconstruction printed rc=1 into the scroll and the session
+    # went on to ~35 minutes of timed arms. A watchdog kill (rc 4) on any ident
+    # arm was likewise only caught indirectly, via the md5 of a truncated file.
     ok=1
+    while read -r n rc; do
+        case "$n" in 1*) [ "$rc" = 0 ] || { echo "   *** $n FAILED rc=$rc"; ok=0; };; esac
+    done < "$MANIFEST"
     set -- id 1591 sl 937
     while [ $# -ge 2 ]; do
         p=$1; ref=$2; shift 2
@@ -176,7 +268,7 @@ fi
 if want wide; then
     NQW=$(( NQ/4 > 0 ? NQ/4 : 1 ))     # --nq 0 is refused by the parser
     W="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
-       --logI 16 --J 32768 --qrange 190000000: --nq $NQW --restart"
+       --logI 16 --J 32768 --qrange 190000000: --nq $NQW --restart $MAXB $DEVFLAG"
     # THREE interleaved pairs, not one. The 2026-09-10 5090 session ran a single
     # pair here and it returned the only NEGATIVE rel/J in the whole run (-1.4%,
     # board +7.3% against wall -5.5%) -- the row that decides deployment, on the
@@ -198,8 +290,17 @@ fi
 # c183 I15e: fewer regions per kernel, so one kernel underfeeds the card worse.
 # If the pipeline gain tracks the synthetic gain anywhere, it is here.
 if want c147; then
-    C="--pipeline --cofactor --poly ../oracle/c147.job \
-       --logI 14 --J 8192 --qrange 120000000: --nq $NQ --restart"
+    # A staged factor base, not the in-process GPU generator: without --fb1 every
+    # one of these four arms rebuilds the whole algebraic FB inside the power
+    # window, diluting this geometry's board mean by an amount the other
+    # geometries do not share.
+    # || exit 1 like every other build phase: without it a truncated fbgen is
+    # followed by four arms pointed at the partial file, and the next session
+    # silently reuses it because [ -s ] is true for a truncated file.
+    [ -s ../oracle/c147.fb1 ] || run 29-c147-fb ./fbgen --poly ../oracle/c147.job \
+        --maxbits 14 --threads "$(nproc)" --out ../oracle/c147.fb1 || exit 1
+    C="--pipeline --cofactor --poly ../oracle/c147.job --fb1 ../oracle/c147.fb1 \
+       --logI 14 --J 8192 --qrange 120000000: --nq $NQ --restart --maxbits 14 $DEVFLAG"
     for p in 1 2; do
         S_ARM=(runp "30-c147-serial-$p"     ./bench $C --relations "$OUT/c.s.$p.rels"
                --log "$OUT/c.s.$p.log" --log-every 5 $WD "$OUT/c.s.$p.wd")
@@ -251,9 +352,14 @@ fi
 if want refuse; then
     for SJ in 16384 24576 32768; do
         R_BASE="--pipeline --cofactor --poly ../oracle/input.job --fb1 ../oracle/c183.fb1 \
-                --logI 16 --J 32768 --region 15 --slab-j $SJ --qrange 120000000: --nq 1 --restart"
-        run "50-refuse-sj$SJ-serial"     ./bench $R_BASE
-        run "51-refuse-sj$SJ-concurrent" ./bench $R_BASE --fill-concurrent
+                --logI 16 --J 32768 --region 15 --slab-j $SJ --qrange 120000000: --nq 1 \
+                --restart $MAXB $DEVFLAG"
+        # Per-arm .wd paths. A shared one let the concurrent arm truncate the
+        # serial arm's diagnostic, making a watchdog kill indistinguishable from
+        # the memory refusal this ladder exists to demonstrate.
+        run "50-refuse-sj$SJ-serial"     ./bench $R_BASE $WD "$OUT/refuse-sj$SJ-s.wd"
+        run "51-refuse-sj$SJ-concurrent" ./bench $R_BASE $WD "$OUT/refuse-sj$SJ-c.wd" \
+            --fill-concurrent
     done
     echo "   --- refusal ladder ---"
     for SJ in 16384 24576 32768; do
@@ -284,9 +390,16 @@ echo "=============================== SUMMARY ==============================="
 # change to that label would have broken one and left the other quietly matching.
 TAB="$OUT/.summary.$$"; : > "$TAB"
 while read -r n rc; do
-    case "$n" in 2*|3*) ;; *) continue;; esac
+    # timed arms only -- the factor-base build is recorded in the manifest for
+    # its exit code, not for a timing row
+    case "$n" in 2[0156]-*|3[01]-*) ;; *) continue;; esac
     f="$OUT/$n.log"
-    pw=$(awk '{s+=$1;c++} END{if(c)printf "%.1f",s/c}' "$OUT/$n.pw" 2>/dev/null)
+    # pw_mean, NOT a fresh whole-file average. The band-scoping fix was written,
+    # printed to the scroll during the run, and then not used here -- so every
+    # J/q and rel/J in this table kept the diluted figure the fix exists to
+    # remove, while RESULTS.md asserted the fix had landed. Half a fix reads
+    # exactly like a whole one from the terminal.
+    pw=$(pw_mean "$n" | awk '{print $1}')
     printf '%-26s ' "$n"
     if [ "$rc" != 0 ] || ! grep -q "band of" "$f" 2>/dev/null; then
         # A killed or crashed arm is REPORTED, not skipped. rc 4 is the watchdog
@@ -300,6 +413,11 @@ while read -r n rc; do
         printf '*** NO RESULT (rc=%s%s), excluded from the spread check\n' "$rc" "$extra"
         continue
     fi
+    # Energy uses W (`wall clock per q, COMPLETE`), not w. `ALL RELATIONS/q`
+    # counts relations the queue emitted during the post-band drain, and the
+    # power window spans that drain -- so pairing them with `wall clock per q`,
+    # which EXCLUDES cofac_tail, made the numerator long by the tail's relations
+    # and the denominator short by its seconds. COMPLETE is the matching figure.
     awk -v pw="${pw:-}" -v nm="$n" -v tab="$TAB" \
         'function v(  i){for(i=1;i<=NF;i++) if($i=="ms") return $(i-1); return ""}
          /^  wall clock per q  /            {w=v()}
@@ -312,9 +430,10 @@ while read -r n rc; do
          /^  ALL RELATIONS.q/               {r=$NF}
          END{printf "wall %8s cmplt %8s sieve %8s fill %8s apply %8s ovl %9s acc %5s rel/q %6s",
                     w,W,s,f,a,(o==""?"-":o),g,r
-             if(pw!="" && w!="" && r!="")
-                 printf "  board %6.1fW J/q %7.3f rel/J %6.3f", pw, w/1000*pw,
-                        r/(w/1000*pw)
+             if(pw+0>0 && W+0>0 && r+0>0)
+                 # W, not w -- see the note above the awk.
+                 printf "  board %6.1fW J/q %7.3f rel/J %6.3f", pw, W/1000*pw,
+                        r/(W/1000*pw)
              printf "\n"
              printf "%s %s %s %s\n", nm, w, (g==""?"-":g), (pw==""?"-":pw) >> tab}' "$f"
 done < "$MANIFEST"
@@ -350,7 +469,22 @@ rm -f "$TAB"
 
 echo "power, from the --log sidecars (board= is a SPOT SAMPLE, not an"
 echo "integrated measurement -- treat rel/J here as indicative):"
-for f in "$OUT"/b.?.?.log "$OUT"/w.?.?.log "$OUT"/c.?.?.log; do
+# Manifest-scoped like the table above. Globbing here reintroduced the exact
+# defect the manifest exists to fix, one section over: a second invocation into
+# the same OUTDIR printed the first one's sidecars beside its own, unmarked.
+# Read line by line rather than word-splitting a command substitution: the
+# unquoted `for f in $(...)` this replaced dropped the whole section, silently,
+# for any OUTDIR containing a space, and was subject to pathname expansion too.
+while read -r n _; do
+    case "$n" in
+        2[01]-band-serial-*)     f="$OUT/b.s.${n##*-}.log";;
+        2[01]-band-concurrent-*) f="$OUT/b.c.${n##*-}.log";;
+        2[56]-wide-serial-*)     f="$OUT/w.s.${n##*-}.log";;
+        2[56]-wide-concurrent-*) f="$OUT/w.c.${n##*-}.log";;
+        3[01]-c147-serial-*)     f="$OUT/c.s.${n##*-}.log";;
+        3[01]-c147-concurrent-*) f="$OUT/c.c.${n##*-}.log";;
+        *) continue;;
+    esac
     [ -e "$f" ] || continue
     printf '  %-16s ' "$(basename "$f" .log)"
     awk '{for(i=1;i<=NF;i++){if($i~/^rel\/s=/){r=substr($i,7)}
@@ -358,7 +492,7 @@ for f in "$OUT"/b.?.?.log "$OUT"/w.?.?.log "$OUT"/c.?.?.log; do
           if(r+0>0&&b+0>0){R+=r;B+=b;n++}}
          END{if(n)printf "rel/s %7.1f  board %6.1fW  rel/J %6.2f  (%d samples)\n",
              R/n,B/n,(R/n)/(B/n),n; else print "no samples"}' "$f"
-done
+done < "$MANIFEST"
 
 echo
 echo "relation counts -- every arm of one geometry must agree:"
@@ -366,17 +500,29 @@ echo "relation counts -- every arm of one geometry must agree:"
 # its count is short and its md5 differs; printing that in a bare list next to
 # five correct ones is exactly how a poisoned run gets quoted.
 for pfx in b w c; do
-    set -- "$OUT/$pfx".*.rels; [ -e "$1" ] || continue
-    ref=""
+    # Manifest-scoped, like the table and the sidecars. Globbing here meant a
+    # smoke run followed by the real run into the same OUTDIR -- the reuse this
+    # script documents as supported -- compared 20-q files against 2000-q ones
+    # and printed "ARMS DISAGREE" on a run whose arms were in fact identical.
+    set --
+    while read -r n _; do
+        case "$n:$pfx" in
+            2[01]-band-serial-*:b)      set -- "$@" "$OUT/b.s.${n##*-}.rels";;
+            2[01]-band-concurrent-*:b)  set -- "$@" "$OUT/b.c.${n##*-}.rels";;
+            2[56]-wide-serial-*:w)      set -- "$@" "$OUT/w.s.${n##*-}.rels";;
+            2[56]-wide-concurrent-*:w)  set -- "$@" "$OUT/w.c.${n##*-}.rels";;
+            3[01]-c147-serial-*:c)      set -- "$@" "$OUT/c.s.${n##*-}.rels";;
+            3[01]-c147-concurrent-*:c)  set -- "$@" "$OUT/c.c.${n##*-}.rels";;
+        esac
+    done < "$MANIFEST"
+    [ $# -gt 0 ] && [ -e "$1" ] || continue
+    ref=""; bad=0
     for f in "$@"; do
         h=$(md5sum < "$f" | cut -c1-12); nl=$(wc -l < "$f")
-        [ -n "$ref" ] || { ref=$h; refn=$nl; }
-        if [ "$h" = "$ref" ]; then mark="   "; else mark="***"; fi
+        [ -n "$ref" ] || ref=$h
+        if [ "$h" = "$ref" ]; then mark="   "; else mark="***"; bad=1; fi
         printf '  %s %-24s %8s  %s\n' "$mark" "$(basename "$f")" "$nl" "$h"
     done
-    for f in "$@"; do
-        [ "$(md5sum < "$f" | cut -c1-12)" = "$ref" ] || {
-            echo "     *** ARMS DISAGREE for '$pfx' -- this run is not usable"; break; }
-    done
+    [ "$bad" = 0 ] || echo "     *** ARMS DISAGREE for $pfx -- this run is not usable"
 done
 echo "======================================================================="

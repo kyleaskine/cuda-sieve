@@ -2076,6 +2076,24 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * and the `unaccounted` residual can go negative. */
         const double     acc_td_q0 = acc_td;
         const double     acc_ovl_q0 = acc_ovl;
+/* Abandoning a q means every band-level accumulator it charged INSIDE the slab
+ * loop has to come back, because `nqdone` is not incremented and the band
+ * summary still prints: the totals would then be divided by an N that excludes
+ * the q, and `unaccounted` can go negative. That is the un-reconcilable stage
+ * total finding 94 exists to forbid.
+ *
+ * It is a macro because there are THREE abandon sites, not one -- the nq_lost
+ * path, and two hard failures further down (`no survivors at this q`, and the
+ * cofactor-gate abort). Twice now this rollback has been written out by hand at
+ * one site and missed at the others: first acc_ovl was added to nq_lost alone,
+ * then acc_td and tm were restored at the hard-failure break and not at the two
+ * below it. Open-coding it is what keeps producing that bug.
+ *
+ * NOT included, deliberately: `nslab_skipped` and `ntd_skipped`. They are raw
+ * band totals reported as counts, never divided by N, and a skip that really
+ * happened should stay counted. The rule binds the per-q TIME accumulators. */
+#define PIPE_Q_ROLLBACK() do { acc_td = acc_td_q0; acc_ovl = acc_ovl_q0; \
+                               tm = tm_q0; } while (0)
         const pipe_tm_t  tm_q0     = tm;
         if (cfg->qspan) { hspan0 = host_ms(); PIPE_CK(cudaEventRecord(qspan0)); }
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
@@ -2719,8 +2737,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * loop -- and the band summary still prints after a hard failure
              * (`if (nqdone)` below), so leaving it in would subtract this dead
              * q's overlap from a sieve total made only of the q that did
-             * complete. Un-reconcilable stage total, finding 94's rule. */
-            acc_ovl = acc_ovl_q0;
+             * complete. Un-reconcilable stage total, finding 94's rule.
+             *
+             * ALL THREE, not just acc_ovl. An earlier version of this rollback
+             * restored the accumulator that prompted it and left acc_td and tm
+             * charged -- acc_td is banked per slab and tm.join/tm.td/tm.rank
+             * inside the slab loop and pipe_td_perq, so a q that dies on slab 3
+             * of 4 leaves all of them holding work that nqdone never counts.
+             * `TD + classify, wall` and `= device total` then print divided by
+             * an N that excludes the q, and `unaccounted` can go negative: the
+             * same defect, one accumulator over. The rule is the rule the
+             * comment states -- every band-level accumulator written inside the
+             * slab loop is restored here -- and it is not satisfied by
+             * restoring whichever one was noticed. */
+            PIPE_Q_ROLLBACK();
             break;
         }
         /* Deferred from pipe_side_prepare_q, which no longer blocks on the
@@ -2764,6 +2794,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * convert a bucket overflow into a dead task by the back door. */
             if (!nslab_skipped_q) {
                 fprintf(stderr, "  pipeline: no survivors at this q\n");
+                PIPE_Q_ROLLBACK();
                 rc = -1; break;
             }
             nq_lost++;
@@ -2780,9 +2811,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * which is the un-reconcilable stage total finding 94 exists to
              * forbid. Any future band-level accumulator written inside the
              * slab loop has to be added here too. */
-            acc_td = acc_td_q0;
-            acc_ovl = acc_ovl_q0;
-            tm     = tm_q0;
+            PIPE_Q_ROLLBACK();
             continue;              /* next q; nqdone is not incremented */
         }
         if (nqdone == 0 && cfg->cofgate &&
@@ -2792,6 +2821,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     " on side%s%s across the complete q\n",
                     cofgate_found[0] ? "" : " 0",
                     cofgate_found[1] ? "" : " 1");
+            PIPE_Q_ROLLBACK();
             rc = -1; break;
         }
 
@@ -3605,6 +3635,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 
 #undef PIPE_CK
 #undef PIPE_VRAM_MARGIN
+#undef PIPE_Q_ROLLBACK
 done:
     /* BELOW `done:`, not above it, so "always reported" is literally true.
      * Every PIPE_CK failure is `rc = -1; goto done`, so sited above this label

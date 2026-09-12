@@ -7616,15 +7616,36 @@ result.
 
 **Fixed by measuring it properly.** `rental5090.sh` now wraps every timed arm in
 `nvidia-smi --query-gpu=power.draw -lms 200`, averages the whole arm, and reports
-`J/q` and `rel/J` from the measured wall and that mean. On the 5070 at c147 the
-new instrument gives 12 samples per arm and board draw that barely moves
-(190.2 W serial against 190.6 W concurrent, **+0.2%**), so the -5.0% wall passes
-almost undiminished into **+5.1% rel/J**. That is the shape the spot samples were
-too coarse to see, and it makes the 5090's "+7.3% board" in run 1 look like what
-the repeat says it was: noise.
+`J/q` and `rel/J` from the measured wall and that mean.
 
-**What this leaves standing.** rel/J tracks wall closely once board draw is
-measured rather than sampled, on both cards and at every geometry tested. The
+**The first evidence offered for that here was worthless and is replaced.** It
+read: "on the 5070 at c147 the new instrument gives 12 samples per arm and board
+draw that barely moves (190.2 W serial against 190.6 W concurrent, +0.2%), so the
+-5.0% wall passes almost undiminished into +5.1% rel/J." Twelve samples at 200 ms
+is **2.4 seconds of arm** -- a smoke test of the plumbing, at exactly the length
+`rental5090.sh`'s own `NQ` comment says is dominated by the boost-clock ramp. It
+was quoted as a measurement because it was the first output the new code
+produced.
+
+The full-length arms say something different and more useful: **the board term is
+card-dependent and is NOT negligible.** Serial to concurrent, 2,000-q bands,
+~1,100 samples per arm:
+
+| card | board delta | wall | rel/J |
+|---|---:|---:|---:|
+| RTX 5070, stock | **+3.02%** | -4.31% | +1.44% |
+| RTX 5070, undervolted | **+2.93%** | -3.73% | +0.92% |
+| RTX 3090 | **+0.25%** | -3.79% | +3.69% |
+
+On the 3090 the board term is noise and rel/J is essentially the reciprocal of
+wall. **On the 5070 it eats two thirds of the wall gain.** So the earlier
+generalisation below -- "rel/J tracks wall closely ... on both cards and at every
+geometry tested" -- was a 3090 result stated as a law; it holds there and not on
+the 5070. What survives across both cards is only the sign.
+
+**What this leaves standing.** rel/J tracks wall *on the 3090*, and is positive
+but materially smaller than wall on the 5070, once board draw is measured rather
+than sampled. The
 "turn it off at 16e" recommendation is **withdrawn**; the honest position is that
 16e gains less than I15e because the geometry already feeds the card better
 (-5.35% against -7.62%), not because it costs energy. **The confirmation run with
@@ -7960,6 +7981,14 @@ way round: the **concurrent** arm's ticks read 90.0-92.4 W against an integrated
 its 140.1 W. Read from the sidecar alone, tonight's undervolted run says
 concurrency is worth **+50% rel/J**; the integrated figure says **+0.92%**.
 
+**A third instance settles it beyond argument.** Three *serial* arms, same card,
+same geometry, same instrument, all at stock: the morning band's ticks read
+152.8-211.4 W, the arm that later wedged read 216.8-218.9 W, and the clean
+evening band read 129.8-147.8 W against an integrated 197-200 W. **An 80 W spread
+between runs of the identical configuration** -- the tick is not measuring board
+draw with error, it is sampling a duty cycle at whatever phase it happens to
+lock to.
+
 So the bias is not a property of either arm. It is aliasing against whatever the
 per-q duty cycle happens to be, and it can err by tens of percent **in either
 direction**. That retires the last defence of the sidecar column as an energy
@@ -8036,6 +8065,131 @@ quantity), and "rel/J tracks wall to within 0.1 points" (c147's +7.67 against
 corrected statement is stronger: rel/J is the reciprocal of the wall ratio
 divided by the board ratio, and with the board term under a quarter of a percent,
 **wall alone predicts every measured rel/J to within 0.01 points.**
+
+### A fourth xhigh review, and the three that were measurement errors rather than code
+
+**2026-09-10/11.** Fifteen findings. The code one first, then the ones that mean
+numbers in this finding are wrong.
+
+- **The hard-failure rollback restored `acc_ovl` and left `acc_td` and `tm`
+  charged.** The fix for the un-reconcilable stage total, applied to whichever
+  accumulator prompted it. A q dying on slab 3 of 4 leaves `acc_td` (banked per
+  slab) and `tm.join`/`tm.td`/`tm.rank` holding work `nqdone` never counts, so
+  `TD + classify, wall` and `= device total` print over an N that excludes it and
+  `unaccounted` can go negative. The comment directly above already stated the
+  rule -- "any future band-level accumulator written inside the slab loop has to
+  be added here too" -- and the rule is not satisfied by restoring one of three.
+- **`rel/J` paired a relation count that INCLUDES the cofactor tail with a wall
+  clock that EXCLUDES it**, while the power window spanned the tail. `ALL
+  RELATIONS/q` counts what the queue emitted during the post-band drain;
+  `wall clock per q` is `acc_wall/N` and drops `cofac_tail`. So the numerator was
+  long by the tail's relations and the denominator short by its seconds. It now
+  uses `wall clock per q, COMPLETE`, which the awk had been parsing and
+  discarding. **On a c147 band the correction is ~8% of rel/J** -- larger than
+  most effects this finding reports.
+- **The power sampler was not pinned to a device.** `nvidia-smi --query-gpu`
+  with no `-i` emits one line per GPU per sample, so on a 2x or 4x rental -- a
+  common shape for a rented 5090 -- the sieving card's ~380 W would have been
+  averaged with idle siblings' ~20 W, collapsing the mean toward idle, halving
+  `J/q` and inflating `rel/J`, with a healthy-looking sample count. **This is the
+  instrument that replaced `board=` because `board=` was biased.** Now `-i $DEV`.
+- **And its window bracketed the whole process, not the band.** Factor-base load
+  (115 MB from file, or a full GPU regeneration when `--fb1` is omitted), the
+  resume scan and teardown all run at near-idle draw. The dilution is 15-25% and
+  **differs per geometry**, which corrupts precisely the cross-geometry
+  comparison the geometry law rests on -- the c147 arms were worst, rebuilding
+  the entire algebraic factor base inside the window on every one of four arms.
+  The mean is now taken over the final `COMPLETE x nq` seconds of samples, and
+  c147 gets a staged `--fb1` like every other geometry.
+
+**Two claims in this finding were therefore built on bad inputs.** The `+5.1%
+rel/J` offered as proof the new instrument worked came from a **2.4-second arm** --
+twelve samples at 200 ms, a plumbing smoke test at exactly the length this
+script's own `NQ` comment says is dominated by the boost ramp. And the wide (16e)
+arms ran `--logI 16` without `--maxbits`, so `maxbits` defaulted to `logI` and
+they built rational powers to 2^16 against an algebraic file pinned at 15, while
+the band arms built to 2^15. The A/B inside each geometry survives that; the
+**cross-geometry** claim did not, and `--maxbits 15` is now pinned on every arm
+so the geometry is the only variable.
+
+Also fixed: the identity phase, documented as THE abort, **discarded the exit
+status of all five of its runs** -- including `--check-relations`, the only gate
+that can see a wrong relation, since the two arms are byte-identical by
+construction and md5 equality holds just as well when both are wrong; a zero
+power mean passed the `pw != ""` guard and then divided by zero, killing the
+whole arm row rather than degrading to the no-power format; the manifest fix was
+applied to the summary table and spread check but **not** to the power-sidecar
+and relation-count sections, which still globbed -- the same defect, one section
+over; `rental5090.sh band` created a directory named `band` and ran the full
+35-minute protocol, because `$1` is taken as the OUTDIR unconditionally; and the
+watchdog comment overclaimed, since `wd_arm_kill()` has one call site inside
+`run_pipeline_impl` and `--watchdog-kill` is pipeline-only, so the eight
+`--fill-streams` arms get reporting and no kill. That limit is now stated rather
+than implied.
+
+### A fifth review, and the finding that half a fix reads exactly like a whole one
+
+**2026-09-11.** Fifteen more. The headline is the shape of the mistake, not any
+one instance of it.
+
+**The band-scoping power fix never reached a single published number.** The
+previous review established that averaging board draw over the whole *process*
+diluted the mean by 15-25%, differently per geometry. A `pw_mean` function was
+written to take only the final `COMPLETE x nq` seconds of samples, it was called
+from `runp`, and it printed a correctly scoped figure to the terminal during
+every arm -- while the SUMMARY table, the thing every `J/q` and `rel/J` in this
+finding is read off, went on recomputing a fresh whole-file average two hundred
+lines below. The scroll said the fix worked. The numbers did not have it. And
+the bullet added to this file asserted "the mean is now taken over the final
+`COMPLETE x nq` seconds of samples" on the strength of the scroll. Verified
+after the repair: the same c147 arm reads **141.7 W band-scoped against 137.0 W
+whole-process**, so the correction was real and was simply not applied.
+
+**The same shape, twice more in the same diff.** `-i $DEV` was added to pin the
+sampler to a card -- without pinning `./bench` to the same ordinal, and CUDA
+renumbers under `CUDA_VISIBLE_DEVICES` independently of NVML, so the fix moved
+the failure rather than closing it (both are now pinned). And `--maxbits 15` was
+described here as "now pinned on every arm" when the `refuse` ladder still ran
+`--logI 16` with no pin -- the phase whose entire purpose is to read memory
+thresholds off a specific configuration.
+
+**The rollback is now a macro, because open-coding it is what keeps producing
+the bug.** There are **three** abandon sites, not one: `nq_lost`, the
+hard-failure break out of the slab loop, and two more further down (`no
+survivors at this q`, and the cofactor-gate abort). `acc_ovl` was added to the
+first alone; `acc_td` and `tm` were then added to the second and missed at the
+other two. `PIPE_Q_ROLLBACK()` is defined once beside the `_q0` snapshots and
+called at all four. Its comment also names what is deliberately *excluded* --
+`nslab_skipped` and `ntd_skipped` are raw counts, never divided by N, and a skip
+that really happened should stay counted -- because the previous comment claimed
+"every band-level accumulator" and two visible counters contradicted it, which is
+how a reader concludes the rule does not bind.
+
+Also fixed: the relation-count section still globbed while the sidecar section
+had been converted, so a smoke run followed by a real run into the same OUTDIR
+would have printed `ARMS DISAGREE` on a run whose arms were identical; `pw_mean`
+fell back to the whole-process mean on an unparseable log and still labelled it
+"(band only)", which would have reinstated the dilution invisibly, and now says
+`WHOLE PROCESS, diluted`; `W` kept the emptiness test that `pw` had just had
+replaced with a numeric one, so a degenerate COMPLETE figure would still divide
+by zero and take the arm's whole row and its spread-check entry with it; the
+c147 factor-base build had no `|| exit 1`, so a truncated `fbgen` would be reused
+by every later session because `[ -s ]` is true for a partial file; the refuse
+ladder shared one `--watchdog-log` path between its serial and concurrent arms,
+letting the second truncate the first's diagnostic and making a watchdog kill
+indistinguishable from the memory refusal the ladder exists to demonstrate; an
+unquoted command substitution word-split the sidecar list, dropping the whole
+section for any OUTDIR containing a space; the manifest was deleted on the
+success path and leaked on every error path, exactly backwards for the one file
+that records each arm's exit code; and the phase vocabulary lived in three
+hand-maintained copies, so a typo ran the full default protocol.
+
+**Two more documents disagreed with this one.** RUNBOOK's 5070 row paired the
+*undervolted* wall figure with the *stock* board and rel/J figures, which does
+not close -- `(1/0.963)/1.030` is +0.8%, not +1.4% -- and the 5070 now appears
+twice, once per voltage state. STATUS said board draw "is measured over the whole
+arm", which contradicted this file's claim of the fix and, as it happens,
+described what the code was actually doing.
 
 ### Cross-card relation identity, gated for the first time
 

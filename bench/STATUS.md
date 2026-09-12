@@ -961,8 +961,32 @@ Cards with measured band data: **RTX 5070** (WSL2), **RTX 5090**, **RTX 4090**,
   answer — the local 5070 against the local CPU box, item 0 — because both
   sides of that comparison are on this UPS. Treat cross-card rel/J as an
   architecture note, not as a verdict input.
-- **THE BOX IS UNDERVOLTED AS OF 2026-08-17, and every timing taken after that
-  date is ~6.7% slower than one taken before it.** The card's V/F curve is
+- **THE UNDERVOLT IS BEING REMOVED, 2026-09-11**, on the owner's hypothesis that
+  it is the cause of this box's intermittent GPU hangs rather than a free
+  efficiency win. **Reasonable, cheap to test, and NOT supported by the one hang
+  that was actually instrumented.** On 2026-09-10 a band arm wedged for 57
+  minutes -- main thread `R` at 100% user CPU with zero syscall time, GPU at 3%
+  and 30 W, which is what a wedged card looks like when CUDA's default sync
+  policy spin-waits -- and it happened while the undervolt was **OFF**, cleared
+  by a reboot and not yet reapplied. The undervolted band run later the same
+  night completed cleanly. That is one hang at stock against one clean run at
+  stock and one clean run undervolted: too little to conclude anything, and what
+  little there is points away from the undervolt.
+  **If the hangs continue at stock, the 35% board rel/J was given up for
+  nothing** -- so treat this as an experiment with a stated outcome, not a fix.
+  The watchdog is now armed on every timed arm and `--watchdog-log` records the
+  phase, so the next hang produces evidence instead of an anecdote.
+
+  **And it moves the corpus convention a second time.** Finding 61 exists so a
+  post-undervolt timing is not read as a regression; removing the undervolt fires
+  that warning in reverse, and **every number taken between 2026-08-17 and
+  2026-09-11 is the undervolted kind.** The conversion is measured rather than
+  estimated, on a paired same-night band with integrated board draw:
+  **stock is 5.10% faster and draws 29.57% more** (90.547 ms/q at 199.0 W against
+  95.163 at 140.1 W, c183 I15e, three interleaved pairs each). Finding 94.
+
+  *The undervolt as it stood:* **THE BOX IS UNDERVOLTED AS OF 2026-08-17, and
+  every timing taken after that date is ~6.7% slower than one taken before it.** The card's V/F curve is
   pinned to ~2900 MHz at 950 mV (stock was 2910 MHz at 1080 mV), which trades
   6.7% of throughput for 28% of board power — **+14.6% whole-box rel/J**,
   finding 61. It is *not* a code change and it is *not* reflected in any
@@ -1530,14 +1554,19 @@ finding 92.
    -13.71% at c147 I14, -7.62% at c183 I15e, -5.45% at c183 I16, with fill's
    share of wall flat at ~39% across the last two. The flag is a repair for
    underfeeding and pays in proportion to the underfeeding left, which means
-   production's preference for wide rectangles works against it. And on rel/J it
-   **every 5090 rel/J figure is withdrawn.** They came from `board=`, which is
+   production's preference for wide rectangles works against it. And on rel/J,
+   **every 5090 figure is withdrawn.** They came from `board=`, which is
    not noisy-but-unbiased but **aliased**: on a 5070 band, nine runlog ticks out
    of nine read 127-148 W against an integrated median of 215 W, and the bias
    flips direction between arms and between voltage regimes. The 16e sign flip
    (-1.4%, then +4.6% on repeat) was never going to resolve by repeating it. `rental5090.sh` now averages
    `nvidia-smi -lms 200` over each timed arm instead; with that instrument board
-   draw barely moves (+0.2% on a 5070 at c147) and rel/J tracks wall. **16e gains
+   draw is integrated at 5 Hz over the BAND -- not the whole arm, which would
+   fold factor-base load and teardown at idle draw into the mean by a different
+   amount per geometry. That term is card-dependent: serial to
+   concurrent it is **+0.25% on a 3090** (so rel/J is the reciprocal of wall,
+   +3.69%) and **+3.0% on a 5070** (so rel/J is +1.44% against a -4.31% wall --
+   two thirds of the gain eaten). **16e gains
    less than I15e (-5.35% pooled) because the geometry already feeds the card
    better, not because it costs energy.** The three-pair confirmation was
    attempted and **discarded for host contention** — serial arms spread 10% and
@@ -3296,7 +3325,32 @@ finding 92.
     weighed against the risk of rewriting the hot dense path before anyone
     starts. **Build it only if item 8's geometry measurement forces slabs below
     16.**
-19. **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
+19. **NOW THE TOP OPEN ITEM** -- item 1 closed, so nothing outranks it.
+
+    **GPU contention is NOT this item and must not be filed under it.** On
+    2026-09-10 the same box, binary and band gave 131.4 ms/q in the morning and
+    90.5 ms/q at night, and a draft of this note offered that 45% swing as
+    evidence the regression is bigger than 10%. It is not evidence of anything
+    here: the morning run had another process on the CARD, and **a sieve sharing
+    a GPU running slowly is expected behaviour, not an unexplained regression.**
+    The measurement is simply discarded. This item is about a slowdown with the
+    box to itself, which is a different question.
+
+    **CPU contention is the one worth minimising**, because it is the condition
+    real deployment runs in -- a BOINC host has other tasks -- and because the
+    sieve's host thread is on the critical path (item 4: identifiable host work
+    is 7% of an idle wall and **triples** under CPU contention, finding 53).
+
+    **`acc/wall` is the discriminator between the two, and it is already in every
+    runlog record and every band summary.** It falls when host time appears with
+    the GPU idle, so CPU contention drives it DOWN while GPU contention leaves it
+    flat. That is exactly what the two runs showed: `acc/wall` was **0.92 in
+    both**, which is what says the morning's loss was all device-side. Quote it
+    beside any timing taken on a shared box; a wall figure alone cannot tell the
+    two apart, and `rental5090.sh` now prints `acc` and mean board draw beside
+    each arm group's spread for that reason.
+
+    *Original statement follows.* **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
     2026-09-02 (finding 88). Worth more than every open item except 1.**
 
     Rebuilding `4b581b33` -- the exact commit August was built from --
