@@ -997,11 +997,18 @@ __global__ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         unsigned long long *__restrict iters,
                         const uint32_t *__restrict s, uint32_t ns,
                         const uint8_t *__restrict s2mask, uint32_t s2vmin,
-                        uint32_t s2nv)
+                        uint32_t s2nv, uint32_t ibeg, uint32_t iend)
 {
+    /* [ibeg, iend) is this launch's slice of the compacted list; cf_sched_t's
+     * `chunk` comment says why the caller may split a round this way. The
+     * count is still read on the device, so the host never has to know it and
+     * the round loop stays free of synchronisation: a slice that starts past
+     * the live count simply runs an empty loop, which is what the later rounds
+     * (a few percent of the jobs) mostly do. */
     const uint32_t cnt = *njp;
+    const uint32_t hi = (iend < cnt) ? iend : cnt;
     const uint64_t stride = bench_grid_stride_x();
-    for (uint64_t ii = bench_grid_thread_x(); ii < cnt; ii += stride) {
+    for (uint64_t ii = ibeg + bench_grid_thread_x(); ii < hi; ii += stride) {
         const uint32_t i = (uint32_t)ii;
         const uint32_t t = sel[i];
         uint64_t o[CF_MAXFAC];
@@ -1071,6 +1078,40 @@ typedef struct {
     uint32_t ns;
     const uint8_t *d_s2mask;/* D=30 stage-2 prime-pair mask per giant step   */
     uint32_t s2vmin, s2nv;
+    /* Records per launch. ALWAYS A CONCRETE COUNT, never a sentinel: a value
+     * at or above the batch means one launch (the original behaviour,
+     * bit-for-bit), and callers with nothing to say pass UINT32_MAX rather
+     * than 0. cfg.cof_chunk's 0 means AUTO and is resolved by cofq_flush
+     * before it ever reaches this struct, so the two zeros are not the same
+     * zero and this one has no special meaning at all.
+     *
+     * WHY THIS EXISTS: a round's launch duration is set by its parameters, not
+     * by any clock -- rho's round r runs `budget << r` iterations and ECM runs
+     * `curves` curves, both over every selected record. A slow device takes
+     * proportionally longer for the identical launch and eventually crosses the
+     * host's GPU watchdog, which kills it: cudaErrorLaunchTimeout ("the launch
+     * timed out and was terminated") on Windows/NVIDIA, the vaguer
+     * "unspecified launch failure" on AMD. Both were seen in the field on
+     * slower volunteer hardware, reported at cofq_flush's sync because that is
+     * where an async launch failure first surfaces, not where it happened.
+     *
+     * WHY THE RECORD AXIS AND NOT THE WORK AXIS: every record's mz_split call
+     * is independent and is left completely untouched by this, so splitting the
+     * compacted list cannot change a single result -- the golden test's exact
+     * relation counts hold by construction. Chunking the OTHER axes cannot say
+     * that: sigma is `c0*1000 + cv + 6` and mz_split restarts its factor stack
+     * from the original cofactor on every call, so a curve sub-range makes a
+     * later chunk restart the top composite with sigmas that cannot split it,
+     * and capping rho's budget moves the rho constant. Both change which
+     * sequences run.
+     *
+     * WHY IT IS FREE WHERE IT IS NEEDED: the grid is multiProcessorCount*6
+     * blocks. On a small device (6 CUs -> 9,216 threads) a 131,072-record batch
+     * is ~14 records per thread, so quartering it still leaves every thread
+     * loaded. On a large one (128 SMs -> 196,608 threads) the grid already
+     * exceeds the batch, and chunking would only idle threads -- which is why
+     * the default is one launch and a caller opts in. */
+    uint32_t chunk;
 } cf_sched_t;
 
 /* Scratch for the per-round compaction. The caller owns it because the inline
@@ -1103,22 +1144,32 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
         k_scan_pass3<<<nb, TD_SCAN_BLK>>>(W->d_off, n, W->d_bsum);
         k_cof_selscatter<<<blocks, threads>>>(n, W->d_flag, W->d_off,
                                               W->d_sel, W->d_nsel);
-        if (S->method) {
-            if (S->s2nv)
-                k_cofac<L, 1, 1><<<blocks, threads>>>(
-                    d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
+        /* One launch per record slice. chunk 0 (or any value covering the
+         * batch) gives exactly one launch over [0, n) -- the original single
+         * launch, same grid, same arguments -- so the default path is
+         * unchanged. Slices are cut against n rather than the live count
+         * because the count lives on the device; see k_cofac. */
+        uint32_t step = (S->chunk < n) ? S->chunk : n;
+        if (!step) step = n;   /* b += 0 would never terminate */
+        for (uint32_t b = 0; b < n; b += step) {
+            const uint32_t e = (n - b > step) ? b + step : n;
+            if (S->method) {
+                if (S->s2nv)
+                    k_cofac<L, 1, 1><<<blocks, threads>>>(
+                        d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
+                        W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
+                        S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
+                else
+                    k_cofac<L, 1, 0><<<blocks, threads>>>(
+                        d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
+                        W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
+                        S->d_s, S->ns, NULL, 0, 0, b, e);
+            } else {
+                k_cofac<L, 0, 0><<<blocks, threads>>>(
+                    d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
                     W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                    S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv);
-            else
-                k_cofac<L, 1, 0><<<blocks, threads>>>(
-                    d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
-                    W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                    S->d_s, S->ns, NULL, 0, 0);
-        } else {
-            k_cofac<L, 0, 0><<<blocks, threads>>>(
-                d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
-                W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                NULL, 0, NULL, 0, 0);
+                    NULL, 0, NULL, 0, 0, b, e);
+            }
         }
     }
 }
@@ -1201,6 +1252,71 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
 
 #define CQ_FLUSH  131072u        /* candidates per flush, ~67 special-q */
 
+/* ---- auto chunk sizing -------------------------------------------------- *
+ *
+ * Per-launch budget. Windows' display watchdog (TDR) kills a kernel at ~2 s by
+ * default and AMD's behaves comparably, so this leaves ~8x margin. The budget
+ * is compared against a whole SIDE's device time, which is the sum over its
+ * rounds and slices and therefore an upper bound on any single launch in it --
+ * deliberately conservative, and free to be, because over-chunking costs
+ * nothing on the devices that ever reach this path (see the floor below).
+ */
+#define COF_CHUNK_TARGET_MS   250.0f
+
+/* Giant steps per curve above which cofq_init warns that record chunking can
+ * no longer bound a launch. ~40x the derived default's ~500 and ~16x below the
+ * ~320,000 of the one configuration known to trip a watchdog; see the warning
+ * site in cofq_init for why this is a judgement rather than a measurement. */
+#define COF_S2NV_WATCHDOG_WARN  20000u
+
+/* The floor is `blocks * threads`: one record per thread, and never less.
+ *
+ * MEASURED on an RTX 3090 (82 SMs -> 492 blocks x 256 = 125,952 threads),
+ * oracle/c183, 300 q, --ecm-b1 5000 --ecm-curves 32, n=3, algebraic queue:
+ *
+ *      chunk   131072   65536   32768   16384
+ *      ms       27.97   33.86   41.93   69.73
+ *      vs off   +0.5%  +21.7%  +50.7% +150.7%
+ *
+ * A slice at or above the thread count costs nothing (131072 and 262144 both
+ * land inside the +-1.5% spread of the unchunked arm itself). Below it the
+ * cost is occupancy, not launch overhead: 1 -> 8 launches is ~35 us of launch
+ * latency against a measured +42 ms, three orders of magnitude apart, so what
+ * is being paid for is threads with no record to work on.
+ *
+ * That is also why this floor makes chunking free exactly where it is needed.
+ * A 780M has 6 CUs -> 36 blocks x 256 = 9,216 threads, so slices of 9,216 are
+ * still one record per thread -- fully loaded -- while cutting a 131,072-record
+ * launch by 14x. The small devices that trip the watchdog subdivide for free;
+ * the large ones (a 4090's 196,608 threads exceed CQ_FLUSH outright) get one
+ * slice and the original code path. */
+static uint32_t cof_chunk_floor(int blocks, int threads)
+{
+    const uint64_t f = (uint64_t)(blocks > 0 ? blocks : 1)
+                     * (uint64_t)(threads > 0 ? threads : 1);
+    return f > 0xffffffffull ? 0xffffffffu : (uint32_t)f;
+}
+
+/* Report the slice in effect, on first choice and on every later change.
+ *
+ * STDERR, unlike the j-slabbing line's stdout, and for the reason bench_main
+ * already gives for the grid line: a BOINC client discards stdout with the
+ * slot directory, so anything a volunteer's failure report needs to carry has
+ * to be on stderr, which is uploaded. This exists to answer "what did it pick
+ * on the host that died?", which is unanswerable from source alone.
+ *
+ * Only on change, never per flush: a long band flushes hundreds of times and
+ * the value converges within a few of them. Unbounded per-event logging has
+ * already produced hundreds of duplicate lines once in this project. */
+static void cof_report_chunk(uint32_t chunk, uint32_t n, int pinned)
+{
+    const uint32_t step = (chunk && chunk < n) ? chunk : n;
+    const uint32_t nl = step ? (n + step - 1) / step : 1u;
+    fprintf(stderr, "  cofactor chunk: %u records/launch, %u launch%s per"
+            " round over %u records (%s)\n", step, nl, nl == 1 ? "" : "es", n,
+            pinned ? "pinned by --cof-chunk" : "auto");
+}
+
 typedef struct {
     uint32_t cap, n, rcap;
     /* The two cofactors, narrowed from the 256-bit norm residual to L0/L1
@@ -1248,6 +1364,12 @@ typedef struct {
      * failure mode this whole width machinery exists to prevent, a silently
      * truncated cofactor, from a wrong relation into a loud stop. */
     uint32_t *d_ovf;
+    /* Records per cofactor launch that auto mode settled on, carried across
+     * flushes so the search is done once per band and not once per flush.
+     * 0 means "not chosen yet"; cofq_init memsets the struct, so the first
+     * flush picks the opening value. Ignored entirely when the operator gave
+     * an explicit --cof-chunk. */
+    uint32_t chunk_cur;
     uint32_t *d_s, ns, ecm_curves;
     /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
      * job because the two sides of a real job are usually different shapes:
@@ -1596,6 +1718,37 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
         printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
                " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
                ecm_b2, Q->s2nv, ecm_curves);
+        /* The one thing --cof-chunk cannot bound.
+         *
+         * Chunking splits the RECORD list, so the smallest launch it can make
+         * is one record per thread. A launch therefore never gets shorter than
+         * ONE record's own splitting work, and stage 2 is where that can grow
+         * without limit: the giant-step count is B2/30, so a large B2 buys a
+         * per-record cost no slice size can divide.
+         *
+         * The auto-derived configuration is nowhere near this -- cof_auto_b1
+         * returns 200..500, so B2 is 6,000..15,000 and s2nv is ~194..500 giant
+         * steps -- which is why the default path needs no warning at all. The
+         * one configuration observed to actually trip a device watchdog is
+         * --ecm-b1 400000 (B2 clamped to 10^7, ~320,000 giant steps), which
+         * reproducibly kills the stage-2 kernel on gfx1103 and is why
+         * cofcheck.sh skips that case on HIP.
+         *
+         * THE THRESHOLD IS A JUDGEMENT, NOT A MEASUREMENT. The real boundary
+         * is per-device and nobody has measured it; this sits well above the
+         * derived default and well below the one value known to fail, and it
+         * warns rather than refuses because a fast card runs these settings
+         * perfectly well. Do not restate it as a supported limit. */
+        if (Q->s2nv > COF_S2NV_WATCHDOG_WARN)
+            fprintf(stderr, "  cofactor queue: WARNING: %u giant steps/curve x"
+                    " %u curves is far above the derived default (~194-500"
+                    " steps at B1 200-500). --cof-chunk bounds a launch by"
+                    " RECORDS and cannot go below one record, so this much"
+                    " stage-2 work per record can still exceed a slow device's"
+                    " GPU watchdog and be killed mid-launch"
+                    " (cudaErrorLaunchTimeout, or \"unspecified launch"
+                    " failure\" on AMD). Lower --ecm-b2 if tasks fail that"
+                    " way.\n", Q->s2nv, ecm_curves);
     }
     {
         static const char *nm[2] = { "rho", "ECM" };
@@ -1718,7 +1871,7 @@ static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
 /* Split everything queued, then write only the relations. */
 static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                       uint64_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
-                      int blocks, int threads, FILE *fo)
+                      uint32_t chunk, int blocks, int threads, FILE *fo)
 {
     const uint32_t n = Q->n;
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
@@ -1749,6 +1902,32 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     S.method = Q->meth[0]; S.rounds = rounds; S.budget = budget;
     S.curves = Q->ecm_curves; S.d_s = Q->d_s; S.ns = Q->ns;
     S.d_s2mask = Q->d_s2mask; S.s2vmin = Q->s2vmin; S.s2nv = Q->s2nv;
+    /* chunk 0 is AUTO, not off: a volunteer cannot be asked to pick a number
+     * for hardware nobody has measured, and picking none is what the field
+     * failures were. An explicit value is honoured as given and never steered,
+     * which is what the A/B above needs to hold one arm still. "Off" is
+     * expressible as any value >= the batch -- one slice, measured
+     * indistinguishable from the unchunked path. */
+    {
+        /* Q->chunk_cur always holds the slice currently in effect, for both
+         * modes, so one place reports it and one place compares against it.
+         *
+         * The auto opening value is the floor and is NOT clamped to this
+         * flush's n: a band whose first flush is a small partial one would
+         * otherwise store that small n and then need several flushes of
+         * doubling to climb back, running the full batches in between at a
+         * slice far below the thread count -- the +150% regime. A stored value
+         * above n is harmless, since cf_run_rounds treats any chunk >= n as
+         * the single-slice case. */
+        const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
+        const uint32_t want = chunk ? chunk
+                            : (Q->chunk_cur ? Q->chunk_cur : floor_ch);
+        if (Q->chunk_cur != want) {
+            Q->chunk_cur = want;
+            cof_report_chunk(Q->chunk_cur, n, chunk != 0);
+        }
+        S.chunk = Q->chunk_cur;
+    }
     S1 = S; S1.method = Q->meth[1];   /* differs only in method */
 
     COF_FLUSH_CK(cudaEventCreate(&e0));
@@ -1781,6 +1960,39 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaEventElapsedTime(&t0, e0, e1));
     COF_FLUSH_CK(cudaEventElapsedTime(&t1, e1, e2));
     Q->ms_rat += t0; Q->ms_alg += t1;
+
+    /* Steer the NEXT flush. Only in auto mode, and only ever between flushes,
+     * so the slice is fixed for the whole of the one just measured.
+     *
+     * Halving on an overrun and doubling on a large margin (rather than
+     * scaling by the ratio) keeps this from chasing a single noisy flush; a
+     * band runs many of them. The floor is the real protection -- a device slow
+     * enough to stay over budget simply parks there, which is the free point
+     * for it, and a device fast enough grows to one slice and stops. */
+    if (!chunk) {
+        const uint32_t floor_ch = cof_chunk_floor(blocks, threads);
+        const uint32_t was = Q->chunk_cur;
+        const float stage = t0 + t1;
+        if (stage > COF_CHUNK_TARGET_MS) {
+            const uint32_t half = Q->chunk_cur / 2;
+            Q->chunk_cur = (half > floor_ch) ? half : floor_ch;
+        } else if (stage < COF_CHUNK_TARGET_MS / 4.0f && Q->chunk_cur < Q->cap) {
+            /* Capped at the QUEUE CAPACITY, not at this flush's n. Several of
+             * pipeline.cuh's cofq_flush call sites are checkpoint- or
+             * stop-driven, so a band's first flush can be far smaller than a
+             * full one; capping at that n would store the small value and then
+             * need one flush per doubling to climb back, running the full
+             * flushes in between at a slice far below the grid width -- the
+             * +50.7% (32768) to +150.7% (16384) regime measured on the 3090.
+             * That is the same trap the opening value above is unclamped to
+             * avoid. cap is the real ceiling: n <= Q->cap always, and a stored
+             * value above n costs nothing because cf_run_rounds treats any
+             * chunk >= n as the single-slice case. */
+            Q->chunk_cur = (Q->chunk_cur > Q->cap / 2) ? Q->cap
+                                                       : Q->chunk_cur * 2;
+        }
+        if (Q->chunk_cur != was) cof_report_chunk(Q->chunk_cur, n, 0);
+    }
 
     COF_FLUSH_CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
     /* The width invariant, asserted rather than trusted: cof_classify rejects
@@ -2669,6 +2881,11 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     sched.method = meth0; sched.rounds = rounds; sched.budget = budget;
     sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
     sched.d_s2mask = d_s2mask; sched.s2vmin = s2vmin; sched.s2nv = s2nv;
+    /* One launch per round here -- UINT32_MAX, i.e. "larger than any batch",
+     * not 0: cf_sched_t's chunk is a concrete count with no sentinel value.
+     * This path is a host-driven batch tool, not the BOINC pipeline, so it is
+     * not what a volunteer's watchdog sees. */
+    sched.chunk = 0xffffffffu;
     if (cf_run_side_dyn(limbs0, j0, n0, lim0, lpb0, st0, fac0, nf0,
                         blocks, threads, 1, &ms0, &sched, "rational")) return -1;
     for (uint32_t k = 0; k < n0; k++) {

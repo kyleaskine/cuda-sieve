@@ -375,7 +375,7 @@ for geom in "${GEOMS[@]}"; do SEEN_LOGI[${geom%%,*}]=1; done
 # NEITHER SETTING RUNS `make`, and the advice it prints instead has to name the
 # arch THIS TREE was built for. An earlier version had --fb-backend gpu build
 # the binary: a bare `make fbgen_gpu` parses the Makefile with the default
-# GPU_ARCH=all, and the $(shell ...) at Makefile:124 rewrites .arch.stamp at
+# GPU_ARCH=all, and the $(shell ...) at Makefile:201 rewrites .arch.stamp at
 # parse time -- every CUDA object depends on that stamp, so a tree built
 # `make GPU_ARCH=native bench` was silently invalidated and the operator paid
 # for a full fat rebuild on their next make.
@@ -409,13 +409,27 @@ gpu_arch_arg() {
     [ -r "$stamp" ] || return 1
     n=$(tr ' ' '\n' < "$stamp" | grep -c -- '^-gencode$')
     case "$n" in
+        0)  return 1 ;;
         1)  cc=$(sed -n 's/.*compute_\([0-9][0-9]*\).*/\1/p' "$stamp")
             [ -n "$cc" ] || return 1
             printf 'GPU_ARCH=%s ' "$cc" ;;
-        0)  return 1 ;;
-        *)  # >1 gencode can only be the default fat list: GPU_ARCH accepts
-            # all|native|<cc>, and the latter two expand to exactly one.
+        7)  # GPU_ARCH_all's gencode count (Makefile/build_windows.bat).
+            # KEEP IN STEP WITH THAT LIST: it moved from 6 to 7 on
+            # 2026-09-09 when sm_75 joined it, and before this fix every
+            # count above 1 was treated as "must be the default fat list" --
+            # which silently mistook a GPU_ARCH=full tree (12 gencodes) for
+            # this one and rewrote .arch.stamp out from under it.
             printf '' ;;
+        12) # GPU_ARCH_full's gencode count (Makefile/build_windows.bat).
+            # Same synchronization risk as the count above: these two
+            # numbers are the only thing standing between this function and
+            # silently rewriting .arch.stamp to the wrong architecture set.
+            printf 'GPU_ARCH=full ' ;;
+        *)  # Neither known fat-binary list's count -- a future GPU_ARCH_all/
+            # GPU_ARCH_full resize this file wasn't updated for, or some
+            # other value entirely. Cannot safely guess which: return 1,
+            # same as the "stamp missing/unreadable" path above.
+            return 1 ;;
     esac
 }
 

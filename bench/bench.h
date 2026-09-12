@@ -641,6 +641,19 @@ typedef struct {
     int      cofactor;      /* split the cofactors inline, cross-q queue        */
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */
+    /* Records per cofactor launch. 0 = AUTO: size it from the device and the
+     * measured stage time, never below one record per thread. A positive value
+     * pins it and disables the steering; any value at or above the batch is one
+     * launch, which measures the same as not chunking at all.
+     *
+     * Splits a round across several launches so no single one runs long enough
+     * for the host's GPU watchdog to kill it (cudaErrorLaunchTimeout on
+     * Windows, "unspecified launch failure" on AMD) on a slow device. Every
+     * record's split is independent and untouched, so this cannot change any
+     * result -- see cf_sched_t's `chunk` in cofac.cuh for why no other axis has
+     * that property, and cof_chunk_floor for the measurements behind the
+     * floor. */
+    uint32_t cof_chunk;
     uint64_t target_rels;   /* stop the band once this many relations exist     */
     /* TRI-STATE, not a boolean: COF_METHOD_AUTO (-1) is the default and means
      * "decide per side by LP count", so `if (cfg->cof_ecm)` is TRUE for AUTO

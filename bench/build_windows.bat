@@ -6,7 +6,8 @@ rem the standalone GPU factor-base cache generator.
 rem Run from an "x64 Native Tools Command Prompt for VS" with CUDA on PATH.
 rem
 rem Knobs, matching bench/Makefile so a Windows binary is the same build:
-rem   GPU_ARCH  all (default) | native | a bare compute capability, e.g. 86
+rem   GPU_ARCH  all (default) | native | full | a bare compute capability,
+rem             e.g. 86 -- full needs CUDA <= 12.8 on PATH, see :arch_full
 rem   CF_LMAX   4 (default, 128-bit cofactors) | 3 (96-bit)
 rem   DEFS      extra -D's for pricing experiments, e.g. -DNORM_FAST_LOG2
 rem             (dash form: these reach nvcc too, which rejects /D)
@@ -43,23 +44,93 @@ rem Validated rather than pasted straight into the gencode string. An
 rem unchecked value produces "compute_sm_86" or "compute_8.6" and an opaque
 rem ptxas diagnostic; the Makefile rejects the same three spellings by hand
 rem and says why, so this does too.
+rem
+rem Case-sensitive comparisons, on purpose: the Makefile's `ifeq` has no
+rem case-insensitive mode, so GPU_ARCH=Full/ALL/Native would build here but
+rem get rejected there. Matching that (rather than the friendlier /I) keeps
+rem one spelling giving one answer on both platforms.
 if not defined GPU_ARCH set "GPU_ARCH=all"
-if /I "%GPU_ARCH%"=="all" goto :arch_all
-if /I "%GPU_ARCH%"=="native" goto :arch_native
+
+rem Shared SASS list and PTX-fallback suffix, set unconditionally and
+rem BEFORE the dispatch below (a plain string assignment, no process spawn)
+rem so :arch_full composes from the same six real targets :arch_all uses
+rem instead of re-spelling them -- one string to update when a target joins
+rem or leaves the fat binary, not two. Must come before the `goto`s: each
+rem one jumps straight past anything below it, so setting these after the
+rem dispatch would leave them undefined by the time :arch_all/:arch_full
+rem read them -- caught by testing this change against real cmd.exe.
+set "NVCC_ARCH_ALL_SASS=-gencode arch=compute_120,code=sm_120 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_75,code=sm_75"
+set "NVCC_ARCH_PTX_FALLBACK=-gencode arch=compute_80,code=compute_80"
+
+if "%GPU_ARCH%"=="all" goto :arch_all
+if "%GPU_ARCH%"=="native" goto :arch_native
+if "%GPU_ARCH%"=="full" goto :arch_full
 echo %GPU_ARCH%| findstr /r /c:"^[0-9][0-9]*$" >nul || goto :arch_bad
 set "NVCC_ARCH=-gencode arch=compute_%GPU_ARCH%,code=sm_%GPU_ARCH%"
 goto :arch_done
 
 :arch_bad
-echo error: GPU_ARCH must be all, native, or a bare compute capability like 86
-echo        or 120 -- got "%GPU_ARCH%". Not sm_86, not 8.6.
+echo error: GPU_ARCH must be all, native, full, or a bare compute capability
+echo        like 86 or 120 -- got "%GPU_ARCH%". Not sm_86, not 8.6.
 exit /b 1
 
 :arch_all
 rem Same fat-binary set as the Makefile's default, including the compute_80
-rem PTX floor so a newer card than this list still runs.
-set "NVCC_ARCH=-gencode arch=compute_120,code=sm_120 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_80,code=compute_80"
+rem PTX floor so a newer card than this list still runs. sm_75 joined this
+rem list 2026-09-09: it is QUALIFIED on real RTX 2080 Ti hardware
+rem (STATUS.md item 15) and still compiles under this project's CUDA
+rem 13.2/13.3 canonical toolchain. sm_50/52/60/61/70 do NOT -- CUDA 13 drops
+rem them outright -- so they live only in :arch_full below, not here.
+set "NVCC_ARCH=%NVCC_ARCH_ALL_SASS% %NVCC_ARCH_PTX_FALLBACK%"
 goto :arch_done
+
+:arch_full
+rem sm_50-through-sm_120 fat binary -- the Makefile's GPU_ARCH_full twin.
+rem Every target in :arch_all plus sm_50/52/60/61/70. Needs CUDA <= 12.8:
+rem CUDA 13 hard-rejects sm_50/52/60/61/70 with "Unsupported gpu
+rem architecture", confirmed 2026-09-09 against real nvcc 13.0; nvcc
+rem 12.8.93 accepts all of them (deprecation warning only). Only sm_61 and
+rem sm_75 are hardware-qualified (STATUS.md item 15) -- sm_50/52/60/70 are
+rem untested, included because nvcc accepts them, not because a card
+rem confirmed them.
+rem
+rem The version check is inlined here rather than a separate `call`ed
+rem subroutine: a `call`ed `exit /b` only returns to the caller with an
+rem errorlevel set, it does not stop the calling script by itself -- that
+rem exact gotcha cost a real bug during development (this error printed,
+rem then the build continued anyway). A plain `goto` to an error label
+rem below, matching :arch_bad/:native_bad's own convention, has no such
+rem trap and needs no caller-side errorlevel check.
+set "NVCC_VER_LINE="
+for /f "tokens=*" %%L in ('nvcc --version ^| findstr /c:"release"') do if not defined NVCC_VER_LINE set "NVCC_VER_LINE=%%L"
+set "NVCC_MAJOR="
+if not defined NVCC_VER_LINE goto :arch_full_ver_bad
+rem Search for the word "release", not a fixed field position: findstr
+rem confirms it is present, then %VAR:*release =% strips everything up to
+rem and including it, wherever it falls in the line. A previous version of
+rem this used a fixed "tokens=2 delims=," position, which would silently
+rem break if nvcc's banner ever gains or loses a field before "release" --
+rem this is the same "search for the keyword" approach the Makefile's own
+rem `grep -oE 'release [0-9]+'` already uses, not a fixed-position guess.
+set "NVCC_REST=%NVCC_VER_LINE:*release =%"
+for /f "tokens=1 delims=, " %%V in ("%NVCC_REST%") do set "NVCC_VER=%%V"
+for /f "tokens=1 delims=." %%A in ("%NVCC_VER%") do set "NVCC_MAJOR=%%A"
+echo %NVCC_MAJOR%| findstr /r /c:"^[0-9][0-9]*$" >nul || goto :arch_full_ver_bad
+if %NVCC_MAJOR% GEQ 13 goto :arch_full_too_new
+set "NVCC_ARCH=%NVCC_ARCH_ALL_SASS% -gencode arch=compute_70,code=sm_70 -gencode arch=compute_61,code=sm_61 -gencode arch=compute_60,code=sm_60 -gencode arch=compute_52,code=sm_52 -gencode arch=compute_50,code=sm_50 %NVCC_ARCH_PTX_FALLBACK%"
+goto :arch_done
+
+:arch_full_ver_bad
+echo error: GPU_ARCH=full: could not read nvcc's version (got "%NVCC_MAJOR%" from `nvcc --version`^).
+exit /b 1
+
+:arch_full_too_new
+echo error: GPU_ARCH=full needs CUDA ^<= 12.8 -- nvcc reports release %NVCC_MAJOR%.x,
+echo        and CUDA 13 dropped Maxwell/Pascal/Volta outright ^(verified
+echo        2026-09-09: nvcc 13.0 refuses sm_50/52/60/61/70; nvcc 12.8.93
+echo        accepts all of them^). Put a CUDA ^<= 12.8 Toolkit's bin directory
+echo        on PATH to build this target.
+exit /b 1
 
 :arch_native
 set "GPU_CC="

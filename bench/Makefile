@@ -28,8 +28,8 @@ CXX       ?= g++
 # finding 48's --reps 100 floor is calibrated against, and it recurs every
 # process start if the cache is disabled or evicted.
 #
-# sm_80 is also the floor, and it is a tuning floor rather than an instruction
-# one. The only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
+# sm_80 was the floor at the tuning level, but not at the instruction one. The
+# only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
 # __ballot_sync (k_apply's threshold scan), which all long predate Ampere --
 # but k_fill_l1's, k_fill_l2's AND k_apply's __launch_bounds__(512, 3) target
 # 1536 threads/SM and 3 x 33 KB of shared memory, which are Ampere-and-later
@@ -37,21 +37,60 @@ CXX       ?= g++
 # finding 75); its opt-in per-block shared-memory LIMIT is still queried from
 # the selected device at runtime rather than hardcoded, but the three-block
 # occupancy target it now carries is not. sm_75 still compiles with ptxas
-# warning that .minnctapersm is out of range on every fill kernel -- and now on
-# k_apply too, Turing offering 1024 threads/SM against the annotation's 1536 --
-# and then oversubscribes Turing's 64 KB of shared memory in the fill path.
-# Below that nothing is possible anyway: CUDA 13 dropped Volta, so nvcc 13.2
-# rejects sm_70 outright.
-GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
-                -gencode arch=compute_90,code=sm_90 \
-                -gencode arch=compute_89,code=sm_89 \
-                -gencode arch=compute_86,code=sm_86 \
-                -gencode arch=compute_80,code=sm_80 \
-                -gencode arch=compute_80,code=compute_80
+# warning that .minnctapersm is out of range on every fill kernel -- k_fill_l1
+# and k_fill_l2 specifically, confirmed on real Turing hardware 2026-09-09
+# (STATUS.md item 15). k_apply does NOT trip that warning on either Turing or
+# Pascal, measured on real GTX 1080 and RTX 2080 Ti hardware the same day --
+# so the tuning floor turned out not to bite the kernel that is actually in
+# the production pipeline. sm_61 and sm_75 are QUALIFIED on real hardware
+# (STATUS.md item 15: correctness-matched against the RTX 3090/4090, same
+# relation counts, same split/dead/stuck candidates); sm_50/52/60/70 below are
+# NOT -- added because nvcc accepts them, not because a card confirmed them.
+#
+# sm_70 and below are a harder floor: CUDA 13 dropped Maxwell/Pascal/Volta
+# outright, confirmed 2026-09-09 by direct compile test against real nvcc
+# 13.0 in a k8s pod -- `nvcc fatal: Unsupported gpu architecture 'compute_70'`
+# (and the same for 50/52/60/61). Only sm_75-and-later compiles under the
+# CUDA 13.2/13.3 line this project's canonical build uses, which is why
+# GPU_ARCH_all stops at sm_75 rather than reaching down to sm_50. Building
+# for sm_50/52/60/61/70 needs CUDA <= 12.8 (confirmed the same day against
+# real nvcc 12.8.93: all five compile, deprecation warning only) -- use
+# `make GPU_ARCH=full` on a toolchain that old, not this default target.
+# Split into a shared SASS list and the PTX-fallback suffix so GPU_ARCH_full
+# below can compose from GPU_ARCH_all_SASS instead of re-spelling it -- one
+# list to update when a target joins or leaves the fat binary, not two.
+GPU_ARCH_all_SASS := -gencode arch=compute_120,code=sm_120 \
+                      -gencode arch=compute_90,code=sm_90 \
+                      -gencode arch=compute_89,code=sm_89 \
+                      -gencode arch=compute_86,code=sm_86 \
+                      -gencode arch=compute_80,code=sm_80 \
+                      -gencode arch=compute_75,code=sm_75
+GPU_ARCH_PTX_FALLBACK := -gencode arch=compute_80,code=compute_80
+GPU_ARCH_all := $(GPU_ARCH_all_SASS) $(GPU_ARCH_PTX_FALLBACK)
+
+# A second, opt-in fat-binary set (`make GPU_ARCH=full`): every target above
+# plus sm_50/52/60/61/70, sm_50 through sm_120 in one binary. Needs CUDA <=
+# 12.8: CUDA 13 hard-rejects sm_50/52/60/61/70 outright (see the
+# sm_70-and-below note above) -- verified 2026-09-09 that nvcc 12.8.93 alone
+# accepts the WHOLE span (sm_90/sm_120 are not a 12.8 problem, only
+# sm_50/52/60/61/70 under 13.x are). Only sm_61 and sm_75 are
+# hardware-qualified (STATUS.md item 15); sm_50/52/60/70 are untested --
+# included because nvcc accepts them, not because a card confirmed them.
+# Carries the same PTX floor as GPU_ARCH_all, for the same
+# forward-compatibility reason.
+GPU_ARCH_full := $(GPU_ARCH_all_SASS) \
+                 -gencode arch=compute_70,code=sm_70 \
+                 -gencode arch=compute_61,code=sm_61 \
+                 -gencode arch=compute_60,code=sm_60 \
+                 -gencode arch=compute_52,code=sm_52 \
+                 -gencode arch=compute_50,code=sm_50 \
+                 $(GPU_ARCH_PTX_FALLBACK)
 
 # `make GPU_ARCH=native` builds only for the card in this machine,
 # `make GPU_ARCH=86` cross-builds for a named one (bare compute capability, no
-# "sm_" and no dot), and the default builds the portable fat binary.
+# "sm_" and no dot), `make GPU_ARCH=full` builds sm_50 through sm_120 in one
+# binary (needs CUDA <= 12.8, see GPU_ARCH_full above), and the default
+# builds the portable sm_75-and-later fat binary.
 #
 # Named GPU_ARCH, not ARCH: ARCH is exported by kernel-build and cross-compile
 # shells and by some CI images, and make imports the environment, so an inherited
@@ -65,7 +104,7 @@ GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
 #                              CF_LMAX=3   CF_LMAX=4 (default)
 #     sm_120 alone                 277 s         754 s
 #     sm_80 alone                   15 s          26 s
-#     all six targets, -t 0           --         750 s   <- the default
+#     six targets, -t 0               --         750 s   <- measured here
 #
 # Two conclusions, and only the second one changed. ptxas on sm_120 is ~29x
 # slower than on sm_80 and swamps everything else, so the six-target fat build
@@ -73,6 +112,13 @@ GPU_ARCH_all := -gencode arch=compute_120,code=sm_120 \
 # its job, adding sm_90 was free, and dropping targets buys nothing. Keep the
 # fat binary here. GPU_ARCH=native is the real win on an Ampere or Ada host,
 # where it drops sm_120 and takes the build to well under a minute.
+#
+# GPU_ARCH_all is SEVEN targets today, not six: sm_75 joined it 2026-09-09,
+# after this table was measured, and was not re-timed. The conclusion above
+# ("adding a target was free, sm_120 alone dominates") is almost certainly
+# still true -- sm_75 is a cheap ptxas target, cheaper than sm_90 was -- but
+# that is inference from the same mechanism, not a re-measurement, and this
+# table is not evidence for a seven-target default until someone re-times it.
 #
 # What changed is the CAUSE. The 4th cofactor limb costs sm_120 2.72x, and
 # that -- not the target list -- is why a full build now takes ~12.5 min. For
@@ -104,11 +150,42 @@ $(error GPU_ARCH=native: no usable compute capability from nvidia-smi (got "$(GP
 endif
 NVCC_ARCH := -gencode arch=compute_$(GPU_CC),code=sm_$(GPU_CC)
 else
+ifeq ($(GPU_ARCH),full)
+# sm_50-through-sm_120 fat binary -- see GPU_ARCH_full above. Needs CUDA <=
+# 12.8: CUDA 13 hard-rejects sm_50/52/60/61/70 with "Unsupported gpu
+# architecture", confirmed 2026-09-09 against real nvcc 13.0; nvcc 12.8.93
+# accepts all of them.
+#
+# Skipped when every requested goal is `clean` -- clean touches no
+# compiler at all, and build_windows.bat's own `clean` argument bypasses
+# all GPU_ARCH logic the same way (its `clean` check runs before arch
+# parsing even begins). A bare `make GPU_ARCH=full clean` should not need a
+# working nvcc. $(MAKECMDGOALS) empty means no goal was named on the
+# command line, i.e. the default goal (`all`, which does need nvcc) runs.
+GPU_ARCH_FULL_NEEDS_NVCC := $(strip $(if $(MAKECMDGOALS),$(filter-out clean,$(MAKECMDGOALS)),1))
+ifneq ($(GPU_ARCH_FULL_NEEDS_NVCC),)
+# override, not plain :=, on all three: a command-line NVCC_MAJOR=/
+# NVCC_MAJOR_VALID=/NVCC_TOO_NEW= would otherwise take precedence over the
+# assignment below (GNU Make command-line variables always win over a
+# simple in-makefile assignment) and could silently defeat this gate.
+override NVCC_MAJOR := $(shell $(NVCC) --version 2>/dev/null | grep -oE 'release [0-9]+' | grep -oE '[0-9]+')
+override NVCC_MAJOR_VALID := $(shell echo '$(NVCC_MAJOR)' | grep -qxE '[0-9]+' && echo yes)
+ifneq ($(NVCC_MAJOR_VALID),yes)
+$(error GPU_ARCH=full: could not read nvcc's version (got "$(NVCC_MAJOR)" from `$(NVCC) --version`))
+endif
+override NVCC_TOO_NEW := $(shell [ $(NVCC_MAJOR) -ge 13 ] && echo yes)
+ifeq ($(NVCC_TOO_NEW),yes)
+$(error GPU_ARCH=full needs CUDA <= 12.8 -- $(NVCC) reports release $(NVCC_MAJOR).x, and CUDA 13 dropped Maxwell/Pascal/Volta outright (verified 2026-09-09: nvcc 13.0 refuses sm_50/52/60/61/70 with "Unsupported gpu architecture"; nvcc 12.8.93 accepts all of them). Point NVCC at a 12.x toolchain, e.g. the nvidia/cuda:12.8.1-devel-ubuntu22.04 image already used for the cross-GPU qualification in STATUS.md item 15)
+endif
+endif
+NVCC_ARCH := $(GPU_ARCH_full)
+else
 GPU_ARCH_VALID := $(shell echo '$(GPU_ARCH)' | grep -qxE '[0-9]+' && echo yes)
 ifneq ($(GPU_ARCH_VALID),yes)
-$(error GPU_ARCH must be all, native, or a bare compute capability like 86 or 120 -- got "$(GPU_ARCH)". Not sm_86, not 8.6)
+$(error GPU_ARCH must be all, native, full, or a bare compute capability like 86 or 120 -- got "$(GPU_ARCH)". Not sm_86, not 8.6)
 endif
 NVCC_ARCH := -gencode arch=compute_$(GPU_ARCH),code=sm_$(GPU_ARCH)
+endif
 endif
 endif
 

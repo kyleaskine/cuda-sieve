@@ -234,6 +234,12 @@ static void usage(void)
 "  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
 "                   [6 for --cofac; 4 for --pipeline --cofactor]\n"
 "  --cof-budget N   rho iterations in the first round\n"
+"  --cof-chunk N    cofactor records per launch; 0 = auto [0], sized from the\n"
+"                   device and the measured stage time, never below one record\n"
+"                   per thread. Splits a round across several launches so a\n"
+"                   slow device cannot exceed its GPU watchdog mid-kernel. A\n"
+"                   positive value pins it; any value >= the batch is one\n"
+"                   launch. Results are identical whatever it is set to\n"
 "                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
 "  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
 "                   while tuned stage 2 is near rho at matched yield\n"
@@ -999,6 +1005,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * bites, the fix is a separate curve-escalation count, not a bigger
      * shared one. */
     cfg.cofactor = 0; cfg.cof_rounds = 4; cfg.cof_budget = 65536;
+    cfg.cof_chunk = 0;
     cfg.cof_ecm = COF_METHOD_AUTO;  /* per side, by LP count; --cof-ecm/--cof-rho force */
     cfg.ecm_b1 = 0; cfg.ecm_b2 = 0; cfg.ecm_curves = 0;   /* 0 = derive */
     cfg.cof_meth0 = cfg.cof_meth1 = COF_METHOD_RHO;
@@ -1207,6 +1214,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
         else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
+        else if (!strcmp(argv[i], "--cof-chunk") && i + 1 < argc) { cfg.cof_chunk = (uint32_t)strtoul(argv[++i], 0, 10); }
         else if (!strcmp(argv[i], "--cof-ecm")) cfg.cof_ecm = COF_METHOD_ECM;
         else if (!strcmp(argv[i], "--cof-rho")) cfg.cof_ecm = COF_METHOD_RHO;
         /* Deriving is now unconditional, so this is accepted and ignored

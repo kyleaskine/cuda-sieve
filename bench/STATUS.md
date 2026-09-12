@@ -3032,8 +3032,11 @@ finding 92.
     read 2026-08-20, NOT tested on any such card.** **Fixed 2026-08-21:** both
     the production pipeline and standalone apply benchmark now query
     `cudaDevAttrMaxSharedMemoryPerBlockOptin` from the selected device at runtime;
-    the default remains `--region 14`. `GPU_ARCH_all` starts at sm_80, but the
-    apply path no longer assumes one architecture family's opt-in limit.
+    the default remains `--region 14`. `GPU_ARCH_all` started at sm_80 at the
+    time (sm_75 joined it later, 2026-09-09 -- see below, this item is now
+    stale on that specific point), but the apply path no longer assumes one
+    architecture family's opt-in limit regardless of which target sits at
+    the fat binary's floor.
 
     Before the fix, both `pipeline.cuh` and `bench_kernels.cu` hardcoded
     `101376` bytes as "the opt-in limit". CUDA does not define one universal
@@ -3059,16 +3062,105 @@ finding 92.
     kernel is launched. This is capability detection only: `--region 14` is
     still the default because larger regions have not been shown to be faster.
 
-    **What is NOT established.** No card older than the current sm_80 build
-    floor has been qualified by this change. Lowering `GPU_ARCH_all` would still
-    require compilation and byte-comparison testing on that hardware.
-    Launch-bounds/shared-memory tuning remains a separate constraint, and as of
-    2026-08-25 it is **no longer confined to the fill kernels**: `k_apply`
-    carries `__launch_bounds__(512, 3)` too (finding 75), so it targets 1536
-    threads/SM and three blocks of ~33 KB. On a 1024-thread/SM part such as
-    sm_75 that annotation both trips the `.minnctapersm` warning and cannot
-    reach its three-block target — on the kernel that is 54% of the sieve
-    chain. Qualify apply alongside fill, not after it.
+    **QUALIFIED on sm_61 AND sm_75, 2026-09-09.** Real GTX 1080 (Pascal,
+    compute 6.1, 8 GB) and RTX 2080 Ti (Turing, compute 7.5, 11 GB), each via
+    a k8s pod (`nvidia/cuda:12.8.1-devel-ubuntu22.04`, toolkit 12.8.93), built
+    with `GPU_ARCH=61` / `GPU_ARCH=75` respectively. On both: `make bench`
+    compiled clean, `--verify-only` passed, `fbgen_gpu` reproduced
+    `oracle/c183.fb1` byte-for-byte identically (7,605,616 entries, matching
+    the RTX 4090's own generation of the same file), `cofcheck.sh` passed all
+    ~52 cases (including the 4-slab apply path this item is actually about),
+    and a real `--pipeline --cofactor` band against `oracle/c183` reproduced
+    the SAME candidate/relation counts on both cards as on the RTX 3090/4090
+    (44 relations from the sieve pass, 254 total after cofactorisation,
+    identical side-0/side-1 split/dead/stuck counts) -- correctness, not just
+    "it ran".
+
+    **The Turing warning this item worried about turned out to name the
+    wrong kernel.** `k_fill_l1`/`k_fill_l2` DO trip
+    `ptxas warning: ... .minnctapersm will be ignored` on real sm_75 hardware,
+    exactly as this note predicted -- but `k_apply` does not, on EITHER
+    Pascal or Turing. That distinction matters because `k_fill_l1`/`k_fill_l2`
+    are the two-level fill kernels, reachable only through the benchmark
+    harness's `--fill-mode twolevel` (refused outright under `--pipeline`,
+    and already measured 2.7x slower than the shipping `k_fill_atomic` path --
+    see item 1). `k_apply` is the kernel actually in the production pipeline,
+    and it produced zero occupancy warnings and zero wrong output on both
+    real devices. The GTX 1080 run separately confirmed the same thing on
+    Pascal (no warning there either) with no `-Xptxas -v` cross-check on
+    either card, so "why" is still a plausible read (Pascal's 2048 max
+    resident threads/SM and Turing's 1024 are both apparently enough headroom
+    for `k_apply`'s three-block target where the wider fill kernels are not),
+    not a measurement -- but "does it happen" is now settled by hardware on
+    both architectures, and it does not.
+
+    **`GPU_ARCH_all` UPDATED 2026-09-09: sm_75 added.** `sm_75` is now in the
+    default fat binary (both `Makefile` and `build_windows.bat`) alongside
+    sm_80/86/89/90/120 -- it is qualified above and compiles clean under this
+    project's CUDA 13.2/13.3 canonical toolchain. `sm_61` was NOT added to
+    `GPU_ARCH_all`: CUDA 13 hard-rejects it (`nvcc fatal: Unsupported gpu
+    architecture 'compute_61'`, confirmed the same day against real nvcc
+    13.0), so it cannot live in the same fat binary as sm_75/80/86/89/90/120
+    at all, qualified or not -- this is an nvcc floor, not a caution.
+
+    A second, opt-in target -- `GPU_ARCH=full` -- was added instead, covering
+    every `GPU_ARCH_all` target plus sm_50/52/60/61/70: sm_50 through sm_120
+    in one binary. It needs CUDA <= 12.8 (verified: nvcc 12.8.93 accepts the
+    whole span; nvcc 13.0 accepts only sm_75-and-later) and the Makefile/
+    batch script both detect and reject a >=13 nvcc with an explicit error
+    rather than failing with a bare "Unsupported gpu architecture". Same
+    qualification split as above: only sm_61/sm_75 are hardware-confirmed;
+    sm_50/52/60/70 are in the list because nvcc accepts them, not because a
+    card has.
+
+    (An intermediate design briefly split this into two opt-in targets --
+    `GPU_ARCH=legacy` for just sm_50-through-sm_75, and `GPU_ARCH=full` as
+    their union -- before `legacy` was dropped as redundant: `full` is a
+    strict superset, and item 16's -t 0 concurrency argument says adding a
+    target is free WHEN the build host has at least as many free threads as
+    targets. **Not re-measured for this 12-target case** -- item 16's table
+    was 6-7 targets on a 16-thread box, so "no real extra cost" here is
+    inference from that mechanism, not a fresh measurement; a host with
+    fewer than 12 free threads would see the extra legacy targets queue
+    rather than run concurrently.)
+
+    Both the Makefile and `build_windows.bat` paths for `GPU_ARCH=full` were
+    exercised directly (dry-run against real nvcc 13.0 and 12.8 in k8s pods
+    for the Makefile; fake `nvcc`/`cl` stubs under real cmd.exe for the
+    batch script) -- and that exercise caught a real bug in the first draft
+    of the batch script, back when it still had a separate `:arch_legacy`
+    target sharing this gate: `exit /b 1` inside a `call`ed subroutine only
+    returns to the caller with an errorlevel set, it does not stop the
+    calling script, so the version-gate error printed and the build
+    continued anyway. Fixed at the time by checking `if errorlevel 1 exit /b
+    1` after the `call`.
+
+    **A code review of this whole change (same day) found 14 more issues**
+    before it was committed -- most were documentation drift this entry
+    itself was causing (the sm_80-floor claim above, the six/seven-target
+    count, the repetition just edited out of the two paragraphs above), but
+    two were real: `bench/testsieve.sh`'s `gpu_arch_arg()` counted
+    `-gencode` entries in `.arch.stamp` to reconstruct which `GPU_ARCH` a
+    tree was built with, and its `>1 means the default all list` assumption
+    silently broke the moment `full` also became a multi-gencode option --
+    it would have told an operator to rebuild a `full` tree with a bare
+    `make fbgen_gpu`, quietly reverting it to `all` and invalidating every
+    object in it. Fixed by teaching it the two known counts (7 and 12)
+    instead of treating any count over 1 as "the default". Separately, the
+    batch script's `call`-based subroutine was inlined into `:arch_full`
+    (removing the `call`/`errorlevel` trap by construction, not just
+    documenting it), and `:arch_all`/`:arch_full` were changed to compose
+    their gencode lists from one shared SASS string instead of each
+    re-spelling it -- which, while re-verifying the composed lists against
+    real cmd.exe, surfaced a THIRD real bug: the shared string was
+    initialized after the `GPU_ARCH=all`/`full` dispatch `goto`s, so both
+    branches read it before it was ever set. Two deliberate exclusions from
+    that review, left as-is: `bench.h`'s `TD_RECORD_THREADS` comment still
+    enumerates sm_80/86/89/90 as the "512 threads may be fine" set without
+    sm_75 (a real gap, but out of scope for this entry), and the version
+    gate still checks only that nvcc isn't *too new* (>= 13) and not that
+    it's new enough for sm_90/sm_120 (CUDA >= 11.8 / >= 12.8) -- a real
+    asymmetry, deliberately deferred rather than fixed here.
 16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
     **See first: the default-goal trap, fixed 2026-08-25 (finding 75).** Until
     that date the Makefile had no `.DEFAULT_GOAL`, and its first explicit rule
@@ -3104,6 +3196,9 @@ finding 92.
        The fat binary is free and adding sm_90 cost nothing measurable — the
        one target that cannot be dropped is the expensive one. This confirms
        the stale table's *conclusion* even though its numbers are wrong.
+       (`GPU_ARCH_all` is seven targets as of 2026-09-09, sm_75 having
+       joined after this measurement; not re-timed, so "free" above is this
+       table's finding, not a re-verified one for today's default.)
     3. **The ptxas asymmetry widened.** sm_120/sm_80 was ~15x when the table
        was written and is **29x** now (754/26). The 4th limb costs sm_120
        disproportionately, so this is a ptxas scaling problem on Blackwell

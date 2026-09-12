@@ -2227,7 +2227,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                             " two).");
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                           cfg->cof_rounds, cfg->cof_budget, blocks,
+                           cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
                            cfg->threads, fr)) { rc = -1; break; }
             /* Guarded on fr, like the clean stop above and like the
              * norm-width cap: without a relation file there is nothing to
@@ -2268,7 +2268,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             wd_phase("stop.cofq_flush");
             if (cfg->cofactor && Q.n &&
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                           cfg->cof_rounds, cfg->cof_budget, blocks,
+                           cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
                            cfg->threads, fr)) { rc = -1; break; }
             pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
                                 base_rel + (cfg->cofactor ? Q.nrel
@@ -2343,7 +2343,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                     " over the band.", nqskip);
                     if (cfg->cofactor && Q.n &&
                         cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim,
-                                   cfg->lpb, cfg->cof_rounds, cfg->cof_budget,
+                                   cfg->lpb, cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk,
                                    blocks, cfg->threads, fr)) { rc = -1; break; }
                     /* Guarded on fr, like the degradation ceiling above.
                      * pipe_checkpoint returns 0 -- success -- at its own
@@ -2638,7 +2638,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     wd_phase("slab.cofq_flush");
                     if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
                                    cfg->lim, cfg->lpb, cfg->cof_rounds,
-                                   cfg->cof_budget, blocks, cfg->threads, fr)) {
+                                   cfg->cof_budget, cfg->cof_chunk,
+                                   blocks, cfg->threads, fr)) {
                         rc = -1; break;
                     }
                     if (fr && slab == 0)
@@ -3157,7 +3158,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const double cf0 = host_ms();
         wd_phase("band.final_cofq_flush");
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
-                       cfg->cof_rounds, cfg->cof_budget, blocks, cfg->threads, fr))
+                       cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks, cfg->threads, fr))
             rc = -1;
         cofac_tail = host_ms() - cf0;
     }
