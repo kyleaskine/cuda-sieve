@@ -10155,6 +10155,15 @@ is kept as `bench/attic/lazy_norm_v3.patch` (575 lines, against `6997d77`:
 kernel, `--lazy-norm`, the cofcheck identity gate, the `LAZY_NORM_CHECK`
 build).
 
+> **Corrected 2026-09-25 by finding 104.** The spill was NOT the cost of the
+> lazy designs. Design 3's lazy instantiation spilled one value, once per
+> 32-group batch; the +16% below was design 2's EAGER path, whose allocation
+> the runtime flag changed. What cost design 3 was its correction pass, which
+> tested every cell a second time behind an extra barrier: merging it into the
+> scan took c183 from +13.5% to ~0% (finding 104). The heading's "a register
+> spill that alone cost +16%" and the control section's "covers most of the
+> +11-14% losses" are wrong on that point.
+
 ### The idea (STATUS item 10)
 
 The init writes `CINIT - T(x)` into every cell, where `T` costs two degree-`d`
@@ -10281,3 +10290,172 @@ loss. `--norm const` existed the whole time.
 | transform + plattice | 3.09 | 5% |
 | host per-q, intersect, unaccounted | ~4.5 | 7% |
 | **wall** | **67.45** | |
+
+## Finding 104 — two more lazy-norm designs. One pass instead of two took c183 from +13.5% to ~0%; a lane-per-group scan then WON on c183 (apply −13.6%, wall −4.3%) but LOST on C194 (apply +3%) and AS276 (+16%). Not shipped; item 10 parked. Finding 103's spill explanation was wrong
+
+**Date:** 2026-09-25, RTX 5070, card idle, host load 2.2-2.6 (one CPU ECM
+stage-2 process). Base: `8d36ed4` (kernel code as `6997d77`). Reverted again;
+both designs are kept, self-contained against `8d36ed4` (each carries the
+floor, the `LAZY_NORM_CHECK` build, `--lazy-norm` and the cofcheck gate from
+`lazy_norm_v3.patch`): `bench/attic/lazy_norm_v4.patch` (design 4, 624 lines)
+and `bench/attic/lazy_norm_v5.patch` (design 5, 651 lines). The kernel code is
+as measured; only comments and the default changed afterwards: `--lazy-norm`
+defaults to **0** in both, because applying a patch must not silently switch
+every run to a lever that loses on C194 and AS276 while every identity gate
+still passes. The measured runs passed `--lazy-norm 0|1` explicitly.
+
+### Correction to finding 103: the spill was not the cost
+
+Finding 103 put most of design 3's loss on "the 8-byte spill every lazy variant
+carried". Wrong. Design 3's lazy instantiation spilled ONE value, the group
+floor: one `STL` and one `LDL` per 32-group batch, i.e. per warp per region
+on c183. The +16% belonged to design 2's EAGER path, whose allocation the
+runtime flag changed; nothing measured it on a lazy path. What ncu's
+source counters do show for design 3 is the correction pass itself: its
+per-group candidate test (~0.4 G instructions on the algebraic side) read
+and tested every cell a second time, about as much as the scan that followed
+it (~0.44 G), behind an extra barrier. Item 10's "spill-free" next step was
+aimed at the wrong cost.
+
+### Design 4: the correction pass merged into the scan
+
+Zero init as in design 3, but the candidate test IS the threshold scan: each
+warp floors 32 groups lane-parallel, tests group by group (one shuffle for the
+floor, one ballot), queues candidates with the `__ffs` loop, computes `T` 32
+at a time, and routes each exact survivor to the lane that owns its group's
+survivor word, which is stored once per batch. No extra pass, no extra barrier.
+One spill (the warp's survivor count, once per batch).
+
+| design 4 | eager apply | lazy apply | change |
+|---|---:|---:|---:|
+| c183, 3 interleaved rounds (eager = HEAD + `--lazy-norm 0`) | 18.672 ms | 18.694 | +0.1% |
+| C194, 2 ABBA pairs | 81.23 | 95.20 | **+17.2%** |
+| AS276, 1 pair | 206.82 | 261.15 | **+26.3%** |
+
+The c183 raw arms: eager 18.63-18.70 (six runs), lazy 18.67-18.75. That the
+pair repeats finding 103's design-2 eager-arm check (18.67 vs 18.69) to the
+hundredth is a coincidence: different binaries, a different day, host load
+1.8-2.5 against 13-24.
+
+ncu, c183, one q's two launches (eager -> lazy), at ncu's defaults -- which
+**lock the clocks at base (`--clock-control base`) and serialise kernels**,
+neither of which the pipeline does; every ncu reading in this finding carries
+that caveat: executed instructions
+5.45 -> 4.34 G (−20%) and 3.54 -> 2.68 G (−24%); **issue slots busy 89 -> 71%
+and 88 -> 67%**; barrier-stall PC samples 77k -> 278k and 49k -> 233k, almost
+all at the `__syncthreads` after the bucket add; small-prime sieve samples
++15%. The instructions are saved, and the issue slots are lost.
+
+**This is specific to the lazy kernels, not to removing the norm.** The
+standalone `--norm const` control under ncu (algebraic side) keeps barrier
+stall at 0.67 per issued instruction (0.66 exact), while design 4 goes 0.68 ->
+2.56. So the barrier growth is not "the norm was hiding imbalance". **The
+mechanism is not identified**: the code before that barrier is the same in both
+builds. One guess, UNTESTED: the lazy scan's shared-memory reads, shuffles and
+ballots contend with the small-prime sieve's shared atomics in other resident
+blocks, where the eager norm is pure FMA. Also unexplained: under ncu design 4 was
+2-5% FASTER per launch; in the pipeline it was flat. Locked clocks are NOT the
+explanation: the re-read at `--clock-control none` below still has design 4
+10.6% faster on c183's algebraic side. That leaves ncu's kernel serialisation,
+untested.
+
+### Design 5: lane per group
+
+Lane k of each warp owns group `gb+k` outright: its floor, its candidate mask
+(four 128-bit shared loads, rotated by `lane>>1` so each 8-lane phase hits all
+eight 16-byte bank groups, and packed 16-bit `__vcmpgeu2` compares), and its
+survivor word. Candidates are compacted 32 per round by a prefix sum over the
+lanes' counts and a 5-step binary search for each slot's owner; each round
+writes the candidates' exact cells back, and after `__syncwarp` each owner
+re-reads its group against `THRESH`. No per-group shuffle, ballot or serial
+loop. The same one-value spill.
+
+| design 5 | eager apply | lazy apply | change | eager wall | lazy wall | change |
+|---|---:|---:|---:|---:|---:|---:|
+| c183, 3 interleaved rounds | 19.075 ms | 16.474 | **−13.6%** | 66.78 ms/q | 63.94 | **−4.3%** |
+| C194, 2 ABBA pairs | 83.22 | 85.79 | +3.1% | 251.44 | 254.19 | +1.1% |
+| AS276, 1 pair | 212.28 | 246.25 | +16.0% | 623.45 | 662.97 | +6.3% |
+
+The c183 eager arm (HEAD and `--lazy-norm 0` agree: 19.03 and 19.12) is
+0.4 ms higher than design 4's run at the same load; the comparison is within
+each run's interleaved arms. The c183 lazy arms are 16.42-16.50 against
+eager's 18.89-19.41: no overlap.
+
+**C194 loses per launch, not in aggregate only.** `gpu__time_duration` of
+all 16 `k_apply` launches of 2 q: eager 12.93-14.23 ms (odd launches) and
+9.44-10.83 (even); lazy 14.04-15.54 and 9.66-10.87, slower in 13 of the 16
+launch-for-launch pairs.
+(A `--set full` profile of two of those launches showed lazy faster, 14.50 ->
+14.12 and 10.92 -> 9.06; it replays each kernel many times, and the plain
+duration pass is the one to trust. Its other readings: issue slots busy 87 ->
+60% and 83 -> 56%, instructions −29% and −39%. Same shape as design 4: fewer
+instructions, idle issue slots -- at base clocks, as above.)
+
+### Re-read at unlocked clocks, by side
+
+A review asked whether ncu's locked base clocks made the issue-slot readings,
+and whether a per-side switch (lazy only where it wins) would help. `ncu
+--clock-control none`, every `k_apply` launch, one arm after another in the
+order HEAD, design 4, design 5, HEAD (2 q for c183 and C194, 1 q for AS276;
+the pipeline issues side 1, the algebraic side, first). Mean duration per
+launch, HEAD as the mean of its two runs:
+
+| | c183 alg | c183 rat | C194 alg | C194 rat | AS276 alg | AS276 rat |
+|---|---:|---:|---:|---:|---:|---:|
+| HEAD, ms (run 1 / run 2) | 11.87 / 12.32 | 7.24 / 7.22 | 11.81 / 11.94 | 8.53 / 8.94 | 14.54 / 15.52 | 11.19 / 11.99 |
+| design 4 | −10.6% | −1.0% | +16.4% | +6.4% | +29.0% | +24.5% |
+| design 5 | **−20.9%** | **−15.0%** | +1.2% | −6.9% | **+14.9%** | **+19.4%** |
+| issue slots busy, HEAD -> design 5 | 89.8 -> 71.1% | 88.2 -> 60.5% | 88.1 -> 60.5% | 85.3 -> 55.2% | 83.7 -> 57.7% | 80.2 -> 50.3% |
+| barrier stall / issue, HEAD -> design 5 | 0.71 -> 2.94 | 0.59 -> 5.10 | 0.59 -> 5.45 | 0.58 -> 6.90 | 0.59 -> 6.00 | 0.52 -> 8.88 |
+
+- **The lost issue slots are real at boost clocks**, not a locked-clock
+  artifact: design 5 keeps 50-71% busy against HEAD's 80-90%. **The barrier
+  stall grows with job size, as the loss does**: ~3-5 per issued instruction on
+  c183, ~5.5-7 on C194, ~6-9 on AS276, against 0.5-0.7 eager.
+- **A per-side switch does not rescue AS276** (both sides lose 15-19%) and
+  would be a coin toss on C194. c183 wins on both sides.
+- **C194 is near break-even and these samples cannot settle it.** The two
+  HEAD runs differ by up to 4.9% per side (6.7% on AS276's algebraic side, the
+  later run slower in every column but one), so single-q readings are this
+  noisy. Summed over both sides this pass has design 5 −2.2% on C194, the
+  earlier duration-only pass at locked clocks had it slower in 13 of 16
+  launches, and the pipeline has it +3.1% over 2 ABBA pairs of 40 q. The
+  pipeline figure is the best-controlled of the three; the verdict rests on it
+  and on AS276, whose loss is large in every measurement.
+
+**The floor is not why the larger jobs lose.** A `LAZY_NORM_CHECK` build of
+design 5 on 4 C194 q: **0 of 12,884,901,888 cells with `Tlo > T`**, mean
+gap 1.05 units, 0.56% zero floors, as tight as c183's (0 of 16.1e9, 1.06,
+0.72%, rerun for both designs). The check build sends every cell through the
+compaction and write-back path, and its 20-q c183 relations match HEAD's
+byte for byte (876 relations, `b2d2e6a1`), as do the normal lazy build's.
+All timed runs were byte-identical (c183 `a6545ecf`, C194 `a2811e49`, AS276
+`20022ca0`). `make check` was not run on either design: the verdict does
+not ship code.
+
+### Verdict
+
+**Not shipped.** A lever that takes 4% off c183 wall and adds 1-6% to the
+representative C194 and the AS276 target is not a default. Its −4.3% is ~60%
+of finding 103's ceiling for c183 (the norm is ~24% of apply by
+duration-weighted instruction share, ~6.8% of wall). Making it an
+opt-in per job would need a measurement nobody has yet: which property of a
+job predicts the sign. Nothing here measured per-side candidate density on
+the three jobs, the obvious first suspect. **Item 10 is
+parked, not closed:** the ceiling still stands. Designs 4 and 5 saved 20-39%
+of `k_apply`'s instructions and lost issue slots (80-90% busy -> 50-73%, at
+base clocks and at boost alike); designs 2 and 3 saved only 6-8% (finding
+103) and design 1 was never profiled. So the last two show that where the saved instructions go
+matters more than how many are saved. If anyone returns to it: explain the
+barrier stall that grows with job size, from 0.5-0.7 per issued instruction
+eager to 3-9 lazy (both designs reproducible from the attic); the per-side
+split and the boost-clock re-read are done, above, and change nothing. Two known costs in design 5 were
+never removed: each compaction slot finds its bit with a serial divergent
+loop (a 5-step popc select would make it constant), and every
+candidate-holding group re-reads all 64 bytes although the round that wrote
+each cell already knows whether it passes.
+
+**Lesson:** read the profile before choosing what to fix. Finding 103 named
+the spill as the cost from an eager-path measurement. Two minutes of SASS and
+ncu source counters showed a trivial spill and a whole duplicated pass, and
+fixing the pass turned +13.5% into ~0% on the first try.

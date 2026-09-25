@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-24.**
+is not current. **Last updated 2026-09-25.**
 
 ## Architecture
 
@@ -839,9 +839,10 @@ compound to **~−21.8%** at matched host load (raw figures across the day mix
 host loads from ~4 to ~14.5). On the ALGEBRAIC side's `k_apply`, what leads now is the block tier's
 hits and their shared-memory atomics (~21% of its samples) and the norm (~15% of
 samples, 22.6% of instructions);
-the rational side's shares differ. Finding 103 tried to recover the norm
-lazily and lost (apply +11-14%), but a `--norm const` control removes 24-28%
-of apply, so that lever is open, not closed. Fresh profile at `6997d77`
+the rational side's shares differ. Findings 103-104 tried to recover the norm
+lazily in five designs: the best wins on c183 (apply −13.6%) but loses on
+C194 and AS276, so it is not shipped and item 10 is parked, although a
+`--norm const` control removes 24-28% of apply. Fresh profile at `6997d77`
 (finding 103): **fill 16.5 / apply 18.7 / TD + classify 14.6 / cofactor 10.1
 of 67.5 ms/q**. The older numbers below are all from before these findings.
 
@@ -1301,7 +1302,7 @@ not by size.
 | 8a | Share the warp tier's setup; fix the block tier's load balance | local GPU | **DONE 2026-09-23, finding 102** — warp-tier shuffle: apply −5.2% / wall −1.7% c183, −1.8% C194, −2.9% AS276, byte-identical. Rotating the block tier's start thread was SLOWER (apply +3.6%) and is dropped |
 | 8b | Pattern-sieve the tiniest moduli | local GPU | **open, and harder than it looks** — with 16-bit cells a word holds 2, so one modulus composed word-wide saves nothing; only summing ALL tiny moduli per word in registers (dropping their atomics for one plain RMW) can win, and it pays per-(entry, word) residue arithmetic. Dropping those moduli prices only the ceiling (finding 101). Block-tier hits + atomics are ~21% of the ALGEBRAIC `k_apply`'s samples |
 | 9 | Reclaim bucket VRAM freed by the skip | local GPU | **open, and NOT by scaling the estimate** — the per-region cap is uniform and a third of rows (odd `j`, `3` not dividing `j`) lose no records, so a cap scaled to 2/3 would overflow every slab (finding 100, review). Needs a per-row-class capacity; the current sizing is correct |
-| 10 | Lazy / bounded norm evaluation | local GPU | **open, re-scoped by finding 103** — three designs, all byte-identical with a floor clean on every cell of 20 c183 q (0 of 16.1e9, mean gap 1.06 units), all SLOWER (apply +11% to +14% c183). A `--norm const` control shows the norm IS recoverable (−24% / −28% of apply by side), so the losses were the designs' own cost: an 8-byte spill at the 40-register cap (alone +16%) and an extra barrier-separated pass. Ceiling ~24% of apply, ~6.8% of c183 wall. Next: a spill-free design; patch in `bench/attic/lazy_norm_v3.patch` |
+| 10 | Lazy / bounded norm evaluation | local GPU | **parked by finding 104** — five designs, all byte-identical, with a floor clean on every cell checked (0 of 16.1e9 c183, 0 of 12.9e9 C194; mean gap ~1 unit). The best (lane-per-group scan) takes c183 apply −13.6% / wall −4.3% but C194 apply +3% and AS276 +16%, so it is not shipped. Designs 4-5 saved 20-39% of the instructions and lost issue slots (80-90% -> 50-73% busy, at base and boost clocks alike), with barrier stall growing with job size (0.5-0.7 per issued instruction eager, 3-9 lazy); why is not identified. Ceiling ~24% of apply, ~6.8% of c183 wall (finding 103), of which design 5 took ~60% on c183. A per-side switch does not help (AS276 loses on both sides). Next: explain the barrier-stall growth. Patches `bench/attic/lazy_norm_v4.patch`, `lazy_norm_v5.patch` (default off) |
 | 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource

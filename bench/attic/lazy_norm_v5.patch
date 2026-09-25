@@ -1,0 +1,651 @@
+diff --git a/bench/Makefile b/bench/Makefile
+index f13d12b..2659862 100644
+--- a/bench/Makefile
++++ b/bench/Makefile
+@@ -30,7 +30,8 @@ CXX       ?= g++
+ #
+ # sm_80 was the floor at the tuning level, but not at the instruction one. The
+ # only warp intrinsics used are __syncwarp, __shfl{,_up}_sync and
+-# __ballot_sync (k_apply's threshold scan), which all long predate Ampere --
++# __ballot_sync (k_apply's threshold scan), which all long predate Ampere
++# (with --lazy-norm also __shfl_xor_sync, and the SIMD __vcmpgeu2) --
+ # but k_fill_l1's, k_fill_l2's AND k_apply's __launch_bounds__(512, 3) target
+ # 1536 threads/SM and 3 x 33 KB of shared memory, which are Ampere-and-later
+ # tuning numbers. k_apply acquired that annotation on 2026-08-25 (RESULTS
+diff --git a/bench/bench.h b/bench/bench.h
+index 87f4e46..d7426d1 100644
+--- a/bench/bench.h
++++ b/bench/bench.h
+@@ -629,6 +629,16 @@ typedef struct {
+      * k_apply as its own argument, which ORs it into not_both_even.
+      * RESULTS finding 100. */
+     int      sieve_skip;
++    /* Bound the norm target from below per 32-cell group
++     * (norm_group_floor) and compute the exact target only for cells that
++     * pass the threshold against that floor. 1 = on, 0 (the default) = the
++     * eager init. OFF by default because it LOSES on C194 (apply +3%) and
++     * AS276 (+16%) while winning on c183 (-13.6%). Output-identical as long
++     * as the floor is <= the exact value, which is derived and checked
++     * (LAZY_NORM_CHECK), not proven by the check. Pipeline only; the kernel
++     * falls back to the eager init whenever it is asked for exact values
++     * everywhere (dump, probe, cell dump). RESULTS findings 103-104. */
++    int      lazy_norm;
+     const char *other_bits; /* the OTHER side's bitmap; enables device intersect */
+     const char *emit;       /* write the compacted survivor list here           */
+     int      td;            /* run exact norms + trial division on survivors    */
+diff --git a/bench/bench_kernels.cu b/bench/bench_kernels.cu
+index 547ec57..db659a2 100644
+--- a/bench/bench_kernels.cu
++++ b/bench/bench_kernels.cu
+@@ -559,6 +559,204 @@ __device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
+         && !(not_both_even && pos_both_even(x, pos_row<SLABBED>(x, logI, j_base)));
+ }
+ 
++/* ---- the per-cell norm target, and a sound per-group floor under it ---- */
++
++/* T(x) for one cell: the value the init has always written, CINIT - T of it.
++ * One function so the eager init and the lazy scan cannot drift apart. */
++template <int CELLBITS>
++__device__ __forceinline__ uint32_t norm_cell_target(const norm_t &N, int32_t ii,
++                                                     uint32_t jj, uint32_t CINIT)
++{
++    const float fi = (float)ii;
++    const float fj = (float)jj;
++    const float u = fmaf(N.ua, fi, N.ub * fj);
++    const float v = fmaf(N.va, fi, N.vb * fj);
++    float acc = N.d[N.deg], vp = 1.0f;
++    /* The same Horner on |.|, which bounds the cancellation. The
++     * normalisation gives fp32 ample dynamic RANGE, but near a root
++     * line of F the terms are O(1) and cancel to something tiny, so
++     * what is left is mostly rounding noise. Measured before this
++     * guard: 144 of 63,497 positions in a band along the three real
++     * root lines rounded to the wrong sieve-log value, -3.31 to
++     * +2.57 units and BOTH SIGNS -- false survivors and lost
++     * relations alike. */
++    float aabs = fabsf(N.d[N.deg]), vpa = 1.0f;
++    const float au = fabsf(u), av = fabsf(v);
++    #pragma unroll
++    for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
++        if (k < N.deg) {
++            vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
++            vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
++        }
++    float s = fabsf(acc);
++    if (s < NORM_CANCEL_TOL * aabs) {
++        /* redo in fp64: (a,b) exactly in int64, sum at 2^-53.
++         * Doubles are 1/64 rate on this part, but this fires on
++         * well under one cell in a thousand. */
++        const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
++        const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
++        const double ud = a / N.A, vd = b / N.B;
++        double accd = N.dd[N.deg], vpd = 1.0;
++        #pragma unroll
++        for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
++            if (k < N.deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
++        s = (float)fabs(accd);
++    }
++    /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5).
++     * las clamps here at 255 because its cell IS a byte, and that
++     * is the whole reason `scale` exists (1.28 * 196.61 = 251.7).
++     * Our cell is 16 bits, so the ceiling is CINIT, not 255, and
++     * scale becomes a free parameter rather than a constraint --
++     * at scale 1.28 las discards 0.39 bits of resolution per
++     * position that we can keep. Clamping at 255 threw that away
++     * and, worse, would have silently flattened every norm above
++     * 255/scale into one bucket the moment anyone raised scale. */
++    /* log2f, NOT __log2f. The fast intrinsic is ~2 ulp and has no
++     * host equivalent, so the CPU replay could not mirror this
++     * expression exactly and "0 cells differ" was measuring two
++     * slightly different functions. Accurate log2f is reproducible
++     * on both sides; norm init was 1.76 ms of a 27 ms apply, so the
++     * difference is affordable and correctness is not. */
++#ifdef NORM_FAST_LOG2
++#warning "NORM_FAST_LOG2: __log2f breaks CPU parity; --verify and dumpcmp will \
++report spurious cell mismatches. Pricing builds only, never for relations."
++    /* PRICING SWITCH, not a shipping option: __log2f is one MUFU
++     * instruction against log2f's software sequence, and the point
++     * of building with it is to measure what the accurate version
++     * costs -- see the paragraph above for why the accurate one is
++     * the default.
++     *
++     * This SILENTLY INVALIDATES THE PARITY GATE, which is why the
++     * #warning above exists. poly.c's norm_target_host mirrors the
++     * device expression deliberately -- same float type, same
++     * clamp, same log2f -- so that "0 cells differ" means
++     * something. Building with this breaks the mirror on the
++     * device side only, and the ~2 ulp difference shows up as
++     * scattered mismatches at threshold boundaries that read
++     * exactly like a kernel regression. */
++    float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
++#else
++    float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
++#endif
++    int ti = (int)floorf(lg + 0.5f);
++    const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
++    return (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
++}
++
++/* --lazy-norm: a floor Tlo <= T(x) for all 32 cells x = xbase + 32g + 0..31
++ * of one group, which lie in one row at i0 .. i0+31. The lazy init leaves
++ * every cell at its bare sieved sum v, so CINIT - Tlo + v >= CINIT - T + v
++ * (the exact cell) and a threshold test against the floor is a SUPERSET test;
++ * only the cells that pass it pay for T. Survivors are identical exactly when
++ * Tlo <= T, and nothing else here has to be right: the correction writes
++ * CINIT - T + v, which does not involve Tlo at all.
++ *
++ * The floor is the mean value theorem on F_f, the normalised form evaluated in
++ * real arithmetic with the float parameters (d[], ua..vb). Along the row, u and
++ * v move by ua and va per cell, so with the centre c = i0 + 15.5 and h = 15.5,
++ *     |F_f(i)| >= |F_f(c)| - h * max|dF_f/di|   over i0 .. i0+31.
++ * Every |u| on the group is at most Ua = |ua|(|c| + h) + |ub| j -- the
++ * ABSOLUTE sum, which cancellation in u cannot shrink -- and likewise Va, both
++ * padded by 2^-20 relative for their own rounding. With P the
++ * absolute-coefficient form, max|dF_f/di| <= |ua| dP/dU + |va| dP/dV at
++ * (Ua, Va).
++ *
++ * Three rounding gaps separate that from what the device writes: the fp32
++ * centre value against F_f(c), the per-cell fp32 path against F_f(i), and the
++ * fp64 fallback against F_f(i) (it uses the double parameters). Each is below
++ * (8*deg + 1) * 2^-24 * P(Ua, Va) -- 2^-17.9 of it at deg 8: the Horner's own
++ * error is 2*deg ulps of P(|u|,|v|) <= P(Ua,Va); an error of 2^-23 Ua in u
++ * (its fmaf, or the rounding of ua and ub) moves F by at most 2^-23 Ua dP/dU,
++ * and Ua dP/dU + Va dP/dV = deg * P(Ua,Va) by Euler's identity for a
++ * homogeneous form; the d[] rounding adds 2^-24 P. The slack is 2^-14 P(Ua,Va),
++ * about 5x their sum. It is LOCAL: an absolute slack (2^-14 sum|d_k|, the
++ * first version) zeroed the floor on 3.9% of c183's cells, every row whose
++ * norms sit far below the form's maximum. The -1 on the rounded value covers
++ * log2f's ulp and the fp32 mul/add after it (both monotone under
++ * round-to-nearest), and a floor that comes out <= 0 -- a root of F_f inside
++ * the group -- is Tlo = 0, which is always sound.
++ *
++ * LAZY_NORM_CHECK builds compute both for EVERY cell and count Tlo > T. */
++__device__ __forceinline__ uint32_t norm_group_floor(const norm_t &N, int32_t i0,
++                                                     uint32_t jj, uint32_t TMAX)
++{
++    const float h   = 15.5f;
++    const float pad = 1.0f + 0x1p-20f;
++    const float fc  = __fadd_rn((float)i0, 15.5f);     /* exact: |i0| < 2^20 */
++    const float fj  = (float)jj;
++    const float uc  = __fmaf_rn(N.ua, fc, __fmul_rn(N.ub, fj));
++    const float vc  = __fmaf_rn(N.va, fc, __fmul_rn(N.vb, fj));
++    const float ai  = __fadd_rn(fabsf(fc), h);
++    const float U   = __fmul_rn(__fmaf_rn(fabsf(N.ua), ai, __fmul_rn(fabsf(N.ub), fj)), pad);
++    const float V   = __fmul_rn(__fmaf_rn(fabsf(N.va), ai, __fmul_rn(fabsf(N.vb), fj)), pad);
++
++    /* descending k: F_f(c), and P with dP/dU by Horner-in-U */
++    float acc = N.d[N.deg], vp = 1.0f;
++    float p = fabsf(N.d[N.deg]), pu = 0.0f, Vp = 1.0f;
++    #pragma unroll
++    for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
++        if (k < N.deg) {
++            vp  = __fmul_rn(vp, vc);
++            acc = __fmaf_rn(acc, uc, __fmul_rn(N.d[k], vp));
++            Vp  = __fmul_rn(Vp, V);
++            pu  = __fmaf_rn(pu, U, p);
++            p   = __fmaf_rn(p, U, __fmul_rn(fabsf(N.d[k]), Vp));
++        }
++    /* ascending k: dP/dV by Horner-in-V */
++    float q = fabsf(N.d[0]), qv = 0.0f, Up = 1.0f;
++    #pragma unroll
++    for (int k = 1; k <= BENCH_MAX_DEGREE; k++)
++        if (k <= N.deg) {
++            Up = __fmul_rn(Up, U);
++            qv = __fmaf_rn(qv, V, q);
++            q  = __fmaf_rn(q, V, __fmul_rn(fabsf(N.d[k]), Up));
++        }
++    const float D    = __fmaf_rn(fabsf(N.ua), pu, __fmul_rn(fabsf(N.va), qv));
++    const float loss = __fmul_rn(__fmaf_rn(h, D, __fmul_rn(0x1p-14f, p)),
++                                 1.0f + 0x1p-10f);
++    const float slo  = __fsub_rn(fabsf(acc), loss);
++    if (!(slo > 0.0f)) return 0u;
++    const float lg = __fmul_rn(N.scale,
++        __fsub_rn(__fadd_rn(N.log2M, log2f(fmaxf(slo, 1e-30f))), N.bias));
++    const int ti = (int)floorf(__fadd_rn(lg, 0.5f)) - 1;
++    return (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
++}
++
++/* --lazy-norm: bit c set iff 16-bit cell c of 32-cell group g is >= lim.
++ * The group is 16 words, read as four 128-bit loads. One lane reads one group,
++ * so a warp's addresses are 64 B apart; rotating the load order by lane>>1
++ * spreads each 8-lane phase of an LDS.128 over all eight 16-byte bank groups,
++ * where the plain order would be 4-way conflicted. */
++__device__ __forceinline__ uint32_t group_ge_mask(const uint32_t *S, uint32_t g,
++                                                  uint32_t lane, uint32_t lim)
++{
++    const uint4 *G = reinterpret_cast<const uint4 *>(S) + (g << 2);
++    const uint32_t lim2 = lim * 0x00010001u;
++    uint32_t m = 0;
++    #pragma unroll
++    for (uint32_t k = 0; k < 4u; k++) {
++        const uint32_t q = (k + (lane >> 1)) & 3u;
++        const uint4 w = G[q];
++        /* __vcmpgeu2: 0xFFFF in each half that is >= */
++        const uint32_t r0 = __vcmpgeu2(w.x, lim2), r1 = __vcmpgeu2(w.y, lim2);
++        const uint32_t r2 = __vcmpgeu2(w.z, lim2), r3 = __vcmpgeu2(w.w, lim2);
++        const uint32_t b = (r0 & 1u) | ((r0 >> 15) & 2u)
++                         | ((r1 & 1u) << 2) | ((r1 >> 13) & 8u)
++                         | ((r2 & 1u) << 4) | ((r2 >> 11) & 32u)
++                         | ((r3 & 1u) << 6) | ((r3 >> 9) & 128u);
++        m |= b << (q * 8u);
++    }
++    return m;
++}
++
++#ifdef LAZY_NORM_CHECK
++#warning "LAZY_NORM_CHECK: computes the exact norm for every cell; a soundness \
++build for --lazy-norm, never for timing."
++/* [0] cells checked, [1] Tlo > T (must stay 0), [2] sum of T - Tlo where
++ * Tlo > 0, [3] cells whose group floor is 0 */
++__device__ unsigned long long g_lazy_check[4];
++#endif
++
+ /* One block owns one bucket region for its entire life: it initialises the
+  * cells to the log-norm bound in shared memory, accumulates every log p that
+  * landed in the region, scans for survivors, and writes only the survivors
+@@ -578,7 +776,8 @@ __device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
+  * price what correctness costs, since a byte cell overflows into its
+  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
+  */
+-template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
++template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
++          bool LAZY = false>
+ /* __launch_bounds__(512, 3): ptxas otherwise settles on 45-46 registers, which
+  * fits only TWO 512-thread blocks per SM and pins theoretical occupancy at
+  * 66.67%. ncu on a 5070 (sm_120) reports the limiter explicitly -- Block Limit
+@@ -596,6 +795,9 @@ template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false>
+  *
+  * ptxas lands on 40 with NO spill for all nine instantiations, on sm_120 and
+  * sm_80 alike; total spill bytes across the whole TU stay at 0, as at HEAD.
++ * (Written before --lazy-norm. Its two LAZY instantiations make eleven, and
++ * each spills ONE value on sm_120, 8 bytes of stack: the warp's survivor
++ * count, touched once per 32-group batch. The eager ones stay at 0.)
+  * This is the mirror image of k_fill_l1, where the same annotation had to be
+  * REVERTED because a widened walk pushed it past the cap into 12 spill stores:
+  * check `-Xptxas -v` before assuming a cap is free, in both directions.
+@@ -652,7 +854,32 @@ void k_apply(const uint32_t *__restrict buckets,
+ 
+     for (uint32_t i = tid; i < nslice; i += nth) lut[i] = slice_logp[i];
+ 
++    /* --lazy-norm (see norm_group_floor): the lazy scan works a warp at a
++     * time on whole 32-cell groups in one row, so lazy needs
++     * whole warps, 32 | ncell and 32 | I.
++     *
++     * A TEMPLATE PARAMETER, not a runtime flag, because the pass is register
++     * pressure: compiled into the one production instantiation it forced an
++     * 8-byte spill at the 40-register cap and cost the EAGER path ~16% of
++     * apply with --lazy-norm 0 (c183, same binary). Each variant is now
++     * allocated on its own.
++     * The dump, the probe and the CPU cell dump all read EXACT cell values for
++     * every position, so they keep the eager init -- which is also what the
++     * cell-parity gates therefore test; --lazy-norm is gated on relations. */
++    const bool lazy = LAZY && CELLBITS == 16 && NORMMODE == NORM_HORNER
++                   && logI >= 5 && log_region >= 5
++                   && nth >= 32u && (nth & 31u) == 0u
++                   && !dump && !dbg_cells && !probe_out;
++
+     /* ---- init: log-norm bound, computed in shared memory ---- */
++    if (lazy) {
++        /* Every cell starts at 0 and holds just its sieved sum, which the lazy
++         * scan below reads as it is; nword is a multiple of 4 (32 | ncell),
++         * hence the 16-byte stores. Both-even cells need nothing more: they
++         * are dropped anyway. */
++        for (uint32_t w = tid; w < nword / 4u; w += nth)
++            reinterpret_cast<uint4 *>(S)[w] = make_uint4(0u, 0u, 0u, 0u);
++    } else
+     for (uint32_t w = tid; w < nword; w += nth) {
+         uint32_t word = 0;
+         #pragma unroll
+@@ -666,84 +893,9 @@ void k_apply(const uint32_t *__restrict buckets,
+             } else if (NORMMODE == NORM_CONST) {
+                 t = tconst;
+             } else {
+-                const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
+-                const uint32_t jlocal = x >> logI;
+-                uint32_t jj = jlocal;
+-                if constexpr (SLABBED) jj += j_base;
+-                const float fi = (float)ii;
+-                const float fj = (float)jj;
+-                const float u = fmaf(N.ua, fi, N.ub * fj);
+-                const float v = fmaf(N.va, fi, N.vb * fj);
+-                float acc = N.d[N.deg], vp = 1.0f;
+-                /* The same Horner on |.|, which bounds the cancellation. The
+-                 * normalisation gives fp32 ample dynamic RANGE, but near a root
+-                 * line of F the terms are O(1) and cancel to something tiny, so
+-                 * what is left is mostly rounding noise. Measured before this
+-                 * guard: 144 of 63,497 positions in a band along the three real
+-                 * root lines rounded to the wrong sieve-log value, -3.31 to
+-                 * +2.57 units and BOTH SIGNS -- false survivors and lost
+-                 * relations alike. */
+-                float aabs = fabsf(N.d[N.deg]), vpa = 1.0f;
+-                const float au = fabsf(u), av = fabsf(v);
+-                #pragma unroll
+-                for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+-                    if (k < N.deg) {
+-                        vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
+-                        vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
+-                    }
+-                float s = fabsf(acc);
+-                if (s < NORM_CANCEL_TOL * aabs) {
+-                    /* redo in fp64: (a,b) exactly in int64, sum at 2^-53.
+-                     * Doubles are 1/64 rate on this part, but this fires on
+-                     * well under one cell in a thousand. */
+-                    const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
+-                    const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
+-                    const double ud = a / N.A, vd = b / N.B;
+-                    double accd = N.dd[N.deg], vpd = 1.0;
+-                    #pragma unroll
+-                    for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+-                        if (k < N.deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
+-                    s = (float)fabs(accd);
+-                }
+-                /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5).
+-                 * las clamps here at 255 because its cell IS a byte, and that
+-                 * is the whole reason `scale` exists (1.28 * 196.61 = 251.7).
+-                 * Our cell is 16 bits, so the ceiling is CINIT, not 255, and
+-                 * scale becomes a free parameter rather than a constraint --
+-                 * at scale 1.28 las discards 0.39 bits of resolution per
+-                 * position that we can keep. Clamping at 255 threw that away
+-                 * and, worse, would have silently flattened every norm above
+-                 * 255/scale into one bucket the moment anyone raised scale. */
+-                /* log2f, NOT __log2f. The fast intrinsic is ~2 ulp and has no
+-                 * host equivalent, so the CPU replay could not mirror this
+-                 * expression exactly and "0 cells differ" was measuring two
+-                 * slightly different functions. Accurate log2f is reproducible
+-                 * on both sides; norm init was 1.76 ms of a 27 ms apply, so the
+-                 * difference is affordable and correctness is not. */
+-#ifdef NORM_FAST_LOG2
+-#warning "NORM_FAST_LOG2: __log2f breaks CPU parity; --verify and dumpcmp will \
+-report spurious cell mismatches. Pricing builds only, never for relations."
+-                /* PRICING SWITCH, not a shipping option: __log2f is one MUFU
+-                 * instruction against log2f's software sequence, and the point
+-                 * of building with it is to measure what the accurate version
+-                 * costs -- see the paragraph above for why the accurate one is
+-                 * the default.
+-                 *
+-                 * This SILENTLY INVALIDATES THE PARITY GATE, which is why the
+-                 * #warning above exists. poly.c's norm_target_host mirrors the
+-                 * device expression deliberately -- same float type, same
+-                 * clamp, same log2f -- so that "0 cells differ" means
+-                 * something. Building with this breaks the mirror on the
+-                 * device side only, and the ~2 ulp difference shows up as
+-                 * scattered mismatches at threshold boundaries that read
+-                 * exactly like a kernel regression. */
+-                float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
+-#else
+-                float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
+-#endif
+-                int ti = (int)floorf(lg + 0.5f);
+-                const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
+-                t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
++                t = norm_cell_target<CELLBITS>(N, (int32_t)(x & Imask) - Ihalf,
++                                               pos_row<SLABBED>(x, logI, j_base),
++                                               CINIT);
+             }
+             if (probe_out && x == probe_x) probe_out[0] = t;
+             word |= (CINIT - t) << (c * CELLBITS);
+@@ -828,6 +980,112 @@ report spurious cell mismatches. Pricing builds only, never for relations."
+      * non-returning red.global.add per warp.
+      */
+     const uint32_t CMASK = (CELLBITS == 16) ? 0xFFFFu : 0xFFu;
++    if (lazy) {
++        /* ---- --lazy-norm: the threshold scan and the norm in one pass ----
++         *
++         * The lazy init left each cell holding only its sieved sum v; the
++         * exact cell is CINIT - T + v. With the group's floor Tlo <= T, the
++         * cell can pass only if v >= THRESH + Tlo - CINIT -- the candidates.
++         * Everything else FAILS EXACTLY, so its survivor bit is 0 without T.
++         *
++         * LANE PER GROUP. Each warp takes 32 groups and lane k owns group
++         * gb+k outright: its floor, its candidate mask (four 128-bit loads
++         * and packed 16-bit compares, no shuffle or ballot per group) and its
++         * survivor word. The earlier warp-per-group shape (one shuffle, one
++         * ballot and a serial __ffs loop per group, finding 104's design 4)
++         * cut apply's instructions 20-24% and saved no time: issue-slot use
++         * fell from 89% to 67-71%, with barrier and branch stalls taking up
++         * the difference.
++         *
++         * The candidates are then compacted 32 per round across the warp --
++         * a prefix sum over the per-lane counts, and a binary search over it
++         * for each slot's owner -- so each exact T is computed with the warp
++         * converged; ~5% of cells are candidates on c183 (design 3's count, the
++         * algebraic side), so ~80% of groups hold one, ~1.5 each, and T per
++         * owner lane in place would take as many rounds as the fullest of
++         * the 32 groups holds -- mostly idle lanes. A
++         * round writes each candidate's exact cell back; after __syncwarp the
++         * owner re-reads its group and keeps the candidates that pass
++         * THRESH, which is the survivor word, stored with one coalesced
++         * store per batch. The cells are only touched by the warp that owns
++         * them.
++         *
++         * LAZY_NORM_CHECK makes EVERY cell the scan could keep a candidate,
++         * so the exact value everywhere is checked against its floor. */
++        const uint32_t lane = tid & 31u, ngrp = ncell >> 5;
++        uint16_t *S16 = (uint16_t *)S;              /* cell off is half-word off */
++        uint32_t nlocal = 0;
++        for (uint32_t gb = (tid >> 5) << 5; gb < ngrp; gb += (nth >> 5) << 5) {
++            const uint32_t g = gb + lane;
++            uint32_t tlo = 0, cmask = 0;
++            if (g < ngrp) {
++                const uint32_t x0 = xbase + (g << 5);
++                const uint32_t j0 = pos_row<SLABBED>(x0, logI, j_base);
++                tlo = norm_group_floor(N, (int32_t)(x0 & Imask) - Ihalf, j0, CINIT);
++#ifdef LAZY_NORM_CHECK
++                cmask = 0xFFFFFFFFu;
++#else
++                const uint32_t lim = (THRESH + tlo > CINIT) ? THRESH + tlo - CINIT : 0u;
++                cmask = group_ge_mask(S, g, lane, lim);
++#endif
++                /* x0 is even, so cell c has i-parity c: drop the even cells
++                 * of an even row. NOTE: an open-coded FIFTH skip site that
++                 * bypasses pos_both_even (see pos_row's comment: the sites
++                 * must agree and no gate compares them), and the cofcheck
++                 * lazy gate runs only at the default --sieve-skip, so the
++                 * drop_both_even == 0 branch here is untested. */
++                if (drop_both_even && !(j0 & 1u)) cmask &= 0xAAAAAAAAu;
++            }
++            const uint32_t cnt = __popc(cmask);
++            uint32_t incl = cnt;
++            #pragma unroll
++            for (uint32_t d = 1; d < 32u; d <<= 1) {
++                const uint32_t t = __shfl_up_sync(0xFFFFFFFFu, incl, d);
++                if (lane >= d) incl += t;
++            }
++            const uint32_t total = __shfl_sync(0xFFFFFFFFu, incl, 31);
++            for (uint32_t base = 0; base < total; base += 32u) {   /* warp-uniform */
++                const uint32_t s = base + lane;
++                /* owner = the number of lanes whose inclusive count is <= s */
++                uint32_t L = 0;
++                #pragma unroll
++                for (uint32_t step = 16; step; step >>= 1)
++                    if (__shfl_sync(0xFFFFFFFFu, incl, L + step - 1) <= s) L += step;
++                L &= 31u;             /* redundant: the 5-step search tops out at 31 */
++                const uint32_t ex = __shfl_sync(0xFFFFFFFFu, incl - cnt, L);
++                uint32_t mm       = __shfl_sync(0xFFFFFFFFu, cmask, L);
++#ifdef LAZY_NORM_CHECK
++                const uint32_t ltlo = __shfl_sync(0xFFFFFFFFu, tlo, L);
++#endif
++                if (s < total) {
++                    for (uint32_t r = s - ex; r; r--) mm &= mm - 1u;
++                    const uint32_t off = ((gb + L) << 5) | (__ffs(mm) - 1u);
++                    const uint32_t qx  = xbase + off;
++                    const uint32_t qt  = norm_cell_target<CELLBITS>(N,
++                        (int32_t)(qx & Imask) - Ihalf,
++                        pos_row<SLABBED>(qx, logI, j_base), CINIT);
++#ifdef LAZY_NORM_CHECK
++                    atomicAdd(&g_lazy_check[0], 1ull);
++                    if (ltlo > qt) atomicAdd(&g_lazy_check[1], 1ull);
++                    else if (ltlo != 0u)
++                        atomicAdd(&g_lazy_check[2], (unsigned long long)(qt - ltlo));
++                    if (ltlo == 0u) atomicAdd(&g_lazy_check[3], 1ull);
++#endif
++                    S16[off] = (uint16_t)(S16[off] + CINIT - qt);
++                }
++            }
++            __syncwarp();
++            if (g < ngrp) {
++                const uint32_t mask = cmask ? cmask & group_ge_mask(S, g, lane, THRESH) : 0u;
++                if (survbits) survbits[(xbase >> 5) + g] = mask;
++                nlocal += __popc(mask);
++            }
++        }
++        #pragma unroll
++        for (int d = 16; d > 0; d >>= 1)
++            nlocal += __shfl_xor_sync(0xFFFFFFFFu, nlocal, d);
++        if (lane == 0 && nlocal) atomicAdd(nsurv, nlocal);
++    } else
+     if (ncell >= 32u && nth >= 32u && (nth & 31u) == 0u) {
+         const uint32_t lane = tid & 31u;
+         const uint32_t ngrp = ncell >> 5;
+diff --git a/bench/bench_main.cu b/bench/bench_main.cu
+index bb7be7e..c6022e0 100644
+--- a/bench/bench_main.cu
++++ b/bench/bench_main.cu
+@@ -313,6 +313,8 @@ static void usage(void)
+ "  --sieve-skip N   pipeline: skip sieve work gcd(i,j) rules out [2]\n"
+ "                   0 = off, 1 = both-even positions, 2 = also 3|i and 3|j\n"
+ "                   (fill only); relations are identical at every level\n"
++"  --lazy-norm N    pipeline: 1 = exact norm only where a floor passes [0]\n"
++"                   0 = every cell; relations are identical either way\n"
+ "  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
+ "  --other-bits F   the other side's bitmap -> device intersect+gcd+compact\n"
+ "  --emit FILE      write the compacted survivor list (x, a, b) here\n"
+@@ -993,6 +995,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
+     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
+     cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
+     cfg.survbits = NULL; cfg.not_both_even = 0; cfg.sieve_skip = 2;
++    cfg.lazy_norm = 0;
+     cfg.other_bits = NULL; cfg.emit = NULL;
+     cfg.td = 0; cfg.cofgate = NULL; cfg.emit_cof = NULL;
+     cfg.lim = 0; cfg.lpb = 0; cfg.mfb = 0;   /* 0 == take the side's default */
+@@ -1039,6 +1042,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
+     cfg.resume_nrel = 0; cfg.resume_nq = 0;
+     int maxbits = 0, maxbits_set = 0;
+     int sieve_skip_set = 0;
++    int lazy_norm_set = 0;
+     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
+     const char *cofac_in = NULL;
+     const char *check_rel = NULL;
+@@ -1438,6 +1442,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
+                 return 1;
+             sieve_skip_set = 1;
+         }
++        else if (!strcmp(argv[i], "--lazy-norm") && i + 1 < argc) {
++            if (parse_int_range_arg("--lazy-norm", argv[++i], 0, 1,
++                                    &cfg.lazy_norm))
++                return 1;
++            lazy_norm_set = 1;
++        }
+         else if (!strcmp(argv[i], "--maxbits") && i + 1 < argc) {
+             maxbits = atoi(argv[++i]); maxbits_set = 1;
+         }
+@@ -1478,6 +1488,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
+         fprintf(stderr, "--sieve-skip applies to --pipeline only\n");
+         return 1;
+     }
++    if (lazy_norm_set && !cfg.pipeline) {
++        fprintf(stderr, "--lazy-norm applies to --pipeline only\n");
++        return 1;
++    }
+     if (!bkthresh) bkthresh = 1u << cfg.logI;
+     /* The bucket walk is Franke-Kleinjung, whose basis (plattice.cuh) exists
+      * only for p >= I: then a row holds at most one hit and each walk step
+diff --git a/bench/cofcheck.sh b/bench/cofcheck.sh
+index 626a8e8..60bfc8d 100755
+--- a/bench/cofcheck.sh
++++ b/bench/cofcheck.sh
+@@ -478,7 +478,33 @@ for sj in 0 4095; do
+                "sieve-skip output identity" "$shape" "$got"; fail=1
+     fi
+ done
++
++# --lazy-norm is output-identical by construction too (RESULTS findings 103-104): 0
++# runs the eager init, which runs none of the floor code. Both slab shapes,
++# because the floor takes its row from j_base like every skip site does.
++for sj in 0 4095; do
++    case $sj in
++        0) sjarg=""            ; shape="unslabbed"       ;;
++        *) sjarg="--slab-j $sj"; shape="odd slab starts" ;;
++    esac
++    got=""
++    ok=1
++    for lz in 0 1; do
++        n=$(run --cofactor $sjarg --lazy-norm $lz --relations $TMP/z$lz.txt \
++            | grep 'total relations' | tail -1 | awk '{print $NF}') || true
++        got="$got${got:+/}${n:-none}"
++        [ "$n" = "37" ] || ok=0
++    done
++    cmp -s $TMP/z0.txt $TMP/z1.txt || ok=0
++    if [ $ok -eq 1 ]; then
++        printf 'PASS   %-34s %s, 37 at 0/1, byte-identical\n' "lazy-norm output identity" "$shape"
++    else
++        printf 'FAIL   %-34s %s, expected 37/37 identical, got %s\n' \
++               "lazy-norm output identity" "$shape" "$got"; fail=1
++    fi
++done
+ expect_refused "sieve-skip not an integer"      --sieve-skip two
++expect_refused "lazy-norm out of range"         --lazy-norm 2
+ expect_refused "bkthresh below I"               --bkthresh 16384
+ expect_refused "bkthresh above 2^30"            --bkthresh 2147483648
+ 
+diff --git a/bench/pipeline.cuh b/bench/pipeline.cuh
+index 9e9d99c..bd45f7b 100644
+--- a/bench/pipeline.cuh
++++ b/bench/pipeline.cuh
+@@ -781,14 +781,18 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
+      * ever shows up in a profile. */
+     SLAB_CK(cudaMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
+     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
+-    k_apply<16, 1, NORM_HORNER, SLABBED><<<nregion, athr, S->apply_smem, st>>>(
+-        (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
+-        S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
+-        S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
+-        S->sp, S->srt, S->sg, S->slp, S->smag,
+-        S->nsmall, S->nblk, S->nwrp,
+-        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
+-        j_base);
++#define PIPE_APPLY(LZ)                                                             \
++    k_apply<16, 1, NORM_HORNER, SLABBED, LZ><<<nregion, athr, S->apply_smem, st>>>( \
++        (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,   \
++        S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,     \
++        S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,                         \
++        S->sp, S->srt, S->sg, S->slp, S->smag,                                  \
++        S->nsmall, S->nblk, S->nwrp,                                            \
++        0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,    \
++        j_base)
++    if (cfg->lazy_norm) PIPE_APPLY(true);
++    else                PIPE_APPLY(false);
++#undef PIPE_APPLY
+     SLAB_CK(cudaEventRecord(S->ev[3], st));
+     rc = 0;
+ done:
+@@ -1865,7 +1869,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+         /* MaxDynamicSharedMemorySize belongs to this k_apply specialization.
+          * Setting it independently while initializing the two sides is wrong:
+          * the second side can lower the limit required by the first. */
+-        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED>,
++        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, false>,
++            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
++        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, true>,
+             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+     }
+     VRAM_MARK("factor bases + bitmaps");
+@@ -3536,6 +3542,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+         printf("  %-34s %8.3f\n", "COMPLETE RELATIONS/q", (double)acc_rel / N);
+         printf("  %-34s %8llu\n", "total relations", (unsigned long long)acc_rel);
+         printf("  %-34s %8llu\n", "total candidates", (unsigned long long)acc_cand);
++#ifdef LAZY_NORM_CHECK
++        {
++            unsigned long long lc[4] = {0, 0, 0, 0};
++            if (cudaMemcpyFromSymbol(lc, g_lazy_check, sizeof lc) == cudaSuccess)
++                printf("  LAZY_NORM_CHECK cells %llu  floor>T %llu  mean T-floor"
++                       " (floor>0) %.3f  floor-0 cells %.4f%%\n", lc[0], lc[1],
++                       lc[0] > lc[1] + lc[3]
++                           ? (double)lc[2] / (double)(lc[0] - lc[1] - lc[3]) : 0.0,
++                       lc[0] ? 100.0 * (double)lc[3] / (double)lc[0] : 0.0);
++            else
++                printf("  LAZY_NORM_CHECK: could not read the counters\n");
++        }
++#endif
+         /* The band summary in one record, so the log ends with the numbers a
+          * reader would otherwise have to reconstruct from the last heartbeat
+          * and the console output the session no longer has. Timing terms are
