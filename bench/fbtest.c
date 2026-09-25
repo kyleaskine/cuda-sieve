@@ -465,6 +465,39 @@ static int cado_parse_case(const char *text, int want_ok)
     return got_ok == want_ok && clean;
 }
 
+/* A rejection that prints the wrong reason sends the user looking in the
+ * wrong place, so check the message as well as the failure. poly_load's
+ * stderr goes to a temporary file for the call. */
+static int poly_diag_case(const char *text, const char *want)
+{
+    char path[] = "/tmp/cuda-sieve-poly-diag-XXXXXX";
+    char msg[512];
+    FILE *cap = tmpfile();
+    poly_t P;
+    size_t n = 0;
+    int saved = -1, got_ok = 1;
+
+    if (!cap || write_text_file(path, text)) goto done;
+    fflush(stderr);
+    saved = dup(STDERR_FILENO);
+    if (saved < 0 || dup2(fileno(cap), STDERR_FILENO) < 0) goto done;
+    got_ok = poly_load(path, &P) == 0;
+    fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    rewind(cap);
+    n = fread(msg, 1, sizeof(msg) - 1u, cap);
+done:
+    msg[n] = '\0';
+    if (saved >= 0) close(saved);
+    if (cap) fclose(cap);
+    unlink(path);
+    if (got_ok || !strstr(msg, want)) {
+        fprintf(stderr, "poly diagnostic: want \"%s\", got \"%s\"\n", want, msg);
+        return 0;
+    }
+    return 1;
+}
+
 /* The text factor-base parser is a trust boundary. Check strict numeric
  * conversion, complete-line consumption, exponent metadata, roots, ordering,
  * and fail-closed cleanup independently of the central validator. */
@@ -546,6 +579,36 @@ static int verify_poly_parser_strict(void)
         "skew:1x\nc0:-1\nc1:2\nY0:0\nY1:1\n",
         "skew:1\rjunk\nc0:-1\nc1:2\nY0:0\nY1:1\n"
     };
+    /* Unicode pasted from a web page must be named, not blamed on the
+     * value's syntax. The field-name cases loaded before, silently dropping
+     * c2 and giving a degree-1 polynomial. The rest guard the ASCII
+     * diagnostics against being shadowed. */
+    static const struct { const char *text, *want; } diag[] = {
+        { "skew:1\nc0:-1\nc1:2\nY0:0\xE2\x80\x8B\nY1:1\n",
+          ":4: Y0 contains U+200B (zero-width space) at column 5; it is invisible" },
+        { "skew:1\nc0:-1\nc1:2\nY0:\xC2\xA0" "0\nY1:1\n",
+          ":4: Y0 contains U+00A0 (no-break space) at column 4;" },
+        { "skew:1\nc0:\xE2\x88\x92" "1\nc1:2\nY0:0\nY1:1\n",
+          ":2: c0 contains U+2212 (minus sign) at column 4; use ASCII '-'" },
+        { "skew:1\nc0:-1\nc1:2\n\xE2\x80\x8B" "c2:1\nY0:0\nY1:1\n",
+          ":4: field name contains U+200B (zero-width space) at column 1;" },
+        { "skew:1\nc0:-1\nc1:2\n\xEF\xBD\x83" "2:1\nY0:0\nY1:1\n",
+          ":4: field name contains U+FF43 at column 1; job files must be plain ASCII" },
+        { "skew:1\nc0:-1\nc1:2\nc2:\xE0\x80\x80\nY0:0\nY1:1\n",
+          ":4: c2 contains byte 0xE0 (not UTF-8) at column 4;" },
+        { "skew:1\nfoo # caf\xC3\xA9\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+          ":2: non-comment line has no ':' separator" },
+        { "skew:1\nc0:-1\nc123456789012345678:2\nY0:0\nY1:1\n",
+          ":3: coefficient index overflow" },
+    };
+    /* A Notepad byte-order mark, a zero-padded coefficient name longer than
+     * any field name, and non-ASCII inside a comment all still load. */
+    static const char *good_deg1[] = {
+        "\xEF\xBB\xBFn: 12345\nskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+        "\xEF\xBB\xBFskew:1\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+        "skew:1\nc0:-1\nc0000000000000001:2\nY0:0\nY1:1\n",
+        "skew:1 # caf\xC3\xA9\nc0:-1\nc1:2\nY0:0\nY1:1\n",
+    };
     char long_coeff[512];
     poly_t P;
     size_t i, off;
@@ -555,13 +618,21 @@ static int verify_poly_parser_strict(void)
         return 0;
     for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
         if (!poly_parse_case(bad[i], 0, NULL)) return 0;
+    for (i = 0; i < sizeof(diag) / sizeof(diag[0]); i++)
+        if (!poly_diag_case(diag[i].text, diag[i].want)) return 0;
+    for (i = 0; i < sizeof(good_deg1) / sizeof(good_deg1[0]); i++)
+        if (!poly_parse_case(good_deg1[i], 1, &P) || P.deg != 1 ||
+            strcmp(P.cs[1], "2"))
+            return 0;
 
     off = (size_t)snprintf(long_coeff, sizeof(long_coeff),
                            "skew:1\nc0:-1\nc1:");
     memset(long_coeff + off, '7', 100);
     off += 100;
     snprintf(long_coeff + off, sizeof(long_coeff) - off, "\nY0:0\nY1:1\n");
-    if (!poly_parse_case(long_coeff, 0, NULL)) return 0;
+    if (!poly_diag_case(long_coeff,
+                        ":3: c1 must be a decimal integer of at most 79 characters"))
+        return 0;
     return 1;
 }
 
@@ -712,7 +783,7 @@ int main(int argc, char **argv)
     ok("strict CADO text parser", verify_cado_parser_strict(),
        "numeric bounds, metadata, roots, ordering and trailing input checked");
     ok("strict polynomial parser", verify_poly_parser_strict(),
-       "required fields, exact integers, finite values and duplicates checked");
+       "fields, exact integers, finite values, duplicates, pasted Unicode");
 
     printf("\n[2] transform vs definition, set equality, q <= %d, all roots"
            " in [0,2q)\n", qmax);

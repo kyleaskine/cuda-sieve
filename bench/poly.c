@@ -243,6 +243,85 @@ static int exact_decimal_is_zero(const char *s)
     return *s == '\0';
 }
 
+/* Text copied through a web page can carry Unicode that looks like ASCII:
+ * vBulletin code blocks insert U+200B, browsers turn spaces into U+00A0, and
+ * some sites typeset '-' as U+2212. The line still looks right, so a
+ * diagnostic that blames the value's syntax or length sends the reader looking
+ * in the wrong place. Name the character and its column instead. Job files
+ * are plain ASCII, so any other non-ASCII character is reported the same way.
+ *
+ * Decodes one UTF-8 sequence at u. Returns the code point, or -1 when u is not
+ * the start of a well-formed sequence (overlong forms and surrogates
+ * included). Each continuation test fails on the terminating NUL, so a
+ * sequence cut short by the end of the line never reads past it. */
+static long decode_utf8(const unsigned char *u)
+{
+#define CONT(x) (((x) & 0xC0u) == 0x80u)
+    if (u[0] >= 0xC2u && u[0] <= 0xDFu && CONT(u[1]))
+        return (long)((u[0] & 0x1Fu) << 6 | (u[1] & 0x3Fu));
+    if (u[0] >= 0xE0u && u[0] <= 0xEFu && CONT(u[1]) && CONT(u[2]) &&
+        !(u[0] == 0xE0u && u[1] < 0xA0u) &&     /* overlong */
+        !(u[0] == 0xEDu && u[1] > 0x9Fu))       /* surrogate */
+        return (long)((u[0] & 0x0Fu) << 12 | (u[1] & 0x3Fu) << 6 |
+                      (u[2] & 0x3Fu));
+    if (u[0] >= 0xF0u && u[0] <= 0xF4u && CONT(u[1]) && CONT(u[2]) &&
+        CONT(u[3]) &&
+        !(u[0] == 0xF0u && u[1] < 0x90u) &&     /* overlong */
+        !(u[0] == 0xF4u && u[1] > 0x8Fu))       /* above U+10FFFF */
+        return (long)((u[0] & 0x07u) << 18 | (u[1] & 0x3Fu) << 12 |
+                      (u[2] & 0x3Fu) << 6 | (u[3] & 0x3Fu));
+    return -1;
+#undef CONT
+}
+
+/* Report the first non-ASCII byte in [from, to), if any. Returns 1 after
+ * printing, 0 when the range is pure ASCII and the caller's own diagnostic
+ * applies. */
+static int diag_non_ascii(const char *path, unsigned long linenr,
+                          const char *line, const char *from, const char *to,
+                          const char *what, int what_len)
+{
+    static const struct {
+        long cp;
+        const char *name, *advice;
+    } known[] = {
+        { 0x00A0, "no-break space", NULL },
+        { 0x200B, "zero-width space", NULL },
+        { 0x200C, "zero-width non-joiner", NULL },
+        { 0x200D, "zero-width joiner", NULL },
+        { 0x2060, "word joiner", NULL },
+        { 0xFEFF, "zero-width no-break space", NULL },
+        { 0x2212, "minus sign", "use ASCII '-'" },
+    };
+    /* NULL advice marks a character that is invisible or looks like a space. */
+    static const char invisible[] =
+        "it is invisible, and usually pasted from a web page; retype the line";
+    const unsigned char *u = (const unsigned char *)from;
+    const char *name = NULL, *advice = "job files must be plain ASCII";
+    char desc[48];
+    size_t i;
+    long cp;
+
+    while (u < (const unsigned char *)to && *u < 0x80u) u++;
+    if (u >= (const unsigned char *)to) return 0;
+    cp = decode_utf8(u);
+    for (i = 0; cp >= 0 && i < sizeof(known) / sizeof(known[0]); i++)
+        if (known[i].cp == cp) {
+            name = known[i].name;
+            advice = known[i].advice ? known[i].advice : invisible;
+        }
+    if (cp < 0)
+        snprintf(desc, sizeof(desc), "byte 0x%02X (not UTF-8)", u[0]);
+    else if (name)
+        snprintf(desc, sizeof(desc), "U+%04lX (%s)", cp, name);
+    else
+        snprintf(desc, sizeof(desc), "U+%04lX", cp);
+    poly_diag(path, linenr, "%.*s contains %s at column %zu; %s",
+              what_len, what, desc,
+              (size_t)((const char *)u - line) + 1u, advice);
+    return 1;
+}
+
 static int parse_exact_integer(const char *value, char *exact, size_t exact_cap,
                                double *approx)
 {
@@ -298,13 +377,19 @@ int poly_load(const char *path, poly_t *P)
             poly_diag(path, linenr, "line exceeds %zu bytes", sizeof(line) - 1u);
             goto done;
         }
+        /* Notepad's "UTF-8" encoding starts the file with a byte-order mark.
+         * It is an encoding marker, not content. */
+        if (linenr == 1u && !strncmp(line, "\xEF\xBB\xBF", 3))
+            memmove(line, line + 3, strlen(line + 3) + 1u);
         s = (char *)skip_hspace(line);
         if (!*s || *s == '#' ||
             ((*s == '\n' || *s == '\r') && value_ended(s)))
             continue;
         colon = strchr(s, ':');
         if (!colon) {
-            poly_diag(path, linenr, "non-comment line has no ':' separator");
+            if (!diag_non_ascii(path, linenr, line, s, s + strcspn(s, "#\n"),
+                                "line", 4))
+                poly_diag(path, linenr, "non-comment line has no ':' separator");
             goto done;
         }
         key_end = colon;
@@ -316,6 +401,12 @@ int poly_load(const char *path, poly_t *P)
             poly_diag(path, linenr, "empty field name");
             goto done;
         }
+        /* Unknown fields are ignored, so an invisible character pasted into
+         * a known name would make the line vanish: "<U+200B>c8:" would drop c8
+         * and load a lower-degree polynomial. Every CADO and GGNFS field name
+         * is ASCII, so reject any name that is not. */
+        if (diag_non_ascii(path, linenr, line, s, key_end, "field name", 10))
+            goto done;
 
 #define KEY_IS(k) (key_len == sizeof(k) - 1u && !memcmp(s, (k), sizeof(k) - 1u))
 #define DUP_GUARD(flag, name)                                                \
@@ -325,6 +416,17 @@ int poly_load(const char *path, poly_t *P)
                 goto done;                                                   \
             }                                                                \
             (flag) = 1;                                                      \
+        } while (0)
+/* A value that fails to parse is reported by its invisible character if it
+ * has one, and by the caller's message otherwise. A comment after the value
+ * may contain anything. */
+#define VALUE_FAIL(...)                                                      \
+        do {                                                                 \
+            if (!diag_non_ascii(path, linenr, line, value,                   \
+                                value + strcspn(value, "#\n"),               \
+                                s, (int)key_len))                            \
+                poly_diag(path, linenr, __VA_ARGS__);                        \
+            goto done;                                                       \
         } while (0)
 
         /* Claim only the coefficient namespace, c<digits>:. Unknown metadata
@@ -357,35 +459,24 @@ int poly_load(const char *path, poly_t *P)
                 goto done;
             }
             if (parse_exact_integer(value, P->cs[k], sizeof(P->cs[k]),
-                                    &P->c[k])) {
-                poly_diag(path, linenr,
-                          "c%u must be a complete finite integer shorter than %zu bytes",
-                          k, sizeof(P->cs[k]));
-                goto done;
-            }
+                                    &P->c[k]))
+                VALUE_FAIL("c%u must be a decimal integer of at most %zu characters",
+                           k, sizeof(P->cs[k]) - 1u);
             seen_c |= 1u << k;
         } else if (KEY_IS("skew")) {
             DUP_GUARD(seen_skew, "skew");
-            if (parse_finite_value(value, &P->skew) || P->skew <= 0.0) {
-                poly_diag(path, linenr, "skew must be finite and positive");
-                goto done;
-            }
+            if (parse_finite_value(value, &P->skew) || P->skew <= 0.0)
+                VALUE_FAIL("skew must be finite and positive");
         } else if (KEY_IS("Y0")) {
             DUP_GUARD(seen_y0, "Y0");
-            if (parse_exact_integer(value, P->y0s, sizeof(P->y0s), &P->y0)) {
-                poly_diag(path, linenr,
-                          "Y0 must be a complete finite integer shorter than %zu bytes",
-                          sizeof(P->y0s));
-                goto done;
-            }
+            if (parse_exact_integer(value, P->y0s, sizeof(P->y0s), &P->y0))
+                VALUE_FAIL("Y0 must be a decimal integer of at most %zu characters",
+                           sizeof(P->y0s) - 1u);
         } else if (KEY_IS("Y1")) {
             DUP_GUARD(seen_y1, "Y1");
-            if (parse_exact_integer(value, P->y1s, sizeof(P->y1s), &P->y1)) {
-                poly_diag(path, linenr,
-                          "Y1 must be a complete finite integer shorter than %zu bytes",
-                          sizeof(P->y1s));
-                goto done;
-            }
+            if (parse_exact_integer(value, P->y1s, sizeof(P->y1s), &P->y1))
+                VALUE_FAIL("Y1 must be a decimal integer of at most %zu characters",
+                           sizeof(P->y1s) - 1u);
         } else if (KEY_IS("rlim")) {
             DUP_GUARD(seen_rlim, "rlim");
             if (parse_u32_value(value, &P->rlim)) goto bad_u32;
@@ -406,16 +497,12 @@ int poly_load(const char *path, poly_t *P)
             if (parse_u32_value(value, &P->mfba)) goto bad_u32;
         } else if (KEY_IS("rlambda")) {
             DUP_GUARD(seen_rlambda, "rlambda");
-            if (parse_finite_value(value, &P->rlambda) || P->rlambda < 0.0) {
-                poly_diag(path, linenr, "rlambda must be finite and nonnegative");
-                goto done;
-            }
+            if (parse_finite_value(value, &P->rlambda) || P->rlambda < 0.0)
+                VALUE_FAIL("rlambda must be finite and nonnegative");
         } else if (KEY_IS("alambda")) {
             DUP_GUARD(seen_alambda, "alambda");
-            if (parse_finite_value(value, &P->alambda) || P->alambda < 0.0) {
-                poly_diag(path, linenr, "alambda must be finite and nonnegative");
-                goto done;
-            }
+            if (parse_finite_value(value, &P->alambda) || P->alambda < 0.0)
+                VALUE_FAIL("alambda must be finite and nonnegative");
         } else {
             /* CADO/GGNFS files carry metadata such as n:. Unknown fields are
              * deliberately ignored, but every recognized field above is
@@ -424,10 +511,9 @@ int poly_load(const char *path, poly_t *P)
         continue;
 
 bad_u32:
-        poly_diag(path, linenr,
-                  "%.*s must be a complete unsigned 32-bit integer",
-                  (int)key_len, s);
-        goto done;
+        VALUE_FAIL("%.*s must be a complete unsigned 32-bit integer",
+                   (int)key_len, s);
+#undef VALUE_FAIL
 #undef DUP_GUARD
 #undef KEY_IS
     }
