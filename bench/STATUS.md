@@ -4,7 +4,7 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-09-23.**
+is not current. **Last updated 2026-09-24.**
 
 ## Architecture
 
@@ -834,12 +834,16 @@ wall fell **12.3%** on c183 I15, **13.1%** on C194 I16 and **10.0%** on AS276
 I17. **Then finding 101 (same day)** removed the small-prime sieve's replicated
 per-entry setup: apply −19 to −24%, wall −7 to −9%, again byte-identical, and
 **finding 102** did the same for the warp tier (apply −4 to −5%, wall −2 to
-−3%). c183 now reads **fill 16.6 / apply 18.8 of 68.9 ms/q**; the three findings
+−3%). c183 read **fill 16.6 / apply 18.8 of 68.9 ms/q** after finding 102; the three findings
 compound to **~−21.8%** at matched host load (raw figures across the day mix
 host loads from ~4 to ~14.5). On the ALGEBRAIC side's `k_apply`, what leads now is the block tier's
-hits and their shared-memory atomics (~21% of its samples) and the norm (~15%);
-the rational side's shares differ. The older numbers below are all from before
-these two findings.
+hits and their shared-memory atomics (~21% of its samples) and the norm (~15% of
+samples, 22.6% of instructions);
+the rational side's shares differ. Finding 103 tried to recover the norm
+lazily and lost (apply +11-14%), but a `--norm const` control removes 24-28%
+of apply, so that lever is open, not closed. Fresh profile at `6997d77`
+(finding 103): **fill 16.5 / apply 18.7 / TD + classify 14.6 / cofactor 10.1
+of 67.5 ms/q**. The older numbers below are all from before these findings.
 
 **`k_fill_atomic` is L2-bound, measured 2026-08-25 (finding 76).** ncu on a
 5070: L2 throughput 68.7%, DRAM 24.7%, SM throughput 9.4%, IPC 0.22 of 4.0,
@@ -1297,7 +1301,7 @@ not by size.
 | 8a | Share the warp tier's setup; fix the block tier's load balance | local GPU | **DONE 2026-09-23, finding 102** — warp-tier shuffle: apply −5.2% / wall −1.7% c183, −1.8% C194, −2.9% AS276, byte-identical. Rotating the block tier's start thread was SLOWER (apply +3.6%) and is dropped |
 | 8b | Pattern-sieve the tiniest moduli | local GPU | **open, and harder than it looks** — with 16-bit cells a word holds 2, so one modulus composed word-wide saves nothing; only summing ALL tiny moduli per word in registers (dropping their atomics for one plain RMW) can win, and it pays per-(entry, word) residue arithmetic. Dropping those moduli prices only the ceiling (finding 101). Block-tier hits + atomics are ~21% of the ALGEBRAIC `k_apply`'s samples |
 | 9 | Reclaim bucket VRAM freed by the skip | local GPU | **open, and NOT by scaling the estimate** — the per-region cap is uniform and a third of rows (odd `j`, `3` not dividing `j`) lose no records, so a cap scaled to 2/3 would overflow every slab (finding 100, review). Needs a per-row-class capacity; the current sizing is correct |
-| 10 | Lazy / bounded norm evaluation | local GPU | **open, re-ranked after item 8** — after finding 101 the norm is ~15% of the algebraic `k_apply`'s samples (`log2f` 5.4, the two Horner chains 5.1 + 3.2), the same size as item 8b's target and simpler to keep exact: evaluate `log2` only where a sound per-group lower bound says a cell could pass. Candidate next after finding 102 |
+| 10 | Lazy / bounded norm evaluation | local GPU | **open, re-scoped by finding 103** — three designs, all byte-identical with a floor clean on every cell of 20 c183 q (0 of 16.1e9, mean gap 1.06 units), all SLOWER (apply +11% to +14% c183). A `--norm const` control shows the norm IS recoverable (−24% / −28% of apply by side), so the losses were the designs' own cost: an 8-byte spill at the 40-register cap (alone +16%) and an extra barrier-separated pass. Ceiling ~24% of apply, ~6.8% of c183 wall. Next: a spill-free design; patch in `bench/attic/lazy_norm_v3.patch` |
 | 11 | `--bkthresh` below `I` | nothing | **FIXED 2026-09-23** — silently lost relations (5,079 and 7,456 of 9,053 at 8192 / 16384, exit 0) because the Franke-Kleinjung walk needs `p >= I`; now refused at startup and again in `run_pipeline_impl`, and capped at 2^30. Defaults were never affected. Raising it is correct but not faster, so the sweep is closed |
 
 **On (5), why both arms in one session.** Card-hours are the scarce resource

@@ -10146,3 +10146,138 @@ that evaluates `log2` only where a sound bound says a cell can pass; the norm
 is ~15% of the algebraic `k_apply`) and item 8b (block-tier hits and their
 atomics, ~21%), in that order: item 10 keeps output identical by
 construction and needs no new data layout.
+
+## Finding 103 — three lazy-norm designs all LOST (apply +11 to +27%), relations byte-identical — but not because the norm is free: a `--norm const` control at HEAD removes 24-28% of apply. The losses are the implementations' own cost (a register spill that alone cost +16%, and an extra barrier-separated pass). Item 10 stays open. Also a fresh c183 stage profile
+
+**Date:** 2026-09-24, RTX 5070, card idle unless stated, host load 13-24 (a
+CPU job). Base: `6997d77` (finding 102). The code is reverted; the last design
+is kept as `bench/attic/lazy_norm_v3.patch` (575 lines, against `6997d77`:
+kernel, `--lazy-norm`, the cofcheck identity gate, the `LAZY_NORM_CHECK`
+build).
+
+### The idea (STATUS item 10)
+
+The init writes `CINIT - T(x)` into every cell, where `T` costs two degree-`d`
+Horner chains and an accurate `log2f`, and then only ~1-2% of each side's cells
+pass the threshold. So: bound `T` from below per 32-cell group, threshold
+against the floor (a superset test), and compute the exact `T` only for the
+cells that pass. Output-identical as long as `Tlo <= T`.
+
+**The floor** (`norm_group_floor` in the patch) is the mean value theorem on
+the normalised form along the row. With `c` the group's centre and `h = 15.5`,
+`|F(i)| >= |F(c)| - h max|dF/di|`, and by the chain rule `dF/di = ua F_u +
+va F_v`, so `max|dF/di| <= |ua| P_U(Ua,Va) + |va| P_V(Ua,Va)`, where `P` is the
+absolute-coefficient form and `Ua = |ua|(|c|+h) + |ub| j` (likewise `Va`) is
+the absolute sum that cancellation in `u` cannot shrink, padded 2^-20 relative.
+A slack of `2^-14 P(Ua,Va)` covers the three rounding gaps to what the device
+writes (the fp32 centre value, the per-cell fp32 path, the fp64 fallback: each
+below `(8d+1) 2^-24 P(Ua,Va)`, the `u`/`v` rounding terms via Euler's identity
+`Ua P_U + Va P_V = d P`), and the rounded result drops one more unit for
+`log2f`.
+
+**Checked, not proven by the check.** The derivation is the argument; the
+evidence is a `-DLAZY_NORM_CHECK` build that computed both values for every
+cell, both sides, of 20 c183 q's: **0 of 16,106,127,360 cells had `Tlo > T`**,
+mean gap **1.06 units** where the floor is positive, **0.72%** of cells with a
+zero floor (root crossings). C194 and AS276 were checked only by relation
+identity, which cannot see `Tlo > T` on a cell that fails anyway. The first
+version's slack was absolute (`2^-14 sum|d_k|`): also clean on c183, but it
+zeroed 3.93% of cells — every row whose norms sit far below the form's
+maximum — and left a mean gap of 10.1.
+
+### Three designs, all slower
+
+Relations byte-identical in every run (c183 `a6545ecf`, 20-q `b2d2e6a1`,
+C194 `a2811e49`). None ran `make check`; each lazy build fell back to the eager
+init whenever the dump, the probe or the CPU cell dump was requested (those
+read exact values for every cell, which a lazy cell does not hold), so the
+cell-parity gates never saw lazy code.
+
+1. **Correct in the scan** (floor written at init; a warp with a candidate
+   recomputes the floor, its candidate lanes compute `T`). At a 1-2% pass rate
+   27-48% of 32-cell groups hold a candidate (independent cells), each paying a
+   divergent `T`. Apply +12% on a 20-q c183 run with the card shared with ECM:
+   indicative only.
+2. **A batched correction pass** before the scan: each warp floors 32 groups
+   lane-parallel and packs candidates into a 32-lane queue by shuffle, so `T`
+   runs converged. Compiled into the production instantiation behind a runtime
+   flag, it cost the **eager path +16% apply at `--lazy-norm 0`** — an 8-byte
+   spill at the 40-register cap changed the whole kernel's allocation. As a
+   template parameter the eager path was back to HEAD (18.67 vs 18.69 ms), and
+   lazy was **+11.1%** (c183, 2 interleaved pairs: 18.67 -> 20.74).
+3. **Zero init** (cells hold the bare sieved sum, candidates are `v + CINIT -
+   Tlo >= THRESH`, one floor per group instead of two, candidates queued by a
+   warp-uniform `__ffs` loop) with the local slack. Non-candidates are then
+   below `THRESH` exactly (`v < THRESH - CINIT + Tlo <= THRESH`), so the scan's
+   survivor test ran unchanged. Fewest instructions, but **slower than design
+   2**:
+
+| design 3 | apply ms/q, eager -> lazy | wall ms/q, eager -> lazy |
+|---|---:|---:|
+| c183, 3 interleaved rounds | 18.64 -> 21.17 (**+13.5%**) | 68.30 -> 71.41 (+4.6%) |
+| C194 I16, ONE pair, not interleaved | 80.89 -> 102.79 (+27%) | 256.61 -> 279.19 (+8.8%) |
+
+The c183 wall moved 3.11 ms/q against apply's 2.53: ~0.6 ms/q of other-stage
+difference that lazy did not cause, so the arms were not perfectly load-matched
+(host load 20-21 throughout). The C194 pair is a single uncontrolled sample.
+
+### ncu, c183, one q's two `k_apply` launches
+
+| | eager | design 2 | design 3 |
+|---|---:|---:|---:|
+| algebraic duration | 13.01 ms | 14.02 | 14.12 |
+| rational duration | 8.15 ms | 9.72 | 10.09 |
+| algebraic "Executed Instructions" | 5.45 G | 5.11 G (−6.2%) | 5.00 G (−8.2%) |
+| issue slots busy (alg) | 89.3% | 78.0% | 73.2% |
+| `stall_barrier` share of samples (alg / rat) | 4.8% / 4.5% | 19.1% / 22.9% | 24.6% / 22.6% |
+
+- **Eager**, by the source view's instruction counter (a different counter:
+  5.90 G eager, 5.73 G design 2): the norm is 1.33 G, **22.6%** of the
+  algebraic side (27.3% rational). Design 2 took it to 0.18 G and its own code
+  added 1.07 G (pass 0.46, floor writes 0.26, queue compaction 0.18, floors
+  0.17); the rest moved 4.57 -> 4.48 G. **Net −3% in that counter, −6% in
+  "Executed Instructions"** — nowhere near the norm's 22.6%.
+- **The lost issue slots are barrier stalls**, at the `__syncthreads` after the
+  bucket add (13-20% of samples) and after the init.
+
+### The control: the norm IS recoverable time
+
+The first draft of this finding read the table above as "the norm fills issue
+slots the barrier-bound phases leave idle, so removing it saves nothing" and
+closed item 10. A review pointed at finding 97's `--norm const` measurement
+(−25% apply), and the control was rerun at HEAD — standalone `--stage apply
+--reps 100`, c183, two ABBA rounds per side, host load ~24:
+
+| side | `--norm horner` | `--norm const` | change |
+|---|---:|---:|---:|
+| algebraic | 13.31 ms | 10.08 | **−24.3%** |
+| rational | 8.23 ms | 5.96 | **−27.6%** |
+
+**Removing the norm without adding work saves about its instruction share.**
+So the lazy designs lost to their own cost, not to an overlap property of the
+kernel. Two costs are identified, not separated: the 8-byte spill every lazy
+variant carried (design 2's eager arm shows that allocation change alone
+costing +16%, which covers most of the +11-14% losses), and the extra
+barrier-separated pass. **Item 10 stays open**, re-scoped: its ceiling is
+~24% of apply by the duration-weighted instruction shares (the standalone
+control has no `--sieve-skip`, the ncu shares do), ~4.5 ms/q or ~6.8% of c183
+wall. The missing experiment is a lazy design that stays spill-free at 40
+registers — the candidate correction is what pushes it over — before any
+conclusion about the pass itself.
+
+**Lesson:** when a lever loses, run the removal control before explaining the
+loss. `--norm const` existed the whole time.
+
+### Fresh c183 stage profile at `6997d77`
+
+200 q, 9,053 relations, host load ~13.5:
+
+| stage | ms/q | share |
+|---|---:|---:|
+| apply | 18.69 | 28% |
+| fill | 16.52 | 24% |
+| TD + classify (of which resieve + scatter 8.56) | 14.61 | 22% |
+| cofactorisation, in-loop flushes | 10.09 | 15% |
+| transform + plattice | 3.09 | 5% |
+| host per-q, intersect, unaccounted | ~4.5 | 7% |
+| **wall** | **67.45** | |
