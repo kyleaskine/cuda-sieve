@@ -1,0 +1,31 @@
+total samples 632743, warp instructions 1.911e+09
+ 16.3%  12.9%  plattice.cuh:253   x2 = (x2 & 1) ? (uint32_t)((x2 + p) >> 1) : (x2 >> 1);
+ 16.3%  12.8%  plattice.cuh:249   x1 = (x1 & 1) ? (uint32_t)((x1 + p) >> 1) : (x1 >> 1);
+ 13.8%  13.7%  plattice.cuh:368   while (b) { uint32_t t = a % b; a = b; b = t; }
+ 11.1%  12.2%  plattice.cuh:247   while ((u & 1) == 0) {
+  8.2%   2.9%  plattice.cuh:255   if (u >= v) { u -= v; x1 = (x1 >= x2) ? x1 - x2 : x1 + p - x2; }
+  4.4%   4.8%  bench_kernels.cu:132   }
+  4.2%  12.2%  plattice.cuh:251   while ((v & 1) == 0) {
+  2.9%   2.7%  plattice.cuh:84    uint32_t k = B->mi0 / B->i1;
+  2.4%   0.0%  plattice.cuh:401   const int isp = (r_enc >= q);
+  2.4%   2.3%  plattice.cuh:105   uint32_t k = B->i1 / B->mi0;
+  2.3%   2.9%  plattice.cuh:256   else        { v -= u; x2 = (x2 >= x1) ? x2 - x1 : x2 + p - x1; }
+  2.1%   1.9%  plattice.cuh:77    uint32_t a = (B->mi0 + B->i1 - I) / B->i1;
+  1.1%   1.2%  plattice.cuh:402   return pl_transform_gen(q, isp ? r_enc - q : r_enc, isp,
+  1.0%   1.1%  plattice.cuh:378   int64_t D = is_proj ? (((int64_t)r * a0 - a1) % Q) : ((a0 - (int64_t)r * a1) % Q);
+  0.9%   0.9%  plattice.cuh:98    uint32_t a = (B->mi0 + B->i1 - I) / B->mi0;
+  0.9%   0.5%  plattice.cuh:384   m = q / g;
+  0.8%   0.8%  plattice.cuh:388   * pl_invmod_any(dg % m, m)) % (uint64_t)m);
+  0.8%   2.6%  plattice.cuh:252   v >>= 1;
+  0.8%   2.6%  plattice.cuh:248   u >>= 1;
+  0.5%   1.7%  plattice.cuh:246   while (u != 1 && v != 1) {
+  0.5%   0.5%  plattice.cuh:387   *rt_out = (uint32_t)(((uint64_t)((uint32_t)N % m)
+  0.4%   0.1%  plattice.cuh:122   if (B.i1 >> logI) {                         /* vertical line */
+  0.4%   0.4%  plattice.cuh:379   int64_t N = is_proj ? ((b1 - (int64_t)r * b0) % Q) : (((int64_t)r * b1 - b0) % Q);
+  0.4%   0.4%  plattice.cuh:70    if (B->i1 < I) {
+  0.4%   0.3%  plattice.cuh:88    if (B->mi0 < I) {
+  0.3%   0.1%  plattice.cuh:258   return (u == 1) ? x1 : x2;
+  0.3%   0.4%  plattice.cuh:386   dg = (uint32_t)((uint64_t)D / g);
+  0.3%   0.2%  bench_kernels.cu:118   if (k < n_rt) rt_out[k] = (g > 1) ? ROWRT_NONE : rt;
+  0.3%   0.2%  plattice.cuh:71    if (B->i1 == 0) {
+  0.3%   0.3%  plattice.cuh:85    B->mi0 -= k * B->i1;

@@ -1,0 +1,7 @@
+cuda qp: exit=0  wall clock per q, COMPLETE 223.55 ms load=11.45
+cuda single: exit=0  wall clock per q, COMPLETE 235.71 ms load=11.12
+cado slots8: exit=0 # Total 6520 reports [0.003227s/r, 71.65r/sq] in 21.04 elapsed s [559.7% CPU] load=14.09
+exported cado-slots8.nsys-rep: 0
+exported cuda-qp.nsys-rep: 0
+exported cuda-single.nsys-rep: 0
+done

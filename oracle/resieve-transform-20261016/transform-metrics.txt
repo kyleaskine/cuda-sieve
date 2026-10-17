@@ -1,0 +1,15 @@
+gpu__time_duration.sum                                     6.940544  3.436128
+launch__grid_size                                          288  288
+launch__block_size                                         256  256
+launch__registers_per_thread                               28  28
+sm__warps_active.avg.pct_of_peak_sustained_active          71.286683  71.304013
+smsp__issue_active.avg.pct_of_peak_sustained_active        74.495263  74.467967
+smsp__inst_executed.sum                                    1878899358.000000  1252964225.000000
+sm__throughput.avg.pct_of_peak_sustained_elapsed           73.203933  74.194217
+lts__throughput.avg.pct_of_peak_sustained_elapsed          6.590596  6.869385
+lts__t_sectors.sum                                         24276533.000000  15041533.000000
+lts__t_sector_hit_rate.pct                                 6.067279  6.708711
+l1tex__throughput.avg.pct_of_peak_sustained_elapsed        5.778372  5.988545
+l1tex__t_sector_hit_rate.pct                               54.545451  54.545345
+dram__throughput.avg.pct_of_peak_sustained_elapsed         (absent)
+smsp__thread_inst_executed_per_inst_executed.ratio         13.79  13.79

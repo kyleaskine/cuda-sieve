@@ -90,6 +90,9 @@ static int cuda_optin_smem_limit(size_t *out)
  *     denominator makes binary Euclid spin forever ON THE DEVICE.
  * pl_transform_enc handles all three; the first two are wrong answers and the
  * third is a hang, so none of them would have shown up as a failed gate.
+ * pl_transform_fast is the same function with a branch-free path for odd
+ * moduli whose denominator it can prove invertible; everything else still
+ * reaches pl_transform_enc, and fbtest compares the two exactly.
  *
  * What is still not expressible is g > 1: hits confined to every g-th row,
  * which is not a plat_t walk. Those emit an empty walk, and the kernel
@@ -112,7 +115,7 @@ __global__ void k_transform(const uint32_t *__restrict primes,
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         const uint32_t q = primes[k];
-        uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
+        uint32_t rt, g, m = pl_transform_fast(q, roots[k], a0, a1, b0, b1, &rt, &g);
         /* --fill-rows: the row tier walks i == rt*j (mod q) row by row, which
          * is the same lattice pl_make reduces whenever g == 1 (then m == q). */
         if (k < n_rt) rt_out[k] = (g > 1) ? ROWRT_NONE : rt;
@@ -770,13 +773,38 @@ __device__ __forceinline__ void apply_cell_side_effects(
     }
 }
 
+/* j is x's global row. The packed scan computes it once per 64 positions,
+ * which is why the row is a parameter rather than derived here. */
+__device__ __forceinline__ int apply_keep_row(uint32_t x, uint32_t j, uint32_t v,
+                                              uint32_t THRESH, int not_both_even)
+{
+    return (v >= THRESH) && !(not_both_even && pos_both_even(x, j));
+}
+
 template <bool SLABBED>
 __device__ __forceinline__ int apply_keep(uint32_t x, uint32_t v,
                                           uint32_t THRESH, int logI,
                                           uint32_t j_base, int not_both_even)
 {
-    return (v >= THRESH)
-        && !(not_both_even && pos_both_even(x, pos_row<SLABBED>(x, logI, j_base)));
+    return apply_keep_row(x, pos_row<SLABBED>(x, logI, j_base), v, THRESH,
+                          not_both_even);
+}
+
+/* Whether k_apply's threshold scan takes its store path, which writes EVERY
+ * survbits word of the regions it covers with a plain store, so a caller
+ * whose launch covers the whole bitmap need not clear it first. One
+ * definition, read by the kernel to pick its path and by the pipeline to
+ * skip the clear, so the two cannot disagree. 16-bit cells take 64 positions
+ * per warp step (two survbits words), 8-bit cells 32. The logI test is the
+ * packed scan's: it computes one row per 64 positions, which is exact only
+ * when 64 aligned positions never straddle a row. */
+template <int CELLBITS>
+__host__ __device__ __forceinline__ bool apply_scan_stores(int logI, int log_region,
+                                                           uint32_t nth)
+{
+    const int min_region = (CELLBITS == 16) ? 6 : 5;
+    return log_region >= min_region && (CELLBITS != 16 || logI >= 6)
+        && nth >= 32u && (nth & 31u) == 0u;
 }
 
 /* One block owns one bucket region for its entire life: it initialises the
@@ -998,11 +1026,12 @@ report spurious cell mismatches. Pricing builds only, never for relations."
 
     /* ---- threshold scan ----
      *
-     * A WARP covers 32 consecutive positions, which is exactly one survbits
-     * word, so the bitmap is written with ONE unconditional 32-bit store per
-     * group instead of one atomicOr per survivor. Adjacent lanes read the same
-     * shared word (CPW cells share a word), so the read broadcasts rather than
-     * conflicting.
+     * A WARP covers 32 consecutive positions per ballot, which is exactly one
+     * survbits word, so the bitmap is written with ONE unconditional 32-bit
+     * store per group instead of one atomicOr per survivor. (16-bit cells take
+     * two ballots per step, positions k and k + 32 in lane k; see below.)
+     * Adjacent lanes read the same shared word (CPW cells share a word), so
+     * the read broadcasts rather than conflicting.
      *
      * MEASURED idle, paired, relations byte-identical throughout:
      *
@@ -1025,12 +1054,14 @@ report spurious cell mismatches. Pricing builds only, never for relations."
      * no more to get by shaving the scan itself.
      *
      * The store is only race-free across blocks when a block owns whole
-     * survbits words -- log_region >= 5 -- so smaller regions keep the atomicOr
-     * form. (The full-warp half of the guard is belt-and-braces: bench_main
+     * survbits words -- log_region >= 5, and >= 6 for the packed 16-bit scan,
+     * whose step is two words -- so smaller regions keep the atomicOr form.
+     * (The full-warp half of the guard is belt-and-braces: bench_main
      * already rejects an --apply-threads that is not a multiple of 32, but this
-     * kernel is also launched directly by the standalone harness.) This is why
-     * the callers still clear survbits: the fast path makes the clear
-     * redundant, the fallback does not.
+     * kernel is also launched directly by the standalone harness.) The whole
+     * condition is apply_scan_stores, which the pipeline also reads to skip
+     * its clear: the fast path makes the clear redundant, the fallback does
+     * not. The standalone harness still clears unconditionally.
      *
      * **CALLER CONTRACT, unenforceable from inside the kernel.** The fast path
      * OVERWRITES survbits words rather than OR-ing into them, which is correct
@@ -1051,29 +1082,70 @@ report spurious cell mismatches. Pricing builds only, never for relations."
      * non-returning red.global.add per warp.
      */
     const uint32_t CMASK = (CELLBITS == 16) ? 0xFFFFu : 0xFFu;
-    if (ncell >= 32u && nth >= 32u && (nth & 31u) == 0u) {
+    if (apply_scan_stores<CELLBITS>(logI, log_region, nth)) {
         const uint32_t lane = tid & 31u;
-        const uint32_t ngrp = ncell >> 5;
         uint32_t nlocal = 0;
-        for (uint32_t g = tid >> 5; g < ngrp; g += (nth >> 5)) {
-            const uint32_t off = (g << 5) + lane;
-            const uint32_t x   = xbase + off;
-            const uint32_t v   =
-                (S[off / CPW] >> ((off % CPW) * CELLBITS)) & CMASK;
-            const int keep = apply_keep<SLABBED>(x, v, THRESH, logI,
-                                                 j_base, drop_both_even);
-            const uint32_t mask = __ballot_sync(0xFFFFFFFFu, keep);
-            if (lane == 0) {
-                if (survbits) survbits[x >> 5] = mask;
-                nlocal += __popc(mask);
+        if constexpr (CELLBITS == 16) {
+            /* TWO cells per lane, 32 positions apart: lane k takes positions
+             * k and k + 32 of a 64-position step, so each ballot is one
+             * survbits word as it stands and lanes 0 and 1 store the pair.
+             * Lane k's cells sit in the same half of their words (k & 1) in
+             * every step, so the shift is fixed per lane, and the row is one
+             * value per step (apply_scan_stores requires logI >= 6). One cell
+             * per lane spent 14-20% of this kernel's instructions at I16
+             * (finding 110); this is half the steps and half the per-step
+             * overhead. */
+            const uint32_t ngrp = ncell >> 6;
+            const uint32_t sh   = (lane & 1u) * 16u;
+            /* Only the standalone harness passes either. Tested once here, the
+             * per-cell pointer and position tests leave the step: they were
+             * ~11 of its ~51 warp instructions. */
+            const bool side_fx = probe_out || dump;
+            for (uint32_t g = tid >> 5; g < ngrp; g += (nth >> 5)) {
+                const uint32_t xg = xbase + (g << 6);
+                const uint32_t j  = pos_row<SLABBED>(xg, logI, j_base);
+                const uint32_t xa = xg + lane, xb = xa + 32u;
+                const uint32_t wa = (g << 5) + (lane >> 1);
+                const uint32_t va = (S[wa] >> sh) & CMASK;
+                const uint32_t vb = (S[wa + 16u] >> sh) & CMASK;
+                const uint32_t ma = __ballot_sync(0xFFFFFFFFu,
+                    apply_keep_row(xa, j, va, THRESH, drop_both_even));
+                const uint32_t mb = __ballot_sync(0xFFFFFFFFu,
+                    apply_keep_row(xb, j, vb, THRESH, drop_both_even));
+                /* The masks are warp-uniform, so every lane counts both and
+                 * lane 0 commits; the store is predicated, not a branch (a
+                 * lane-0/1 branch cost a BSSY/BSYNC pair per step). */
+                nlocal += __popc(ma) + __popc(mb);
+                if (survbits && lane < 2u)
+                    survbits[(xg >> 5) + lane] = lane ? mb : ma;
+                if (side_fx) {
+                    apply_cell_side_effects(xa, va, CINIT, probe_x, probe_out, dump);
+                    apply_cell_side_effects(xb, vb, CINIT, probe_x, probe_out, dump);
+                }
             }
-            apply_cell_side_effects(x, v, CINIT, probe_x, probe_out, dump);
+        } else {
+            const uint32_t ngrp = ncell >> 5;
+            for (uint32_t g = tid >> 5; g < ngrp; g += (nth >> 5)) {
+                const uint32_t off = (g << 5) + lane;
+                const uint32_t x   = xbase + off;
+                const uint32_t v   =
+                    (S[off / CPW] >> ((off % CPW) * CELLBITS)) & CMASK;
+                const int keep = apply_keep<SLABBED>(x, v, THRESH, logI,
+                                                     j_base, drop_both_even);
+                const uint32_t mask = __ballot_sync(0xFFFFFFFFu, keep);
+                if (lane == 0) {
+                    if (survbits) survbits[x >> 5] = mask;
+                    nlocal += __popc(mask);
+                }
+                apply_cell_side_effects(x, v, CINIT, probe_x, probe_out, dump);
+            }
         }
         if (lane == 0 && nlocal) atomicAdd(nsurv, nlocal);
     } else {
-        /* Fallback: log_region < 5, or a launch whose block is not whole warps.
-         * survbits words are then shared between blocks, so the store has to be an
-         * atomicOr into a pre-cleared bitmap. */
+        /* Fallback: the store path's launch-shape condition fails
+         * (apply_scan_stores). survbits words may then be shared between
+         * blocks, so the store has to be an atomicOr into a pre-cleared
+         * bitmap. */
         for (uint32_t w = tid; w < nword; w += nth) {
             const uint32_t word = S[w];
             #pragma unroll
@@ -1770,8 +1842,8 @@ static uint32_t td_fill_small(const fb_t *fbs, const qlat_t *L, int logI,
     for (uint32_t i = 0; i < fbs->n; i++) {
         uint32_t rt, g, m;
         if (FB_ISPOW(fbs, i)) continue;
-        m = pl_transform_enc(fbs->primes[i], fbs->roots[i],
-                             L->a0, L->a1, L->b0, L->b1, &rt, &g);
+        m = pl_transform_fast(fbs->primes[i], fbs->roots[i],
+                              L->a0, L->a1, L->b0, L->b1, &rt, &g);
         if (m * g != fbs->primes[i]) {          /* the invariant above */
             fprintf(stderr, "td_build_small: m*g != p at entry %u"
                             " (p=%u m=%u g=%u)\n", i, fbs->primes[i], m, g);
@@ -2721,7 +2793,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         h_ms_transform = host_ms();
         for (i = 0; i < fbs->n; i++) {
             uint32_t q = fbs->primes[i], r = fbs->roots[i], rt, g, m;
-            m = pl_transform_enc(q, r, L->a0, L->a1, L->b0, L->b1, &rt, &g);
+            m = pl_transform_fast(q, r, L->a0, L->a1, L->b0, L->b1, &rt, &g);
             if (g > 1) nrow++;
             if (r >= q) nprj++;
             hsp[k] = m; hsrt[k] = rt; hsg[k] = g;

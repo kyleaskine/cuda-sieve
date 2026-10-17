@@ -1,0 +1,109 @@
+PASS   trial division only                7 relations
+PASS   rho, inline queue                  37 relations
+PASS   ECM, inline queue                  37 relations
+PASS   rho, chunked launches              37 relations
+PASS   ECM, chunked launches              37 relations
+PASS   chunk below one block              refused
+PASS   ECM stage 2 control, disabled      36 relations
+PASS   ECM stage 2, inline queue          37 relations
+PASS   ECM honoured, not silently rho     7 relations
+PASS   zero ECM curves                    refused
+PASS   B2 derived from B1                 B2 = 30*B1
+PASS   large B1 with derived B2           accepted
+PASS   stage 2 with rho forced            refused
+PASS   stage 2 below B1                   refused
+PASS   job file parsed                    all six keys
+PASS   GGNFS lambda conversion            3.5 -> 94.5 bits, reported not applied
+PASS   lambda not applied                 job lambda did not reach the bound
+PASS   explicit flags outrank job file    37 each, byte-identical
+PASS   side-0 mfb above 3 limbs           refused
+PASS   side-0 4LP refused                 refused
+PASS   side-1 4LP refused                 refused
+PASS   side-0 3LP width (mfb0 88)         accepted
+PASS   sq-side out of range               refused
+PASS   derived allowance policy           36 relations
+PASS   lpb above the 64-bit word          refused
+PASS   job-file lpba above 64             refused
+PASS   lpb 33 emits and verifies          59 relations, 24 factors > 2^32, all reconstruct
+PASS   lpb bound is enforced              same file refused at lpb 32
+PASS   auto method, 2LP and 3LP sides     rho / ECM
+PASS   --cof-rho / --cof-ecm override     both directions
+PASS   build reports its widest cofactor  4 limbs
+PASS   mfb above the widest cofactor      refused
+PASS   rho at 4 limbs                     identical to the 3-limb run
+PASS   4/3 split width                    identical to the 3-limb run
+PASS   ECM at 4 limbs                     identical to the 3-limb run
+PASS   lpb 33 / mfb 99 needs 4 limbs      4/3 derived, 66 relations, all reconstruct
+PASS   cof-limbs below what mfb needs     refused
+PASS   zero rho budget                    refused
+PASS   rho rounds overflowing shift       refused
+PASS   lambda in the typo window          refused
+PASS   lambda absurdly large              refused
+PASS   lambda 0 == automatic              37 relations
+PASS   even cofactors refused             refused
+PASS   unterminated candidate file        30 each, terminated and not
+PASS   inline == two-pass                 byte-identical
+PASS   warp vs thread recording           unslabbed, 37 relations, identical
+PASS   warp vs thread recording           4 slabs, 37 relations, identical
+PASS   sieve-skip output identity         unslabbed, 37 at 0/1/2, byte-identical
+PASS   sieve-skip output identity         odd slab starts, 37 at 0/1/2, byte-identical
+PASS   sieve-skip not an integer          refused
+PASS   bkthresh below I                   refused
+PASS   bkthresh above 2^30                refused
+PASS   emitted factors rebuild norms      inline
+PASS   emitted factors rebuild norms      s1
+PASS   reconstruction negative control    corruption detected
+PASS   primality negative control         composite factor detected
+PASS   multi-q generated band             cached + streamed q, byte-identical
+PASS   zero qrange lower bound            parsed as an empty generated band
+PASS   warp-multiple guard                --threads 33 rejected
+PASS   arithmetic safety, exhaustive grid             12480 cases
+PASS   trajectory invariants                          7 models x 4 grids
+PASS   the descent branch is reached                  
+PASS   the unreachable park is reached                
+PASS   a descent records its slice                    
+PASS   an in-bound flush clears the history           
+PASS   under the bound, all four new fields stay zero 
+PASS   and the chunk trajectory is the floor, as before 
+PASS   arithmetic safety, exhaustive grid             12480 cases
+PASS   trajectory invariants                          7 models x 4 grids
+PASS   the floor park is reached                      (hard floor above the grid)
+PASS   under the bound, all four new fields stay zero 
+PASS   and the chunk trajectory is the floor, as before 
+PASS   GNFS, maxbits=15                 d5e628b16c6a8f7329c8d474899645693cc8866969ea8f484b630ee10d7e72f1
+PASS   GNFS, legacy maxbits=1           4cf1c1bde338f073d62094d411b1d925e033ce21ad7407cd2a66b630e3cd5fd6
+PASS   octic, default maxbits=15        33bfee4610882c5d162d13c7c398461b1c790331c97f9e1fbabdd7a037216882
+PASS   C147 timing FB, maxbits=14       546a78a12d0310a8e3c221267067d347f338318d9ce01d95170f17a423a9745c
+PASS   central special-q validation
+PASS   algebraic q above alim       84 roots
+PASS   rational open --nq          25 roots
+PASS   inclusive qrange upper bound
+PASS   oracle q/rho agreement       67 pairs
+PASS   missing rational Y1 refused
+PASS   16-bit slice ID boundary           65,536 slices accepted; 65,537 rejected fail-closed
+PASS   64-bit grid-stride product         16,777,216 x 256 remains 2^32 rather than wrapping to zero
+PASS   strict finite decimal parser       junk, range errors, NaN and infinities rejected without assignment
+PASS   strict unsigned decimal parser     signs, whitespace, junk and overflow rejected without assignment
+PASS   checked survivor threshold         truncation preserved; invalid values and BOUND > CINIT rejected
+PASS   8-bit factor-base logs             out-of-range logs fail without publishing a partial array
+PASS   strict --qrange parser             open/closed ranges accepted; junk, overflow and reversed bounds rejected
+PASS   validator fail-closed cases        mixed composites, flags, roots, ordering, .afb.0 powers
+PASS   validator dense fast path          65,536 distinct moduli checked by sieve; injected composite rejected
+PASS   file loaders invoke validator      .afb.0 and text inputs reject malformed moduli and clean up
+PASS   strict CADO text parser            numeric bounds, metadata, roots, ordering and trailing input checked
+PASS   strict polynomial parser           fields, exact integers, finite values, duplicates, pasted Unicode
+PASS   synthetic moduli                   primes, prime powers, even moduli, affine + projective
+PASS   fast path == general path          19014464 (m, rt, g) compared exactly, 17979125 by the fast path; small special-q x prime powers to 2000, random moduli to 2^32
+PASS   side 1 small part                  3840 entries checked
+PASS   side 1 fast path == general path   every entry exact, 7605406 of 7605616 by the fast path
+PASS   side 1 moduli are prime powers     7605616 ideals
+PASS   side 1 projective entries seen     41 projective, 35 with a NONZERO reciprocal
+PASS   side 1 sum(logp/q)                 42.2913 (independent expectation 42.2913)
+PASS   side 0 small part                  3590 entries checked
+PASS   side 0 fast path == general path   every entry exact, 3957293 of 3957374 by the fast path
+PASS   side 0 moduli are prime powers     3957374 ideals
+PASS   side 0 projective ladder           10 projective, 3 with a NONZERO reciprocal (expect >= 3: 59^2, 101^2, 127^2)
+PASS   side 0 sum(logp/q)                 25.2037 (independent expectation 25.2037)
+PASS   octic below 256-bit bound          upper bound 255.17 bits
+PASS   octic above 256-bit bound          upper bound 256.17 bits refused
+all gates passed

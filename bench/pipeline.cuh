@@ -24,6 +24,11 @@
 #include "watchdog.h"
 #include <signal.h>
 
+/* The pipeline's apply cell width. One constant for the k_apply instances it
+ * launches, their shared-memory size and the survbits-clear guard
+ * (apply_scan_stores), so the three cannot disagree. */
+#define PIPE_CELLBITS 16
+
 /* ---- clean stop -------------------------------------------------------- *
  *
  * A band runs for days and gets interrupted. Without a handler the process
@@ -383,7 +388,7 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
         goto done;
     }
     {
-        const size_t smem = ((size_t)1 << cfg->log_region) * 2 +
+        const size_t smem = ((size_t)1 << cfg->log_region) * (PIPE_CELLBITS / 8) +
                             (size_t)S->nslice_pow2 * sizeof(*hlogp);
         if (smem > optin_smem_limit) {
             fprintf(stderr, "  apply needs %zu B of shared memory for %u"
@@ -545,9 +550,9 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
         uint16_t *hslp = S->hslp;
         uint32_t k = 0;
         for (uint32_t i = 0; i < fbs->n; i++) {
-            uint32_t rt, g, m = pl_transform_enc(fbs->primes[i], fbs->roots[i],
-                                                 L->a0, L->a1, L->b0, L->b1,
-                                                 &rt, &g);
+            uint32_t rt, g, m = pl_transform_fast(fbs->primes[i], fbs->roots[i],
+                                                  L->a0, L->a1, L->b0, L->b1,
+                                                  &rt, &g);
             hsp[k] = m;
             hsrt[k] = rt;
             hsg[k] = g;
@@ -913,19 +918,17 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     }
     SLAB_CK(cudaEventRecord(S->ev[2], st));
     SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
-    /* Provably redundant on every production geometry: k_apply's warp-ballot
-     * path stores every word of the slab bitmap unconditionally, and this
-     * function has both inputs its guard tests (log_region and athr, above), so
-     * `if (cfg->log_region < 5 || (athr & 31))` would skip the clear safely.
-     * Measured cost of keeping it: ~512 MB of device writes per q at I16/J32768
-     * x 4 slabs x 2 sides, about 0.7 ms against ~440, i.e. 0.16%.
-     *
-     * It stays anyway, and the honest reason is not "avoiding coupling" -- the
-     * coupling already exists implicitly. It is that the guard would restate
-     * k_apply's launch-shape condition in a second place, where it can rot out
-     * of sync with the kernel's, and the payoff is 0.16%. Revisit if the clear
-     * ever shows up in a profile. */
-    SLAB_CK(cudaMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
+    /* Only when k_apply's scan will not overwrite every word itself. Its store
+     * path writes each word of the regions it covers, and the regions cover
+     * the slab whenever xmax is a whole number of them (always under
+     * --pipeline, where the region lies in one row). The condition is
+     * apply_scan_stores, the kernel's own, so it cannot rot out of sync with
+     * the kernel -- which was the reason this clear used to stay
+     * unconditional. 512 MiB of writes per q at I16/J32768 (4 slabs x 2
+     * sides). */
+    if (!apply_scan_stores<PIPE_CELLBITS>(cfg->logI, log_region, (uint32_t)athr)
+        || ((uint64_t)nregion << log_region) != xmax)
+        SLAB_CK(cudaMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
     {   /* The instance with the two-step tail only when this q has one: at
          * logI <= 15 it never does, and that instance's thread tier is the
@@ -934,8 +937,8 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
          * table with a tail would give silently wrong residues, and traps.
          * Its own scope, so the SLAB_CK gotos above do not jump past it. */
         auto *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
-            ? k_apply<16, 1, NORM_HORNER, SLABBED, true>
-            : k_apply<16, 1, NORM_HORNER, SLABBED, false>;
+            ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>
+            : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>;
         apply_kern<<<nregion, athr, S->apply_smem, st>>>(
             (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
             S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
@@ -1093,6 +1096,29 @@ typedef struct {
     unsigned long long ovf;
 } td_ctr_t;
 
+/* k_resieve_scatter's coarse filter (td.cuh), measured 2026-10-16 with
+ * relations byte-identical throughout. Pipelined wall against the same build
+ * without it: NFS@Home I16 -8.3%, C194 -6.7%, c183 -7.3% (all 2^29-position
+ * slabs); C143's 2^26 single slab +0.6%. At 2^27 and 2^28 (C143 at I14) the
+ * pipelined wall still gained 1-6%, but single-queued the resieve ran 45-50%
+ * SLOWER, so it switches on only at PIPE_RS_COARSE_MIN positions per slab,
+ * where every arm measured faster. Shared memory: PIPE_RS_COARSE words, 32 KB,
+ * one bit per summary word (2048 positions) up to 2^29-position slabs and
+ * coarser beyond. 512 threads keep 48 warps per SM at three such blocks; 256
+ * left 24 and gave back two thirds of the gain. */
+#define PIPE_RS_COARSE      8192u
+#define PIPE_RS_COARSE_MIN  (1u << 29)
+#define PIPE_RS_THREADS     512
+
+/* Words of the coarse filter for nsw summary words at 2^cshift summary words
+ * per bit. The one definition behind the filter's sizing, its build
+ * (k_build_summary_g with wper = 2^cshift computes the same count) and the
+ * resieve's shared-memory size and copy length. */
+static inline uint32_t pipe_rs_ncoarse(uint32_t nsw, int cshift)
+{
+    return (((nsw + (1u << cshift) - 1u) >> cshift) + 31u) / 32u;
+}
+
 typedef struct {
     double rank, emit, summary, resieve, td, classify, compact, record;
     double readback, join, hostq, cofac;
@@ -1103,6 +1129,14 @@ typedef struct {
     uint32_t scap, ccap;          /* survivors, joint candidates */
     /* shared by both sides: functions of the two-sided bitmap alone */
     uint32_t *d_cnt, *d_gbase, *d_bsum, *d_sum;
+    /* k_resieve_scatter's shared-memory filter (k_build_summary_g over the
+     * summary): one bit per 2^rs_cshift summary words, rs_cshift the least
+     * that fits PIPE_RS_COARSE words; rs_blocks[SLABBED] is the resident grid
+     * at PIPE_RS_THREADS with that much shared memory, 0 when that instance
+     * cannot be resident at all (the plain resieve then runs). NULL when no
+     * slab reaches PIPE_RS_COARSE_MIN. */
+    uint32_t *d_coarse;
+    int rs_cshift, rs_blocks[2];
     uint32_t *d_x;  int64_t *d_a, *d_b;
     uint32_t *d_flags;  unsigned long long *d_ovf;
     /* d_flags, d_nacc and d_ovf are views into ONE device block, d_ctr, so
@@ -1142,6 +1176,7 @@ static void pipe_td_free(pipe_td_t *C)
 {
     cudaFree(C->d_cnt); cudaFree(C->d_gbase); cudaFree(C->d_bsum);
     cudaFree(C->d_sum); cudaFree(C->d_x); cudaFree(C->d_a); cudaFree(C->d_b);
+    cudaFree(C->d_coarse);
     cudaFree(C->d_ctr);     /* d_flags, d_nacc, d_ovf point into it */
     cudaFree(C->d_aflag); cudaFree(C->d_aoff); cudaFree(C->d_absum);
     cudaFree(C->d_sel);
@@ -1264,6 +1299,20 @@ static int pipe_td_init(pipe_td_t *C, const fb_t *fbs1, const fb_t *fbs0,
     CK(cudaMalloc(&C->d_gbase, (size_t)C->ngroup * 4));
     CK(cudaMalloc(&C->d_bsum, (size_t)C->nb * 4));
     CK(cudaMalloc(&C->d_sum, (size_t)C->nsumword * 4));
+    if ((uint64_t)nbitword * 32u >= PIPE_RS_COARSE_MIN) {
+        int dev = 0, nsm = 0, nbk = 0;
+        while (pipe_rs_ncoarse(C->nsumword, C->rs_cshift) > PIPE_RS_COARSE)
+            C->rs_cshift++;
+        CK(cudaMalloc(&C->d_coarse, (size_t)PIPE_RS_COARSE * 4));
+        CK(cudaGetDevice(&dev));
+        CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbk,
+               k_resieve_scatter<4, false, true>, PIPE_RS_THREADS, PIPE_RS_COARSE * 4));
+        C->rs_blocks[0] = nbk > 0 ? nsm * nbk : 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbk,
+               k_resieve_scatter<4, true, true>, PIPE_RS_THREADS, PIPE_RS_COARSE * 4));
+        C->rs_blocks[1] = nbk > 0 ? nsm * nbk : 0;
+    }
     CK(cudaMalloc(&C->d_ctr, sizeof(td_ctr_t)));
     C->d_flags = &C->d_ctr->flags;
     C->d_nacc  = &C->d_ctr->nacc;
@@ -1528,6 +1577,20 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     /* 1 summary bit per 2 bitmap words == per 64 positions, the setting the
      * resieve sweep selected. */
     k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, C->d_sum);
+    /* the resieve's shared-memory filter, for slabs large enough to gain,
+     * when its instance can be resident, and only if a side's FK walk will
+     * read it (under --resieve-rows the row tier may cover a whole side) */
+    const uint32_t nsw = (nbitword + 63u) / 64u;
+    const uint32_t ncw = pipe_rs_ncoarse(nsw, C->rs_cshift);
+    const uint32_t nr1 = cfg->resieve_rows ? S[1]->nrow : 0;
+    const uint32_t nr0 = cfg->resieve_rows ? S[0]->nrow : 0;
+    const int coarse = C->d_coarse && xmax >= PIPE_RS_COARSE_MIN
+                    && C->rs_blocks[SLABBED ? 1 : 0] > 0
+                    && (S[1]->nfb > nr1 || S[0]->nfb > nr0);
+    if (coarse)   /* the same OR-reduction as the summary, one level up */
+        k_build_summary_g<<<(ncw + 255u) / 256u, 256>>>(C->d_sum, nsw,
+                                                         1u << C->rs_cshift,
+                                                         C->d_coarse);
     CK(cudaEventRecord(E[4]));
 
     for (int si = 0; si < 2; si++) {
@@ -1546,7 +1609,16 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                 C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
                 PIPE_K, C->d_ovf, 6, j_base);
         }
-        if (S[side]->nfb > nr)
+        if (S[side]->nfb > nr && coarse)
+            k_resieve_scatter<4, SLABBED, true><<<C->rs_blocks[SLABBED ? 1 : 0],
+                                                  PIPE_RS_THREADS, (size_t)ncw * 4>>>(
+                S[side]->plat + nr, S[side]->primes + nr, NULL,
+                S[side]->nfb - nr, xmax, cfg->logI,
+                C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
+                PIPE_K, C->d_ovf, 6,
+                SLABBED ? S[side]->walk_cur + nr : NULL,
+                C->d_coarse, ncw, C->rs_cshift);
+        else if (S[side]->nfb > nr)
             k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
                 S[side]->plat + nr, S[side]->primes + nr, NULL,
                 S[side]->nfb - nr, xmax, cfg->logI,
@@ -2148,9 +2220,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * Setting it independently while initializing the two sides is wrong:
          * the second side can lower the limit required by the first. Both
          * SSTAIL instances, because the launch picks one per q. */
-        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, false>,
+        PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
-        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, true>,
+        PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
     }
     VRAM_MARK("factor bases + bitmaps");
@@ -3192,7 +3264,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             wd_phase("slab.intersect");
             PIPE_CK(cudaMemset(d_n, 0, 4));
             PIPE_CK(cudaMemset(d_pre, 0, 8));
-            PIPE_CK(cudaMemset(d_two, 0, (size_t)nbitword * 4));
+            /* No clear of d_two: k_intersect_compact stores every one of its
+             * nbitword words outright (256 MiB per q at I16/J32768). */
             PIPE_CK(cudaEventRecord(ea));
             k_intersect_compact<1, SLABBED><<<blocks, cfg->threads>>>(
                 S1.survbits, S0.survbits, nbitword, cfg->logI,

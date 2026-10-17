@@ -594,8 +594,19 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
  * any of them multiplies memory-level parallelism per warp by UNROLL. The walk
  * itself is pure register arithmetic, so running ahead costs nothing and needs
  * no speculation.
+ *
+ * AT I16 THE BOUND IS DIFFERENT, and COARSE is for it. Measured 2026-10-16
+ * (ncu, NFS@Home lpba-34 job, 2^29-position slabs): L2 throughput 78-89% of
+ * peak with issue active 21-26%, ~0.83 L2 sectors per step and an L1 hit rate
+ * of 23% -- the 1 MB summary of a slab no longer sits close, so every probe is
+ * a 32-byte L2 sector for one bit. COARSE puts a bitmap of the summary's
+ * nonzero words (one bit per 2048 positions, 32 KB per such slab) in shared
+ * memory and loads the summary only where that bit is set. Unlike the global
+ * pre-filter above, a rejecting probe here costs no L2 traffic at all. The
+ * set of (survivor, prime) pairs is unchanged: a coarse bit is clear only
+ * when every summary bit under it is.
  */
-template <int UNROLL, bool SLABBED = false>
+template <int UNROLL, bool SLABBED = false, bool COARSE = false>
 __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   const uint32_t *__restrict primes,
                                   const uint8_t *__restrict ispow,
@@ -608,12 +619,23 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                                   uint32_t K,
                                   unsigned long long *__restrict noverflow,
                                   int log_gran,
-                                  const uint64_t *__restrict walk_cur)
+                                  const uint64_t *__restrict walk_cur,
+                                  const uint32_t *__restrict coarse = nullptr,
+                                  uint32_t ncoarse = 0, int cshift = 0)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
     const uint64_t stride = bench_grid_stride_x();
     unsigned long long ovf = 0;
+    /* COARSE: one bit per 2^cshift summary words, set when any is nonzero
+     * (k_build_summary_g over the summary, wper = 2^cshift), copied to
+     * shared memory once per block. See the note above. */
+    extern __shared__ uint32_t s_coarse[];
+    if constexpr (COARSE) {
+        for (uint32_t w = threadIdx.x; w < ncoarse; w += blockDim.x)
+            s_coarse[w] = coarse[w];
+        __syncthreads();
+    }
 
     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
@@ -639,12 +661,30 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
                 if (x < xmax) { xs[u] = (uint32_t)x; x = pl_next64(x, &P, Imask); }
                 else xs[u] = NONE;
             }
-            /* every one of these is independent, so they issue together */
-            #pragma unroll
-            for (int u = 0; u < UNROLL; u++) {
-                uint32_t sb = xs[u] >> log_gran;
-                hit[u] = (xs[u] == NONE) ? 0u
-                                         : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+            if constexpr (COARSE) {
+                /* shared memory first; only a step whose coarse bit is set
+                 * loads its summary word. The loads stay independent, so
+                 * they still issue together. */
+                uint32_t pass[UNROLL];
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    const uint32_t c = (xs[u] >> (log_gran + 5)) >> cshift;
+                    pass[u] = (xs[u] == NONE) ? 0u
+                                              : ((s_coarse[c >> 5] >> (c & 31u)) & 1u);
+                }
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    uint32_t sb = xs[u] >> log_gran;
+                    hit[u] = pass[u] ? ((summary[sb >> 5] >> (sb & 31u)) & 1u) : 0u;
+                }
+            } else {
+                /* every one of these is independent, so they issue together */
+                #pragma unroll
+                for (int u = 0; u < UNROLL; u++) {
+                    uint32_t sb = xs[u] >> log_gran;
+                    hit[u] = (xs[u] == NONE) ? 0u
+                                             : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
+                }
             }
             #pragma unroll
             for (int u = 0; u < UNROLL; u++) {

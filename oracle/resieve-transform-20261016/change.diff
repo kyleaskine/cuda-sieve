@@ -1,0 +1,657 @@
+diff --git a/bench/bench.h b/bench/bench.h
+index f417684..84118ef 100644
+--- a/bench/bench.h
++++ b/bench/bench.h
+@@ -1091,6 +1091,8 @@ int verify_transform(const qlat_t *L, int ncheck);
+ /* The same set-equality gate driven by a real factor base: checks every entry
+  * with q <= maxq against the definition. Returns entries checked, or -1. */
+ int verify_fb_transform(const fb_t *fb, const qlat_t *L, uint32_t maxq);
++/* pl_transform_fast == pl_transform_enc exactly; returns comparisons or -1 */
++int verify_transform_fast(const fb_t *fb, const qlat_t *L, uint64_t *nfast);
+ 
+ /* Does factor-base entry (q, r_enc) hit position (i,j)? Straight from the
+  * definition -- no lattice algebra. Ground truth for the gates and for
+diff --git a/bench/bench_kernels.cu b/bench/bench_kernels.cu
+index 2c93f20..ab252c5 100644
+--- a/bench/bench_kernels.cu
++++ b/bench/bench_kernels.cu
+@@ -90,6 +90,9 @@ static int cuda_optin_smem_limit(size_t *out)
+  *     denominator makes binary Euclid spin forever ON THE DEVICE.
+  * pl_transform_enc handles all three; the first two are wrong answers and the
+  * third is a hang, so none of them would have shown up as a failed gate.
++ * pl_transform_fast is the same function with a branch-free path for odd
++ * moduli whose denominator it can prove invertible; everything else still
++ * reaches pl_transform_enc, and fbtest compares the two exactly.
+  *
+  * What is still not expressible is g > 1: hits confined to every g-th row,
+  * which is not a plat_t walk. Those emit an empty walk, and the kernel
+@@ -112,7 +115,7 @@ __global__ void k_transform(const uint32_t *__restrict primes,
+     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+         const uint32_t k = (uint32_t)kk;
+         const uint32_t q = primes[k];
+-        uint32_t rt, g, m = pl_transform_enc(q, roots[k], a0, a1, b0, b1, &rt, &g);
++        uint32_t rt, g, m = pl_transform_fast(q, roots[k], a0, a1, b0, b1, &rt, &g);
+         /* --fill-rows: the row tier walks i == rt*j (mod q) row by row, which
+          * is the same lattice pl_make reduces whenever g == 1 (then m == q). */
+         if (k < n_rt) rt_out[k] = (g > 1) ? ROWRT_NONE : rt;
+diff --git a/bench/fbtest.c b/bench/fbtest.c
+index 49bdeae..b9ceb83 100644
+--- a/bench/fbtest.c
++++ b/bench/fbtest.c
+@@ -789,6 +789,14 @@ int main(int argc, char **argv)
+            " in [0,2q)\n", qmax);
+     ok("synthetic moduli", verify_transform(&L, qmax) == 0,
+        "primes, prime powers, even moduli, affine + projective");
++    {
++        uint64_t nf;
++        n = verify_transform_fast(NULL, &L, &nf);
++        ok("fast path == general path", n > 0,
++           "%d (m, rt, g) compared exactly, %llu by the fast path; small"
++           " special-q x prime powers to 2000, random moduli to 2^32",
++           n, (unsigned long long)nf);
++    }
+ 
+     if (do_trace) {
+         const int64_t a = (int64_t)ti * L.a0 + (int64_t)tj * L.b0;
+@@ -829,6 +837,13 @@ int main(int argc, char **argv)
+         }
+         n = verify_fb_transform(&fbs, &L, bkthresh);
+         ok("side 1 small part", n > 0, "%d entries checked", n);
++        {
++            uint64_t nf;
++            n = verify_transform_fast(&fb, &L, &nf);
++            ok("side 1 fast path == general path", n > 0,
++               "every entry exact, %llu of %u by the fast path",
++               (unsigned long long)nf, fb.n);
++        }
+         ok("side 1 moduli are prime powers", fb_check_prime_powers(&fb) < 0,
+            "%u ideals", fb.n);
+         ok("side 1 projective entries seen", np > 0,
+@@ -866,6 +881,13 @@ int main(int argc, char **argv)
+         }
+         n = verify_fb_transform(&fbs, &L, bkthresh);
+         ok("side 0 small part", n > 0, "%d entries checked", n);
++        {
++            uint64_t nf;
++            n = verify_transform_fast(&fb, &L, &nf);
++            ok("side 0 fast path == general path", n > 0,
++               "every entry exact, %llu of %u by the fast path",
++               (unsigned long long)nf, fb.n);
++        }
+         ok("side 0 moduli are prime powers", fb_check_prime_powers(&fb) < 0,
+            "%u ideals", fb.n);
+         /* Y1 = 59*101*127*281*1259*38321*5746453, so seven projective primes,
+diff --git a/bench/pipeline.cuh b/bench/pipeline.cuh
+index 59e3caa..22cdaeb 100644
+--- a/bench/pipeline.cuh
++++ b/bench/pipeline.cuh
+@@ -1093,6 +1093,20 @@ typedef struct {
+     unsigned long long ovf;
+ } td_ctr_t;
+ 
++/* k_resieve_scatter's coarse filter (td.cuh), measured 2026-10-16 with
++ * relations byte-identical throughout. Pipelined wall against the same build
++ * without it: NFS@Home I16 -8.3%, C194 -6.7%, c183 -7.3% (all 2^29-position
++ * slabs); C143's 2^26 single slab +0.6%. At 2^27 and 2^28 (C143 at I14) the
++ * pipelined wall still gained 1-6%, but single-queued the resieve ran 45-50%
++ * SLOWER, so it switches on only at PIPE_RS_COARSE_MIN positions per slab,
++ * where every arm measured faster. Shared memory: PIPE_RS_COARSE words, 32 KB,
++ * one bit per summary word (2048 positions) up to 2^29-position slabs and
++ * coarser beyond. 512 threads keep 48 warps per SM at three such blocks; 256
++ * left 24 and gave back two thirds of the gain. */
++#define PIPE_RS_COARSE      8192u
++#define PIPE_RS_COARSE_MIN  (1u << 29)
++#define PIPE_RS_THREADS     512
++
+ typedef struct {
+     double rank, emit, summary, resieve, td, classify, compact, record;
+     double readback, join, hostq, cofac;
+@@ -1103,6 +1117,12 @@ typedef struct {
+     uint32_t scap, ccap;          /* survivors, joint candidates */
+     /* shared by both sides: functions of the two-sided bitmap alone */
+     uint32_t *d_cnt, *d_gbase, *d_bsum, *d_sum;
++    /* k_resieve_scatter's shared-memory filter (k_build_coarse): one bit per
++     * 2^rs_cshift summary words, rs_cshift the least that fits PIPE_RS_COARSE
++     * words; rs_blocks[SLABBED] is the resident grid at PIPE_RS_THREADS with
++     * that much shared memory. NULL when no slab reaches PIPE_RS_COARSE_MIN. */
++    uint32_t *d_coarse;
++    int rs_cshift, rs_blocks[2];
+     uint32_t *d_x;  int64_t *d_a, *d_b;
+     uint32_t *d_flags;  unsigned long long *d_ovf;
+     /* d_flags, d_nacc and d_ovf are views into ONE device block, d_ctr, so
+@@ -1142,6 +1162,7 @@ static void pipe_td_free(pipe_td_t *C)
+ {
+     cudaFree(C->d_cnt); cudaFree(C->d_gbase); cudaFree(C->d_bsum);
+     cudaFree(C->d_sum); cudaFree(C->d_x); cudaFree(C->d_a); cudaFree(C->d_b);
++    cudaFree(C->d_coarse);
+     cudaFree(C->d_ctr);     /* d_flags, d_nacc, d_ovf point into it */
+     cudaFree(C->d_aflag); cudaFree(C->d_aoff); cudaFree(C->d_absum);
+     cudaFree(C->d_sel);
+@@ -1264,6 +1285,21 @@ static int pipe_td_init(pipe_td_t *C, const fb_t *fbs1, const fb_t *fbs0,
+     CK(cudaMalloc(&C->d_gbase, (size_t)C->ngroup * 4));
+     CK(cudaMalloc(&C->d_bsum, (size_t)C->nb * 4));
+     CK(cudaMalloc(&C->d_sum, (size_t)C->nsumword * 4));
++    if ((uint64_t)nbitword * 32u >= PIPE_RS_COARSE_MIN) {
++        int dev = 0, nsm = 0, nbk = 0;
++        while ((((C->nsumword + (1u << C->rs_cshift) - 1u) >> C->rs_cshift) + 31u) / 32u
++               > PIPE_RS_COARSE)
++            C->rs_cshift++;
++        CK(cudaMalloc(&C->d_coarse, (size_t)PIPE_RS_COARSE * 4));
++        CK(cudaGetDevice(&dev));
++        CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
++        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbk,
++               k_resieve_scatter<4, false, true>, PIPE_RS_THREADS, PIPE_RS_COARSE * 4));
++        C->rs_blocks[0] = nsm * (nbk > 0 ? nbk : 1);
++        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbk,
++               k_resieve_scatter<4, true, true>, PIPE_RS_THREADS, PIPE_RS_COARSE * 4));
++        C->rs_blocks[1] = nsm * (nbk > 0 ? nbk : 1);
++    }
+     CK(cudaMalloc(&C->d_ctr, sizeof(td_ctr_t)));
+     C->d_flags = &C->d_ctr->flags;
+     C->d_nacc  = &C->d_ctr->nacc;
+@@ -1528,6 +1564,13 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
+     /* 1 summary bit per 2 bitmap words == per 64 positions, the setting the
+      * resieve sweep selected. */
+     k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, C->d_sum);
++    /* the resieve's shared-memory filter, for slabs large enough to gain */
++    const uint32_t nsw = (nbitword + 63u) / 64u;
++    const uint32_t ncw = (((nsw + (1u << C->rs_cshift) - 1u) >> C->rs_cshift) + 31u) / 32u;
++    const int coarse = C->d_coarse && xmax >= PIPE_RS_COARSE_MIN;
++    if (coarse)
++        k_build_coarse<<<(ncw + 255u) / 256u, 256>>>(C->d_sum, nsw, C->rs_cshift,
++                                                     C->d_coarse);
+     CK(cudaEventRecord(E[4]));
+ 
+     for (int si = 0; si < 2; si++) {
+@@ -1546,7 +1589,16 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
+                 C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
+                 PIPE_K, C->d_ovf, 6, j_base);
+         }
+-        if (S[side]->nfb > nr)
++        if (S[side]->nfb > nr && coarse)
++            k_resieve_scatter<4, SLABBED, true><<<C->rs_blocks[SLABBED ? 1 : 0],
++                                                  PIPE_RS_THREADS, (size_t)ncw * 4>>>(
++                S[side]->plat + nr, S[side]->primes + nr, NULL,
++                S[side]->nfb - nr, xmax, cfg->logI,
++                C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
++                PIPE_K, C->d_ovf, 6,
++                SLABBED ? S[side]->walk_cur + nr : NULL,
++                C->d_coarse, ncw, C->rs_cshift);
++        else if (S[side]->nfb > nr)
+             k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
+                 S[side]->plat + nr, S[side]->primes + nr, NULL,
+                 S[side]->nfb - nr, xmax, cfg->logI,
+diff --git a/bench/plattice.cuh b/bench/plattice.cuh
+index 533cb8d..575f001 100644
+--- a/bench/plattice.cuh
++++ b/bench/plattice.cuh
+@@ -27,6 +27,22 @@
+ #define PL_FN static inline
+ #endif
+ 
++/* Leading zeros of a nonzero 32-bit word, on the device and on every host
++ * compiler the builds use (MSVC has no __builtin_clz). */
++#if defined(__CUDA_ARCH__)
++#define PL_CLZ32(x) __clz((int)(x))
++#elif defined(__GNUC__) || defined(__clang__)
++#define PL_CLZ32(x) __builtin_clz(x)
++#else
++static inline int pl_clz32_host(uint32_t x)
++{
++    int n = 0;
++    while (!(x & 0x80000000u)) { x <<= 1; n++; }
++    return n;
++}
++#define PL_CLZ32(x) pl_clz32_host(x)
++#endif
++
+ /* Walk parameters. The increments must be 64-bit even while a slab-local
+  * position stays below 2^31. Reduction can produce j0/j1 large enough that
+  * (j << logI) exceeds 2^32 (for example an I16, p~250M walk can have a warp
+@@ -403,6 +419,113 @@ PL_FN uint32_t pl_transform_enc(uint32_t q, uint32_t r_enc,
+                             a0, a1, b0, b1, rt_out, g_out);
+ }
+ 
++/* ---- the transform's fast path: Montgomery residues, Fermat inverse ---- *
++ *
++ * Measured at I16 (ncu, NFS@Home lpba-34 job): pl_transform_enc spends 63% of
++ * k_transform's instructions in pl_invmod's binary Euclid and 14% in
++ * pl_gcd32, with 13.8 of 32 lanes active -- both loops run a data-dependent
++ * number of iterations with data-dependent branches inside. For an odd
++ * modulus whose denominator is invertible (every prime entry but the
++ * special-q's own ideal) this computes the same (m, rt, g) = (q, N/D, 1)
++ * without either loop:
++ *
++ *   - REDC(T) = T * 2^-32 (mod q) for T < q * 2^32 replaces the 64-bit `%`.
++ *     The four lattice terms reduce to D * 2^-32 and N * 2^-32, and the
++ *     factors 2^-32 cancel in N/D.
++ *   - the inverse is D^(q-2) by Montgomery square-and-multiply, the multiply
++ *     computed on every bit and selected, so lanes stay converged.
++ *   - D * D^-1 == 1 is then CHECKED. That check, not primality, is what
++ *     admits the result: it passes exactly when D is invertible mod q, so
++ *     g == gcd(D, q) == 1 and m == q, and then rt = N * D^-1 is the unique
++ *     residue pl_transform_gen also returns. A prime power for which Fermat's
++ *     exponent is not the inverse, a denominator divisible by p, D == 0, an
++ *     even modulus or a lattice coefficient of 2^32 or more falls through to
++ *     pl_transform_enc, unchanged. fbtest's gates compare the two exactly. */
++PL_FN uint32_t pl_redc(uint64_t T, uint32_t q, uint32_t qinv)
++{
++    /* T < q * 2^32. The low words of T and m*q agree, so (T - m*q) / 2^32 is
++     * the difference of the high words: no 65-bit intermediate for q >= 2^31. */
++    const uint32_t m = (uint32_t)T * qinv;
++    const uint32_t u = (uint32_t)(((uint64_t)m * q) >> 32);
++    const uint32_t h = (uint32_t)(T >> 32);
++    return (h >= u) ? h - u : h - u + q;
++}
++
++PL_FN uint32_t pl_montmul(uint32_t a, uint32_t b, uint32_t q, uint32_t qinv)
++{
++    return pl_redc((uint64_t)a * b, q, qinv);
++}
++
++/* x * |c| * 2^-32 (mod q), negated when c < 0. x < q and |c| < 2^32. */
++PL_FN uint32_t pl_redc_term(uint32_t x, int64_t c, uint32_t q, uint32_t qinv)
++{
++    const uint32_t v = pl_redc((uint64_t)x * (uint32_t)(c < 0 ? -c : c), q, qinv);
++    return (c < 0 && v) ? q - v : v;
++}
++
++PL_FN uint32_t pl_subq(uint32_t a, uint32_t b, uint32_t q)
++{
++    return (a >= b) ? a - b : a + (q - b);
++}
++
++/* The fast path alone: returns 1 and writes rt when it applies (then
++ * m == q and g == 1), 0 when the caller must use pl_transform_enc. */
++PL_FN int pl_transform_fast_try(uint32_t q, uint32_t r_enc,
++                                int64_t a0, int64_t a1, int64_t b0, int64_t b1,
++                                uint32_t *rt_out)
++{
++    const int isp = (r_enc >= q);
++    const uint32_t r = isp ? r_enc - q : r_enc;
++    const int64_t LIM = (int64_t)1 << 32;
++    if ((q & 1u) && q > 1u && r < q &&
++        a0 > -LIM && a0 < LIM && a1 > -LIM && a1 < LIM &&
++        b0 > -LIM && b0 < LIM && b1 > -LIM && b1 < LIM) {
++        uint32_t qinv = q, d, n, acc, t, e;
++        int bit;
++        /* q^-1 mod 2^32 by Newton: q*q == 1 (mod 8) for odd q, and each
++         * step doubles the correct bits, 3 -> 48. */
++        qinv *= 2u - q * qinv; qinv *= 2u - q * qinv;
++        qinv *= 2u - q * qinv; qinv *= 2u - q * qinv;
++        /* D and N times 2^-32, in pl_transform_gen's two encodings */
++        if (isp) {
++            d = pl_subq(pl_redc_term(r, a0, q, qinv), pl_redc_term(1u, a1, q, qinv), q);
++            n = pl_subq(pl_redc_term(1u, b1, q, qinv), pl_redc_term(r, b0, q, qinv), q);
++        } else {
++            d = pl_subq(pl_redc_term(1u, a0, q, qinv), pl_redc_term(r, a1, q, qinv), q);
++            n = pl_subq(pl_redc_term(r, b1, q, qinv), pl_redc_term(1u, b0, q, qinv), q);
++        }
++        if (d) {
++            /* acc = d^(q-2) in Montgomery form, which is (d*2^-32)^-1 * 2^64
++             * for prime q; left to right from the top bit, so no 2^32 mod q */
++            e = q - 2u;
++            acc = d;
++            for (bit = 30 - (int)PL_CLZ32(e); bit >= 0; bit--) {
++                acc = pl_montmul(acc, acc, q, qinv);
++                t = pl_montmul(acc, d, q, qinv);
++                acc = ((e >> bit) & 1u) ? t : acc;
++            }
++            /* REDC(REDC(d * acc)) == 1  <=>  acc * 2^-64 is d's inverse */
++            if (pl_redc(pl_montmul(d, acc, q, qinv), q, qinv) == 1u) {
++                *rt_out = pl_redc(pl_montmul(n, acc, q, qinv), q, qinv);
++                return 1;
++            }
++        }
++    }
++    return 0;
++}
++
++/* Same contract and outputs as pl_transform_enc. */
++PL_FN uint32_t pl_transform_fast(uint32_t q, uint32_t r_enc,
++                                 int64_t a0, int64_t a1, int64_t b0, int64_t b1,
++                                 uint32_t *rt_out, uint32_t *g_out)
++{
++    if (pl_transform_fast_try(q, r_enc, a0, a1, b0, b1, rt_out)) {
++        *g_out = 1u;
++        return q;
++    }
++    return pl_transform_enc(q, r_enc, a0, a1, b0, b1, rt_out, g_out);
++}
++
+ /* Projective factor-base root (GGNFS and CADO both encode it as root >= p):
+  * the condition is b == 0 (mod p) rather than a == r*b. Kept for the
+  * prime-modulus paths; pl_transform_gen handles it uniformly. */
+diff --git a/bench/td.cuh b/bench/td.cuh
+index efcce84..70df9c2 100644
+--- a/bench/td.cuh
++++ b/bench/td.cuh
+@@ -563,6 +563,29 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
+     }
+ }
+ 
++/* One bit per 2^cshift words of the resieve summary: set when any is nonzero.
++ * nsw is the slab's summary length; one thread per output word. */
++__global__ void k_build_coarse(const uint32_t *__restrict summary, uint32_t nsw,
++                               int cshift, uint32_t *__restrict coarse)
++{
++    const uint32_t per = 1u << cshift;
++    const uint32_t ncb = (nsw + per - 1u) >> cshift;      /* coarse bits */
++    const uint32_t ncw = (ncb + 31u) >> 5;
++    const uint64_t stride = bench_grid_stride_x();
++    for (uint64_t ww = bench_grid_thread_x(); ww < ncw; ww += stride) {
++        const uint32_t w = (uint32_t)ww;
++        uint32_t out = 0;
++        for (uint32_t b = 0; b < 32; b++) {
++            const uint32_t lo = (w * 32u + b) << cshift;
++            uint32_t o = 0;
++            if (lo >= nsw) break;
++            for (uint32_t k = 0; k < per && lo + k < nsw; k++) o |= summary[lo + k];
++            if (o) out |= 1u << b;
++        }
++        coarse[w] = out;
++    }
++}
++
+ /* ---- resieve that scatters into per-survivor lists --------------------- *
+  *
+  * k_resieve_rewalk with the output changed from an unordered (x,p) array to a
+@@ -594,8 +617,19 @@ __global__ void k_emit_ranked(const uint32_t *__restrict bits,
+  * any of them multiplies memory-level parallelism per warp by UNROLL. The walk
+  * itself is pure register arithmetic, so running ahead costs nothing and needs
+  * no speculation.
++ *
++ * AT I16 THE BOUND IS DIFFERENT, and COARSE is for it. Measured 2026-10-16
++ * (ncu, NFS@Home lpba-34 job, 2^29-position slabs): L2 throughput 78-89% of
++ * peak with issue active 21-26%, ~0.83 L2 sectors per step and an L1 hit rate
++ * of 23% -- the 1 MB summary of a slab no longer sits close, so every probe is
++ * a 32-byte L2 sector for one bit. COARSE puts a bitmap of the summary's
++ * nonzero words (one bit per 2048 positions, 32 KB per such slab) in shared
++ * memory and loads the summary only where that bit is set. Unlike the global
++ * pre-filter above, a rejecting probe here costs no L2 traffic at all. The
++ * set of (survivor, prime) pairs is unchanged: a coarse bit is clear only
++ * when every summary bit under it is.
+  */
+-template <int UNROLL, bool SLABBED = false>
++template <int UNROLL, bool SLABBED = false, bool COARSE = false>
+ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
+                                   const uint32_t *__restrict primes,
+                                   const uint8_t *__restrict ispow,
+@@ -608,12 +642,22 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
+                                   uint32_t K,
+                                   unsigned long long *__restrict noverflow,
+                                   int log_gran,
+-                                  const uint64_t *__restrict walk_cur)
++                                  const uint64_t *__restrict walk_cur,
++                                  const uint32_t *__restrict coarse = nullptr,
++                                  uint32_t ncoarse = 0, int cshift = 0)
+ {
+     const uint32_t Imask = (1u << logI) - 1;
+     const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
+     const uint64_t stride = bench_grid_stride_x();
+     unsigned long long ovf = 0;
++    /* COARSE: k_build_coarse's bitmap, one bit per 2^cshift summary words,
++     * copied to shared memory once per block. See the note above. */
++    extern __shared__ uint32_t s_coarse[];
++    if constexpr (COARSE) {
++        for (uint32_t w = threadIdx.x; w < ncoarse; w += blockDim.x)
++            s_coarse[w] = coarse[w];
++        __syncthreads();
++    }
+ 
+     for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+         const uint32_t k = (uint32_t)kk;
+@@ -639,12 +683,30 @@ __global__ void k_resieve_scatter(const plat_t *__restrict plat,
+                 if (x < xmax) { xs[u] = (uint32_t)x; x = pl_next64(x, &P, Imask); }
+                 else xs[u] = NONE;
+             }
+-            /* every one of these is independent, so they issue together */
+-            #pragma unroll
+-            for (int u = 0; u < UNROLL; u++) {
+-                uint32_t sb = xs[u] >> log_gran;
+-                hit[u] = (xs[u] == NONE) ? 0u
+-                                         : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
++            if constexpr (COARSE) {
++                /* shared memory first; only a step whose coarse bit is set
++                 * loads its summary word. The loads stay independent, so
++                 * they still issue together. */
++                uint32_t pass[UNROLL];
++                #pragma unroll
++                for (int u = 0; u < UNROLL; u++) {
++                    const uint32_t c = (xs[u] >> (log_gran + 5)) >> cshift;
++                    pass[u] = (xs[u] == NONE) ? 0u
++                                              : ((s_coarse[c >> 5] >> (c & 31u)) & 1u);
++                }
++                #pragma unroll
++                for (int u = 0; u < UNROLL; u++) {
++                    uint32_t sb = xs[u] >> log_gran;
++                    hit[u] = pass[u] ? ((summary[sb >> 5] >> (sb & 31u)) & 1u) : 0u;
++                }
++            } else {
++                /* every one of these is independent, so they issue together */
++                #pragma unroll
++                for (int u = 0; u < UNROLL; u++) {
++                    uint32_t sb = xs[u] >> log_gran;
++                    hit[u] = (xs[u] == NONE) ? 0u
++                                             : ((summary[sb >> 5] >> (sb & 31u)) & 1u);
++                }
+             }
+             #pragma unroll
+             for (int u = 0; u < UNROLL; u++) {
+diff --git a/bench/verify_cpu.c b/bench/verify_cpu.c
+index 256aab7..0e72683 100644
+--- a/bench/verify_cpu.c
++++ b/bench/verify_cpu.c
+@@ -194,6 +194,212 @@ int verify_fb_transform(const fb_t *fb, const qlat_t *L, uint32_t maxq)
+     return (int)checked;
+ }
+ 
++/* pl_transform_fast against pl_transform_enc, EXACT on (m, rt, g): the fast
++ * path claims the same output, not merely the same lattice, so the walks it
++ * produces -- and every relation downstream -- are identical. Three sources:
++ *
++ *   1. every entry of a real factor base under the gate's own lattice;
++ *   2. small special-q (3..13) against every prime power up to 2000 and every
++ *      root in [0, 2q). This is where a prime power p^k with p dividing the
++ *      special-q lives: D and N can then share the factor p, and a fast path
++ *      that checked rt*D == N instead of invertibility would return g = 1
++ *      where pl_transform_gen returns g = p;
++ *   3. deterministic random large moduli (primes, odd prime powers, powers of
++ *      two) with random roots, under reduced lattices of random special-q and
++ *      under raw coefficients up to and past the 2^32 guard. Every sample is
++ *      kept inside pl_transform_gen's own int64 domain (q*|c| < 4e18), since
++ *      it is the reference.
++ *
++ * With fb, only source 1; without, sources 2 and 3. Wherever the fast path
++ * answers, its root is also checked against the definition in exact 64-bit
++ * arithmetic; the comparison with pl_transform_enc covers moduli below 2^31,
++ * its valid range (see fast_cmp). Returns the number of cases, or -1 on the
++ * first failure; *nfast counts those the fast path answered itself. */
++static uint32_t vtf_modq(int64_t v, uint32_t q)
++{
++    const int64_t r = v % (int64_t)q;
++    return (uint32_t)(r < 0 ? r + (int64_t)q : r);
++}
++
++static uint32_t vtf_gcd(uint32_t a, uint32_t b)
++{
++    while (b) { const uint32_t t = a % b; a = b; b = t; }
++    return a;
++}
++
++static int fast_cmp(uint32_t q, uint32_t r_enc, int64_t a0, int64_t a1,
++                    int64_t b0, int64_t b1, uint64_t *nfast)
++{
++    uint32_t rt0, g0, rt1, g1, m0, m1, rtt;
++    const int took = pl_transform_fast_try(q, r_enc, a0, a1, b0, b1, &rtt);
++    if (took) {
++        /* the definition, independently and exactly in 64 bits: D is
++         * invertible mod q and rt*D == N, so rt is THE root (g = 1, m = q) */
++        const int isp = r_enc >= q;
++        const uint32_t r = isp ? r_enc - q : r_enc;
++        const uint64_t A0 = vtf_modq(a0, q), A1 = vtf_modq(a1, q);
++        const uint64_t B0 = vtf_modq(b0, q), B1 = vtf_modq(b1, q);
++        const uint64_t D = isp ? ((uint64_t)r * A0 % q + q - A1) % q
++                               : (A0 + q - (uint64_t)r * A1 % q) % q;
++        const uint64_t N = isp ? (B1 + q - (uint64_t)r * B0 % q) % q
++                               : ((uint64_t)r * B1 % q + q - B0) % q;
++        if (vtf_gcd((uint32_t)D, q) != 1 || (uint64_t)rtt * D % q != N) {
++            fprintf(stderr,
++                "verify_transform_fast DEFINITION q=%u r=%u basis (%lld,%lld,%lld,%lld):"
++                " fast rt=%u, D=%llu N=%llu\n", q, r_enc, (long long)a0,
++                (long long)a1, (long long)b0, (long long)b1, rtt,
++                (unsigned long long)D, (unsigned long long)N);
++            return 1;
++        }
++        (*nfast)++;
++    }
++    /* pl_transform_enc is the reference only below 2^31: pl_invmod's
++     * (x1 + p) >> 1 wraps in 32 bits above it (pre-existing, unreachable at
++     * today's factor-base limits; the fast path does not use it). */
++    if (q >= 0x80000000u) return 0;
++    m0 = pl_transform_enc(q, r_enc, a0, a1, b0, b1, &rt0, &g0);
++    m1 = pl_transform_fast(q, r_enc, a0, a1, b0, b1, &rt1, &g1);
++    if (m0 != m1 || rt0 != rt1 || g0 != g1) {
++        fprintf(stderr,
++            "verify_transform_fast MISMATCH q=%u r=%u basis (%lld,%lld,%lld,%lld):"
++            " enc (m=%u,rt=%u,g=%u) fast (m=%u,rt=%u,g=%u)\n",
++            q, r_enc, (long long)a0, (long long)a1, (long long)b0, (long long)b1,
++            m0, rt0, g0, m1, rt1, g1);
++        return 1;
++    }
++    return 0;
++}
++
++static uint64_t vtf_rng(uint64_t *s)
++{
++    *s = *s * 6364136223846793005ull + 1442695040888963407ull;
++    return *s >> 11;
++}
++
++static uint32_t vtf_mulmod(uint32_t a, uint32_t b, uint32_t m)
++{
++    return (uint32_t)((uint64_t)a * b % m);
++}
++
++/* Deterministic Miller-Rabin for n < 2^32: bases 2, 7, 61. */
++static int vtf_isprime(uint32_t n)
++{
++    static const uint32_t B[3] = {2, 7, 61};
++    uint32_t d = n - 1, x, k;
++    int s = 0, i, r;
++    if (n < 2) return 0;
++    if (n < 4) return 1;
++    if (!(n & 1u)) return 0;
++    while (!(d & 1u)) { d >>= 1; s++; }
++    for (i = 0; i < 3; i++) {
++        uint32_t a = B[i] % n, e = d;
++        if (!a) continue;
++        x = 1;
++        k = a;
++        while (e) { if (e & 1u) x = vtf_mulmod(x, k, n); k = vtf_mulmod(k, k, n); e >>= 1; }
++        if (x == 1 || x == n - 1) continue;
++        for (r = 1; r < s; r++) {
++            x = vtf_mulmod(x, x, n);
++            if (x == n - 1) break;
++        }
++        if (r == s) return 0;
++    }
++    return 1;
++}
++
++int verify_transform_fast(const fb_t *fb, const qlat_t *L, uint64_t *nfast)
++{
++    static const uint64_t SQ[] = {3, 5, 7, 13};
++    static const double SKEW[] = {1.0, 3.0e5};
++    uint64_t s = 0x9e3779b97f4a7c15ull;
++    uint32_t pool[4096];
++    int npool = 0, n = 0, i;
++    uint32_t k;
++
++    *nfast = 0;
++    /* 1. the real factor base, and nothing else when one is given */
++    if (fb) {
++        for (k = 0; k < fb->n; k++, n++)
++            if (fast_cmp(fb->primes[k], fb->roots[k], L->a0, L->a1, L->b0, L->b1, nfast))
++                return -1;
++        return n;
++    }
++
++    /* 2. small special-q, every prime power to 2000, every root */
++    for (i = 0; i < (int)(sizeof(SQ) / sizeof(SQ[0])); i++) {
++        int z;
++        for (z = 0; z < 2; z++) {
++            uint64_t rho;
++            for (rho = 0; rho < SQ[i]; rho += 2) {
++                qlat_t M;
++                uint32_t q, r;
++                qlat_build(&M, SQ[i], rho, SKEW[z]);
++                for (q = 2; q <= 2000; q++) {
++                    if (!fb_is_prime_power(q)) continue;
++                    for (r = 0; r < 2 * q; r++, n++)
++                        if (fast_cmp(q, r, M.a0, M.a1, M.b0, M.b1, nfast)) return -1;
++                }
++            }
++        }
++    }
++
++    /* 3. random large moduli */
++    while (npool < 3072) {                       /* primes, 2^16 .. 2^32 */
++        const int bits = 17 + (int)(vtf_rng(&s) % 16);
++        uint32_t c = (uint32_t)(vtf_rng(&s) & ((bits == 32) ? 0xFFFFFFFFull
++                                                            : ((1ull << bits) - 1)));
++        c |= (1u << (bits - 1)) | 1u;
++        while (!vtf_isprime(c) && c < 0xFFFFFFF0u) c += 2;
++        if (vtf_isprime(c)) pool[npool++] = c;
++    }
++    {                                            /* odd prime powers, powers of 2 */
++        static const uint32_t P[] = {3, 5, 7, 11, 13, 101, 257, 65521};
++        for (i = 0; i < (int)(sizeof(P) / sizeof(P[0])) && npool < 4096; i++) {
++            uint64_t v = (uint64_t)P[i] * P[i];
++            for (; v < (1ull << 32) && npool < 4096; v *= P[i])
++                pool[npool++] = (uint32_t)v;
++        }
++        for (k = 1; k < 32 && npool < 4096; k++) pool[npool++] = 1u << k;
++    }
++    for (i = 0; i < 400000; i++, n++) {
++        const uint32_t q = pool[vtf_rng(&s) % (uint64_t)npool];
++        const uint32_t r = (uint32_t)(vtf_rng(&s) % (2ull * q));
++        int64_t c[4];
++        int t;
++        if (i & 1) {
++            /* a reduced lattice of a random special-q up to 2^40 */
++            qlat_t M;
++            const uint64_t sq = 3 + vtf_rng(&s) % (1ull << (5 + vtf_rng(&s) % 36));
++            qlat_build(&M, sq, vtf_rng(&s) % sq, exp((double)(vtf_rng(&s) % 40)));
++            c[0] = M.a0; c[1] = M.a1; c[2] = M.b0; c[3] = M.b1;
++            if (sq % q == 0) continue;
++            for (t = 0; t < 4; t++)          /* the reference's own int64 domain */
++                if ((double)q * fabs((double)c[t]) >= 4.0e18) break;
++            if (t < 4) continue;
++        } else {
++            /* raw coefficients, magnitude classes up to and past 2^32; keep
++             * the reference's r*c inside int64 */
++            for (t = 0; t < 4; t++) {
++                const uint64_t u = vtf_rng(&s);
++                int64_t v;
++                switch (u % 6) {
++                case 0:  v = (int64_t)(u >> 8) % 1000; break;
++                case 1:  v = (int64_t)((u >> 8) & 0x7FFFFFFFull); break;
++                case 2:  v = 0xFFFFFFFFll; break;
++                case 3:  v = 0x100000000ll; break;
++                case 4:  v = (int64_t)((u >> 8) & 0xFFFFFFFFull); break;
++                default: v = (int64_t)((u >> 8) & 0x3FFFFFFFFFull); break;
++                }
++                if ((u >> 3) & 1u) v = -v;
++                while ((double)q * (double)(v < 0 ? -v : v) >= 4.0e18) v /= 2;
++                c[t] = v;
++            }
++        }
++        if (fast_cmp(q, r, c[0], c[1], c[2], c[3], nfast)) return -1;
++    }
++    return n;
++}
++
+ int verify_walk(int logI, uint32_t J, int nprimes)
+ {
+     /* Primes just above I are the interesting regime: that is where the

@@ -453,3 +453,79 @@ block used whole-percent capacities that either overflowed everything (85%) or
 nothing (95-99%). `ovf2.sh` produced `ovf2.txt`, the forced-overflow
 comparison at the per-mille settings where only some slabs overflow. `real-timing.txt`
 is the clean fat-vs-fat timing of the landed build, with the card free.
+
+## The NFS@Home I16 job against cado-gpu, equal yield (2026-10-16)
+
+[`i16-h2h-20261016/`](i16-h2h-20261016/) holds the evidence for
+[finding 115](../bench/RESULTS.md#finding-115), pinned in `MANIFEST.sha256`.
+`nfs.poly` is the job in CADO's format and `makefb.log` its factor-base
+build. `run.sh` produced `run.txt`: end-to-end CADO (skip off twice,
+default once) and cuda-sieve (twice), per-kernel arms (CADO one slot with GPU
+stats, cuda-sieve `--no-q-pipeline`), then `relcmp.py` (from
+`c143-fill-20261013/`) on the relation sets. `round2.sh` produced
+`round2.txt`, a second interleaved round with SM clock and power logged.
+Each arm's CADO stderr and `/usr/bin/time`, or cuda-sieve band output and
+time, is kept as `cado-<arm>.*` / `cuda-<arm>.*`. `cado-phases.txt` holds
+CADO's startup/steady split and host/device cofactor counts, read from the
+relation files. `nsys-trace.sh` captured three timelines (`nsys-trace.txt`).
+`nsys-analysis.txt` and `nsys-gaps-qp.txt` are `analyze.py` and `gaps.py`
+from `nsys-c143-20261014/`, and `kernsum.py` produced `nsys-kernsum.txt`
+(ms per q per kernel). `qpcheck.sh`, `qprel.sh` and `full.sh` (`.txt`)
+check the q-pipeline against single-queued without nsys. `build.txt` names
+both builds. The relation files, `.nsys-rep` captures and SQLite exports
+stay in the git-ignored `work/cado-nfs-i16/` and `work/nsys-i16-20261016/`.
+Recorded at host load 10-22 (nine CPU ECM processes throughout).
+
+## Resieve filter and transform fast path (2026-10-16)
+
+[`resieve-transform-20261016/`](resieve-transform-20261016/) holds the
+evidence for [finding 116](../bench/RESULTS.md#finding-116), pinned in
+`MANIFEST.sha256`. `change.diff` is the code change.
+- **Profiles:** `prof.sh` captured the ncu reports (one q of the NFS@Home
+  job: eight resieve launches, two transform launches). `metrics.py`
+  produced `*-metrics.txt`, and `agg.py` from `work/applyprof/` produced
+  `*-lines.txt`, the per-source-line split.
+- **Identity:** `ident.sh` (`ident.txt`) on four jobs and three arms.
+- **Experiments:** `ab.sh`, `ab2.sh` and `ab3.sh` (`.txt`) are the free-card
+  A/Bs at I16, on the other geometries, and at intermediate slab areas.
+- **Gates:** `gates.sh` (`gates.txt`) ran them on the final source.
+  `check-summary.txt` and `skipslab.txt` are their detail.
+- **Final timing:** `final-timing.sh` and `c143-recheck.sh` (`.txt`) ran
+  with the card time-sliced against the NFS@Home client.
+  `final-timing-clean.sh`, `c143-clean.sh` and `c143-more.sh` (`.txt`) are
+  the same on a free card.
+- **Landed binary:** `fat-check.sh` (`fat-check.txt`) checked the rebuilt fat
+  `bench/bench`.
+
+`build.txt` names the binaries. The ncu reports and snapshot builds stay in
+the git-ignored `work/resieve-i16/`.
+
+## Threshold scan and bitmap clears (2026-10-16)
+
+[`scan-clears-20261016/`](scan-clears-20261016/) holds the evidence for
+[finding 117](../bench/RESULTS.md#finding-117), pinned in
+`MANIFEST.sha256`. `change.diff` is the code change.
+- **Code shape:** `scan-sass.txt` is the threshold-scan loop of the
+  production I16 `k_apply` instance (sm_120) in the base, first and final
+  versions. `gates.txt` lists the registers of every instance.
+- **Profiles:** `prof.sh` (`prof-base.csv`, `prof-new.csv`,
+  `prof-summary.txt`) is the per-launch ncu run on one NFS@Home q. `split.csv`
+  and `split-summary.txt` are the per-kernel durations by side.
+- **Gates:** `sbgate.sh` (`sbgate.txt`) compares the harness's survivor
+  bitmaps, base against new. `ident.sh` (`ident.txt`) checks relation
+  identity on four jobs. `gates.txt` covers `--verify-only`, `make check` and
+  fillcheck.
+- **Timing:** `timing.sh` (`timing.txt`) is the three-round free-card A/B.
+  `c183-single.txt` is the single-queued intersect check.
+- **Per-side acceptance:** `sidestats.diff` is the test-only counter and
+  `sidestats.txt` its four bands. It was never landed.
+- **Review fixes (2026-10-17):** `review.diff` is the change.
+  `review-gates.sh` (`review-gates.txt`) ran the gates, and `verify-c183.txt`
+  is its `--verify` run. `timing-review.txt` is the A/B that a GPU ECM job
+  time-sliced, so only its host timers (`host-timers.txt`) are used.
+  `timing.sh` gained the `B=` override for it.
+- **Landed binary:** `fat-check.sh` (`fat-check.txt`) checked the rebuilt fat
+  `bench/bench`, after the review fixes.
+
+`build.txt` names the binaries. The snapshot builds and SASS dumps stay in
+the git-ignored `work/scan-i16/`.

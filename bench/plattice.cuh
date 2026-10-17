@@ -27,6 +27,22 @@
 #define PL_FN static inline
 #endif
 
+/* Leading zeros of a nonzero 32-bit word, on the device and on every host
+ * compiler the builds use (MSVC has no __builtin_clz). */
+#if defined(__CUDA_ARCH__)
+#define PL_CLZ32(x) __clz((int)(x))
+#elif defined(__GNUC__) || defined(__clang__)
+#define PL_CLZ32(x) __builtin_clz(x)
+#else
+static inline int pl_clz32_host(uint32_t x)
+{
+    int n = 0;
+    while (!(x & 0x80000000u)) { x <<= 1; n++; }
+    return n;
+}
+#define PL_CLZ32(x) pl_clz32_host(x)
+#endif
+
 /* Walk parameters. The increments must be 64-bit even while a slab-local
  * position stays below 2^31. Reduction can produce j0/j1 large enough that
  * (j << logI) exceeds 2^32 (for example an I16, p~250M walk can have a warp
@@ -238,7 +254,11 @@ PL_FN uint64_t pl_rows_to_hit(uint32_t off, uint32_t rt, uint32_t q, uint32_t I)
 
 /* Binary extended Euclid. p odd, 0 < a < p. Returns a^-1 mod p, or 0 if
  * a == 0. Divergent by nature; the design doc's recommended replacement is
- * a branch-free 2-adic (Hensel/REDC) inverse, which is variant "TH". */
+ * a branch-free 2-adic (Hensel/REDC) inverse, which is variant "TH".
+ * The halving adds in 64 bits: x + p passes 2^32 when p >= 2^31, and the
+ * 32-bit form lost that carry (q = 3,982,922,849 gave rt 1,330,206,460 for
+ * 662,933,767; finding 117's review). The subtractions need no widening:
+ * x1 + p - x2 wraps back below p. */
 PL_FN uint32_t pl_invmod(uint32_t a, uint32_t p)
 {
     uint32_t u = a, v = p, x1 = 1, x2 = 0;
@@ -246,11 +266,11 @@ PL_FN uint32_t pl_invmod(uint32_t a, uint32_t p)
     while (u != 1 && v != 1) {
         while ((u & 1) == 0) {
             u >>= 1;
-            x1 = (x1 & 1) ? (uint32_t)((x1 + p) >> 1) : (x1 >> 1);
+            x1 = (x1 & 1) ? (uint32_t)(((uint64_t)x1 + p) >> 1) : (x1 >> 1);
         }
         while ((v & 1) == 0) {
             v >>= 1;
-            x2 = (x2 & 1) ? (uint32_t)((x2 + p) >> 1) : (x2 >> 1);
+            x2 = (x2 & 1) ? (uint32_t)(((uint64_t)x2 + p) >> 1) : (x2 >> 1);
         }
         if (u >= v) { u -= v; x1 = (x1 >= x2) ? x1 - x2 : x1 + p - x2; }
         else        { v -= u; x2 = (x2 >= x1) ? x2 - x1 : x2 + p - x1; }
@@ -401,6 +421,115 @@ PL_FN uint32_t pl_transform_enc(uint32_t q, uint32_t r_enc,
     const int isp = (r_enc >= q);
     return pl_transform_gen(q, isp ? r_enc - q : r_enc, isp,
                             a0, a1, b0, b1, rt_out, g_out);
+}
+
+/* ---- the transform's fast path: Montgomery residues, Fermat inverse ---- *
+ *
+ * Measured at I16 (ncu, NFS@Home lpba-34 job): pl_transform_enc spends 63% of
+ * k_transform's instructions in pl_invmod's binary Euclid and 14% in
+ * pl_gcd32, with 13.8 of 32 lanes active -- both loops run a data-dependent
+ * number of iterations with data-dependent branches inside. For an odd
+ * modulus whose denominator is invertible (every prime entry but the
+ * special-q's own ideal) this computes the same (m, rt, g) = (q, N/D, 1)
+ * without either loop:
+ *
+ *   - REDC(T) = T * 2^-32 (mod q) for T < q * 2^32 replaces the 64-bit `%`.
+ *     The four lattice terms reduce to D * 2^-32 and N * 2^-32, and the
+ *     factors 2^-32 cancel in N/D.
+ *   - the inverse is D^(q-2) by Montgomery square-and-multiply, the multiply
+ *     computed on every bit and selected, so lanes stay converged.
+ *   - D * D^-1 == 1 is then CHECKED. That check, not primality, is what
+ *     admits the result. It passes ONLY when D is invertible mod q -- always,
+ *     for a prime q; for a prime power p^k only when D^(q-1) == 1, so an
+ *     invertible D can still fall through (q = 9, D = 2) -- and whenever it
+ *     passes, g == gcd(D, q) == 1, m == q and rt = N * D^-1 is the unique
+ *     residue pl_transform_gen also returns. A failed check, D == 0, an even
+ *     modulus or a lattice coefficient of 2^32 or more falls through to
+ *     pl_transform_enc, unchanged. fbtest's gates compare the two exactly. */
+PL_FN uint32_t pl_redc(uint64_t T, uint32_t q, uint32_t qinv)
+{
+    /* T < q * 2^32. The low words of T and m*q agree, so (T - m*q) / 2^32 is
+     * the difference of the high words: no 65-bit intermediate for q >= 2^31. */
+    const uint32_t m = (uint32_t)T * qinv;
+    const uint32_t u = (uint32_t)(((uint64_t)m * q) >> 32);
+    const uint32_t h = (uint32_t)(T >> 32);
+    return (h >= u) ? h - u : h - u + q;
+}
+
+PL_FN uint32_t pl_montmul(uint32_t a, uint32_t b, uint32_t q, uint32_t qinv)
+{
+    return pl_redc((uint64_t)a * b, q, qinv);
+}
+
+/* x * |c| * 2^-32 (mod q), negated when c < 0. x < q and |c| < 2^32. */
+PL_FN uint32_t pl_redc_term(uint32_t x, int64_t c, uint32_t q, uint32_t qinv)
+{
+    const uint32_t v = pl_redc((uint64_t)x * (uint32_t)(c < 0 ? -c : c), q, qinv);
+    return (c < 0 && v) ? q - v : v;
+}
+
+PL_FN uint32_t pl_subq(uint32_t a, uint32_t b, uint32_t q)
+{
+    return (a >= b) ? a - b : a + (q - b);
+}
+
+/* The fast path alone: returns 1 and writes rt when it applies (then
+ * m == q and g == 1), 0 when the caller must use pl_transform_enc. */
+PL_FN int pl_transform_fast_try(uint32_t q, uint32_t r_enc,
+                                int64_t a0, int64_t a1, int64_t b0, int64_t b1,
+                                uint32_t *rt_out)
+{
+    const int isp = (r_enc >= q);
+    const uint32_t r = isp ? r_enc - q : r_enc;
+    const int64_t LIM = (int64_t)1 << 32;
+    if ((q & 1u) && q > 1u && r < q &&
+        a0 > -LIM && a0 < LIM && a1 > -LIM && a1 < LIM &&
+        b0 > -LIM && b0 < LIM && b1 > -LIM && b1 < LIM) {
+        uint32_t qinv = q, d, n, acc, t, e;
+        int bit;
+        /* q^-1 mod 2^32 by Newton: q*q == 1 (mod 8) for odd q, and each
+         * step doubles the correct bits, 3 -> 48. */
+        qinv *= 2u - q * qinv; qinv *= 2u - q * qinv;
+        qinv *= 2u - q * qinv; qinv *= 2u - q * qinv;
+        /* D and N times 2^-32, in pl_transform_gen's two encodings */
+        if (isp) {
+            d = pl_subq(pl_redc_term(r, a0, q, qinv), pl_redc_term(1u, a1, q, qinv), q);
+            n = pl_subq(pl_redc_term(1u, b1, q, qinv), pl_redc_term(r, b0, q, qinv), q);
+        } else {
+            d = pl_subq(pl_redc_term(1u, a0, q, qinv), pl_redc_term(r, a1, q, qinv), q);
+            n = pl_subq(pl_redc_term(r, b1, q, qinv), pl_redc_term(1u, b0, q, qinv), q);
+        }
+        if (d) {
+            /* acc = d^(q-2) * 2^(-32(q-3)), each montmul dropping a 2^32:
+             * d^-1 * 2^64 for prime q. Left to right from the top bit, so no
+             * 2^32 mod q is needed to start. */
+            e = q - 2u;
+            acc = d;
+            for (bit = 30 - (int)PL_CLZ32(e); bit >= 0; bit--) {
+                acc = pl_montmul(acc, acc, q, qinv);
+                t = pl_montmul(acc, d, q, qinv);
+                acc = ((e >> bit) & 1u) ? t : acc;
+            }
+            /* REDC(REDC(d * acc)) == 1  <=>  acc * 2^-64 is d's inverse */
+            if (pl_redc(pl_montmul(d, acc, q, qinv), q, qinv) == 1u) {
+                *rt_out = pl_redc(pl_montmul(n, acc, q, qinv), q, qinv);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Same contract and outputs as pl_transform_enc. */
+PL_FN uint32_t pl_transform_fast(uint32_t q, uint32_t r_enc,
+                                 int64_t a0, int64_t a1, int64_t b0, int64_t b1,
+                                 uint32_t *rt_out, uint32_t *g_out)
+{
+    if (pl_transform_fast_try(q, r_enc, a0, a1, b0, b1, rt_out)) {
+        *g_out = 1u;
+        return q;
+    }
+    return pl_transform_enc(q, r_enc, a0, a1, b0, b1, rt_out, g_out);
 }
 
 /* Projective factor-base root (GGNFS and CADO both encode it as root >= p):

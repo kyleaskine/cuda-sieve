@@ -1,0 +1,16 @@
+base qp     wall   7.41 xform 0.561 | client=0
+new  qp     wall   7.62 xform 0.258 | client=0
+base --no-q-pipeline wall   9.35 xform 0.531 | client=0
+new  --no-q-pipeline wall   9.17 xform 0.241 | client=0
+new  qp     wall   7.45 xform 0.253 | client=0
+base qp     wall   7.55 xform 0.563 | client=0
+new  --no-q-pipeline wall   9.51 xform 0.241 | client=0
+base --no-q-pipeline wall   9.57 xform 0.532 | client=0
+base qp     wall   7.60 xform 0.568 | client=0
+new  qp     wall   7.69 xform 0.254 | client=0
+base --no-q-pipeline wall   9.59 xform 0.533 | client=0
+new  --no-q-pipeline wall   9.50 xform 0.240 | client=0
+new  qp     wall   7.65 xform 0.256 | client=0
+base qp     wall   7.57 xform 0.559 | client=0
+new  --no-q-pipeline wall   9.36 xform 0.238 | client=0
+base --no-q-pipeline wall   9.78 xform 0.531 | client=0

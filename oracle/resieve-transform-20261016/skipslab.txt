@@ -1,0 +1,18 @@
+  build width: 128 bits (BN_LIMBS*32)
+  A single:   j-slabbing: 4 slabs, up to 2048 rows/slab | warnings 16 | summary 16 | 
+  A qp:   j-slabbing: 4 slabs, up to 2048 rows/slab | warnings 16 | summary 16 |  issued ahead (--q-pipeline) 306 slab(s), 93 q
+PASS   A skips fired                              16
+PASS   A same skips both ways                     16 = 16
+PASS   A pipelined summary = warnings             16
+PASS   A four slabs                               
+PASS   A slabs issued ahead                       306
+PASS   A relations byte-identical                 49914
+  B single:   j-slabbing: 4 slabs, up to 2048 rows/slab | warnings 12 | summary 12 | 
+  B qp:   j-slabbing: 4 slabs, up to 2048 rows/slab | warnings 12 | summary 12 |  issued ahead (--q-pipeline) 312 slab(s), 99 q
+PASS   B skips fired                              12
+PASS   B same skips both ways                     12 = 12
+PASS   B pipelined summary = warnings             12
+PASS   B four slabs                               
+PASS   B slabs issued ahead                       312
+PASS   B relations byte-identical                 32606
+skipslab: all cases passed

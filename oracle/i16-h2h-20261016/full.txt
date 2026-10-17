@@ -1,0 +1,2 @@
+qp:  wall clock per q, COMPLETE 218.84 ms | sm=2877 MHz power=223 W | load=10.65
+single:  wall clock per q, COMPLETE 230.20 ms | sm=2876 MHz power=215 W | load=10.38

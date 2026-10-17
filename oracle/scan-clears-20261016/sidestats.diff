@@ -1,0 +1,48 @@
+--- a/bench/pipeline.cuh	2026-10-16 22:38:23.733777154 -0400
++++ b/bench/pipeline.cuh	2026-10-16 22:57:29.567492595 -0400
+@@ -1497,6 +1497,28 @@
+     return v;
+ }
+ 
++/* TEST-ONLY (work/scan-i16/stat, never landed): per-side acceptance. */
++__global__ void k_side_stats(const uint8_t *__restrict st0, const uint8_t *__restrict st1,
++                             uint32_t n, unsigned long long *__restrict out)
++{
++    unsigned long long a0 = 0, a1 = 0, b = 0;
++    for (uint64_t t = bench_grid_thread_x(); t < n; t += bench_grid_stride_x()) {
++        const int x0 = (st0[t] == COF_ACCEPT || st0[t] == COF_SPLIT);
++        const int x1 = (st1[t] == COF_ACCEPT || st1[t] == COF_SPLIT);
++        a0 += x0; a1 += x1; b += x0 & x1;
++    }
++    if (a0) atomicAdd(&out[0], a0);
++    if (a1) atomicAdd(&out[1], a1);
++    if (b)  atomicAdd(&out[2], b);
++}
++static unsigned long long g_ss_tot[4];
++static void side_stats_print(void)
++{
++    printf("  [sidestats] two-sided %llu | side 1 accept %llu (%.2f%%) | side 0 accept %llu (%.2f%%) | both %llu (%.3f%%)\n",
++           g_ss_tot[3], g_ss_tot[1], 100.0 * g_ss_tot[1] / g_ss_tot[3],
++           g_ss_tot[0], 100.0 * g_ss_tot[0] / g_ss_tot[3], g_ss_tot[2], 100.0 * g_ss_tot[2] / g_ss_tot[3]);
++}
++
+ template <bool SLABBED>
+ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
+                         const ptd_side_t *S1, const ptd_side_t *S0,
+@@ -1618,6 +1640,16 @@
+         CK(cudaEventRecord(E[e + 3]));
+     }
+ 
++    {   /* TEST-ONLY per-side acceptance */
++        static unsigned long long *d_ss = NULL; static int reg = 0;
++        if (!d_ss) CK(cudaMalloc(&d_ss, 32));
++        CK(cudaMemset(d_ss, 0, 32));
++        k_side_stats<<<blocks, threads>>>(C->d_status[0], C->d_status[1], n, d_ss);
++        unsigned long long h[4];
++        CK(cudaMemcpy(h, d_ss, 32, cudaMemcpyDeviceToHost));
++        g_ss_tot[0] += h[0]; g_ss_tot[1] += h[1]; g_ss_tot[2] += h[2]; g_ss_tot[3] += n;
++        if (!reg) { reg = 1; atexit(side_stats_print); }
++    }
+     /* ---- joint acceptance, compacted on device ---- */
+     nab = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+     k_accept_flags<<<blocks, threads>>>(C->d_status[0], C->d_status[1], n, C->d_aflag);

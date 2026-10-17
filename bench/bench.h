@@ -1091,6 +1091,8 @@ int verify_transform(const qlat_t *L, int ncheck);
 /* The same set-equality gate driven by a real factor base: checks every entry
  * with q <= maxq against the definition. Returns entries checked, or -1. */
 int verify_fb_transform(const fb_t *fb, const qlat_t *L, uint32_t maxq);
+/* pl_transform_fast == pl_transform_enc exactly; returns comparisons or -1 */
+int verify_transform_fast(const fb_t *fb, const qlat_t *L, uint64_t *nfast);
 
 /* Does factor-base entry (q, r_enc) hit position (i,j)? Straight from the
  * definition -- no lattice algebra. Ground truth for the gates and for

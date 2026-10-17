@@ -1,0 +1,386 @@
+--- a/bench/bench_kernels.cu	2026-10-16 22:55:43.647866147 -0400
++++ b/bench/bench_kernels.cu	2026-10-17 07:19:57.099604712 -0400
+@@ -1842,8 +1842,8 @@
+     for (uint32_t i = 0; i < fbs->n; i++) {
+         uint32_t rt, g, m;
+         if (FB_ISPOW(fbs, i)) continue;
+-        m = pl_transform_enc(fbs->primes[i], fbs->roots[i],
+-                             L->a0, L->a1, L->b0, L->b1, &rt, &g);
++        m = pl_transform_fast(fbs->primes[i], fbs->roots[i],
++                              L->a0, L->a1, L->b0, L->b1, &rt, &g);
+         if (m * g != fbs->primes[i]) {          /* the invariant above */
+             fprintf(stderr, "td_build_small: m*g != p at entry %u"
+                             " (p=%u m=%u g=%u)\n", i, fbs->primes[i], m, g);
+@@ -2793,7 +2793,7 @@
+         h_ms_transform = host_ms();
+         for (i = 0; i < fbs->n; i++) {
+             uint32_t q = fbs->primes[i], r = fbs->roots[i], rt, g, m;
+-            m = pl_transform_enc(q, r, L->a0, L->a1, L->b0, L->b1, &rt, &g);
++            m = pl_transform_fast(q, r, L->a0, L->a1, L->b0, L->b1, &rt, &g);
+             if (g > 1) nrow++;
+             if (r >= q) nprj++;
+             hsp[k] = m; hsrt[k] = rt; hsg[k] = g;
+--- a/bench/pipeline.cuh	2026-10-17 08:00:13.535872619 -0400
++++ b/bench/pipeline.cuh	2026-10-17 07:20:44.378142672 -0400
+@@ -24,6 +24,11 @@
+ #include "watchdog.h"
+ #include <signal.h>
+ 
++/* The pipeline's apply cell width. One constant for the k_apply instances it
++ * launches, their shared-memory size and the survbits-clear guard
++ * (apply_scan_stores), so the three cannot disagree. */
++#define PIPE_CELLBITS 16
++
+ /* ---- clean stop -------------------------------------------------------- *
+  *
+  * A band runs for days and gets interrupted. Without a handler the process
+@@ -383,7 +388,7 @@
+         goto done;
+     }
+     {
+-        const size_t smem = ((size_t)1 << cfg->log_region) * 2 +
++        const size_t smem = ((size_t)1 << cfg->log_region) * (PIPE_CELLBITS / 8) +
+                             (size_t)S->nslice_pow2 * sizeof(*hlogp);
+         if (smem > optin_smem_limit) {
+             fprintf(stderr, "  apply needs %zu B of shared memory for %u"
+@@ -545,9 +550,9 @@
+         uint16_t *hslp = S->hslp;
+         uint32_t k = 0;
+         for (uint32_t i = 0; i < fbs->n; i++) {
+-            uint32_t rt, g, m = pl_transform_enc(fbs->primes[i], fbs->roots[i],
+-                                                 L->a0, L->a1, L->b0, L->b1,
+-                                                 &rt, &g);
++            uint32_t rt, g, m = pl_transform_fast(fbs->primes[i], fbs->roots[i],
++                                                  L->a0, L->a1, L->b0, L->b1,
++                                                  &rt, &g);
+             hsp[k] = m;
+             hsrt[k] = rt;
+             hsg[k] = g;
+@@ -921,7 +926,7 @@
+      * the kernel -- which was the reason this clear used to stay
+      * unconditional. 512 MiB of writes per q at I16/J32768 (4 slabs x 2
+      * sides). */
+-    if (!apply_scan_stores<16>(cfg->logI, log_region, (uint32_t)athr)
++    if (!apply_scan_stores<PIPE_CELLBITS>(cfg->logI, log_region, (uint32_t)athr)
+         || ((uint64_t)nregion << log_region) != xmax)
+         SLAB_CK(cudaMemsetAsync(S->survbits, 0, (size_t)nbitword * 4, st));
+     wd_phase(side ? "slab.apply.side1" : "slab.apply.side0");
+@@ -932,8 +937,8 @@
+          * table with a tail would give silently wrong residues, and traps.
+          * Its own scope, so the SLAB_CK gotos above do not jump past it. */
+         auto *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
+-            ? k_apply<16, 1, NORM_HORNER, SLABBED, true>
+-            : k_apply<16, 1, NORM_HORNER, SLABBED, false>;
++            ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>
++            : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>;
+         apply_kern<<<nregion, athr, S->apply_smem, st>>>(
+             (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
+             S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
+@@ -1105,6 +1110,15 @@
+ #define PIPE_RS_COARSE_MIN  (1u << 29)
+ #define PIPE_RS_THREADS     512
+ 
++/* Words of the coarse filter for nsw summary words at 2^cshift summary words
++ * per bit. The one definition behind the filter's sizing, its build
++ * (k_build_summary_g with wper = 2^cshift computes the same count) and the
++ * resieve's shared-memory size and copy length. */
++static inline uint32_t pipe_rs_ncoarse(uint32_t nsw, int cshift)
++{
++    return (((nsw + (1u << cshift) - 1u) >> cshift) + 31u) / 32u;
++}
++
+ typedef struct {
+     double rank, emit, summary, resieve, td, classify, compact, record;
+     double readback, join, hostq, cofac;
+@@ -1115,10 +1129,12 @@
+     uint32_t scap, ccap;          /* survivors, joint candidates */
+     /* shared by both sides: functions of the two-sided bitmap alone */
+     uint32_t *d_cnt, *d_gbase, *d_bsum, *d_sum;
+-    /* k_resieve_scatter's shared-memory filter (k_build_coarse): one bit per
+-     * 2^rs_cshift summary words, rs_cshift the least that fits PIPE_RS_COARSE
+-     * words; rs_blocks[SLABBED] is the resident grid at PIPE_RS_THREADS with
+-     * that much shared memory. NULL when no slab reaches PIPE_RS_COARSE_MIN. */
++    /* k_resieve_scatter's shared-memory filter (k_build_summary_g over the
++     * summary): one bit per 2^rs_cshift summary words, rs_cshift the least
++     * that fits PIPE_RS_COARSE words; rs_blocks[SLABBED] is the resident grid
++     * at PIPE_RS_THREADS with that much shared memory, 0 when that instance
++     * cannot be resident at all (the plain resieve then runs). NULL when no
++     * slab reaches PIPE_RS_COARSE_MIN. */
+     uint32_t *d_coarse;
+     int rs_cshift, rs_blocks[2];
+     uint32_t *d_x;  int64_t *d_a, *d_b;
+@@ -1285,18 +1301,17 @@
+     CK(cudaMalloc(&C->d_sum, (size_t)C->nsumword * 4));
+     if ((uint64_t)nbitword * 32u >= PIPE_RS_COARSE_MIN) {
+         int dev = 0, nsm = 0, nbk = 0;
+-        while ((((C->nsumword + (1u << C->rs_cshift) - 1u) >> C->rs_cshift) + 31u) / 32u
+-               > PIPE_RS_COARSE)
++        while (pipe_rs_ncoarse(C->nsumword, C->rs_cshift) > PIPE_RS_COARSE)
+             C->rs_cshift++;
+         CK(cudaMalloc(&C->d_coarse, (size_t)PIPE_RS_COARSE * 4));
+         CK(cudaGetDevice(&dev));
+         CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
+         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbk,
+                k_resieve_scatter<4, false, true>, PIPE_RS_THREADS, PIPE_RS_COARSE * 4));
+-        C->rs_blocks[0] = nsm * (nbk > 0 ? nbk : 1);
++        C->rs_blocks[0] = nbk > 0 ? nsm * nbk : 0;
+         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbk,
+                k_resieve_scatter<4, true, true>, PIPE_RS_THREADS, PIPE_RS_COARSE * 4));
+-        C->rs_blocks[1] = nsm * (nbk > 0 ? nbk : 1);
++        C->rs_blocks[1] = nbk > 0 ? nsm * nbk : 0;
+     }
+     CK(cudaMalloc(&C->d_ctr, sizeof(td_ctr_t)));
+     C->d_flags = &C->d_ctr->flags;
+@@ -1562,13 +1577,20 @@
+     /* 1 summary bit per 2 bitmap words == per 64 positions, the setting the
+      * resieve sweep selected. */
+     k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, C->d_sum);
+-    /* the resieve's shared-memory filter, for slabs large enough to gain */
++    /* the resieve's shared-memory filter, for slabs large enough to gain,
++     * when its instance can be resident, and only if a side's FK walk will
++     * read it (under --resieve-rows the row tier may cover a whole side) */
+     const uint32_t nsw = (nbitword + 63u) / 64u;
+-    const uint32_t ncw = (((nsw + (1u << C->rs_cshift) - 1u) >> C->rs_cshift) + 31u) / 32u;
+-    const int coarse = C->d_coarse && xmax >= PIPE_RS_COARSE_MIN;
+-    if (coarse)
+-        k_build_coarse<<<(ncw + 255u) / 256u, 256>>>(C->d_sum, nsw, C->rs_cshift,
+-                                                     C->d_coarse);
++    const uint32_t ncw = pipe_rs_ncoarse(nsw, C->rs_cshift);
++    const uint32_t nr1 = cfg->resieve_rows ? S[1]->nrow : 0;
++    const uint32_t nr0 = cfg->resieve_rows ? S[0]->nrow : 0;
++    const int coarse = C->d_coarse && xmax >= PIPE_RS_COARSE_MIN
++                    && C->rs_blocks[SLABBED ? 1 : 0] > 0
++                    && (S[1]->nfb > nr1 || S[0]->nfb > nr0);
++    if (coarse)   /* the same OR-reduction as the summary, one level up */
++        k_build_summary_g<<<(ncw + 255u) / 256u, 256>>>(C->d_sum, nsw,
++                                                         1u << C->rs_cshift,
++                                                         C->d_coarse);
+     CK(cudaEventRecord(E[4]));
+ 
+     for (int si = 0; si < 2; si++) {
+@@ -2198,9 +2220,9 @@
+          * Setting it independently while initializing the two sides is wrong:
+          * the second side can lower the limit required by the first. Both
+          * SSTAIL instances, because the launch picks one per q. */
+-        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, false>,
++        PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
+             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+-        PIPE_CK(cudaFuncSetAttribute(k_apply<16, 1, NORM_HORNER, SLABBED, true>,
++        PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>,
+             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+     }
+     VRAM_MARK("factor bases + bitmaps");
+--- a/bench/td.cuh	2026-10-16 16:55:34.000000000 -0400
++++ b/bench/td.cuh	2026-10-17 07:20:52.723923446 -0400
+@@ -563,29 +563,6 @@
+     }
+ }
+ 
+-/* One bit per 2^cshift words of the resieve summary: set when any is nonzero.
+- * nsw is the slab's summary length; one thread per output word. */
+-__global__ void k_build_coarse(const uint32_t *__restrict summary, uint32_t nsw,
+-                               int cshift, uint32_t *__restrict coarse)
+-{
+-    const uint32_t per = 1u << cshift;
+-    const uint32_t ncb = (nsw + per - 1u) >> cshift;      /* coarse bits */
+-    const uint32_t ncw = (ncb + 31u) >> 5;
+-    const uint64_t stride = bench_grid_stride_x();
+-    for (uint64_t ww = bench_grid_thread_x(); ww < ncw; ww += stride) {
+-        const uint32_t w = (uint32_t)ww;
+-        uint32_t out = 0;
+-        for (uint32_t b = 0; b < 32; b++) {
+-            const uint32_t lo = (w * 32u + b) << cshift;
+-            uint32_t o = 0;
+-            if (lo >= nsw) break;
+-            for (uint32_t k = 0; k < per && lo + k < nsw; k++) o |= summary[lo + k];
+-            if (o) out |= 1u << b;
+-        }
+-        coarse[w] = out;
+-    }
+-}
+-
+ /* ---- resieve that scatters into per-survivor lists --------------------- *
+  *
+  * k_resieve_rewalk with the output changed from an unordered (x,p) array to a
+@@ -650,8 +627,9 @@
+     const uint32_t NONE = 0xFFFFFFFFu;      /* local x < 2^31, cannot collide */
+     const uint64_t stride = bench_grid_stride_x();
+     unsigned long long ovf = 0;
+-    /* COARSE: k_build_coarse's bitmap, one bit per 2^cshift summary words,
+-     * copied to shared memory once per block. See the note above. */
++    /* COARSE: one bit per 2^cshift summary words, set when any is nonzero
++     * (k_build_summary_g over the summary, wper = 2^cshift), copied to
++     * shared memory once per block. See the note above. */
+     extern __shared__ uint32_t s_coarse[];
+     if constexpr (COARSE) {
+         for (uint32_t w = threadIdx.x; w < ncoarse; w += blockDim.x)
+--- a/bench/plattice.cuh	2026-10-16 16:52:35.000000000 -0400
++++ b/bench/plattice.cuh	2026-10-17 07:19:42.742480651 -0400
+@@ -254,7 +254,11 @@
+ 
+ /* Binary extended Euclid. p odd, 0 < a < p. Returns a^-1 mod p, or 0 if
+  * a == 0. Divergent by nature; the design doc's recommended replacement is
+- * a branch-free 2-adic (Hensel/REDC) inverse, which is variant "TH". */
++ * a branch-free 2-adic (Hensel/REDC) inverse, which is variant "TH".
++ * The halving adds in 64 bits: x + p passes 2^32 when p >= 2^31, and the
++ * 32-bit form lost that carry (q = 3,982,922,849 gave rt 1,330,206,460 for
++ * 662,933,767; finding 117's review). The subtractions need no widening:
++ * x1 + p - x2 wraps back below p. */
+ PL_FN uint32_t pl_invmod(uint32_t a, uint32_t p)
+ {
+     uint32_t u = a, v = p, x1 = 1, x2 = 0;
+@@ -262,11 +266,11 @@
+     while (u != 1 && v != 1) {
+         while ((u & 1) == 0) {
+             u >>= 1;
+-            x1 = (x1 & 1) ? (uint32_t)((x1 + p) >> 1) : (x1 >> 1);
++            x1 = (x1 & 1) ? (uint32_t)(((uint64_t)x1 + p) >> 1) : (x1 >> 1);
+         }
+         while ((v & 1) == 0) {
+             v >>= 1;
+-            x2 = (x2 & 1) ? (uint32_t)((x2 + p) >> 1) : (x2 >> 1);
++            x2 = (x2 & 1) ? (uint32_t)(((uint64_t)x2 + p) >> 1) : (x2 >> 1);
+         }
+         if (u >= v) { u -= v; x1 = (x1 >= x2) ? x1 - x2 : x1 + p - x2; }
+         else        { v -= u; x2 = (x2 >= x1) ? x2 - x1 : x2 + p - x1; }
+@@ -435,11 +439,12 @@
+  *   - the inverse is D^(q-2) by Montgomery square-and-multiply, the multiply
+  *     computed on every bit and selected, so lanes stay converged.
+  *   - D * D^-1 == 1 is then CHECKED. That check, not primality, is what
+- *     admits the result: it passes exactly when D is invertible mod q, so
+- *     g == gcd(D, q) == 1 and m == q, and then rt = N * D^-1 is the unique
+- *     residue pl_transform_gen also returns. A prime power for which Fermat's
+- *     exponent is not the inverse, a denominator divisible by p, D == 0, an
+- *     even modulus or a lattice coefficient of 2^32 or more falls through to
++ *     admits the result. It passes ONLY when D is invertible mod q -- always,
++ *     for a prime q; for a prime power p^k only when D^(q-1) == 1, so an
++ *     invertible D can still fall through (q = 9, D = 2) -- and whenever it
++ *     passes, g == gcd(D, q) == 1, m == q and rt = N * D^-1 is the unique
++ *     residue pl_transform_gen also returns. A failed check, D == 0, an even
++ *     modulus or a lattice coefficient of 2^32 or more falls through to
+  *     pl_transform_enc, unchanged. fbtest's gates compare the two exactly. */
+ PL_FN uint32_t pl_redc(uint64_t T, uint32_t q, uint32_t qinv)
+ {
+@@ -495,8 +500,9 @@
+             n = pl_subq(pl_redc_term(r, b1, q, qinv), pl_redc_term(1u, b0, q, qinv), q);
+         }
+         if (d) {
+-            /* acc = d^(q-2) in Montgomery form, which is (d*2^-32)^-1 * 2^64
+-             * for prime q; left to right from the top bit, so no 2^32 mod q */
++            /* acc = d^(q-2) * 2^(-32(q-3)), each montmul dropping a 2^32:
++             * d^-1 * 2^64 for prime q. Left to right from the top bit, so no
++             * 2^32 mod q is needed to start. */
+             e = q - 2u;
+             acc = d;
+             for (bit = 30 - (int)PL_CLZ32(e); bit >= 0; bit--) {
+--- a/bench/verify_cpu.c	2026-10-16 16:54:47.000000000 -0400
++++ b/bench/verify_cpu.c	2026-10-17 07:20:11.479082548 -0400
+@@ -199,8 +199,8 @@
+  * produces -- and every relation downstream -- are identical. Three sources:
+  *
+  *   1. every entry of a real factor base under the gate's own lattice;
+- *   2. small special-q (3..13) against every prime power up to 2000 and every
+- *      root in [0, 2q). This is where a prime power p^k with p dividing the
++ *   2. small special-q (3, 5, 7, 11, 13), every special-q root, against every
++ *      prime power up to 2000 and every root in [0, 2q). This is where a prime power p^k with p dividing the
+  *      special-q lives: D and N can then share the factor p, and a fast path
+  *      that checked rt*D == N instead of invertibility would return g = 1
+  *      where pl_transform_gen returns g = p;
+@@ -212,9 +212,11 @@
+  *
+  * With fb, only source 1; without, sources 2 and 3. Wherever the fast path
+  * answers, its root is also checked against the definition in exact 64-bit
+- * arithmetic; the comparison with pl_transform_enc covers moduli below 2^31,
+- * its valid range (see fast_cmp). Returns the number of cases, or -1 on the
+- * first failure; *nfast counts those the fast path answered itself. */
++ * arithmetic, and every case is compared with pl_transform_enc. Returns the
++ * number of cases compared, or -1 on the first failure; *nfast counts those
++ * the fast path answered itself. Every random draw is its own statement:
++ * C leaves the order of two calls in one expression unspecified, and the
++ * Windows build's compiler must see the same sample stream. */
+ static uint32_t vtf_modq(int64_t v, uint32_t q)
+ {
+     const int64_t r = v % (int64_t)q;
+@@ -253,10 +255,6 @@
+         }
+         (*nfast)++;
+     }
+-    /* pl_transform_enc is the reference only below 2^31: pl_invmod's
+-     * (x1 + p) >> 1 wraps in 32 bits above it (pre-existing, unreachable at
+-     * today's factor-base limits; the fast path does not use it). */
+-    if (q >= 0x80000000u) return 0;
+     m0 = pl_transform_enc(q, r_enc, a0, a1, b0, b1, &rt0, &g0);
+     m1 = pl_transform_fast(q, r_enc, a0, a1, b0, b1, &rt1, &g1);
+     if (m0 != m1 || rt0 != rt1 || g0 != g1) {
+@@ -309,7 +307,7 @@
+ 
+ int verify_transform_fast(const fb_t *fb, const qlat_t *L, uint64_t *nfast)
+ {
+-    static const uint64_t SQ[] = {3, 5, 7, 13};
++    static const uint64_t SQ[] = {3, 5, 7, 11, 13};
+     static const double SKEW[] = {1.0, 3.0e5};
+     uint64_t s = 0x9e3779b97f4a7c15ull;
+     uint32_t pool[4096];
+@@ -330,7 +328,7 @@
+         int z;
+         for (z = 0; z < 2; z++) {
+             uint64_t rho;
+-            for (rho = 0; rho < SQ[i]; rho += 2) {
++            for (rho = 0; rho < SQ[i]; rho++) {
+                 qlat_t M;
+                 uint32_t q, r;
+                 qlat_build(&M, SQ[i], rho, SKEW[z]);
+@@ -361,7 +359,7 @@
+         }
+         for (k = 1; k < 32 && npool < 4096; k++) pool[npool++] = 1u << k;
+     }
+-    for (i = 0; i < 400000; i++, n++) {
++    for (i = 0; i < 400000; i++) {
+         const uint32_t q = pool[vtf_rng(&s) % (uint64_t)npool];
+         const uint32_t r = (uint32_t)(vtf_rng(&s) % (2ull * q));
+         int64_t c[4];
+@@ -369,8 +367,11 @@
+         if (i & 1) {
+             /* a reduced lattice of a random special-q up to 2^40 */
+             qlat_t M;
+-            const uint64_t sq = 3 + vtf_rng(&s) % (1ull << (5 + vtf_rng(&s) % 36));
+-            qlat_build(&M, sq, vtf_rng(&s) % sq, exp((double)(vtf_rng(&s) % 40)));
++            const uint64_t sqbits = 5 + vtf_rng(&s) % 36;
++            const uint64_t sq = 3 + vtf_rng(&s) % (1ull << sqbits);
++            const uint64_t rho = vtf_rng(&s) % sq;
++            const double skew = exp((double)(vtf_rng(&s) % 40));
++            qlat_build(&M, sq, rho, skew);
+             c[0] = M.a0; c[1] = M.a1; c[2] = M.b0; c[3] = M.b1;
+             if (sq % q == 0) continue;
+             for (t = 0; t < 4; t++)          /* the reference's own int64 domain */
+@@ -395,6 +396,7 @@
+                 c[t] = v;
+             }
+         }
++        n++;
+         if (fast_cmp(q, r, c[0], c[1], c[2], c[3], nfast)) return -1;
+     }
+     return n;
+@@ -773,9 +775,10 @@
+  * wrong congruence). Comparing all 32K region counts against the GPU's cursors
+  * gates PLACEMENT, at the same host cost.
+  *
+- * This shares pl_transform_enc with the device, so it validates the walk and
+- * the fill, not the transform -- verify_transform is what gates that, against
+- * the definition. */
++ * This runs the device's own transform, pl_transform_fast, so it validates the
++ * walk and the fill, not the transform. verify_transform gates
++ * pl_transform_enc against the definition, and verify_transform_fast gates
++ * pl_transform_fast against both. */
+ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
+                               int logI, uint32_t J,
+                               int log_region, uint32_t *per_region)
+@@ -793,7 +796,7 @@
+         uint32_t rt, g, m;
+         plat_t P;
+         uint32_t x;
+-        m = pl_transform_enc(q, fb->roots[k], L->a0, L->a1, L->b0, L->b1, &rt, &g);
++        m = pl_transform_fast(q, fb->roots[k], L->a0, L->a1, L->b0, L->b1, &rt, &g);
+         if (g > 1) { nrow++; continue; }      /* the kernel drops these too */
+         P = pl_make(m, rt, logI);
+         for (x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {

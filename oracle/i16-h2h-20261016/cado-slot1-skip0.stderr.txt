@@ -1,0 +1,56 @@
+# GPU init tables (16 threads): 0.31 s
+# GPU init context wait: 0.00 s
+# GPU init fb: 0.11 s
+# GPU init malloc: 0.07 s
+# GPU init pinned: 0.51 s
+# GPU slots: 1, chunk 2^29, 7.84 GB per slot, fill stage 0 x 0 blocks, 0 of 16384 regions staged, bucket slab 1, gate shift 3, side-0 tail kernel 1, side-0 candidate region 1
+# Threads: 2 sievers, 16 workers, pinned
+# Total 23293 reports [0.002857s/r, 70.80r/sq] in 66.55 elapsed s [603.0% CPU]
+# Process seconds: 0.00 norm, 0.00 divide, 0.00 tiny, 972.32 facul (904210 survivors, 904210 coprime, 904210 facul calls)
+# GPU transform: 1.06 s
+# GPU fill: 16.62 s
+# GPU region: 30.82 s
+# GPU tiny: 0.44 s
+# GPU resieve_s: 3.40 s
+# GPU filter: 3.71 s
+# GPU ecm: 1.68 s
+# GPU bucket max 0: 4239 of 22784, entries 12713746401
+# GPU bucket max 1: 19227 of 23680, entries 266095365400
+# GPU chunk span 57.32 s, covered 54.83 s, holes 2.49 s (4.35%)
+# GPU holes: 2032, sum 2.495 s, top (ms): 45.602 29.973 27.176 23.730 16.785 14.039 13.049 12.865 12.637 12.193
+# GPU slot tails (ms): 0.0
+# GPU siever states, 2 threads (in holes vs span):
+#   other      0.1% vs   0.0%
+#   prep       0.0% vs   0.0%
+#   feed       0.3% vs   0.4%
+#   acquire   49.8% vs  50.0%
+#   launch     0.3% vs   0.4%
+#   stats      0.7% vs   0.7%
+#   sync_ctr  44.4% vs  44.0%
+#   sync_out   4.1% vs   4.3%
+#   pack       0.2% vs   0.2%
+#   assemble   0.0% vs   0.0%
+#   sink       0.0% vs   0.0%
+# GPU worker states, 16 threads (in holes vs span):
+#   other     99.9% vs  99.9%
+#   prep       0.0% vs   0.0%
+#   feed       0.0% vs   0.0%
+#   acquire    0.0% vs   0.0%
+#   launch     0.0% vs   0.0%
+#   stats      0.0% vs   0.0%
+#   sync_ctr   0.0% vs   0.0%
+#   sync_out   0.0% vs   0.0%
+#   pack       0.0% vs   0.0%
+#   assemble   0.1% vs   0.1%
+#   sink       0.0% vs   0.0%
+# GPU top hole states (siever-ms per state):
+#    45.602 ms @   41209.4: feed 0.2 acquire 45.6 launch 0.2 stats 0.5 sync_ctr 41.0 sync_out 3.5 pack 0.1
+#    29.973 ms @   52679.5: acquire 30.0 sync_ctr 30.0
+#    27.176 ms @   37826.8: prep 0.1 feed 0.2 acquire 27.2 launch 0.2 stats 0.5 sync_ctr 22.8 sync_out 3.1 pack 0.2
+#    23.730 ms @   39668.4: feed 0.2 acquire 23.7 launch 0.2 stats 0.5 sync_ctr 18.8 sync_out 4.1
+#    16.785 ms @   58279.9: feed 0.2 acquire 16.8 launch 0.2 stats 0.6 sync_ctr 14.7 sync_out 1.2
+#    14.039 ms @   35797.3: acquire 14.0 sync_ctr 14.0
+#    13.049 ms @   17804.0: acquire 13.0 stats 3.7 sync_ctr 9.4
+#    12.865 ms @   25627.7: feed 0.1 acquire 12.9 launch 0.2 stats 0.7 sync_ctr 7.9 sync_out 3.9 pack 0.1
+#    12.637 ms @   10848.4: acquire 12.6 sync_ctr 12.6
+#    12.193 ms @    5994.9: other 6.6 feed 0.2 acquire 5.6 launch 0.5 stats 0.5 sync_ctr 6.1 sync_out 4.0 pack 0.2 sink 0.7

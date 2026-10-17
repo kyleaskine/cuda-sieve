@@ -1,0 +1,34 @@
+build: exit=0 (sm_120 snapshot of the final source) | warnings 0
+verify-only OK lines: 3
+make check exit=0 (108 PASS, 0 FAIL) all gates passed
+  PASS validator dense fast path 65,536 distinct moduli checked by sieve; injected composite rejected
+  PASS fast path == general path 19014464 (m, rt, g) compared exactly, 17979125 by the fast path; small special-q x prime powers to 2000, random moduli to 2^32
+  PASS side 1 fast path == general path every entry exact, 7605406 of 7605616 by the fast path
+  PASS side 0 fast path == general path every entry exact, 3957293 of 3957374 by the fast path
+fillcheck exit=0 (60 ok) fillcheck: all arms byte-identical
+== identity vs the reference relation files
+nfs OK(2845) c183 OK(9053) c143 OK(155108) c194 OK(6730) 
+== stop/resume
+  c194:  stopped after 128 q this session (128 total, 14445 relation | resumed IDENTICAL (44846)
+  c143:  stopped after 640 q this session (640 total, 99544 relation | resumed IDENTICAL (618656)
+== skipslab (BN_LIMBS=4)
+l4 exit=0
+skipslab exit=0
+PASS A skips fired 16
+PASS A same skips both ways 16 = 16
+PASS A pipelined summary = warnings 16
+PASS A four slabs 
+PASS A slabs issued ahead 306
+PASS A relations byte-identical 49914
+PASS B skips fired 12
+PASS B same skips both ways 12 = 12
+PASS B pipelined summary = warnings 12
+PASS B four slabs 
+PASS B slabs issued ahead 312
+PASS B relations byte-identical 32606
+skipslab: all cases passed
+== TD-list truncation (PIPE_K=8), single-queued vs pipelined
+pk8 exit=0
+  slab4095: IDENTICAL (6875) | skipped single 11 qp 11
+  oneslab: IDENTICAL (6492) | skipped single 11 qp 11
+done

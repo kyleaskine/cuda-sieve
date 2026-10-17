@@ -1,0 +1,23 @@
+== cuda-qp.sqlite: idle 0.291 s of 13.687 s window (2.1%)
+  last kernel -> next kernel                                      idle   gaps  mean us
+  k_tdsmall_advance -> k_transform                                0.6%     64   1273.9
+  k_cof_enqueue -> k_intersect_compact                            0.4%     25   2009.3
+  k_scatter_sel -> k_gather_ab                                    0.4%    213    234.8
+  k_intersect_compact -> k_fill_atomic                            0.2%    193    126.0
+  k_tdsmall_advance -> k_intersect_compact                        0.2%    129    174.8
+  k_td_record_warp -> k_cand_stats                                0.1%    218     69.2
+  k_cof_enqueue -> k_tdsmall_advance                              0.1%    193     52.9
+  k_apply -> k_intersect_compact                                  0.1%     39    244.9
+  k_gather_ab -> k_td_record_warp                                 0.0%    217     30.2
+  k_cand_stats -> k_cof_enqueue                                   0.0%    217     21.0
+  k_fill_atomic -> k_apply                                        0.0%     41    109.6
+  k_tdsmall_advance -> k_tdsmall_advance                          0.0%    193     18.6
+  host CUDA calls in progress during the idle time (share of idle):
+    cudaLaunchKernel_v7000                               15.7%
+    cudaStreamSynchronize_v3020                          14.8%
+    cudaEventRecord_v3020                                 7.6%
+    cudaMemcpyAsync_v3020                                 5.4%
+    cudaMemsetAsync_v3020                                 4.6%
+    cudaMemset_v3020                                      4.5%
+    cudaEventSynchronize_v3020                            2.6%
+    cuKernelGetName                                       0.6%

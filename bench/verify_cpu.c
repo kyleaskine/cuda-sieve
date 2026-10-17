@@ -194,6 +194,214 @@ int verify_fb_transform(const fb_t *fb, const qlat_t *L, uint32_t maxq)
     return (int)checked;
 }
 
+/* pl_transform_fast against pl_transform_enc, EXACT on (m, rt, g): the fast
+ * path claims the same output, not merely the same lattice, so the walks it
+ * produces -- and every relation downstream -- are identical. Three sources:
+ *
+ *   1. every entry of a real factor base under the gate's own lattice;
+ *   2. small special-q (3, 5, 7, 11, 13), every special-q root, against every
+ *      prime power up to 2000 and every root in [0, 2q). This is where a prime power p^k with p dividing the
+ *      special-q lives: D and N can then share the factor p, and a fast path
+ *      that checked rt*D == N instead of invertibility would return g = 1
+ *      where pl_transform_gen returns g = p;
+ *   3. deterministic random large moduli (primes, odd prime powers, powers of
+ *      two) with random roots, under reduced lattices of random special-q and
+ *      under raw coefficients up to and past the 2^32 guard. Every sample is
+ *      kept inside pl_transform_gen's own int64 domain (q*|c| < 4e18), since
+ *      it is the reference.
+ *
+ * With fb, only source 1; without, sources 2 and 3. Wherever the fast path
+ * answers, its root is also checked against the definition in exact 64-bit
+ * arithmetic, and every case is compared with pl_transform_enc. Returns the
+ * number of cases compared, or -1 on the first failure; *nfast counts those
+ * the fast path answered itself. Every random draw is its own statement:
+ * C leaves the order of two calls in one expression unspecified, and the
+ * Windows build's compiler must see the same sample stream. */
+static uint32_t vtf_modq(int64_t v, uint32_t q)
+{
+    const int64_t r = v % (int64_t)q;
+    return (uint32_t)(r < 0 ? r + (int64_t)q : r);
+}
+
+static uint32_t vtf_gcd(uint32_t a, uint32_t b)
+{
+    while (b) { const uint32_t t = a % b; a = b; b = t; }
+    return a;
+}
+
+static int fast_cmp(uint32_t q, uint32_t r_enc, int64_t a0, int64_t a1,
+                    int64_t b0, int64_t b1, uint64_t *nfast)
+{
+    uint32_t rt0, g0, rt1, g1, m0, m1, rtt;
+    const int took = pl_transform_fast_try(q, r_enc, a0, a1, b0, b1, &rtt);
+    if (took) {
+        /* the definition, independently and exactly in 64 bits: D is
+         * invertible mod q and rt*D == N, so rt is THE root (g = 1, m = q) */
+        const int isp = r_enc >= q;
+        const uint32_t r = isp ? r_enc - q : r_enc;
+        const uint64_t A0 = vtf_modq(a0, q), A1 = vtf_modq(a1, q);
+        const uint64_t B0 = vtf_modq(b0, q), B1 = vtf_modq(b1, q);
+        const uint64_t D = isp ? ((uint64_t)r * A0 % q + q - A1) % q
+                               : (A0 + q - (uint64_t)r * A1 % q) % q;
+        const uint64_t N = isp ? (B1 + q - (uint64_t)r * B0 % q) % q
+                               : ((uint64_t)r * B1 % q + q - B0) % q;
+        if (vtf_gcd((uint32_t)D, q) != 1 || (uint64_t)rtt * D % q != N) {
+            fprintf(stderr,
+                "verify_transform_fast DEFINITION q=%u r=%u basis (%lld,%lld,%lld,%lld):"
+                " fast rt=%u, D=%llu N=%llu\n", q, r_enc, (long long)a0,
+                (long long)a1, (long long)b0, (long long)b1, rtt,
+                (unsigned long long)D, (unsigned long long)N);
+            return 1;
+        }
+        (*nfast)++;
+    }
+    m0 = pl_transform_enc(q, r_enc, a0, a1, b0, b1, &rt0, &g0);
+    m1 = pl_transform_fast(q, r_enc, a0, a1, b0, b1, &rt1, &g1);
+    if (m0 != m1 || rt0 != rt1 || g0 != g1) {
+        fprintf(stderr,
+            "verify_transform_fast MISMATCH q=%u r=%u basis (%lld,%lld,%lld,%lld):"
+            " enc (m=%u,rt=%u,g=%u) fast (m=%u,rt=%u,g=%u)\n",
+            q, r_enc, (long long)a0, (long long)a1, (long long)b0, (long long)b1,
+            m0, rt0, g0, m1, rt1, g1);
+        return 1;
+    }
+    return 0;
+}
+
+static uint64_t vtf_rng(uint64_t *s)
+{
+    *s = *s * 6364136223846793005ull + 1442695040888963407ull;
+    return *s >> 11;
+}
+
+static uint32_t vtf_mulmod(uint32_t a, uint32_t b, uint32_t m)
+{
+    return (uint32_t)((uint64_t)a * b % m);
+}
+
+/* Deterministic Miller-Rabin for n < 2^32: bases 2, 7, 61. */
+static int vtf_isprime(uint32_t n)
+{
+    static const uint32_t B[3] = {2, 7, 61};
+    uint32_t d = n - 1, x, k;
+    int s = 0, i, r;
+    if (n < 2) return 0;
+    if (n < 4) return 1;
+    if (!(n & 1u)) return 0;
+    while (!(d & 1u)) { d >>= 1; s++; }
+    for (i = 0; i < 3; i++) {
+        uint32_t a = B[i] % n, e = d;
+        if (!a) continue;
+        x = 1;
+        k = a;
+        while (e) { if (e & 1u) x = vtf_mulmod(x, k, n); k = vtf_mulmod(k, k, n); e >>= 1; }
+        if (x == 1 || x == n - 1) continue;
+        for (r = 1; r < s; r++) {
+            x = vtf_mulmod(x, x, n);
+            if (x == n - 1) break;
+        }
+        if (r == s) return 0;
+    }
+    return 1;
+}
+
+int verify_transform_fast(const fb_t *fb, const qlat_t *L, uint64_t *nfast)
+{
+    static const uint64_t SQ[] = {3, 5, 7, 11, 13};
+    static const double SKEW[] = {1.0, 3.0e5};
+    uint64_t s = 0x9e3779b97f4a7c15ull;
+    uint32_t pool[4096];
+    int npool = 0, n = 0, i;
+    uint32_t k;
+
+    *nfast = 0;
+    /* 1. the real factor base, and nothing else when one is given */
+    if (fb) {
+        for (k = 0; k < fb->n; k++, n++)
+            if (fast_cmp(fb->primes[k], fb->roots[k], L->a0, L->a1, L->b0, L->b1, nfast))
+                return -1;
+        return n;
+    }
+
+    /* 2. small special-q, every prime power to 2000, every root */
+    for (i = 0; i < (int)(sizeof(SQ) / sizeof(SQ[0])); i++) {
+        int z;
+        for (z = 0; z < 2; z++) {
+            uint64_t rho;
+            for (rho = 0; rho < SQ[i]; rho++) {
+                qlat_t M;
+                uint32_t q, r;
+                qlat_build(&M, SQ[i], rho, SKEW[z]);
+                for (q = 2; q <= 2000; q++) {
+                    if (!fb_is_prime_power(q)) continue;
+                    for (r = 0; r < 2 * q; r++, n++)
+                        if (fast_cmp(q, r, M.a0, M.a1, M.b0, M.b1, nfast)) return -1;
+                }
+            }
+        }
+    }
+
+    /* 3. random large moduli */
+    while (npool < 3072) {                       /* primes, 2^16 .. 2^32 */
+        const int bits = 17 + (int)(vtf_rng(&s) % 16);
+        uint32_t c = (uint32_t)(vtf_rng(&s) & ((bits == 32) ? 0xFFFFFFFFull
+                                                            : ((1ull << bits) - 1)));
+        c |= (1u << (bits - 1)) | 1u;
+        while (!vtf_isprime(c) && c < 0xFFFFFFF0u) c += 2;
+        if (vtf_isprime(c)) pool[npool++] = c;
+    }
+    {                                            /* odd prime powers, powers of 2 */
+        static const uint32_t P[] = {3, 5, 7, 11, 13, 101, 257, 65521};
+        for (i = 0; i < (int)(sizeof(P) / sizeof(P[0])) && npool < 4096; i++) {
+            uint64_t v = (uint64_t)P[i] * P[i];
+            for (; v < (1ull << 32) && npool < 4096; v *= P[i])
+                pool[npool++] = (uint32_t)v;
+        }
+        for (k = 1; k < 32 && npool < 4096; k++) pool[npool++] = 1u << k;
+    }
+    for (i = 0; i < 400000; i++) {
+        const uint32_t q = pool[vtf_rng(&s) % (uint64_t)npool];
+        const uint32_t r = (uint32_t)(vtf_rng(&s) % (2ull * q));
+        int64_t c[4];
+        int t;
+        if (i & 1) {
+            /* a reduced lattice of a random special-q up to 2^40 */
+            qlat_t M;
+            const uint64_t sqbits = 5 + vtf_rng(&s) % 36;
+            const uint64_t sq = 3 + vtf_rng(&s) % (1ull << sqbits);
+            const uint64_t rho = vtf_rng(&s) % sq;
+            const double skew = exp((double)(vtf_rng(&s) % 40));
+            qlat_build(&M, sq, rho, skew);
+            c[0] = M.a0; c[1] = M.a1; c[2] = M.b0; c[3] = M.b1;
+            if (sq % q == 0) continue;
+            for (t = 0; t < 4; t++)          /* the reference's own int64 domain */
+                if ((double)q * fabs((double)c[t]) >= 4.0e18) break;
+            if (t < 4) continue;
+        } else {
+            /* raw coefficients, magnitude classes up to and past 2^32; keep
+             * the reference's r*c inside int64 */
+            for (t = 0; t < 4; t++) {
+                const uint64_t u = vtf_rng(&s);
+                int64_t v;
+                switch (u % 6) {
+                case 0:  v = (int64_t)(u >> 8) % 1000; break;
+                case 1:  v = (int64_t)((u >> 8) & 0x7FFFFFFFull); break;
+                case 2:  v = 0xFFFFFFFFll; break;
+                case 3:  v = 0x100000000ll; break;
+                case 4:  v = (int64_t)((u >> 8) & 0xFFFFFFFFull); break;
+                default: v = (int64_t)((u >> 8) & 0x3FFFFFFFFFull); break;
+                }
+                if ((u >> 3) & 1u) v = -v;
+                while ((double)q * (double)(v < 0 ? -v : v) >= 4.0e18) v /= 2;
+                c[t] = v;
+            }
+        }
+        n++;
+        if (fast_cmp(q, r, c[0], c[1], c[2], c[3], nfast)) return -1;
+    }
+    return n;
+}
+
 int verify_walk(int logI, uint32_t J, int nprimes)
 {
     /* Primes just above I are the interesting regime: that is where the
@@ -567,9 +775,10 @@ uint32_t verify_apply_region(const uint32_t *records, uint32_t nrec,
  * wrong congruence). Comparing all 32K region counts against the GPU's cursors
  * gates PLACEMENT, at the same host cost.
  *
- * This shares pl_transform_enc with the device, so it validates the walk and
- * the fill, not the transform -- verify_transform is what gates that, against
- * the definition. */
+ * This runs the device's own transform, pl_transform_fast, so it validates the
+ * walk and the fill, not the transform. verify_transform gates
+ * pl_transform_enc against the definition, and verify_transform_fast gates
+ * pl_transform_fast against both. */
 uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                               int logI, uint32_t J,
                               int log_region, uint32_t *per_region)
@@ -587,7 +796,7 @@ uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
         uint32_t rt, g, m;
         plat_t P;
         uint32_t x;
-        m = pl_transform_enc(q, fb->roots[k], L->a0, L->a1, L->b0, L->b1, &rt, &g);
+        m = pl_transform_fast(q, fb->roots[k], L->a0, L->a1, L->b0, L->b1, &rt, &g);
         if (g > 1) { nrow++; continue; }      /* the kernel drops these too */
         P = pl_make(m, rt, logI);
         for (x = pl_first(&P, logI); x < xmax; x = pl_next(x, &P, Imask)) {

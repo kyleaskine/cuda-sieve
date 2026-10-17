@@ -1,0 +1,9 @@
+tree: e31c65d-dirty
+base: work/scan-i16/bench.f116 = finding 116's fat bench/bench, sha256 ffa2aaae9a09326c
+new:  work/scan-i16/exp/bench/bench, GPU_ARCH=120 snapshot of the final source, sha256 93a7bb09fb62463e
+v1:   work/scan-i16/bench.v1 (packed scan before the step-overhead trim; ncu numbers in RESULTS only), sha256 92e9a69d1b389664
+stat: work/scan-i16/stat/bench/bench = new + sidestats.diff (test-only), sha256 49fdc4c62692fa36
+flags: -DCF_LMAX=4 -DBN_LIMBS=12 -DPIPE_K=16
+review: work/scan-i16/exp/bench/bench rebuilt 2026-10-17 with review.diff (GPU_ARCH=120), sha256 ca511aa7e4542dd4; review-gates.txt ran on it
+f117: work/scan-i16/bench.f117 = the fat bench/bench before the review fixes (timing-review.txt's base), sha256 8f3480fe65a84775
+fat: bench/bench after the review fixes, sha256 9b6919522084793c (fat-check.txt)

@@ -1,0 +1,60 @@
+  (cpu ref: 3 row-confined transformed roots skipped)
+=== cuda-sieve bucket-fill benchmark ===
+polynomial ../oracle/input.job: algebraic degree 5, skew 1.154e+08
+  job file: rlim 67100000, alim 134200000, lpbr 31, lpba 32, mfbr 60, mfba 92
+  job file: alambda 3.5 -> 94.50 bits (side 1), reported only; the allowance is derived below
+  job file: rlambda 2.35 -> 61.10 bits (side 0), reported only; the allowance is derived below
+grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 4608 x 32 for fill (absolute, not per SM)
+text factor base ../oracle/c183.fb1: 7605616 ideals (7605409 prime, 207 prime-power) at scale 1.000
+  bucketed  32768 <= p < 120000011 : 6840490 entries
+  line-sieved       p < 32768 (plus every p^k, k>=2) : 3840 entries
+q-lattice q=120000011 basis (a0,a1,b0,b1) = (-22230824,1,120000011,0), det=-120000011
+  NOTE: rho is synthetic (no root of f mod q computed here). The basis is
+  a genuine reduced q-lattice basis of the right shape, and transformed
+  roots are uniform mod p either way, so fill volume and distribution are
+  representative. Pass --rho to match a real las special-q.
+
+sieve area I=2^15 x J=16384 = 5.369e+08 positions; region 2^14; 32768 regions
+mode=atomic record=4B threads=256 reps=3
+
+[verify] Franke-Kleinjung walk vs brute force, 12 cases over 4:1 to 1:2...
+[verify] OK: 12 cases x 24 primes x 5 roots enumerated identically, 4:1 through 1:2
+[verify] OK: 7 forced/native slab walk cases, including partial tails and I17+
+[verify] OK: 1200 row-tier handoff cases (pl_rows_to_hit against stepping)
+[verify] root transform vs its definition, by set equality...
+[verify] OK: q <= 200, every root in [0,2q) -- primes, prime
+         powers, even moduli, affine and projective
+[verify] the same, over the loaded factor base itself...
+[verify] OK: 3832 small-part entries agree with the definition
+  norm setup: deg 5, A=2.3303e+12 B=1.6384e+04, log2(maxnorm)=196.73, scale=1.000  (sq side: log2(q) divided out)
+  normalised coeffs d[0..5] = -0.0136 -0.0605 1 -0.419 -0.00539 0.381
+  device memory: 10.76 GB free of 11.91 GB
+[verify] direct-TD reciprocal on device (__umulhi path)...
+[verify] OK: 4096 device reciprocal cases through w=0x7fffffff
+[verify] small-sieve first offset, one- and two-step forms...
+[verify] OK: 8192 device ss_first cases, 1599 of them two-step (38 at the corners)
+  factor base cut into 39 slices (padded to 64), log p in [15,27] bits
+  small sieve: 3840 entries (92 block-tier m<64, 226 warp-tier m<1024, 3522 thread-tier), 46 with a row divisor, 41 projective, 5.025e+09 updates
+  init T at (i=0, j=J/2) = 189; survivor bound = 113 (scale 1.000 x 112.00 bits)
+  transformed roots: 3 row-confined (g > 1), 0 positions lost
+  analytic records : 3.119e+08   (sized with 1.15x margin)
+  single-level: 32768 buckets x cap 11202 x 4 B = 1.37 GB
+  records landed   : 311960613   (max bucket 9881, mean 9520 -> imbalance 1.04x)
+  [verify] per-region reference (single-threaded)...
+  [verify] OK: all 32768 regions match the CPU reference exactly
+           (counts are of records ATTEMPTED; bucket overflow is
+            gated separately, above)
+
+  apply: 32768 regions x 16384 cells x 16 bit = 32896 B smem/block, 512 threads, smem atomicAdd, norm=horner
+  survivors: 35467390 of 536870912 positions (1 in 1.514e+01)
+  [verify] region 16384: 9589 records replayed on CPU, 0 cells differ
+  [verify] region 16384 survivors: cpu 0
+
+  transform + plattice (T)      1.471 ms
+  fill: atomic single-level    25.407 ms
+  apply (init+add+scan)        25.244 ms
+  SIEVE CHAIN ms/special-q     52.121 ms
+  host per-q work               0.794 ms  (transform 0.358 + sort 0.072 + H2D 0.364)
+  ns per record (fill)           0.08
+  ns per record (apply)          0.08

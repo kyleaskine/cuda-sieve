@@ -789,6 +789,14 @@ int main(int argc, char **argv)
            " in [0,2q)\n", qmax);
     ok("synthetic moduli", verify_transform(&L, qmax) == 0,
        "primes, prime powers, even moduli, affine + projective");
+    {
+        uint64_t nf;
+        n = verify_transform_fast(NULL, &L, &nf);
+        ok("fast path == general path", n > 0,
+           "%d (m, rt, g) compared exactly, %llu by the fast path; small"
+           " special-q x prime powers to 2000, random moduli to 2^32",
+           n, (unsigned long long)nf);
+    }
 
     if (do_trace) {
         const int64_t a = (int64_t)ti * L.a0 + (int64_t)tj * L.b0;
@@ -829,6 +837,13 @@ int main(int argc, char **argv)
         }
         n = verify_fb_transform(&fbs, &L, bkthresh);
         ok("side 1 small part", n > 0, "%d entries checked", n);
+        {
+            uint64_t nf;
+            n = verify_transform_fast(&fb, &L, &nf);
+            ok("side 1 fast path == general path", n > 0,
+               "every entry exact, %llu of %u by the fast path",
+               (unsigned long long)nf, fb.n);
+        }
         ok("side 1 moduli are prime powers", fb_check_prime_powers(&fb) < 0,
            "%u ideals", fb.n);
         ok("side 1 projective entries seen", np > 0,
@@ -866,6 +881,13 @@ int main(int argc, char **argv)
         }
         n = verify_fb_transform(&fbs, &L, bkthresh);
         ok("side 0 small part", n > 0, "%d entries checked", n);
+        {
+            uint64_t nf;
+            n = verify_transform_fast(&fb, &L, &nf);
+            ok("side 0 fast path == general path", n > 0,
+               "every entry exact, %llu of %u by the fast path",
+               (unsigned long long)nf, fb.n);
+        }
         ok("side 0 moduli are prime powers", fb_check_prime_powers(&fb) < 0,
            "%u ideals", fb.n);
         /* Y1 = 59*101*127*281*1259*38321*5746453, so seven projective primes,

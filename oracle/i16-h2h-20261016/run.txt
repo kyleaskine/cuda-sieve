@@ -1,0 +1,31 @@
+== end to end
+cado skip0: Total 23295 reports [0.002927s/r, 70.81r/sq] in 68.17 elapsed s [598.1% CPU] | elapsed_s=62.66 user_s=363.63 system_s=44.63 load=22.50
+cuda qp: rel=23497 q=329 q  20038 rel | elapsed_s=79.57 user_s=77.40 system_s=1.71 |  wall clock per q, COMPLETE 231.40 ms load=13.73
+cado skip0b: Total 23293 reports [0.002934s/r, 70.80r/sq] in 68.33 elapsed s [586.7% CPU] | elapsed_s=65.04 user_s=364.40 system_s=37.09 load=21.59
+cuda qpb: rel=23497 q=329 q  20038 rel | elapsed_s=78.73 user_s=77.57 system_s=1.65 |  wall clock per q, COMPLETE 232.31 ms load=13.97
+cado default: Total 22206 reports [0.002215s/r, 67.50r/sq] in 49.20 elapsed s [587.8% CPU] | elapsed_s=47.77 user_s=266.64 system_s=23.10 load=21.85
+== per kernel
+cado slot1-skip0: Total 23293 reports [0.002857s/r, 70.80r/sq] in 66.55 elapsed s [603.0% CPU] | elapsed_s=63.10 user_s=371.82 system_s=30.03 load=26.13
+    # GPU transform: 1.06 s
+    # GPU fill: 16.62 s
+    # GPU region: 30.82 s
+    # GPU tiny: 0.44 s
+    # GPU resieve_s: 3.40 s
+    # GPU filter: 3.71 s
+    # GPU ecm: 1.68 s
+    # GPU chunk span 57.32 s, covered 54.83 s, holes 2.49 s (4.35%)
+cuda single: rel=23497 q=329 q  20038 rel | elapsed_s=78.28 user_s=77.26 system_s=1.54 |  wall clock per q, COMPLETE 231.65 ms load=15.14
+== relation sets
+A: raw 23295 unique 23295   (/home/kylea/code/cuda-sieve/work/cado-nfs-i16/cado-skip0.rel.gz)
+B: raw 23497 unique 23497   (/home/kylea/code/cuda-sieve/work/cado-nfs-i16/cuda-qp.rel)
+shared 22466  A-only 829  B-only 1031
+shared (A's lists): n=22466
+  side 0: mean log2(p<96 part) 6.64   0LP:0.125 1LP:0.416 2LP:0.459
+  side 1: mean log2(p<96 part) 21.50   0LP:0.042 1LP:0.216 2LP:0.427 3LP:0.315
+A-only: n=829
+  side 0: mean log2(p<96 part) 6.44   0LP:0.124 1LP:0.410 2LP:0.466
+  side 1: mean log2(p<96 part) 22.03   0LP:0.023 1LP:0.199 2LP:0.437 3LP:0.341
+B-only: n=1031
+  side 0: mean log2(p<96 part) 6.37   0LP:0.124 1LP:0.428 2LP:0.448
+  side 1: mean log2(p<96 part) 22.96   0LP:0.030 1LP:0.162 2LP:0.400 3LP:0.408
+done

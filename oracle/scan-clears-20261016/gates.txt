@@ -1,0 +1,11 @@
+verify-only OK lines: 3
+make check exit=0 (108 PASS, 0 FAIL) all gates passed
+fillcheck exit=0 (60 ok) fillcheck: all arms byte-identical
+
+-- make check tail:
+PASS   octic above 256-bit bound          upper bound 256.17 bits refused
+
+all gates passed
+-- registers, every k_apply instance (sm_120):
+      2 REG:38	STACK:0	LOCAL:0
+      9 REG:40	STACK:0	LOCAL:0

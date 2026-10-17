@@ -12120,3 +12120,549 @@ finished, so there is nothing for the prep to hide under, and the card
 waits for end-of-q host work and the prep. Closing it needs TD split into
 asynchronous phases, or the host preparation on a second thread. Neither
 was attempted.
+
+<a id="finding-115"></a>
+## Finding 115 — the NFS@Home I16 job against cado-gpu at equal yield: 1.22x per raw relation. At I16 neither card idles (2.1% ours, 1.8% CADO's) and CADO's overlap buys it nothing, so the gap is kernel work, 1.17x one q at a time. Cofactorisation is 57% of it: 23.3 ms/q on our GPU against 5.1 on CADO's, which sends 86-89% of its candidates to ~6 CPU threads. The other kernels are within 1.08x. TD in asynchronous phases can win at most ~2% on this job
+
+**Date:** 2026-10-16. RTX 5070, WSL2, NFS@Home client stopped, card free.
+Host load 10-22: nine CPU ECM stage-2 processes on the 16 threads
+throughout, plus CADO's own workers. cuda-sieve `fef825c` (findings
+112-114; `bench/bench` is the landed fat build). cado-gpu as in finding 112.
+Evidence in [`../oracle/i16-h2h-20261016/`](../oracle/i16-h2h-20261016/).
+Finding 114 left TD in asynchronous phases (or host preparation on a second
+thread) as the way to close C143's last idle gap. Before building that, this
+measures where the production geometry's gap is.
+
+Kyle's lpba-34 job (finding 110's `work/applyprof/nfs.job`), special-q on
+side 1 in `[297000000, 297006000)`: 329 q. CADO: `las-glas -A 31` (I = 16,
+J up to 2^15), the job's lim/lpb/mfb, no lambda (its threshold is then mfb,
+the nearest to our allowances of 97.7 and 65.5 bits), `GLAS_SKIP_BOUND=0`,
+`-t 16`, factor base from `makefb -lim 300000000`. cuda-sieve: `--logI 16
+--J 32768`, defaults (4 slabs, q-pipeline). Same protocol as finding 112:
+`/usr/bin/time`, relations written.
+
+### End to end, external clock (`run.txt`, `round2.txt`)
+
+| | relations | ms/q | µs per raw relation | CPU-s |
+|---|---:|---:|---:|---:|
+| CADO skip off, round 1 | 23,295 / 23,293 | 190.5 / 197.7 | 2,690 / 2,792 | 408 / 402 |
+| cuda-sieve, round 1 | 23,497 / 23,497 | 241.9 / 239.3 | 3,386 / 3,351 | 79 / 79 |
+| CADO skip off, round 2 | 23,294 / 23,293 | 188.9 / 184.0 | 2,668 / 2,599 | 418 / 381 |
+| cuda-sieve, round 2 | 23,497 / 23,497 | 232.1 / 226.0 | 3,250 / 3,165 | 75 / 75 |
+| CADO default (skip on), 1 run | 22,206 | 145.2 | 2,151 | 290 |
+
+**1.23x in round 1, 1.22x in round 2** (3,369 and 3,208 against 2,741 and
+2,633 µs). Round 2 was run because round 1's cuda-sieve arms reported 231.4
+and 232.3 ms/q in-band. Seven later pipelined runs of the same binary on this
+band (all 329 q, or the first 80) gave 218.8-222.6. Round 2's two are among
+them, interleaved with CADO at the same post-CADO load (13.4-14.7, SM ~2877 MHz, ~225 W). The cause was not found
+(round 1 logged no clocks). The ratio barely moves because CADO was also
+faster in round 2.
+
+- **Yield:** we find 0.9% more (71.42 against 70.80 rel/q). Of the union,
+  22,466 are shared, 829 CADO-only, 1,031 ours-only (`relcmp.py`). The
+  ours-only relations lean towards three large primes on side 1 (40.8%,
+  against 31.5% of the shared).
+- **CPU:** CADO uses 1.16-1.27 CPU-s per q (~6 threads for the whole run),
+  we use 0.23-0.24. CADO stays GPU-bound despite the ECM load: holes are 4.35%
+  of its chunk span, and its siever threads spend them waiting on the card.
+- **CADO's skip matters at I16:** default gives 4.7% fewer relations in 25%
+  less time than round 1's skip-off runs, 1.27x cheaper per relation (one
+  run). At C143 the
+  two forms cost the same per relation (finding 112). Against CADO default
+  we are 1.5-1.6x.
+
+### The card is busy in both (Nsight Systems, `nsys-*.txt`)
+
+80 q from 297000000 for cuda-sieve, pipelined and `--no-q-pipeline`; CADO
+skip off, 8 slots, q in `[297000000, 297001600)`. CUDA trace only, the
+middle 80% of kernel launches. `kernsum.py` divides by the q in the window
+(transform launches / 2).
+
+| | cuda-sieve pipelined | cuda-sieve single-queued | CADO 8 slots |
+|---|---:|---:|---:|
+| card idle | 2.1% | 3.0% | 1.8% |
+| compression (summed kernels / busy) | 1.16x | 1.00x | 1.03x |
+| summed kernels, ms/q | 243.3 | 219.0 | 181.8 |
+| wall in the window, ms/q | 213.9 | 225.7 | 179.3 |
+
+**Idle is not this job's problem.** C143's card idled 10.7% of a 7 ms q
+(6.5% after finding 114). At I16 a q takes 220 ms and the per-q and
+per-slab host work is about the same size, so it vanishes. What is left
+(`nsys-gaps-qp.txt`) is spread over a dozen transitions, the largest 0.6%
+(end of TD -> the next transform). TD in asynchronous phases, or a 3-deep queue,
+could win at most ~2% here.
+
+**Neither program gains much from overlap at I16.** CADO ran the band in
+63.10 s with one slot and 62.66 s with eight. Our pipeline overlaps
+1.16x, but kernels run slower side by side (243.3 summed against 219.0
+alone), so the net is 5%: 213.9 against 225.7 in the trace, and 218.8
+against 230.2 over the 329 q without nsys (`full.txt`).
+
+### Per kernel, one q at a time (ms/q, `nsys-kernsum.txt`)
+
+cuda-sieve single-queued; CADO 8 slots, compression 1.03x and so nearly one
+at a time. In the trace run CADO's GPU ECM ran only at the end, after the
+window (0.05 s, the final pool), so its row comes from the 329-q slot-1
+stats run: 1.68 s for 99,209 device-routed candidates.
+
+| stage | cuda-sieve | CADO | ours − CADO |
+|---|---:|---:|---:|
+| transform | 7.86 | 3.37 | +4.49 |
+| fill (incl. gate fold) | 55.71 | 55.28 | +0.43 |
+| apply, survivor emit, resieve | 119.94 | 112.69 | +7.25 |
+| TD + classify / filter | 10.52 | 10.43 | +0.09 |
+| intersect | 1.68 | — | +1.68 |
+| cofactorisation on the GPU | **23.28** | **5.11** | **+18.17** |
+| **total** | **218.99** | **186.88** | **+32.11 (1.17x)** |
+
+How the rows are made up:
+
+- **Apply, survivor emit and resieve:** ours is apply 81.43, resieve +
+  scatter 36.01, and summary/rank/emit 2.50. CADO's is region 102.83 (its
+  side-0 pass also emits the survivors and rescans both bucket lists for
+  resieve hits), resieve_small 9.38 and tiny 0.48. The fair comparison is
+  the sum: 1.06x.
+- **Fill:** CADO's is fill_ahead 46.13 + fill_row 8.66 + gate fold 0.49.
+- **TD / filter:** ours is k_td 8.57, classify 1.17, record 0.72 and small
+  kernels 0.06; CADO's is filter 6.15 + filter_prime 4.28.
+- **Cofactorisation:** CADO routes 772,710-805,001 of its 904,210
+  candidates to the host (`cado-phases.txt`). Our algebraic (3LP) queue is
+  21.85 of the 28.99 ms/q our band report times for cofactorisation.
+  Ending in that queue, 161,710 of the 916,070 records are "stuck": the
+  ECM budget ran out before a split or a proof of death.
+
+Without cofactorisation the kernels are 195.7 against 181.8 ms/q:
+**1.08x**. That residue is the apply/resieve group (+7.3), transform (+4.5)
+and intersect (+1.7). Both traces read a few percent above their programs' own timers.
+Ours, from band events: 213.2 single-queued (`cuda-single.output.txt`).
+CADO's slot-1 stats: 175.5 with ECM (`cado-slot1-skip0.stderr.txt`). On
+those the ratio is 1.21x.
+
+### What leads now, for the NFS@Home geometry
+
+1. **Cofactorisation, 18 ms/q of the 32.** There are two directions:
+   - *Cheaper GPU cofactorisation.* What the 161,710 stuck records cost,
+     and how many relations a smaller budget or CADO-style early aborts
+     would lose, is not measured. That is a per-round time and yield
+     table on this band.
+   - *A host path like CADO's.* This is a design decision for Kyle, not a
+     measurement. CADO pays ~6 CPU threads for it, and on Kyle's machine
+     those threads run ECM.
+
+   I would measure the first before considering the second.
+2. **Resieve + scatter, 36 ms/q,** the largest kernel without a cheaper
+   counterpart. CADO rescans the bucket lists inside its region kernel
+   while that region's survivors are on chip. We re-read the buckets in a
+   separate kernel. The net is +7.3 ms/q (1.06x on the group).
+3. **Transform, 7.86 against 3.37** (+4.5 ms/q, 2% of wall).
+4. **Not idle:** TD in asynchronous phases or a deeper queue is worth ≤2%
+   at I16. The 3.9% end-of-q gap from finding 114 stands for small jobs
+   (C143) only.
+5. **Not fill, TD or apply:** at par, or ahead.
+6. CADO's `p < 96` skip pays 1.27x per relation at I16 (one run). Whether a
+   skip would pay us at I16 is not measured.
+
+<a id="finding-116"></a>
+## Finding 116 — finding 115's two kernel leads, fixed with relations byte-identical. The transform's inverse is now branch-free (7.43 -> 3.13 ms/q at I16, under CADO's 3.37). The resieve gets a shared-memory filter on 2^29-position slabs (33.6 -> 20.9 ms/q). Final build on a free card, pipelined wall: NFS@Home I16 −9.7%, C194 −7.6%, c183 −7.9%, C143 unchanged (−0.2% ± 0.4% over twelve rounds)
+
+**Date:** 2026-10-16. RTX 5070, WSL2, host load 10-12 (CPU ECM). Base `fef825c`
+(the previous `bench/bench`). The fat `bench/bench` is rebuilt from this
+source: 6 archs, 0 warnings, `--verify-only`, `fbtest` and identity on four
+jobs (`fat-check.txt`). Evidence in
+[`../oracle/resieve-transform-20261016/`](../oracle/resieve-transform-20261016/).
+Finding 115 ranked resieve + scatter (36 ms/q against CADO's region rescan)
+and transform (7.86 against 3.37) as the kernel leads at I16.
+
+### Why each was slow (`prof.sh`, ncu full set, one q of the NFS job)
+
+- **Resieve + scatter is L2-throughput-bound at I16, not latency-bound.**
+  L2 runs at 78-89% of peak, issue active is 21-26%, and there are 234-258M L2
+  sectors per launch: ~0.83 per walk step at an L1 hit rate of 23%. Each step
+  probes a 1 MB summary (2^29 positions at one bit per 64), so each probe is a
+  32-byte sector fetched for one bit. The kernel's own note, measured at C143,
+  says latency, and that holds where the summary is small.
+- **Transform is issue-bound on divergent loops.** Issue active is 74%, but
+  only 13.8 of 32 lanes are active, at ~1,600 thread instructions per entry.
+  `pl_invmod`'s binary Euclid is 63% of the instructions and `pl_gcd32` 14%.
+  The gcd matters only for prime powers; the lattice reduction is ~8%.
+  CADO's transform has no trick of its own (division Euclid, division
+  Franke-Kleinjung); it simply has no gcd.
+
+### What changed (`change.diff`)
+
+1. **`pl_transform_fast` (`plattice.cuh`), used by `k_transform`.** For an
+   odd modulus:
+   - REDC replaces the 64-bit `%`: the four lattice terms reduce to
+     D·2^-32 and N·2^-32, and the factor cancels in N/D.
+   - The inverse is D^(q-2) by Montgomery square-and-multiply, with the
+     multiply computed on every bit and selected.
+   - D·D^-1 ≡ 1 is then checked; the check, not primality, admits the result.
+
+   The check passes only when gcd(D, q) = 1. That is always the case for a
+   prime q, but for a prime power only when Fermat's exponent happens to
+   give the inverse (q = 9, D = 2 falls through). Whenever it passes, the
+   output equals `pl_transform_enc`'s (m = q, g = 1, rt = N/D). Everything
+   else falls through to `pl_transform_enc` unchanged: a failed check,
+   D ≡ 0, even moduli, coefficients of 2^32 or more. (The first version of
+   this finding said "exactly when"; corrected in finding 117's review.)
+
+   A check of rt·D ≡ N would not be enough. For a prime power whose prime
+   divides the special-q, D and N share that prime and the congruence can
+   hold with g > 1.
+2. **`k_resieve_scatter<…, COARSE>` and a coarse-bitmap build (`td.cuh`).**
+   The build was a kernel of its own, `k_build_coarse`, until finding 117's
+   review: it is `k_build_summary_g` one level up, and now calls it.
+   - A bitmap of the summary's nonzero words (one bit per 2048 positions,
+     32 KB per 2^29 slab) is built per slab inside the summary timer.
+   - Each block copies it to shared memory, and a walk step loads its
+     summary word only when its coarse bit is set. The (survivor, prime)
+     pairs are unchanged.
+   - 512 threads per block: three 32 KB blocks keep 48 warps per SM. With
+     256 threads there were 24 warps, and two thirds of the gain was lost.
+   - The grid is the resident count from the occupancy API at TD init.
+3. **Only on slabs of 2^29 positions or more** (`PIPE_RS_COARSE_MIN`); see
+   below.
+
+### Gates (`gates.txt`, sm_120 snapshot of the final source)
+
+- `--verify-only` passes (3 OK).
+- `make check` passes 108 of 108. It now includes three exact gates
+  (`verify_transform_fast`):
+  - `pl_transform_fast` against `pl_transform_enc` on every entry of both
+    real factor bases (7,605,616 and 3,957,374; the fast path takes all but
+    210 and 81).
+  - 19.0M synthetic cases: small special-q against every prime power to
+    2000 and every root, and random moduli to 2^32 with raw coefficients
+    past the 2^32 guard.
+  - Wherever the fast path answers, the definition is also checked in exact
+    64-bit arithmetic.
+- fillcheck 60 of 60.
+- Relations byte-identical to the reference files on the NFS job, c183,
+  C143 and C194 (`ident.txt` adds the old-resieve and 256-thread arms).
+- Stop/resume identical on C194 (four slabs) and C143.
+- skipslab (`BN_LIMBS=4`) passes all cases.
+- TD-list truncation (`PIPE_K=8`) gives identical relations single-queued
+  and pipelined, with 11 slab skips each way. That holds both below the
+  coarse threshold (`--slab-j 4095`) and above it (c183's one 2^29 slab).
+
+**Found on the way, not fixed:** `pl_invmod` is wrong for moduli of 2^31 and
+up, because `(x1 + p) >> 1` wraps in 32 bits. `pl_transform_enc` is
+therefore wrong there, e.g. q = 3,982,922,849 gives rt 1,330,206,460 where
+the true root is 662,933,767. No factor base today reaches 2^31 (the
+largest limit is 3e8). The fast path does not use `pl_invmod` and is
+correct there, so the new gate checked moduli at or above 2^31 against the
+definition only. **Fixed in finding 117's review:** the halving adds in 64
+bits, and the gate now compares with `pl_transform_enc` at every modulus.
+
+### Timing
+
+On a free card (`ab.txt`, `ab2.txt`), the build with experiment switches
+(the same kernels):
+
+| pipelined wall, ms/q (2 runs) | `fef825c` | + fast transform | + coarse resieve |
+|---|---:|---:|---:|
+| NFS@Home I16, 80 q | 218.9 | 218.0 | **200.0 (−8.6%)** |
+| C194 I16, 60 q | 235.8 | 233.9 | **218.2 (−7.5%)** |
+| c183 I15, 200 q | 62.9 | 61.2 | **56.8 (−9.8%)** |
+| C143 I13, 1,000 q | 7.22 | **7.15 (−1.0%)** | (off below 2^29) |
+
+NFS single-queued: 233.3 -> 211.9 ms/q. Its transform went 7.43 -> 3.13
+and its resieve 33.6 -> 20.9 (256 threads: 27.2). The transform alone
+barely moves the pipelined wall, because it was overlapping the L2-bound
+resieve.
+
+**Why 2^29** (`ab3.txt`, C143 at I14):
+
+| slab | single-queued resieve | pipelined wall |
+|---:|---:|---:|
+| 2^27 | 2.06 -> 3.06 ms/q | 12.65 -> 12.32 |
+| 2^28 | 4.05 -> 5.91 ms/q | 22.99 -> 21.84 |
+
+The filter slows the resieve itself by 45-50%, while the pipelined wall
+still gains 1-6%. Survivor density does not separate the cases: c183's 2^29
+slab sets 27% of coarse bits and wins, C143 at 2^28 sets 16% and loses.
+Slab size does. So the rule is the one with no measured loss in any arm.
+Slabs above 2^29 (a coarser filter, one bit per 4096+ positions) were not
+measured.
+
+Final source against `fef825c` on a **free card**, client stopped
+(`final-timing-clean.txt`), interleaved, two rounds:
+
+| | `fef825c` | final | change |
+|---|---:|---:|---:|
+| NFS I16 pipelined | 227.8 | 205.6 | **−9.7%** |
+| NFS I16 single-queued | 235.5 | 217.7 | −7.5% |
+| C194 pipelined | 243.2 | 224.6 | **−7.6%** |
+| c183 pipelined | 64.0 | 59.0 | **−7.9%** |
+| C143 pipelined | 7.46 | 7.33 | −1.7% |
+
+**C143, where only the transform differs (0.55 -> 0.25 ms/q).** First timed
+with the card time-sliced against the NFS@Home client (`final-timing.txt`,
+`c143-recheck.txt`; absolute times ~2.2x). There it was +1.9% pipelined in
+six rounds out of six, in either order, and −1.1% single-queued. Rechecked
+on the free card (`c143-clean.txt`, `c143-more.txt`, plus the two rounds
+above):
+
+- pipelined, twelve interleaved rounds alternating which arm runs first:
+  7.52 -> 7.51 ms/q, **−0.2% ± 0.4%** (paired differences −0.16 to +0.21
+  ms, new faster in eight of twelve);
+- single-queued, four rounds: 9.57 -> 9.39, **−2.0%**, faster in every
+  round.
+
+So C143 is not slower. The +1.9% appears only when the card is time-sliced
+against another process. Production runs one bench per card. The other
+jobs' gains under sharing (NFS −10.0%, C194 −8.0%, c183 −7.0%) matched the
+free-card ones.
+
+### Against cado-gpu (finding 115's I16 table, projected, not re-measured)
+
+| ms/q | before | after | CADO |
+|---|---:|---:|---:|
+| transform | 7.86 | ~3.3 | 3.37 |
+| apply/resieve group | 119.9 | ~106 | 112.7 |
+| kernels one q at a time | 219.0 | ~201 | 186.9 (1.17x -> ~1.08x) |
+| same, without cofactorisation | 195.7 | ~178 | 181.8 (now slightly ahead) |
+
+The ~13.5 ms/q drop in the apply/resieve group is the trace-equivalent of
+the single-queued resieve cut. With the final build's pipelined wall −9.7%
+on the NFS job, finding 115's 1.22x per raw relation projects to ~1.10x. What remains is mostly
+cofactorisation (23.3 ms/q on our GPU, 5.1 on CADO's plus ~6 CPU threads).
+
+## Finding 117 — apply's threshold scan takes two cells per lane, and two whole-bitmap clears go: k_apply −7.6% at I16 pipelined (warp instructions −7.2% algebraic, −10.6% rational), pipelined wall NFS@Home I16 −3.7%, C194 −2.7%, c183 −2.8%, C143 ~−1% (noisy), relations byte-identical. Per-side acceptance counted for the side-0-first idea: at I16 side 0 accepts 10.5% of two-sided survivors and side 1 24%; at C143 it is the other way round
+
+**Date:** 2026-10-16. RTX 5070, WSL2, host load ~11 (six CPU benchmark
+workers, as in finding 116's clean runs), card free, client not running.
+Base: finding 116's fat `bench/bench` (`ffa2aaae`). New: a `GPU_ARCH=120`
+snapshot of this source. The fat `bench/bench` is rebuilt from this
+source: 6 archs, 0 warnings, `--verify-only`, `fbtest` and identity on four
+jobs (`fat-check.txt`). Evidence in
+[`../oracle/scan-clears-20261016/`](../oracle/scan-clears-20261016/).
+Both changes were in a six-item outside review (another model, relayed by
+Kyle), checked against the code before anything was built. Neither can
+change a survivor, by construction, and the gates below confirm it.
+
+### What changed (`change.diff`)
+
+1. **The 16-bit scan takes 64 positions per warp step.** Lane k takes
+   positions k and k + 32, so each of two ballots is one survbits word as it
+   stands, and lanes 0 and 1 store the pair.
+   - The cell's half-word is fixed per lane, so the shift is too.
+   - The row is computed once per step. That needs 64 aligned positions to
+     sit in one row, i.e. logI >= 6.
+   - The masks are warp-uniform, so every lane counts both and lane 0
+     commits. The store is predicated, not a lane-0/1 branch, which had cost
+     a BSSY/BSYNC pair per step.
+   - The probe and dump side effects (the harness only) sit behind one
+     flag tested before the loop.
+   - `apply_keep` is now `apply_keep_row` plus a wrapper, so the keep test
+     still has one definition. 8-bit cells keep the one-cell loop.
+2. **`apply_scan_stores<CELLBITS>(logI, log_region, nth)`** is the
+   store-path condition, read by the kernel to choose its path and by the
+   pipeline to skip its survbits clear. That is 512 MiB of writes per q at
+   I16/J32768 (4 slabs × 2 sides). The clear stays when the condition fails,
+   or when the regions do not cover the slab exactly. Its comment said it
+   stayed because a guard would restate the kernel's condition in a second
+   place; the guard now calls the kernel's own function.
+3. **No clear of the two-sided bitmap before `k_intersect_compact`.** The
+   kernel stores every word itself: 256 MiB per q at I16.
+
+One path moved: 16-bit cells at `--region 5`, and any logI < 6, now take the
+atomicOr fallback. Both are harness-only geometries, and both are covered
+below.
+
+### The loop (`scan-sass.txt`, the production I16 instance, sm_120)
+
+| | positions per step | warp instructions per 64 positions |
+|---|---:|---:|
+| base | 32 | ~76 (38 per step) |
+| packed, first version | 64 | ~51 |
+| final | 64 | **33** |
+
+The first version still paid the harness's probe and dump tests (~11 per
+step) and the lane-0/1 branch. All 11 `k_apply` instances stay at 40
+registers (38 for two 8-bit ones), with no stack and no spill (`gates.txt`).
+
+ncu, the 8 launches of one NFS@Home q (`prof-summary.txt`): warp
+instructions per launch, algebraic 5.560e9 -> 5.317e9 (first version) ->
+**5.162e9 (−7.2%)**; rational 3.717e9 -> 3.478e9 -> **3.321e9 (−10.6%)**.
+The final run's ncu durations were noisy (two base launches 20-30% slow), so
+the timings below are the measure.
+
+### Gates
+
+- **Survivor bitmaps** (`sbgate.sh`, `sbgate.txt`): the harness's
+  `--survbits`, base against new, **18 of 18 byte-identical**:
+  - c183 at I15, sides 1 and 0, with and without `--not-both-even`;
+  - region 6 (the smallest packed region) and regions 5 and 4 (fallback);
+  - 96 and 32 apply threads;
+  - 8-bit cells;
+  - I12 at region 12 and 6;
+  - logI 6 and 7 with regions spanning 4 rows (`--no-smallsieve`), and logI
+    5 (fallback).
+- Relations byte-identical to the reference files on the NFS job
+  (pipelined and single-queued), c183, C143 and C194 (`ident.txt`).
+- `--verify-only` 3 OK, `make check` 108 of 108, fillcheck 60 of 60.
+
+### Timing (`timing.sh`, `timing.txt`): three rounds, alternating which arm runs first
+
+| ms/q | base | new | change | per round | apply |
+|---|---:|---:|---:|---|---|
+| NFS@Home I16 pipelined | 208.6 | 200.9 | **−3.7%** | −2.5, −3.6, −5.0 | 85.6 -> 79.1 |
+| NFS@Home I16 single-queued | 224.1 | 216.3 | −3.5% | −3.9, −2.7, −3.7 | 77.3 -> 70.9 |
+| C194 pipelined | 227.0 | 221.0 | **−2.7%** | −2.9, −2.8, −2.2 | 85.4 -> 79.1 |
+| c183 pipelined | 59.8 | 58.1 | **−2.8%** | −2.9, −2.7, −2.8 | 19.15 -> 17.75 |
+| C143 pipelined | 7.66 | 7.45 | ~−1% | −2.1, −6.4, +0.5 | 2.62 -> 2.45 |
+
+- **C143's mean is pulled by one slow base run** (7.95 ms/q in round 2).
+  Without that round it is 7.51 -> 7.45, so call it ~−1%: apply −0.17
+  ms/q on a 7.5 ms q.
+- **At I16, apply gives 6.4 ms/q and the wall 7.7.** The ~1.3 ms gap is
+  about what 768 MiB of clears per q costs at this card's bandwidth.
+  Fill is unchanged (55.4 -> 55.2).
+- **The intersect timer rises under the q-pipeline only** (NFS 1.99 ->
+  2.11, c183 0.56 -> 0.68). Single-queued it does not: NFS 1.61 -> 1.61,
+  and c183 0.424 -> 0.416 over four runs (`c183-single.txt`). With the clear
+  gone, the kernel overlaps more of the other stream's work, so the change
+  is in attribution, not kernel time.
+
+### Per-side acceptance, for the side-0-first idea (`sidestats.diff`, `sidestats.txt`)
+
+The same review's largest idea: classify one side first, and run the other
+side's resieve, trial division and classify only on its accepted
+survivors. `sidestats.diff` is a test-only counter of each side's
+ACCEPT/SPLIT over a whole band. It is never landed; the build is the new
+source plus that diff.
+
+| band | two-sided | side 1 accepts | side 0 accepts | both |
+|---|---:|---:|---:|---:|
+| NFS@Home I16, 80 q | 8,838,899 | 24.07% | **10.50%** | 2.53% |
+| C194, 60 q | 14,300,807 | 23.20% | **9.78%** | 2.27% |
+| c183, 200 q | 16,198,754 | 23.04% | **10.31%** | 2.38% |
+| C143, 1,000 q | 10,658,737 | **13.52%** | 16.26% | 2.21% |
+
+So at I16 and I15, side 0 first would leave side 1 about a tenth of the
+survivors. At C143 the order would be reversed, so the choice has to be per
+job. The per-kernel split for one NFS q (`split-summary.txt`; ncu, locked
+clocks, single-queued; side 1 / side 0):
+
+| ms/q | side 1 | side 0 |
+|---|---:|---:|
+| `k_resieve_scatter` | 14.61 | 12.25 |
+| `k_td` | 4.56 | 4.27 |
+| `k_classify` | 0.71 | 0.51 |
+
+What that bounds:
+
+- **Side-0-first could save up to ~4.7 of side 1's 5.3 ms/q of TD and
+  classify** (locked clocks, less a compaction; about 2% of the wall), **but
+  not with today's `k_td`.** That figure scales with the survivor count, and
+  `k_td`'s cost at I16 does not. The job runs 4 slabs per q, so a slab has
+  ~27,600 two-sided survivors against a 288 x 256 = 73,728-thread grid:
+  `iters` is already 1, and every thread marches the whole small-prime table.
+  At ~2,900 survivors per slab each thread's march is as long, on 12 blocks
+  instead of 108. Finding 74 measured the same shape in the thread-per-candidate
+  record pass, a flat ~0.65 ms per launch from 577 to 5,342 candidates, and
+  finding 78b found cost not proportional to marches. The saving needs side
+  1's selected TD in `k_td_record_warp`'s warp-per-candidate shape (finding 77)
+  or STATUS item 18's lanes-per-item. *(Corrected 2026-10-17 after an external
+  review; the first version read the 90% fewer survivors as 90% less time.)*
+- **Side 1's resieve barely shrinks.** It walks every factor-base prime
+  whatever the survivor count. Since finding 116 the walk is most of it,
+  and only the summary probes would thin out.
+- **The bigger exact lever is side 0's resieve itself, 12.25 ms/q.** Under
+  the fill gate, side 0's bucket records are sparse and cover every
+  two-sided survivor. A scan of them for the records on survivors yields the
+  side-0 resieve's (survivor, prime) pairs, but only if the record can name
+  the prime. Today's 4 B record holds a slice, not a factor-base index
+  (the harness's layout-B purge notes the same gap). The records also have
+  a short life. Under `--q-pipeline` both sides fill one bucket array
+  (`bk0 = bk1`, `pipeline.cuh:2450`), and the next slab's sieve is issued
+  right after the intersection (`pipeline.cuh:3286`), before this slab's
+  TD. A scan has to read side 0's records before that issue point, on the
+  serial path, or copy the pairs into storage the next fill does not touch.
+- **Not measured:** the side-0-first restructure, the record scan. The
+  first measurement is side 1's TD at ~10% of the survivors in each shape,
+  before any restructure.
+
+### The rest of that review, for the record
+
+- **Fusing bitmap metadata (summary, group counts) into the intersection:**
+  the kernels it would merge cost ~0.6 ms per slab at locked clocks
+  (summary 0.31, group counts 0.11, scans 0.07, emit 0.12), so ~1-1.5 ms/q
+  is available at I16. Small, exact, not done.
+- **The duplicate survivor-count readback and the host small-prime tables:**
+  host-side, and the card idles ~2% at I16. They matter at C143 sizes, not
+  for production. Not done.
+
+### Review fixes (2026-10-17)
+
+A `/code-review` of the uncommitted source for findings 115-117 found no
+defect that changes a relation. Its 13 points were each checked against the
+code; all held, and all are fixed (`review.diff`).
+
+- **`pl_invmod` at 2^31 and up (finding 116's "not fixed").** The halving
+  adds in 64 bits. q = 3,982,922,849 now gives 662,933,767, so the transform
+  gate compares with `pl_transform_enc` at every modulus, not only below 2^31.
+- **The host runs the device's transform.** Four host sites now call
+  `pl_transform_fast`, which is exact by construction: the check admits a
+  root only when the computed power is D's inverse.
+  - The per-q small-sieve tables, in the pipeline and in the harness.
+  - `td_fill_small`.
+  - `verify_count_updates`. Its comment said it shared `pl_transform_enc`
+    with the device, which stopped being true in finding 116; it is the
+    same function again.
+
+  Host small-prime tables, ms/q: NFS@Home I16 1.86 -> 1.30, C194 1.92 ->
+  1.33, c183 1.02 -> 0.69, C143 0.28 -> 0.21 (`host-timers.txt`; host
+  timers, both arms under the same load). At I16 that work overlaps the
+  card.
+- **Two wrong comments in `plattice.cuh`.**
+  - The fast path's check passes *only* when D is invertible, not
+    *exactly* then. That is always true for a prime q; for a prime power,
+    q = 9 with D = 2 falls through.
+  - The accumulator is d^-1·2^64, not (d·2^-32)^-1·2^64.
+
+  Finding 116's text is corrected to match.
+- **The transform gate overstated itself.**
+  - Its count included random samples it skipped, and moduli above 2^31
+    where nothing was compared.
+  - Several random draws shared one expression, so the evaluation order
+    is unspecified: gcc, clang and MSVC could each test a different case
+    set.
+  - Source 2 skipped special-q 11 and every odd special-q root.
+
+  Now it makes **45,765,270 comparisons**, every one against
+  `pl_transform_enc`, with 43,487,736 answered by the fast path.
+  Finding 116's "19.0M" included skipped samples.
+- **The coarse filter (finding 116).**
+  - `k_build_coarse` was `k_build_summary_g` with wper = 2^cshift and is
+    now that call.
+  - The filter's word count has one definition (`pipe_rs_ncoarse`) for its
+    sizing, build and launch.
+  - An instance the occupancy API cannot make resident now runs the plain
+    resieve. Before, it got a grid of one block, which fails to launch.
+  - The build is skipped when no side's FK walk will read it.
+- **`PIPE_CELLBITS`.** One constant for the pipeline's `k_apply` instances,
+  their shared-memory size and the clear guard. Before, the guard's `<16>`
+  and the launched instance were separate literals.
+
+**Gates** (`review-gates.txt`, sm_120 snapshot):
+- 0 warnings; `--verify-only` 3 OK.
+- `--verify` on c183: all 32,768 regions match the CPU replay, 0 cells
+  differ.
+- `make check` 108 of 108, including the reworked gate above. Both real
+  factor bases are still exact (7,605,406 of 7,605,616 and 3,957,293 of
+  3,957,374 by the fast path).
+- fillcheck 60 of 60.
+- Survivor bitmaps 18 of 18 identical to finding 116's binary. The
+  harness's small-sieve tables changed, so this is a gate here too.
+- Relations byte-identical on the NFS job (pipelined and single-queued),
+  c183, C143 and C194.
+
+**Not timed cleanly.** The A/B against the finding-117 binary
+(`timing-review.txt`) ran while a GPU ECM stage 1 time-sliced the card
+(walls ~1.9x, rounds disagreeing by up to 8%), so its wall times say
+nothing. No hot-path kernel changed. The one GPU change is the coarse build,
+inside the "survivor filter" timer, which read the same single-queued:
+1.150 and 1.158 -> 1.151 and 1.159 ms/q.

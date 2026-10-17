@@ -1,0 +1,20 @@
+# k_apply per launch, NFS@Home I16 q index 3, single-queued, ncu locked clocks (prof.sh)
+# launch order per slab: side 1 (alg), side 0 (rat)
+base
+  0 alg  12.703 ms  warp inst 5.560e9  issue active 90.0%
+  1 rat  11.062 ms  warp inst 3.718e9  issue active 91.1%
+  2 alg  12.716 ms  warp inst 5.560e9  issue active 90.0%
+  3 rat  10.082 ms  warp inst 3.716e9  issue active 91.1%
+  4 alg  12.691 ms  warp inst 5.558e9  issue active 90.1%
+  5 rat   8.316 ms  warp inst 3.715e9  issue active 91.1%
+  6 alg  12.694 ms  warp inst 5.558e9  issue active 90.1%
+  7 rat   8.313 ms  warp inst 3.714e9  issue active 91.1%
+new
+  0 alg  12.555 ms  warp inst 5.162e9  issue active 88.8%
+  1 rat   8.122 ms  warp inst 3.323e9  issue active 89.8%
+  2 alg  13.618 ms  warp inst 5.162e9  issue active 88.7%
+  3 rat   7.554 ms  warp inst 3.321e9  issue active 89.9%
+  4 alg  12.986 ms  warp inst 5.160e9  issue active 89.0%
+  5 rat   8.595 ms  warp inst 3.320e9  issue active 89.9%
+  6 alg  11.954 ms  warp inst 5.160e9  issue active 89.0%
+  7 rat   7.545 ms  warp inst 3.319e9  issue active 89.9%
