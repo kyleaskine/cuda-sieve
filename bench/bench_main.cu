@@ -296,6 +296,15 @@ static void usage(void)
 "                   records only under side 1's survivors\n"
 "                   [on, off under --fill-concurrent, which refuses it]\n"
 "  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
+"  --resieve-scan / --no-resieve-scan  --pipeline only; side 0's resieve\n"
+"                   reads its pairs from its own gated fill records instead\n"
+"                   of walking its factor base. Costs an index array of half\n"
+"                   the bucket array; off when it does not fit, and any slab\n"
+"                   that outgrows it is walked     [on with the gate, else off]\n"
+"  --resieve-scan-cap N  index slots per region; 0 = half the bucket\n"
+"                   capacity (a test knob for the fallback)           [0]\n"
+"  --resieve-scan-pairs N  first capacity of the scan's pair list; 0 =\n"
+"                   auto (a test knob for its growth)                  [0]\n"
 "  --q-pipeline / --no-q-pipeline  --pipeline only; sieve the next slab or\n"
 "                   special-q while this one is trial-divided. Falls back to\n"
 "                   one at a time when its extra VRAM does not fit\n"
@@ -1008,6 +1017,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     /* -1 = resolved below once logI and --fill-concurrent are known */
     cfg.fill_rows = -1; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
+    cfg.resieve_scan = -1; cfg.resieve_scan_cap = 0; cfg.resieve_scan_pairs = 0;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
@@ -1066,7 +1076,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.resume_nrel = 0; cfg.resume_nq = 0;
     int maxbits = 0, maxbits_set = 0;
     int sieve_skip_set = 0;
-    int fill_row_bands_set = 0, fill_gate_shift_set = 0;
+    int fill_row_bands_set = 0, fill_gate_shift_set = 0, resieve_scan_knob = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
@@ -1170,6 +1180,18 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             if (parse_int_range_arg("--fill-gate-shift", argv[++i], 0, 5,
                                     &cfg.fill_gate_shift)) return 1;
             fill_gate_shift_set = 1;
+        }
+        else if (!strcmp(argv[i], "--resieve-scan")) { cfg.resieve_scan = 1; }
+        else if (!strcmp(argv[i], "--no-resieve-scan")) { cfg.resieve_scan = 0; }
+        else if (!strcmp(argv[i], "--resieve-scan-cap") && i + 1 < argc) {
+            if (parse_u32_range_arg("--resieve-scan-cap", argv[++i], 0u,
+                                    UINT32_MAX, &cfg.resieve_scan_cap)) return 1;
+            resieve_scan_knob = 1;
+        }
+        else if (!strcmp(argv[i], "--resieve-scan-pairs") && i + 1 < argc) {
+            if (parse_u32_range_arg("--resieve-scan-pairs", argv[++i], 0u,
+                                    UINT32_MAX, &cfg.resieve_scan_pairs)) return 1;
+            resieve_scan_knob = 1;
         }
         else if (!strcmp(argv[i], "--fill-streams") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-streams", argv[++i], 0,
@@ -1544,6 +1566,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                             cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
     if (cfg.fill_gate < 0)
         cfg.fill_gate = (cfg.pipeline && !cfg.fill_concurrent) ? 1 : 0;
+    /* --resieve-scan: wherever the gate is, since only gated side-0 records
+     * are sparse enough to scan (finding 118). */
+    if (cfg.resieve_scan < 0)
+        cfg.resieve_scan = (cfg.pipeline && cfg.fill_gate) ? 1 : 0;
     /* --q-pipeline (findings 108-109): on wherever it can run. Its VRAM check
      * happens in run_pipeline_impl and falls back to one q at a time;
      * --fill-concurrent and --qspan exclude it, so there the default is off
@@ -1562,6 +1588,17 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     }
     if (cfg.pipeline && cfg.resieve_rows && !cfg.fill_rows) {
         fprintf(stderr, "--resieve-rows uses the --fill-rows tier; give both\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.resieve_scan && !cfg.fill_gate) {
+        fprintf(stderr, "--resieve-scan reads side 0's gated fill records; it"
+                " needs the gate, which is off (--no-fill-gate, or"
+                " --fill-concurrent)\n");
+        return 1;
+    }
+    if (cfg.pipeline && resieve_scan_knob && !cfg.resieve_scan) {
+        fprintf(stderr, "--resieve-scan-cap and --resieve-scan-pairs need the"
+                " scan; it is off (--no-resieve-scan, or no fill gate)\n");
         return 1;
     }
     if (cfg.pipeline && fill_gate_shift_set && !cfg.fill_gate) {
@@ -2190,7 +2227,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--fill-rows", "--fill-row-bands", "--fill-gate", "--resieve-rows",
             "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
             "--no-q-pipeline",
-            "--fill-gate-shift", NULL
+            "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
+            "--resieve-scan-cap", "--resieve-scan-pairs", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -3204,9 +3242,10 @@ resume_artifacts_ready:
              * free VRAM after setup, so run_pipeline_impl writes its own
              * `q-pipeline` line with what was granted. */
             runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
-                        " gate=%d shift=%d", cfg.fill_rows,
+                        " gate=%d shift=%d resieve-scan=%d", cfg.fill_rows,
                         cfg.fill_row_bands, cfg.resieve_rows, cfg.fill_gate,
-                        cfg.fill_gate ? cfg.fill_gate_shift : 0);
+                        cfg.fill_gate ? cfg.fill_gate_shift : 0,
+                        cfg.resieve_scan);
             if (cfg.resume)
                 runlog_note("resume", "at q=%llu rho=%llu after %llu q,"
                             " %llu relations",

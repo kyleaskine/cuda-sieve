@@ -775,6 +775,84 @@ __global__ void k_resieve_rows(const uint32_t *__restrict primes,
     if (ovf) atomicAdd(noverflow, ovf);
 }
 
+/* ---- --resieve-scan: side 0's resieve from its own records ------------- *
+ *
+ * Under the fill gate side 0 writes a bucket record only within 2^shift
+ * positions of a side-1 survivor, and every two-sided survivor is one. Gate
+ * and --sieve-skip drop no record on a two-sided survivor, and fill and
+ * resieve walk the same entries from the same cursors. So side 0's records
+ * on two-sided survivors are exactly the pairs its walk would find: equal
+ * survivor by survivor on five jobs (finding 118). Yet they are 1-6% of side
+ * 0's records, which are themselves a few percent of side 1's. A record names
+ * a slice, not a prime, so side 0's fill also stores each record's
+ * factor-base index at the same (region, slot) of `index` (fill_store_index).
+ *
+ * k_record_scan runs right after the intersection. Under --q-pipeline the
+ * next slab's fill reuses the bucket array before this slab's TD, so the scan
+ * copies each record on a two-sided survivor out as (position, prime) into a
+ * list it owns. k_pair_scatter then does in TD what k_resieve_scatter does
+ * with a pair: rank the position, append the prime. Only the order of primes
+ * within a survivor's list changes. Nothing downstream sees it: k_td divides
+ * them in any order, and both writers sort each factor list.
+ *
+ * One block per region, whole warps per pass so the ballot has every lane.
+ * Slots past icap have no index. The fill counted them, and the host walks
+ * that slab instead, so the scan stops at icap. *npair is the true total even
+ * past pcap, so the host can grow the list. */
+__global__ void k_record_scan(const uint32_t *__restrict bucket,
+                              const uint32_t *__restrict cursor, uint32_t cap,
+                              const uint32_t *__restrict index, uint32_t icap,
+                              int log_region,
+                              const uint32_t *__restrict two,
+                              const uint32_t *__restrict primes,
+                              uint32_t *__restrict px, uint32_t *__restrict pp,
+                              uint32_t pcap, uint32_t *__restrict npair)
+{
+    const uint32_t b = blockIdx.x;
+    const uint32_t offmask = (1u << log_region) - 1u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t *rec = bucket + (size_t)b * cap;
+    const uint32_t *idx = index + (size_t)b * icap;
+    const uint32_t m = min(cursor[b], icap);
+
+    for (uint32_t base = threadIdx.x & ~31u; base < m; base += blockDim.x) {
+        const uint32_t k = base + lane;
+        uint32_t x = 0;
+        bool hit = false;
+        if (k < m) {
+            x = (b << log_region) | (rec[k] & offmask);
+            hit = (two[x >> 5] >> (x & 31u)) & 1u;
+        }
+        const uint32_t mask = __ballot_sync(0xFFFFFFFFu, hit);
+        if (!mask) continue;
+        uint32_t slot = 0;
+        if (lane == 0) slot = atomicAdd(npair, (uint32_t)__popc(mask));
+        slot = __shfl_sync(0xFFFFFFFFu, slot, 0) + __popc(mask & ((1u << lane) - 1u));
+        if (hit && slot < pcap) { px[slot] = x; pp[slot] = primes[idx[k]]; }
+    }
+}
+
+/* k_resieve_scatter's append, for the pairs k_record_scan copied out. */
+__global__ void k_pair_scatter(const uint32_t *__restrict px,
+                               const uint32_t *__restrict pp, uint32_t n,
+                               const uint32_t *__restrict bits,
+                               const uint32_t *__restrict gbase,
+                               uint32_t *__restrict plist,
+                               uint32_t *__restrict pcnt, uint32_t K,
+                               unsigned long long *__restrict noverflow)
+{
+    const uint64_t stride = bench_grid_stride_x();
+    unsigned long long ovf = 0;
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        const uint32_t idx = td_rank(bits, gbase, px[t]);
+        const uint32_t slot = atomicAdd(&pcnt[idx], 1u);
+        if (slot < K) plist[(size_t)idx * K + slot] = pp[t];
+        else ovf++;
+    }
+    if (ovf) atomicAdd(noverflow, ovf);
+}
+
 /* ---- the trial-division kernel ----------------------------------------- */
 
 #define TDF_NORM_OVERFLOW  1u

@@ -1,0 +1,38 @@
+== NFS single-queued (rc=0)
+  j-slabbing: 4 slabs, up to 8192 rows/slab (auto target 32768 bucket regions at --region 14; safety bounds may reduce it further)
+RECSCAN side 1: 202202352 records/slab (6170.73 per region), fullest region 9676 of cap 10900, 1310720 of 2621440 regions over cap/2
+RECSCAN side 0: 7369149 records/slab (224.89 per region), fullest region 2235 of cap 10900, 0 of 2621440 regions over cap/2
+RECSCAN resieve ms/slab: side 1 2.669, side 0 2.493 (80 slabs)
+RECSCAN scan: 2210148 survivors, side-0 records on them 6000883, resieve pairs 6000883, survivors differing 0 (records more by 0, fewer by 0), pcnt > K 0; scan 0.185 ms/slab
+== C194 single-queued (rc=0)
+  j-slabbing: 4 slabs, up to 8192 rows/slab (auto target 32768 bucket regions at --region 14; safety bounds may reduce it further)
+RECSCAN side 1: 197595758 records/slab (6030.14 per region), fullest region 9498 of cap 10658, 1310720 of 2621440 regions over cap/2
+RECSCAN side 0: 10679205 records/slab (325.90 per region), fullest region 3626 of cap 10658, 0 of 2621440 regions over cap/2
+RECSCAN resieve ms/slab: side 1 2.723, side 0 2.569 (80 slabs)
+RECSCAN scan: 4739937 survivors, side-0 records on them 12055944, resieve pairs 12055944, survivors differing 0 (records more by 0, fewer by 0), pcnt > K 0; scan 0.227 ms/slab
+== C183 single-queued (rc=0)
+RECSCAN side 1: 210084868 records/slab (6411.28 per region), fullest region 10079 of cap 11315, 819200 of 1638400 regions over cap/2
+RECSCAN side 0: 15586090 records/slab (475.65 per region), fullest region 3833 of cap 11315, 0 of 1638400 regions over cap/2
+RECSCAN resieve ms/slab: side 1 4.546, side 0 4.069 (50 slabs)
+RECSCAN scan: 4049698 survivors, side-0 records on them 10426402, resieve pairs 10426402, survivors differing 0 (records more by 0, fewer by 0), pcnt > K 0; scan 0.281 ms/slab
+== C183S0 single-queued (rc=0)
+RECSCAN side 1: 210084810 records/slab (6411.28 per region), fullest region 10024 of cap 11315, 819200 of 1638400 regions over cap/2
+RECSCAN side 0: 1630906 records/slab (49.77 per region), fullest region 644 of cap 11315, 0 of 1638400 regions over cap/2
+RECSCAN resieve ms/slab: side 1 4.251, side 0 3.845 (50 slabs)
+RECSCAN scan: 2805643 survivors, side-0 records on them 4612584, resieve pairs 4612584, survivors differing 0 (records more by 0, fewer by 0), pcnt > K 0; scan 0.117 ms/slab
+== C143 single-queued (rc=0)
+RECSCAN side 1: 27690050 records/slab (3380.13 per region), fullest region 5394 of cap 6087, 1228800 of 2457600 regions over cap/2
+RECSCAN side 0: 595770 records/slab (72.73 per region), fullest region 986 of cap 6087, 0 of 2457600 regions over cap/2
+RECSCAN resieve ms/slab: side 1 0.637, side 0 0.607 (300 slabs)
+RECSCAN scan: 3218350 survivors, side-0 records on them 6739950, resieve pairs 6739950, survivors differing 0 (records more by 0, fewer by 0), pcnt > K 0; scan 0.041 ms/slab
+== NFS pipelined (rc=0)
+RECSCAN side 1: 202202352 records/slab (6170.73 per region), fullest region 9676 of cap 10900, 1310720 of 2621440 regions over cap/2
+RECSCAN side 0: 7369149 records/slab (224.89 per region), fullest region 2235 of cap 10900, 0 of 2621440 regions over cap/2
+RECSCAN resieve ms/slab: side 1 3.035, side 0 2.904 (80 slabs)
+RECSCAN scan: not run (--q-pipeline reuses the buckets before TD)
+== C143 pipelined (rc=0)
+RECSCAN side 1: 27690050 records/slab (3380.13 per region), fullest region 5394 of cap 6087, 1228800 of 2457600 regions over cap/2
+RECSCAN side 0: 595770 records/slab (72.73 per region), fullest region 986 of cap 6087, 0 of 2457600 regions over cap/2
+RECSCAN resieve ms/slab: side 1 0.818, side 0 0.991 (300 slabs)
+RECSCAN scan: not run (--q-pipeline reuses the buckets before TD)
+done: 0 failed run(s)

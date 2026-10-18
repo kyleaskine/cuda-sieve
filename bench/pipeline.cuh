@@ -812,6 +812,11 @@ typedef struct {
     uint32_t    *overflow;
     uint32_t     cap;
     cudaStream_t stream;        /* 0 = legacy default stream */
+    /* --resieve-scan, side 0 only: each record's factor-base index, icap
+     * slots per region, and the count of records that found no slot
+     * (fill_store_index). NULL everywhere else. */
+    uint32_t    *index, *index_ovf;
+    uint32_t     icap;
 } pbkt_t;
 
 /* Area-dependent work for one side and one slab, ISSUED but not awaited.
@@ -875,6 +880,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     SLAB_CK(cudaEventRecord(S->ev[1], st));
     SLAB_CK(cudaMemsetAsync(bk->cursor, 0, (size_t)nregion * 4, st));
     SLAB_CK(cudaMemsetAsync(bk->overflow, 0, 4, st));
+    if (bk->index) SLAB_CK(cudaMemsetAsync(bk->index_ovf, 0, 4, st));
     {
         /* --fill-gate: gate_bits is the OTHER side's survivor bitmap for this
          * slab, already complete (the serial arm joins it first). The fold
@@ -895,10 +901,13 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
             const uint32_t rows = xmax >> cfg->logI;
             const uint32_t nband = pipe_row_bands(cfg, rows);
             const uint64_t nthr = (uint64_t)((nrow + 31u) >> 5) * nband * 32u;
-            k_fill_rows<SLABBED><<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
+            auto *const rows_kern = bk->index ? k_fill_rows<SLABBED, true>
+                                              : k_fill_rows<SLABBED, false>;
+            rows_kern<<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
                 S->primes, S->rowrt, S->slice, nrow, nband, rows, cfg->logI,
                 log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
-                cfg->sieve_skip, j_base, gate, gshift);
+                cfg->sieve_skip, j_base, gate, gshift,
+                bk->index, bk->icap, bk->index_ovf);
             /* Only k_resieve_scatter reads the row tier's walk state, and only
              * when --resieve-rows is off; nothing else needs it. */
             if (SLABBED && !cfg->resieve_rows)
@@ -908,13 +917,17 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
         }
         /* The rest by pointer offset: k_fill_atomic indexes every per-entry
          * array by the same k. */
-        if (fb->n > nrow)
-            k_fill_atomic<4, SLABBED><<<fblocks, fthreads, 0, st>>>(
+        if (fb->n > nrow) {
+            auto *const fill_kern = bk->index ? k_fill_atomic<4, SLABBED, true>
+                                              : k_fill_atomic<4, SLABBED, false>;
+            fill_kern<<<fblocks, fthreads, 0, st>>>(
                 S->plat + nrow, S->slice + nrow, fb->n - nrow, xmax, cfg->logI,
                 log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
                 SLABBED ? S->walk_cur + nrow : NULL,
                 SLABBED ? S->walk_next + nrow : NULL,
-                cfg->sieve_skip, j_base, gate, gshift);
+                cfg->sieve_skip, j_base, gate, gshift,
+                bk->index, bk->icap, nrow, bk->index_ovf);
+        }
     }
     SLAB_CK(cudaEventRecord(S->ev[2], st));
     SLAB_CK(cudaMemsetAsync(S->d_nsurv, 0, 4, st));
@@ -1087,6 +1100,15 @@ done:
 #define PIPE_CAP_PCT 100
 #endif
 
+/* TEST-ONLY (0 everywhere else): every growth of the --resieve-scan pair
+ * list fails, to drive the branch that turns the scan off mid-band. No real
+ * job reaches it: the list starts at PIPE_RS_PAIRS_INIT, ~5x the largest
+ * slab measured. Set through DEFS, so a build that sets it is marked a
+ * pricing build. */
+#ifndef PIPE_RS_TEST_GROW_FAIL
+#define PIPE_RS_TEST_GROW_FAIL 0
+#endif
+
 /* TD's three per-slab counters, as ONE device allocation (pipe_td_t.d_ctr)
  * so the host reads them with one copy. Order is the copy's layout; the
  * 64-bit word is 8-byte aligned in both the device block and the pinned
@@ -1106,6 +1128,11 @@ typedef struct {
  * one bit per summary word (2048 positions) up to 2^29-position slabs and
  * coarser beyond. 512 threads keep 48 warps per SM at three such blocks; 256
  * left 24 and gave back two thirds of the gain. */
+/* --resieve-scan: the pair list's first capacity (it grows on demand) and
+ * k_record_scan's block. Measured pairs per slab: ~75K at NFS@Home I16,
+ * ~210K at c183 I15 (finding 118). */
+#define PIPE_RS_PAIRS_INIT  (1u << 20)
+#define PIPE_SCAN_THREADS   256
 #define PIPE_RS_COARSE      8192u
 #define PIPE_RS_COARSE_MIN  (1u << 29)
 #define PIPE_RS_THREADS     512
@@ -1152,6 +1179,7 @@ typedef struct {
         uint32_t base, cnt;     /* last group's scan base and count */
         td_ctr_t ctr;           /* flags, accepted count, overflow word */
         uint32_t isect;         /* the intersection's survivor count */
+        uint32_t rscan[2];      /* --resieve-scan: {pairs, index overflow} */
     } *h_rb;
     /* joint acceptance */
     uint32_t *d_aflag, *d_aoff, *d_absum, *d_sel, *d_nacc;
@@ -1512,6 +1540,15 @@ static inline ptd_side_t pipe_td_side(const pside_t *S)
     return v;
 }
 
+/* --resieve-scan: side 0's (position, prime) pairs for one slab, copied out
+ * of its bucket records by k_record_scan before the next fill reused them. */
+typedef struct {
+    const uint32_t *x, *p;
+    uint32_t n;
+} pipe_rpairs_t;
+
+/* rp: side 0's pairs from k_record_scan, or NULL to walk side 0's factor base
+ * as side 1's always is. */
 template <bool SLABBED>
 static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                         const ptd_side_t *S1, const ptd_side_t *S0,
@@ -1519,7 +1556,7 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                         uint32_t j_base, int blocks, int threads, int verify,
                         uint32_t *n_out, uint32_t *nacc_out, pipe_tm_t *tm,
                         double *t_verify, int want_host, int accumulate_stats,
-                        uint32_t gate_found[2])
+                        uint32_t gate_found[2], const pipe_rpairs_t *rp)
 {
     const ptd_side_t *S[2];
     const uint32_t lpb[2] = {cfg->lpb0, cfg->lpb};
@@ -1579,14 +1616,15 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
     k_build_summary_g<<<blocks, threads>>>(d_two, nbitword, 2u, C->d_sum);
     /* the resieve's shared-memory filter, for slabs large enough to gain,
      * when its instance can be resident, and only if a side's FK walk will
-     * read it (under --resieve-rows the row tier may cover a whole side) */
+     * read it (under --resieve-rows the row tier may cover a whole side;
+     * side 0 is not walked at all when rp brings its pairs) */
     const uint32_t nsw = (nbitword + 63u) / 64u;
     const uint32_t ncw = pipe_rs_ncoarse(nsw, C->rs_cshift);
     const uint32_t nr1 = cfg->resieve_rows ? S[1]->nrow : 0;
     const uint32_t nr0 = cfg->resieve_rows ? S[0]->nrow : 0;
     const int coarse = C->d_coarse && xmax >= PIPE_RS_COARSE_MIN
                     && C->rs_blocks[SLABBED ? 1 : 0] > 0
-                    && (S[1]->nfb > nr1 || S[0]->nfb > nr0);
+                    && (S[1]->nfb > nr1 || (!rp && S[0]->nfb > nr0));
     if (coarse)   /* the same OR-reduction as the summary, one level up */
         k_build_summary_g<<<(ncw + 255u) / 256u, 256>>>(C->d_sum, nsw,
                                                          1u << C->rs_cshift,
@@ -1600,7 +1638,14 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
         /* --resieve-rows: the --fill-rows tier, banded by row; the FK walk
          * takes the rest by pointer offset, as in the fill. */
         const uint32_t nr = cfg->resieve_rows ? S[side]->nrow : 0;
-        if (nr) {
+        /* --resieve-scan: side 0's pairs were already found in its own
+         * records (k_record_scan), so only their append is left. */
+        const int walk = !(side == 0 && rp);
+        if (!walk)
+            k_pair_scatter<<<blocks, threads>>>(rp->x, rp->p, rp->n, d_two,
+                                                C->d_gbase, C->d_plist[0],
+                                                C->d_pcnt[0], PIPE_K, C->d_ovf);
+        if (walk && nr) {
             const uint32_t rows = xmax >> cfg->logI;
             const uint32_t nband = pipe_row_bands(cfg, rows);
             const uint64_t nthr = (uint64_t)nr * nband;
@@ -1609,7 +1654,7 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                 C->d_sum, d_two, C->d_gbase, C->d_plist[side], C->d_pcnt[side],
                 PIPE_K, C->d_ovf, 6, j_base);
         }
-        if (S[side]->nfb > nr && coarse)
+        if (walk && S[side]->nfb > nr && coarse)
             k_resieve_scatter<4, SLABBED, true><<<C->rs_blocks[SLABBED ? 1 : 0],
                                                   PIPE_RS_THREADS, (size_t)ncw * 4>>>(
                 S[side]->plat + nr, S[side]->primes + nr, NULL,
@@ -1618,7 +1663,7 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
                 PIPE_K, C->d_ovf, 6,
                 SLABBED ? S[side]->walk_cur + nr : NULL,
                 C->d_coarse, ncw, C->rs_cshift);
-        else if (S[side]->nfb > nr)
+        else if (walk && S[side]->nfb > nr)
             k_resieve_scatter<4, SLABBED><<<blocks, threads>>>(
                 S[side]->plat + nr, S[side]->primes + nr, NULL,
                 S[side]->nfb - nr, xmax, cfg->logI,
@@ -1971,6 +2016,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     uint32_t *d_cursor = NULL, *d_overflow = NULL, *d_two = NULL;
     /* --fill-gate with --fill-gate-shift > 0: side 1's folded bitmap */
     uint32_t *d_gate = NULL;
+    /* --resieve-scan as GRANTED (finding 118): side 0's record index, the
+     * scan's pair list and its two counters {pairs, index overflow}. rs_on
+     * can turn off mid-band (a pair list that could not grow); rs_granted
+     * says whether the band ever had it, for the summary. */
+    int rs_on = 0, rs_granted = 0;
+    uint32_t *d_ridx = NULL, *rp_x = NULL, *rp_p = NULL, *d_rsc = NULL;
+    uint32_t rs_icap = 0, rs_pcap = 0;
+    cudaEvent_t escan = NULL;
+    double acc_rscan = 0;
+    unsigned long long n_rs_scan = 0, n_rs_idx = 0, n_rs_grow = 0;
     /* --q-pipeline as GRANTED, not as requested: the stream the next q is
      * sieved on. Both sides share the bucket array's overflow counter, as in
      * the serial arm: side 1's count is copied to the host in stream order,
@@ -2405,6 +2460,61 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     } else {
         runlog_note("q-pipeline", "off");
     }
+    /* --resieve-scan (finding 118): side 0's fill stores each record's
+     * factor-base index in an array of icap slots per region, half the
+     * bucket capacity by default (the fullest side-0 region measured 34% of
+     * it), and k_record_scan copies the pairs into a list that grows on
+     * demand. Like --q-pipeline, OFF rather than refused when it does not
+     * fit: side 0 is then walked, as it always was. */
+    if (cfg->resieve_scan) {
+        char why[160] = "";
+        rs_icap = cfg->resieve_scan_cap ? cfg->resieve_scan_cap : cap / 2;
+        if (rs_icap > cap) rs_icap = cap;
+        rs_pcap = cfg->resieve_scan_pairs ? cfg->resieve_scan_pairs : PIPE_RS_PAIRS_INIT;
+        const size_t ineed = (size_t)nregion_alloc * rs_icap * 4;
+        const size_t pneed = (size_t)rs_pcap * 8 + 8;
+        if (concurrent || !cfg->fill_gate) {
+            snprintf(why, sizeof why, "it needs the fill gate");
+        } else {
+            size_t f4 = 0, t4 = 0;
+            PIPE_CK(cudaMemGetInfo(&f4, &t4));
+            if (ineed + pneed + PIPE_VRAM_MARGIN > f4)
+                snprintf(why, sizeof why, "it needs %.2f GB more and %.2f GB"
+                         " is free", (ineed + pneed) / 1073741824.0,
+                         f4 / 1073741824.0);
+        }
+        if (!why[0]) {
+            /* as for --q-pipeline: a failure after the check passed falls
+             * back instead of failing the band */
+            cudaError_t e = cudaMalloc(&d_ridx, ineed);
+            if (e == cudaSuccess) e = cudaMalloc(&rp_x, (size_t)rs_pcap * 4);
+            if (e == cudaSuccess) e = cudaMalloc(&rp_p, (size_t)rs_pcap * 4);
+            if (e == cudaSuccess) e = cudaMalloc(&d_rsc, 8);
+            if (e == cudaSuccess) e = cudaEventCreate(&escan);
+            if (e != cudaSuccess) {
+                cudaGetLastError();
+                cudaFree(d_ridx); cudaFree(rp_x); cudaFree(rp_p); cudaFree(d_rsc);
+                d_ridx = rp_x = rp_p = d_rsc = NULL;
+                if (escan) { cudaEventDestroy(escan); escan = NULL; }
+                snprintf(why, sizeof why, "allocating it failed (%s)",
+                         cudaGetErrorString(e));
+            }
+        }
+        if (why[0]) {
+            printf("  --resieve-scan: side 0 is walked, because %s\n", why);
+            runlog_note("resieve-scan", "off: %s", why);
+        } else {
+            rs_on = rs_granted = 1;
+            printf("  --resieve-scan: side 0 resieved from its own records;"
+                   " index %u x %u x 4 B = %.2f GB, pair list %u\n",
+                   nregion_alloc, rs_icap, ineed / 1073741824.0, rs_pcap);
+            runlog_note("resieve-scan", "on, %u index slots per region,"
+                        " +%.2f GB", rs_icap, (ineed + pneed) / 1073741824.0);
+            VRAM_MARK("side-0 record index");
+        }
+    } else {
+        runlog_note("resieve-scan", "off");
+    }
 #undef VRAM_MARK
     /* Name the fill knobs in the banner: a knob the log does not show is one
      * a reader cannot prove was live. */
@@ -2427,11 +2537,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * second array and each side its own stream. */
     bk1.bucket = d_bucket; bk1.cursor = d_cursor;
     bk1.overflow = d_overflow; bk1.cap = cap;
+    bk1.index = bk1.index_ovf = NULL; bk1.icap = 0;
     bk1.stream = concurrent ? st_side[1] : 0;
     if (concurrent) {
         bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
         bk0.overflow = d_overflow_c; bk0.cap = cap;
         bk0.stream = st_side[0];
+        bk0.index = bk0.index_ovf = NULL; bk0.icap = 0;
     } else {
         bk0 = bk1;
         /* Redundant today -- bk1.stream is provably 0 on this branch -- and
@@ -2449,6 +2561,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         bk1.stream = st_sv;
         bk0 = bk1;
     }
+    /* --resieve-scan: side 0's fill writes the index; side 1's never does */
+    if (rs_on) { bk0.index = d_ridx; bk0.icap = rs_icap; bk0.index_ovf = d_rsc + 1; }
 
     if (cfg->relations && cfg->candidates &&
         !strcmp(cfg->relations, cfg->candidates)) {
@@ -2641,7 +2755,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         qsel_t generated, checked;
         const qsel_t *cur;
         qlat_t Lq;
-        float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0;
+        float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0, trs = 0;
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         double hspan0 = 0, hreg = 0, prologue_q = 0;
         /* Per-q locals for the same reason prologue_q is one: the
@@ -3272,6 +3386,20 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q,
                 NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL, j_base);
             PIPE_CK(cudaEventRecord(eb));
+            /* --resieve-scan: side 0's records on two-sided survivors, copied
+             * out HERE because the issue point below hands the bucket array
+             * to the next fill before this slab's TD runs. Its counters ride
+             * the same wait as the count. d_rsc[1] is the fill's own. */
+            if (rs_on) {
+                PIPE_CK(cudaMemsetAsync(d_rsc, 0, 4, 0));
+                k_record_scan<<<xmax >> cfg->log_region, PIPE_SCAN_THREADS>>>(
+                    (const uint32_t *)bk0.bucket, bk0.cursor, bk0.cap, d_ridx,
+                    rs_icap, cfg->log_region, d_two, S0.primes, rp_x, rp_p,
+                    rs_pcap, d_rsc);
+                PIPE_CK(cudaEventRecord(escan));
+                PIPE_CK(cudaMemcpyAsync(C.h_rb->rscan, d_rsc, 8,
+                                        cudaMemcpyDeviceToHost, 0));
+            }
             /* The count by an async copy queued after eb (so the intersect
              * timing excludes it) and one wait on the legacy stream, where
              * the kernel and the copy run -- not a synchronous round trip
@@ -3282,6 +3410,51 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             PIPE_CK(cudaGetLastError());
             tis += time_kernel(ea, eb);
             hn_s = C.h_rb->isect;
+            /* Side 0 from the pairs only if every record found an index slot
+             * and the list held every pair; otherwise this slab walks side 0
+             * as before, and the list grows for the next. A list that cannot
+             * grow turns the scan off for the band rather than failing it. */
+            pipe_rpairs_t rpv = { rp_x, rp_p, 0 };
+            const pipe_rpairs_t *rpp = NULL;
+            if (rs_on) {
+                trs += time_kernel(eb, escan);
+                const uint32_t np = C.h_rb->rscan[0];
+                if (C.h_rb->rscan[1]) {
+                    n_rs_idx++;
+                } else if (np > rs_pcap) {
+                    const uint32_t ncap = np + np / 2 + 1024;
+                    n_rs_grow++;
+                    cudaFree(rp_x); cudaFree(rp_p);
+                    rp_x = rp_p = NULL;
+                    cudaError_t e = PIPE_RS_TEST_GROW_FAIL
+                        ? cudaErrorMemoryAllocation
+                        : cudaMalloc(&rp_x, (size_t)ncap * 4);
+                    if (e == cudaSuccess) e = cudaMalloc(&rp_p, (size_t)ncap * 4);
+                    if (e == cudaSuccess) {
+                        rs_pcap = ncap;
+                    } else {
+                        /* Off for the band, and everything only the scan
+                         * used goes back too -- the index is 0.67 GB at I16,
+                         * and the TD buffers that grow later want it more.
+                         * Nothing still reads it: this slab's fill is joined
+                         * and the next is issued only below, without it. */
+                        cudaGetLastError();
+                        cudaFree(rp_x); cudaFree(rp_p);
+                        cudaFree(d_ridx); cudaFree(d_rsc);
+                        rp_x = rp_p = d_ridx = d_rsc = NULL;
+                        rs_on = 0;
+                        bk0.index = bk0.index_ovf = NULL; bk0.icap = 0;
+                        runlog_warn("  --resieve-scan: growing the pair list to"
+                                    " %u failed (%s); side 0 is walked for the"
+                                    " rest of the band", ncap,
+                                    cudaGetErrorString(e));
+                    }
+                } else {
+                    rpv.n = np;
+                    rpp = &rpv;
+                    n_rs_scan++;
+                }
+            }
 
             /* ---- --q-pipeline issue point ----
              *
@@ -3347,7 +3520,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                           d_two, xmax,
                                           j_base, blocks, cfg->threads, do_verify,
                                           &n, &nacc_s, &tm, &tv, want_host,
-                                          !want_host, cofgate_found);
+                                          !want_host, cofgate_found, rpp);
                 if (tdrc < 0) { rc = -1; break; }
                 if (tdrc > 0) {
                     /* Untrustworthy TD: drop THIS slab only and carry on.
@@ -3642,7 +3815,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             PIPE_CK(cudaEventSynchronize(qspan1));
             acc_qspan += time_kernel(qspan0, qspan1);
         }
-        acc_isect += tis; acc_host += th1 + th0;
+        acc_isect += tis; acc_rscan += trs; acc_host += th1 + th0;
         acc_wall += host_ms() - qwall - tv;
         acc_surv += hn; acc_cand += ncand; acc_rel += nrel;   /* host path only */
         nqdone++;
@@ -3837,7 +4010,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 const double denom = acc_wall - tm.cofac;
                 const double accwall = denom > 0.0
                     ? (acc_tr + acc_fi + acc_ap - pipe_ovl_credit(acc_ovl)
-                       + acc_isect + devsum) / denom
+                       + acc_isect + acc_rscan + devsum) / denom
                     : 0.0;
                 /* Two q in flight: the next q's sieve time overlaps this q's
                  * host-clocked TD, so the stage sum is no measure of how busy
@@ -4209,6 +4382,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  %-34s %8.3f ms   <- --fill-concurrent\n",
                    "    less: sides overlapped", -ovl_pr / N);
         printf("  %-34s %8.3f ms\n", "  intersect + gcd", acc_isect / N);
+        if (rs_granted)
+            printf("  %-34s %8.3f ms\n", "  side-0 record scan", acc_rscan / N);
         printf("  %-34s %8.3f ms\n", "  host per-q (sieve tables, staging)",
                acc_host / N);
         printf("  %-34s %8.2f ms   <- of which, on the device:\n",
@@ -4241,7 +4416,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  %-34s %8s\n", "  unaccounted", "n/a");
         else
             printf("  %-34s %8.2f ms\n", "  unaccounted",
-                   (acc_wall - acc_sieve - acc_isect - acc_host - acc_td - tm.join
+                   (acc_wall - acc_sieve - acc_isect - acc_rscan - acc_host - acc_td - tm.join
                     - tm.cofac) / N);
         /* The one number that makes host starvation visible. Every stage above
          * is either a cudaEvent (blind to what the CPU is doing) or a host
@@ -4283,7 +4458,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * flush (see the comment on cofac_tail above). On a band shorter than
          * one flush that tail IS the whole cofactorisation, so a short smoke
          * run and a production band are not comparable to each other. */
-        const double gpu_acc = (acc_sieve + acc_isect + dev * N) /
+        const double gpu_acc = (acc_sieve + acc_isect + acc_rscan + dev * N) /
                                (acc_wall - tm.cofac);
         char gpu_acc_s[32];
         if (qpipe) snprintf(gpu_acc_s, sizeof gpu_acc_s, "n/a");
@@ -4295,6 +4470,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (qpipe)
             printf("  %-34s %llu slab(s), %llu q\n", "issued ahead (--q-pipeline)",
                    n_ahead_slab, n_ahead_q);
+        if (rs_granted)
+            printf("  %-34s %llu slab(s); walked: %llu index full, %llu pair"
+                   " list grown%s\n", "side 0 from its records", n_rs_scan,
+                   n_rs_idx, n_rs_grow, rs_on ? "" : ", then off");
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
                (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",
@@ -4498,6 +4677,8 @@ done:
     if (st_side[0]) cudaStreamDestroy(st_side[0]);
     if (st_side[1]) cudaStreamDestroy(st_side[1]);
     cudaFree(d_two); cudaFree(d_n); cudaFree(d_pre); cudaFree(d_gate);
+    cudaFree(d_ridx); cudaFree(rp_x); cudaFree(rp_p); cudaFree(d_rsc);
+    if (escan) cudaEventDestroy(escan);
     if (ea) cudaEventDestroy(ea);
     if (eb) cudaEventDestroy(eb);
     if (qspan0) cudaEventDestroy(qspan0);

@@ -170,11 +170,26 @@ __device__ __forceinline__ int fill_gate_drops(const uint32_t *__restrict gate,
     return !((gate[g >> 5] >> (g & 31u)) & 1u);
 }
 
+/* --resieve-scan (finding 118): INDEX fills also store each record's
+ * factor-base index, ibase + k, at the same (region, slot) of a second array
+ * of icap slots per region, for k_record_scan. A slot at or past icap has no
+ * room and is counted in index_ovf, and the host then walks that slab's
+ * resieve instead. The record itself is stored exactly as without INDEX. */
+__device__ __forceinline__ void fill_store_index(uint32_t *__restrict index,
+                                                 uint32_t icap,
+                                                 uint32_t *__restrict index_ovf,
+                                                 uint32_t b, uint32_t slot,
+                                                 uint32_t fbi)
+{
+    if (slot < icap) index[(size_t)b * icap + slot] = fbi;
+    else atomicAdd(index_ovf, 1u);
+}
+
 /* ---- stage (a): naive single-level atomic append ---------------------- */
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
  * baseline the design doc says to beat. */
-template <int RECBYTES, bool SLABBED = false>
+template <int RECBYTES, bool SLABBED = false, bool INDEX = false>
 __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               const uint16_t *__restrict slice,
                               uint32_t n, uint32_t xmax, int logI,
@@ -186,7 +201,10 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint64_t *__restrict walk_next,
                               int sieve_skip, uint32_t j_base,
                               const uint32_t *__restrict gate = nullptr,
-                              int gate_shift = 0)
+                              int gate_shift = 0,
+                              uint32_t *__restrict index = nullptr,
+                              uint32_t icap = 0, uint32_t ibase = 0,
+                              uint32_t *__restrict index_ovf = nullptr)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -262,6 +280,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
             } else {
                 *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
             }
+            if constexpr (INDEX) fill_store_index(index, icap, index_ovf, b, slot, ibase + k);
         }
         /* x is already the exact first hit at/after the slab end. */
         if constexpr (SLABBED) walk_next[k] = x - xmax;
@@ -289,7 +308,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
  * would skip the entry (PL_INVALID). The row tier needs no walk state; when
  * k_resieve_scatter still walks it (--no-resieve-rows), k_rows_walk_next
  * supplies the cursor. j_base counts only under SLABBED, as in pos_row. */
-template <bool SLABBED>
+template <bool SLABBED, bool INDEX = false>
 __global__ void k_fill_rows(const uint32_t *__restrict primes,
                             const uint32_t *__restrict rts,
                             const uint16_t *__restrict slice,
@@ -299,7 +318,10 @@ __global__ void k_fill_rows(const uint32_t *__restrict primes,
                             uint8_t *__restrict out, uint32_t cap,
                             uint32_t *__restrict overflow,
                             int sieve_skip, uint32_t j_base,
-                            const uint32_t *__restrict gate, int gate_shift)
+                            const uint32_t *__restrict gate, int gate_shift,
+                            uint32_t *__restrict index = nullptr,
+                            uint32_t icap = 0,
+                            uint32_t *__restrict index_ovf = nullptr)
 {
     const uint32_t I = 1u << logI;
     const uint32_t offmask = (1u << log_region) - 1;
@@ -352,8 +374,12 @@ __global__ void k_fill_rows(const uint32_t *__restrict primes,
                    __popc(peers & ((1u << lane) - 1u));
 #endif
             if (slot >= cap) atomicAdd(overflow, 1u);
-            else *(uint32_t *)(out + ((size_t)b * cap + slot) * 4) =
-                     (xl & offmask) | (sl << 16);
+            else {
+                *(uint32_t *)(out + ((size_t)b * cap + slot) * 4) =
+                    (xl & offmask) | (sl << 16);
+                /* the row tier is the factor base's first n entries */
+                if constexpr (INDEX) fill_store_index(index, icap, index_ovf, b, slot, k);
+            }
         }
         if (active) { off += rt; if (off >= q) off -= q; }
     }

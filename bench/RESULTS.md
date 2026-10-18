@@ -12660,9 +12660,270 @@ code; all held, and all are fixed (`review.diff`).
 - Relations byte-identical on the NFS job (pipelined and single-queued),
   c183, C143 and C194.
 
-**Not timed cleanly.** The A/B against the finding-117 binary
-(`timing-review.txt`) ran while a GPU ECM stage 1 time-sliced the card
-(walls ~1.9x, rounds disagreeing by up to 8%), so its wall times say
-nothing. No hot-path kernel changed. The one GPU change is the coarse build,
-inside the "survivor filter" timer, which read the same single-queued:
-1.150 and 1.158 -> 1.151 and 1.159 ms/q.
+**Timing: no change measurable, as expected.** The first A/B against the
+finding-117 binary (`timing-review.txt`) ran while a GPU ECM stage 1
+time-sliced the card (walls ~1.9x, rounds disagreeing by up to 8%) and is
+discarded. It was rerun on 2026-10-18 on a free card against the committed
+build (`timing-retime.sh`, `timing-retime.txt`). The setup was the
+finding's own: three rounds, alternating order, host load ~10 from CPU ECM.
+Each row also records the run's exit status (all 0) and the card's
+utilization just before it (0-6%).
+
+| ms/q | pre-review | committed | change | per round |
+|---|---:|---:|---:|---|
+| NFS@Home I16 pipelined | 201.6 | 200.4 | −0.6% | −0.4, +0.1, −1.5 |
+| NFS@Home I16 single-queued | 215.7 | 216.2 | +0.2% | −1.3, +2.1, −0.0 |
+| C194 pipelined | 220.4 | 219.4 | −0.4% | −0.8, −1.3, +0.7 |
+| c183 pipelined | 58.6 | 58.6 | 0.0% | −2.0, +1.9, +0.1 |
+| C143 pipelined | 7.40 | 7.35 | −0.8% | −1.0, +0.0, −1.4 |
+
+All of this is noise. Four jobs change sign between rounds. C143's
+differences are under 0.1 ms, inside the 7.48-7.95 its base arm spread
+over in the finding's own timing. The change predicts no more:
+- The host tables save 0.56 ms/q at I16, ~0.3% of the wall, and mostly
+  overlap the GPU under the pipeline.
+- No hot-path kernel changed.
+- The one GPU change, the coarse build, sits inside the "survivor filter"
+  timer. That read the same single-queued: 1.150 and 1.158 -> 1.151 and
+  1.159 ms/q.
+
+The pre-review arm (NFS pipelined 201.6, C194 220.4) is also within 0.4%
+of the same source's walls in the finding's own timing (200.9 and 221.0,
+from its sm_120-only build). So the two sessions ran under comparable
+conditions.
+
+## Finding 118 — side 0's gated bucket records already hold every pair the side-0 resieve finds, survivor for survivor, and scanning them costs 11-15x less than the walk. They lack only the prime, and an index for it fits
+
+**Date:** 2026-10-18. RTX 5070, WSL2, card idle, client not running, CPU
+benchmark workers on the host. A measurement only: a test-only build
+(`recscan.diff` on `9b9f314`, `GPU_ARCH=120`), never landed. Evidence in
+[`../oracle/recscan-20261018/`](../oracle/recscan-20261018/).
+
+Finding 117 named side 0's resieve as the larger exact lever (12.25 ms/q at
+I16, locked clocks). Under the fill gate, side 0 writes a bucket record only
+near side-1 survivors, so its records should already contain the side-0
+resieve's (survivor, prime) pairs. But the 4 B record holds a 16-bit slice id
+and no factor-base index, and a slice is a run of equal log p cut every
+262,144 entries (`fb_build_slices`). So the prime cannot be recovered from
+the slice. This measures what a scan of the records would find, what it
+would cost, and whether an index would fit.
+
+**Method.** The test build adds three kernels:
+- After each side's apply, one totals that side's bucket cursors: records
+  written, the fullest region, and regions over `cap/2`.
+- In trial division, after both resieves, one scans side 0's records and
+  ranks those on two-sided survivors. A third compares each survivor's count
+  of them with the resieve's `pcnt[0]`.
+
+The scan only runs single-queued (`--no-q-pipeline`). There the buckets
+still hold side 0's records at TD. Under `--q-pipeline` the next slab's
+fill has reused them by then (`pipeline.cuh:3286`). The fill gate is on in
+both modes. The counts come out the same in both: the pipelined NFS@Home
+and C143 runs give identical cursor totals.
+
+| per slab | NFS@Home I16 | C194 | c183 | c183, q on side 0 | C143 |
+|---|---:|---:|---:|---:|---:|
+| special-q (slabs) | 20 (80) | 20 (80) | 50 (50) | 50 (50) | 300 (300) |
+| side-1 records | 202.2M | 197.6M | 210.1M | 210.1M | 27.7M |
+| side-0 records, gated | 7.37M | 10.68M | 15.59M | 1.63M | 0.60M |
+| of which on two-sided survivors | 1.0% | 1.4% | 1.3% | 5.7% | 3.8% |
+| fullest side-0 region, of cap | 2,235 / 10,900 (21%) | 3,626 / 10,658 (34%) | 3,833 / 11,315 (34%) | 644 (6%) | 986 / 6,087 (16%) |
+| side-0 regions over cap/2 | 0 | 0 | 0 | 0 | 0 |
+| side-0 resieve, ms | 2.49 | 2.57 | 4.07 | 3.85 | 0.61 |
+| record scan, ms | 0.185 | 0.227 | 0.281 | 0.117 | 0.041 |
+
+- **The records cover the resieve exactly.** Summed over each band, side 0's
+  records on two-sided survivors equal the resieve's pairs: 6,000,883 at
+  NFS@Home, 12,055,944 at C194, 10,426,402 at c183, 4,612,584 with the
+  special-q on side 0, and 6,739,950 at C143. Per survivor, 0 of 17.0M
+  survivors differ, and no survivor exceeds `PIPE_K`. It follows from the
+  code: the gate never drops a record at a side-1 survivor, `--sieve-skip`
+  only drops positions the intersection rejects, and fill and resieve walk
+  the same entries from the same cursors.
+- **The scan costs 11-15x less than the walk** (0.185 against 2.49 ms per
+  slab at NFS@Home), and 33x with the special-q on side 0. It reads 4 B per
+  side-0 record, which is 0.8-7.4% of side 1's records, and ranks the ~1-6% on survivors. The walk visits
+  every side-0 factor-base entry whatever the survivor count. A real scan
+  would also gather each hit's prime and append it. That costs one read
+  and one write per pair, ~75,000 per slab at NFS@Home.
+- **An index fits in half the bucket capacity.** The fullest side-0 region
+  uses 34% of `cap` (C194, c183), against 89% for side 1. That is the
+  margin the bucket array is sized for. An index array of `cap/2` per
+  region is 0.67 GB at NFS@Home I16, where 7.09 GB is free in steady state.
+- **The order of a survivor's primes reaches no output.** Both writers sort
+  each factor list (`pipeline.cuh:3450`, and the cofactorizer's
+  `cf_emit_sorted`). So primes appended in scan order instead of walk order
+  leave the candidate stream and the relations byte-identical.
+
+**The bucket lifetime decides where the scan runs.** Under `--q-pipeline`
+both sides fill one bucket array (`bk0 = bk1`). The next slab's sieve is
+issued right after the intersection, before this slab's TD. The scan
+therefore has to run between the intersection and the host wait before
+that issue point. It then has to copy its pairs out to storage the next
+fill does not touch. This puts ~0.2 ms per slab on the serial path, in
+exchange for ~2.5 ms of resieve per slab off the TD stream. The TD stream
+overlaps the next sieve, so the wall gain will be smaller than the
+resieve's time and has to be measured.
+
+**Not measured here:** the change itself, which would mean an index
+written by side 0's fill, the scan, and a pair scatter in place of side 0's
+walk, with the walk kept as the fallback. Implemented and measured in
+finding 119: pipelined wall NFS@Home I16 −4.0%, byte-identical.
+
+## Finding 119 — side 0's resieve now reads its pairs from its own gated bucket records instead of walking its factor base: pipelined wall NFS@Home I16 −4.0%, C194 −3.2%, c183 −2.8%, C143 −6.6%, every round the same sign, relations and the candidate stream byte-identical. A slab whose index or pair list runs out of room is walked as before
+
+**Date:** 2026-10-18. RTX 5070, WSL2, host load ~10 (six CPU benchmark
+workers), card free, client not running. Base: the committed `9b9f314` fat
+`bench/bench` (`9b691952`). New: a `GPU_ARCH=120` snapshot of this source
+(`a7879711`). The fat `bench/bench` is rebuilt from it, after the review below
+(`77f1abab`). It has 6 archs and 0 warnings, passes `--verify-only` and
+`fbtest`, and is 34 of 34 identical under the full `abcheck.sh`
+(`fat-check.txt`). Evidence in
+[`../oracle/rscan-20261018/`](../oracle/rscan-20261018/).
+
+Finding 118 showed that under the fill gate, side 0's bucket records on
+two-sided survivors are exactly the side-0 resieve's (survivor, prime)
+pairs, and that scanning them costs 11-15x less than the walk. The records
+lacked only the prime. This change, `--resieve-scan`, supplies it and
+replaces side 0's walk.
+
+### The change (`change.diff`)
+
+1. **Side 0's fill stores an index.** Each record's factor-base index goes
+   into a separate array, at the same region and slot (`fill_store_index`).
+   The array has `icap` slots per region, half the bucket capacity by
+   default. The fullest side-0 region measured 34% of it. `k_fill_atomic`
+   and `k_fill_rows` take this as a template flag, so side 1's fill and
+   every harness instance compile exactly as before. The records themselves
+   are unchanged, and so is apply.
+2. **The records are scanned before the buckets are reused.**
+   `k_record_scan` runs right after the intersection, before the host wait
+   that precedes the `--q-pipeline` issue point. It runs there because the
+   next slab's fill reuses the bucket array before this slab's TD. It copies
+   every side-0 record on a two-sided survivor out as (position, prime), into
+   a pair list it owns. Its two counters (pairs found, records without an
+   index slot) ride the same async copy and wait as the intersection's
+   count. No new host round trip is added.
+3. **TD appends the pairs instead of walking.** In TD, `k_pair_scatter`
+   does what `k_resieve_scatter` does with each pair: rank the position and
+   append the prime. Side 0's walk (row tier and FK) does not run, and side
+   1 is unchanged. Only the order of primes inside a survivor's list
+   differs. `k_td` divides in any order, and both writers sort each factor
+   list.
+4. **A slab falls back to today's walk, losing no yield, when:**
+   - any record found no index slot;
+   - the pair list was too small (the list then grows for the next slab);
+   - the index did not fit in VRAM at start-up (the scan is off for the band);
+   - a pair list could not grow (the scan turns off for the rest of the
+     band).
+
+   The band summary counts the slabs taken from records and the slabs
+   walked, by reason.
+5. **Options.** `--resieve-scan` defaults on wherever the fill gate is, and
+   is refused explicitly without the gate. `--resieve-scan-cap` and
+   `--resieve-scan-pairs` are test knobs for the index capacity and the
+   pair list's first size. The run log records what was granted. VRAM:
+   0.67 GB at NFS@Home I16, 0.65 at C194, 0.69 at c183, 0.09 at C143.
+
+### Gates (`gates.sh`, `gates.txt`)
+
+`bench/abcheck.sh` ran against the committed build, which compares
+candidates entering cofactorization as well as relations. Each arm kept
+NEW's outputs and printed which path side 0 took on how many slabs.
+
+| arm | cases | identical | side 0 |
+|---|---:|---:|---|
+| default | 34 | 34 | from records on every slab of every pipelined case |
+| `--resieve-scan-cap 1536`, I16 | 5 | 5 | the four slabs of a q split: NFS@Home 115 records / 45 walked, C194 37 / 43 |
+| `--resieve-scan-cap 3072`, c183 | 6 | 6 | 101 / 99, five-slab plan 131 / 19 |
+| `--resieve-scan-cap 768`, C143 | 4 | 4 | 736 / 264; the stop with a q in flight 821 / 294 |
+| `--resieve-scan-cap 1` | 15 | 15 | walked everywhere |
+| `--resieve-scan-pairs 1` | 15 | 15 | first slab walked, list grown, then records |
+| `--no-resieve-scan` | 16 | 16 | walked |
+| pair list too big to fit | 5 | 5 | "side 0 is walked, because it needs 30.49 GB more" |
+
+The caps for the mixed arms were found by trying them on each job.
+`c183.concurrent` is left out of the knob arms: the gate is off under
+`--fill-concurrent`, so the scan is off too and the knobs are refused, as
+they should be. `gates-first.txt` is the first run, where that refusal
+showed up as four failures and a cap of 256 turned out to walk every slab.
+
+The five refusals exit nonzero with a message. `make check` passes. Its two
+FAIL lines are the controller gate's negative control, which must fail.
+`fillcheck.sh` is byte-identical on every arm.
+
+### Timing (`timing.sh`, `timing.txt`)
+
+Three rounds, alternating order, card free (0% busy before every run), all
+30 runs exit 0.
+
+| ms/q | base | new | change | per round |
+|---|---:|---:|---:|---|
+| NFS@Home I16 pipelined | 199.1 | 191.2 | **−4.0%** | −4.6, −3.7, −3.6 |
+| NFS@Home I16 single-queued | 213.2 | 204.2 | −4.2% | −4.2, −4.2, −4.2 |
+| C194 pipelined | 217.4 | 210.4 | **−3.2%** | −3.0, −3.3, −3.4 |
+| c183 pipelined | 57.1 | 55.5 | **−2.8%** | −3.0, −2.5, −3.0 |
+| C143 pipelined | 7.16 | 6.69 | **−6.6%** | −6.6, −7.0, −6.2 |
+
+Single-queued, the stage timers account for the wall at NFS@Home:
+
+| ms/q | base | new |
+|---|---:|---:|
+| resieve, both sides | 20.71 | 10.82 |
+| side-0 record scan | — | 0.82 |
+| fill | 51.81 | 52.43 |
+
+Together these predict −8.5 ms/q, against −9.0 measured. The fill's +0.6
+ms/q is the index stores: 4 B per side-0 record, ~118 MB per q, the same
+in all three rounds. Pipelined, the resieve timer falls 25.5 → 14.5 ms/q at
+NFS@Home, 24.7 → 13.4 at C194, 12.3 → 7.9 at c183 and 1.81 → 1.07 at C143.
+The scan costs 0.88, 1.18, 0.47 and 0.065 ms/q on the serial path. Apply
+falls 78.4 → 76.3 at NFS@Home pipelined because TD shares the card less.
+The intersect timer rises slightly pipelined (2.31 → 2.38, C143 0.083 →
+0.096) and not single-queued (1.555 → 1.565). That is attribution: the next
+sieve now overlaps it more often.
+
+C143 gains the most because the resieve is a larger share of its wall:
+1.81 of 7.16 ms/q, against 25.5 of 199 at NFS@Home. At I13 each walk
+visits the whole factor base for a slab of only 2^26 positions.
+
+### Review (2026-10-18)
+
+An outside review (another model, relayed by Kyle) found no relation-loss
+bug and three defects. All three held, and all are fixed.
+
+- **`gates.sh` exited 0 after failures.** It counted them and then ended on
+  an `echo`. This is the same defect the previous review found in
+  finding 117's scripts, repeated. `recscan/run.sh` (finding 118) had it
+  too. All three scripts now end on an exit-status test.
+- **`fat-check.sh` enforced only `abcheck.sh`.** `--verify-only`, `fbtest`,
+  the arch count and warnings now each count toward its exit status. Both
+  fixed scripts exit 1 against failing stubs (4 failures counted in
+  `fat-check.sh`, 15 in `gates.sh`). The recorded runs passed every check.
+  Their outputs are unchanged; only the exit lines are new.
+- **A pair list that could not grow kept the index.** The scan turned off
+  for the band but held its 0.67 GB index (at I16) until the band ended,
+  memory that TD buffers growing later could need. That branch now frees
+  the index and the counters as well. Nothing still reads them: the slab's
+  fill is joined, and the next one is issued afterwards, without an index.
+
+The branch had never run, since no real job reaches it.
+`PIPE_RS_TEST_GROW_FAIL`, a `DEFS` test hook after `PIPE_CAP_PCT`'s
+pattern, makes every growth fail. `growfail.sh` (`growfail.txt`) runs that
+build with `--resieve-scan-pairs 1`. A `DEFS` build refuses `--relations`,
+because its relations would pass for production. So both binaries write
+only the candidate stream, which is what the branch could change.
+
+The cases are NFS@Home I16, C194, c183, c183 in five slabs, and C143. On
+all of them:
+- the candidate stream is byte-identical to the committed build's;
+- the warning prints ("growing the pair list to 168781 failed (out of
+  memory)");
+- the band summary reads "0 slab(s) ... 1 pair list grown, then off".
+
+### What is left
+
+Side 1's walk is now the resieve: 10.8 ms/q single-queued at NFS@Home. Its
+records are not gated, since side 1 is filled first. A scan would read all
+~200M records per slab (809 MB) to find the ~1% on survivors, so the same
+trick does not carry over.

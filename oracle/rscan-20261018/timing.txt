@@ -1,0 +1,32 @@
+NFS  base        wall   200.09 | fill  55.232 apply  78.746 isect  2.328 rscan        resieve  25.208 | sm=2799 p=158W load=10.33 idle=0% rc=0
+NFS  new         wall   190.97 | fill  54.492 apply  76.429 isect  2.356 rscan  0.880 resieve  14.585 | sm=2800 p=158W load=10.15 idle=0% rc=0
+C194 base        wall   217.02 | fill  51.886 apply  78.445 isect  2.122 rscan        resieve  24.638 | sm=2835 p=175W load=10.04 idle=0% rc=0
+C194 new         wall   210.61 | fill  52.648 apply  78.283 isect  2.144 rscan  1.207 resieve  13.685 | sm=2824 p=174W load=10.16 idle=0% rc=0
+C183 base        wall    57.07 | fill  14.567 apply  17.545 isect  0.745 rscan        resieve  12.249 | sm=2860 p=188W load=10.12 idle=0% rc=0
+C183 new         wall    55.38 | fill  14.455 apply  17.502 isect  0.747 rscan  0.471 resieve   7.877 | sm=2867 p=189W load=10.24 idle=0% rc=0
+C143 base        wall     7.17 | fill   2.550 apply   2.380 isect  0.083 rscan        resieve   1.811 | sm=2904 p=182W load=10.18 idle=0% rc=0
+C143 new         wall     6.70 | fill   2.490 apply   2.390 isect  0.097 rscan  0.070 resieve   1.058 | sm=2903 p=185W load=10.37 idle=0% rc=0
+NFS  base.single wall   213.12 | fill  51.835 apply  69.797 isect  1.560 rscan        resieve  20.742 | sm=2806 p=157W load=10.56 idle=0% rc=0
+NFS  new.single  wall   204.07 | fill  52.435 apply  69.846 isect  1.560 rscan  0.821 resieve  10.841 | sm=2801 p=157W load=10.42 idle=0% rc=0
+NFS  new         wall   191.11 | fill  54.667 apply  76.261 isect  2.394 rscan  0.902 resieve  14.591 | sm=2795 p=164W load=10.48 idle=0% rc=0
+NFS  base        wall   198.53 | fill  54.891 apply  78.133 isect  2.322 rscan        resieve  25.745 | sm=2797 p=164W load=10.38 idle=0% rc=0
+C194 new         wall   210.29 | fill  52.469 apply  78.598 isect  2.142 rscan  1.162 resieve  13.187 | sm=2823 p=176W load=10.21 idle=0% rc=0
+C194 base        wall   217.52 | fill  51.891 apply  78.531 isect  2.099 rscan        resieve  24.408 | sm=2823 p=178W load=10.37 idle=0% rc=0
+C183 new         wall    55.69 | fill  14.471 apply  17.482 isect  0.735 rscan  0.477 resieve   7.928 | sm=2871 p=191W load=10.28 idle=0% rc=0
+C183 base        wall    57.10 | fill  14.569 apply  17.539 isect  0.743 rscan        resieve  12.244 | sm=2870 p=192W load=10.30 idle=0% rc=0
+C143 new         wall     6.68 | fill   2.487 apply   2.389 isect  0.096 rscan  0.063 resieve   1.077 | sm=2902 p=186W load=10.77 idle=0% rc=0
+C143 base        wall     7.18 | fill   2.550 apply   2.379 isect  0.083 rscan        resieve   1.824 | sm=2904 p=183W load=10.57 idle=0% rc=0
+NFS  new.single  wall   204.14 | fill  52.425 apply  69.972 isect  1.561 rscan  0.819 resieve  10.811 | sm=2797 p=157W load=10.31 idle=0% rc=0
+NFS  base.single wall   213.09 | fill  51.780 apply  69.964 isect  1.557 rscan        resieve  20.706 | sm=2802 p=157W load=10.33 idle=0% rc=0
+NFS  base        wall   198.65 | fill  54.948 apply  78.366 isect  2.288 rscan        resieve  25.559 | sm=2791 p=163W load=10.34 idle=0% rc=0
+NFS  new         wall   191.59 | fill  54.723 apply  76.322 isect  2.396 rscan  0.863 resieve  14.174 | sm=2788 p=160W load=10.44 idle=0% rc=0
+C194 base        wall   217.61 | fill  51.865 apply  78.729 isect  2.096 rscan        resieve  25.127 | sm=2830 p=178W load=10.25 idle=0% rc=0
+C194 new         wall   210.21 | fill  52.490 apply  78.516 isect  2.123 rscan  1.158 resieve  13.427 | sm=2826 p=176W load=10.18 idle=0% rc=0
+C183 base        wall    57.24 | fill  14.549 apply  17.564 isect  0.743 rscan        resieve  12.268 | sm=2867 p=191W load=10.22 idle=0% rc=0
+C183 new         wall    55.50 | fill  14.468 apply  17.507 isect  0.765 rscan  0.473 resieve   7.910 | sm=2869 p=193W load=10.24 idle=0% rc=0
+C143 base        wall     7.14 | fill   2.551 apply   2.400 isect  0.083 rscan        resieve   1.803 | sm=2903 p=184W load=10.43 idle=0% rc=0
+C143 new         wall     6.70 | fill   2.490 apply   2.390 isect  0.096 rscan  0.063 resieve   1.072 | sm=2902 p=187W load=10.56 idle=0% rc=0
+NFS  base.single wall   213.32 | fill  51.801 apply  69.916 isect  1.548 rscan        resieve  20.681 | sm=2805 p=157W load=10.47 idle=0% rc=0
+NFS  new.single  wall   204.44 | fill  52.415 apply  69.959 isect  1.575 rscan  0.821 resieve  10.809 | sm=2795 p=156W load=10.50 idle=0% rc=0
+done: 0 failed run(s)
+exit 0

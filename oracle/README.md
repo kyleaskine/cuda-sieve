@@ -523,9 +523,42 @@ the git-ignored `work/resieve-i16/`.
   `review-gates.sh` (`review-gates.txt`) ran the gates, and `verify-c183.txt`
   is its `--verify` run. `timing-review.txt` is the A/B that a GPU ECM job
   time-sliced, so only its host timers (`host-timers.txt`) are used.
-  `timing.sh` gained the `B=` override for it.
+  `timing.sh` gained the `B=` override for it. `timing-retime.sh`
+  (`timing-retime.txt`) is the free-card rerun of 2026-10-18 against the
+  committed build. Its rows also record each run's exit status and the
+  card's utilization just before it.
 - **Landed binary:** `fat-check.sh` (`fat-check.txt`) checked the rebuilt fat
   `bench/bench`, after the review fixes.
 
 `build.txt` names the binaries. The snapshot builds and SASS dumps stay in
 the git-ignored `work/scan-i16/`.
+
+## Side-0 record scan, measured (2026-10-18)
+
+[`recscan-20261018/`](recscan-20261018/) holds the evidence for
+[finding 118](../bench/RESULTS.md#finding-118), pinned in `MANIFEST.sha256`.
+`recscan.diff` is the test-only counter build on `9b9f314`. It was never
+landed. `run.sh` (`run.txt`) ran it on five jobs single-queued, and on two
+of them pipelined. Its final exit-status line was added after the run, in
+finding 119's review. `build.txt` names the binary, which stays in the
+git-ignored `work/recscan/`.
+
+## Side-0 resieve from its records (2026-10-18)
+
+[`rscan-20261018/`](rscan-20261018/) holds the evidence for
+[finding 119](../bench/RESULTS.md#finding-119), pinned in `MANIFEST.sha256`.
+`change.diff` is the code change (`bench/abcheck.sh` is in the tree).
+- **Gates:** `gates.sh` (`gates.txt`) ran `abcheck.sh` against the committed
+  `9b9f314` build: the default arm, mixed record/walk arms, every fallback,
+  the refusals, `make check` and fillcheck. `gates-first.txt` is the first
+  run, with the knob-refusal artefact described in the finding.
+- **Timing:** `timing.sh` (`timing.txt`) is the three-round free-card A/B.
+- **Landed binary:** `fat-check.sh` (`fat-check.txt`, `fat-abcheck.txt`)
+  checked the fat `bench/bench`, rebuilt after the review.
+- **Review:** `growfail.sh` (`growfail.txt`) drove the failed-growth branch
+  with the `PIPE_RS_TEST_GROW_FAIL` test build. `gates.sh` and
+  `fat-check.sh` gained exit statuses that count every check after their
+  recorded runs. Those runs' outputs are unchanged.
+
+`build.txt` names the binaries. The snapshot builds stay in the git-ignored
+`work/rscan/`.

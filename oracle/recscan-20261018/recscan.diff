@@ -1,0 +1,150 @@
+--- bench/pipeline.cuh	2026-10-17 07:20:44.378142672 -0400
++++ work/recscan/stat/bench/pipeline.cuh	2026-10-18 07:04:39.490427582 -0400
+@@ -29,6 +29,69 @@
+  * (apply_scan_stores), so the three cannot disagree. */
+ #define PIPE_CELLBITS 16
+ 
++/* ---- RECSCAN: test-only counters for the side-0 record scan. Never landed.
++ * Per side, after its apply: the bucket records written (the cursor sum, so
++ * overflowed appends included), the fullest region, and how many regions
++ * hold more than cap/2. Single-queued only (buckets still hold side 0's
++ * records at TD): side 0's records on two-sided survivors, counted per
++ * survivor and compared with the side-0 resieve's pcnt[0]. */
++typedef struct {
++    unsigned long long recs[2], maxreg[2], over_half[2], nreg[2];
++    unsigned long long on_surv, n_surv, pcnt_sum, mismatch, more, fewer, over_k;
++} rs_ctr_t;
++static rs_ctr_t *g_rs_ctr = NULL;
++static uint32_t *g_rs_rcnt = NULL, g_rs_rcap = 0, g_rs_cap = 0;
++static const uint32_t *g_rs_bucket = NULL, *g_rs_cursor = NULL;
++static int g_rs_scan = 0;
++static unsigned long long g_rs_nslab = 0;
++static double g_rs_ms_scan = 0, g_rs_ms_rs0 = 0, g_rs_ms_rs1 = 0;
++static cudaEvent_t g_rs_ev[2];
++
++__global__ void k_rs_cursor_stats(const uint32_t *__restrict cursor, uint32_t nregion,
++                                  uint32_t cap, rs_ctr_t *c, int side)
++{
++    unsigned long long sum = 0, over = 0; uint32_t mx = 0;
++    for (uint64_t i = bench_grid_thread_x(); i < nregion; i += bench_grid_stride_x()) {
++        const uint32_t v = cursor[i];
++        sum += v; mx = max(mx, v); over += (v > cap / 2u);
++    }
++    if (sum) atomicAdd(&c->recs[side], sum);
++    if (over) atomicAdd(&c->over_half[side], over);
++    if (mx) atomicMax(&c->maxreg[side], (unsigned long long)mx);
++    if (bench_grid_thread_x() == 0) atomicAdd(&c->nreg[side], (unsigned long long)nregion);
++}
++
++__global__ void k_rs_scan(const uint32_t *__restrict bucket, const uint32_t *__restrict cursor,
++                          uint32_t cap, int log_region, const uint32_t *__restrict two,
++                          const uint32_t *__restrict gbase, uint32_t *__restrict rcnt, rs_ctr_t *c)
++{
++    const uint32_t b = blockIdx.x, offmask = (1u << log_region) - 1u;
++    uint32_t m = cursor[b]; if (m > cap) m = cap;
++    unsigned long long hit = 0;
++    for (uint32_t k = threadIdx.x; k < m; k += blockDim.x) {
++        const uint32_t x = (b << log_region) | (bucket[(size_t)b * cap + k] & offmask);
++        if ((two[x >> 5] >> (x & 31u)) & 1u) { atomicAdd(&rcnt[td_rank(two, gbase, x)], 1u); hit++; }
++    }
++    if (hit) atomicAdd(&c->on_surv, hit);
++}
++
++__global__ void k_rs_compare(const uint32_t *__restrict rcnt, const uint32_t *__restrict pcnt,
++                             uint32_t n, uint32_t K, rs_ctr_t *c)
++{
++    unsigned long long ps = 0, mis = 0, more = 0, fewer = 0, ok = 0, ns = 0;
++    for (uint64_t i = bench_grid_thread_x(); i < n; i += bench_grid_stride_x()) {
++        const uint32_t r = rcnt[i], q = pcnt[i];
++        ps += q; ns++; mis += (r != q); more += (r > q) ? r - q : 0; fewer += (r < q) ? q - r : 0;
++        ok += (q > K);
++    }
++    if (ns) atomicAdd(&c->n_surv, ns);
++    if (ps) atomicAdd(&c->pcnt_sum, ps);
++    if (mis) atomicAdd(&c->mismatch, mis);
++    if (more) atomicAdd(&c->more, more);
++    if (fewer) atomicAdd(&c->fewer, fewer);
++    if (ok) atomicAdd(&c->over_k, ok);
++}
++
+ /* ---- clean stop -------------------------------------------------------- *
+  *
+  * A band runs for days and gets interrupted. Without a handler the process
+@@ -949,6 +1012,9 @@
+             j_base);
+     }
+     SLAB_CK(cudaEventRecord(S->ev[3], st));
++    if (g_rs_ctr)   /* RECSCAN, test-only */
++        k_rs_cursor_stats<<<(nregion + 255u) / 256u, 256, 0, st>>>(bk->cursor, nregion,
++                                                                   bk->cap, g_rs_ctr, side);
+     /* The join's two counts, queued behind apply on the same stream: the
+      * join then waits once (ev[5]) and reads host memory. */
+     SLAB_CK(cudaMemcpyAsync(&S->h_rb->nsurv, S->d_nsurv, 4,
+@@ -1664,6 +1730,24 @@
+     tm->classify += time_kernel(E[6], E[7]) + time_kernel(E[9], E[10]);
+     tm->compact  += time_kernel(E[10], E[11]);
+     tm->rank     += time_kernel(E[0], E[1]);
++    g_rs_ms_rs1 += time_kernel(E[4], E[5]);    /* RECSCAN, test-only */
++    g_rs_ms_rs0 += time_kernel(E[7], E[8]);
++    g_rs_nslab++;
++    if (g_rs_scan && g_rs_ctr) {
++        if (n > g_rs_rcap) {
++            cudaFree(g_rs_rcnt); g_rs_rcap = n + n / 2;
++            CK(cudaMalloc(&g_rs_rcnt, (size_t)g_rs_rcap * 4));
++        }
++        CK(cudaMemset(g_rs_rcnt, 0, (size_t)n * 4));
++        CK(cudaEventRecord(g_rs_ev[0]));
++        k_rs_scan<<<xmax >> cfg->log_region, 256>>>(g_rs_bucket, g_rs_cursor, g_rs_cap,
++                                                    cfg->log_region, d_two, C->d_gbase,
++                                                    g_rs_rcnt, g_rs_ctr);
++        CK(cudaEventRecord(g_rs_ev[1]));
++        k_rs_compare<<<blocks, threads>>>(g_rs_rcnt, C->d_pcnt[0], n, PIPE_K, g_rs_ctr);
++        CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
++        g_rs_ms_scan += time_kernel(g_rs_ev[0], g_rs_ev[1]);
++    }
+ 
+     hflags = C->h_rb->ctr.flags;
+     hovf = C->h_rb->ctr.ovf;
+@@ -2449,6 +2533,13 @@
+         bk1.stream = st_sv;
+         bk0 = bk1;
+     }
++    {   /* RECSCAN, test-only */
++        g_rs_bucket = (const uint32_t *)bk0.bucket; g_rs_cursor = bk0.cursor;
++        g_rs_cap = bk0.cap; g_rs_scan = !qpipe;
++        PIPE_CK(cudaMalloc(&g_rs_ctr, sizeof(rs_ctr_t)));
++        PIPE_CK(cudaMemset(g_rs_ctr, 0, sizeof(rs_ctr_t)));
++        PIPE_CK(cudaEventCreate(&g_rs_ev[0])); PIPE_CK(cudaEventCreate(&g_rs_ev[1]));
++    }
+ 
+     if (cfg->relations && cfg->candidates &&
+         !strcmp(cfg->relations, cfg->candidates)) {
+@@ -4452,6 +4543,28 @@
+ #undef PIPE_VRAM_MARGIN
+ #undef PIPE_Q_ROLLBACK
+ done:
++    if (g_rs_ctr) {   /* RECSCAN, test-only */
++        rs_ctr_t h;
++        cudaDeviceSynchronize();
++        if (cudaMemcpy(&h, g_rs_ctr, sizeof h, cudaMemcpyDeviceToHost) == cudaSuccess) {
++            const double ns = g_rs_nslab ? (double)g_rs_nslab : 1.0;
++            for (int sd = 1; sd >= 0; sd--)
++                printf("RECSCAN side %d: %.0f records/slab (%.2f per region), fullest region %llu"
++                       " of cap %u, %llu of %llu regions over cap/2\n", sd,
++                       h.recs[sd] / ns, h.nreg[sd] ? (double)h.recs[sd] / h.nreg[sd] : 0.0,
++                       h.maxreg[sd], g_rs_cap, h.over_half[sd], h.nreg[sd]);
++            printf("RECSCAN resieve ms/slab: side 1 %.3f, side 0 %.3f (%llu slabs)\n",
++                   g_rs_ms_rs1 / ns, g_rs_ms_rs0 / ns, g_rs_nslab);
++            if (g_rs_scan)
++                printf("RECSCAN scan: %llu survivors, side-0 records on them %llu, resieve pairs %llu,"
++                       " survivors differing %llu (records more by %llu, fewer by %llu), pcnt > K %llu;"
++                       " scan %.3f ms/slab\n",
++                       h.n_surv, h.on_surv, h.pcnt_sum, h.mismatch, h.more, h.fewer, h.over_k,
++                       g_rs_ms_scan / ns);
++            else
++                printf("RECSCAN scan: not run (--q-pipeline reuses the buckets before TD)\n");
++        }
++    }
+     /* BELOW `done:`, not above it, so "always reported" is literally true.
+      * Every PIPE_CK failure is `rc = -1; goto done`, so sited above this label
+      * the whole summary was skipped by exactly the runs that most need it: a

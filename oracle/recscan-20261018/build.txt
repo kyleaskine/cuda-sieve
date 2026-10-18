@@ -1,0 +1,5 @@
+tree: 9b9f314 (clean)
+stat: work/recscan/stat/bench/bench = 9b9f314 + recscan.diff (test-only, never landed),
+      GPU_ARCH=120, 0 warnings, sha256 3dc10d25e2d29485
+flags: -DCF_LMAX=4 -DBN_LIMBS=12 -DPIPE_K=16 (Makefile defaults)
+card: RTX 5070, idle before the runs; host: six CPU opn_benchmark workers

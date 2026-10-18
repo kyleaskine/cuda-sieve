@@ -611,6 +611,20 @@ typedef struct {
      * --fill-concurrent, where an explicit --fill-gate is refused. */
     int      fill_gate;
     int      fill_gate_shift;
+    /* --resieve-scan (finding 118): side 0's resieve takes its (survivor,
+     * prime) pairs from its own gated bucket records instead of walking its
+     * factor base. Side 0's fill also stores each record's factor-base index,
+     * and after the intersection a scan copies out the records that landed on
+     * two-sided survivors. Output-identical by construction: under the gate
+     * those records ARE the walk's pairs. A slab whose index or pair list ran
+     * out of room is resieved by the walk instead. Needs the gate: default on
+     * with it, off without, and refused explicitly without it.
+     * --resieve-scan-cap is the index slots per region (0 = half the bucket
+     * capacity) and --resieve-scan-pairs the pair list's first capacity
+     * (0 = PIPE_RS_PAIRS_INIT); both exist to drive the fallback and the
+     * growth in tests. */
+    int      resieve_scan;
+    uint32_t resieve_scan_cap, resieve_scan_pairs;
     /* --q-pipeline: the next unit of sieving is issued on its own stream
      * after this one's intersection -- the next slab of a slabbed q, or the
      * next q -- so it runs under this one's trial division, cofactorisation

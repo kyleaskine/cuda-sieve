@@ -1,0 +1,273 @@
+== abcheck: default (scan on wherever the gate is)
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+   survivor bitmaps (harness, c183)
+     s1.default         sb   IDENTICAL survivors 35467390 (base cached)
+     s0.default         sb   IDENTICAL survivors 33386694 (base cached)
+     s1.nbe             sb   IDENTICAL survivors 23470851 (base cached)
+     s0.nbe             sb   IDENTICAL survivors 24408652 (base cached)
+     s1.region6         sb   IDENTICAL survivors 23470851 (base cached)
+     s1.thr96           sb   IDENTICAL survivors 23470851 (base cached)
+     s1.thr32           sb   IDENTICAL survivors 35467390 (base cached)
+     s1.cells8          sb   IDENTICAL survivors 23470468 (base cached)
+     s1.I12.r12         sb   IDENTICAL survivors 966034 (base cached)
+     s1.I12.r6          sb   IDENTICAL survivors 966034 (base cached)
+     s0.I12.r6          sb   IDENTICAL survivors 473111 (base cached)
+     s1.I12.r5          sb   IDENTICAL survivors 966034 (base cached)
+     s1.I12.r4          sb   IDENTICAL survivors 1426883 (base cached)
+     s1.I6.r6           sb   IDENTICAL survivors 44394 (base cached)
+     s1.I7.r9.nss       sb   IDENTICAL survivors 13956 (base cached)
+     s1.I6.r8.nss       sb   IDENTICAL survivors 13082 (base cached)
+     s0.I6.r8.nss       sb   IDENTICAL survivors 33038 (base cached)
+     s1.I5.r8.nss       sb   IDENTICAL survivors 15100 (base cached)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 198457 rel 36684 (base cached)
+     c143.i14           cand IDENTICAL cand 67002 rel 12632 (base cached)
+     c183               cand IDENTICAL cand 191426 rel 810 (base cached)
+     c183.slab          cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.sq0           cand IDENTICAL cand 80380 rel 249 (base cached)
+     c183.single        cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.concurrent    cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.norows        cand IDENTICAL cand 57297 rel 234 (base cached)
+     c194               cand IDENTICAL cand 106562 rel 400 (base cached)
+     nfs                cand IDENTICAL cand 110828 rel 391 (base cached)
+     nfs.single         cand IDENTICAL cand 27633 rel 103 (base cached)
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 155108 (base cached)
+     c183               cof  IDENTICAL rel 9053 (base cached)
+     c194               cof  IDENTICAL rel 2221 (base cached)
+     nfs                cof  IDENTICAL rel 2845 (base cached)
+     c143.target        stop IDENTICAL rel 172909 (base cached)
+   34 cases: 34 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c143.i13            --resieve-scan: side 0 resieved from its own records; index 8192 x 3043 x 4 B = 0.09 GB, pair list 1048576; side 0 from its records 1000 slab(s); walked: 0 index full, 0 pair list grown;
+      c143.i14            --resieve-scan: side 0 resieved from its own records; index 8192 x 2683 x 4 B = 0.08 GB, pair list 1048576; side 0 from its records 300 slab(s); walked: 0 index full, 0 pair list grown;
+      c143.target         --resieve-scan: side 0 resieved from its own records; index 8192 x 3043 x 4 B = 0.09 GB, pair list 1048576; side 0 from its records 1115 slab(s); walked: 0 index full, 0 pair list grown;
+      c143                --resieve-scan: side 0 resieved from its own records; index 8192 x 3043 x 4 B = 0.09 GB, pair list 1048576; side 0 from its records 1000 slab(s); walked: 0 index full, 0 pair list grown;
+      c183.concurrent    no scan line
+      c183.norows         --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1048576; side 0 from its records 30 slab(s); walked: 0 index full, 0 pair list grown;
+      c183.single         --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1048576; side 0 from its records 30 slab(s); walked: 0 index full, 0 pair list grown;
+      c183.slab           --resieve-scan: side 0 resieved from its own records; index 8190 x 5658 x 4 B = 0.17 GB, pair list 1048576; side 0 from its records 150 slab(s); walked: 0 index full, 0 pair list grown;
+      c183.sq0            --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1048576; side 0 from its records 50 slab(s); walked: 0 index full, 0 pair list grown;
+      c183                --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1048576; side 0 from its records 200 slab(s); walked: 0 index full, 0 pair list grown;
+      c194                --resieve-scan: side 0 resieved from its own records; index 32768 x 5329 x 4 B = 0.65 GB, pair list 1048576; side 0 from its records 80 slab(s); walked: 0 index full, 0 pair list grown;
+      nfs.single          --resieve-scan: side 0 resieved from its own records; index 32768 x 5450 x 4 B = 0.67 GB, pair list 1048576; side 0 from its records 40 slab(s); walked: 0 index full, 0 pair list grown;
+      nfs                 --resieve-scan: side 0 resieved from its own records; index 32768 x 5450 x 4 B = 0.67 GB, pair list 1048576; side 0 from its records 160 slab(s); walked: 0 index full, 0 pair list grown;
+      s0.I12.r6          no scan line
+      s0.I6.r8.nss       no scan line
+      s0.default         no scan line
+      s0.nbe             no scan line
+      s1.I12.r12         no scan line
+      s1.I12.r4          no scan line
+      s1.I12.r5          no scan line
+      s1.I12.r6          no scan line
+      s1.I5.r8.nss       no scan line
+      s1.I6.r6           no scan line
+      s1.I6.r8.nss       no scan line
+      s1.I7.r9.nss       no scan line
+      s1.cells8          no scan line
+      s1.default         no scan line
+      s1.nbe             no scan line
+      s1.region6         no scan line
+      s1.thr32           no scan line
+      s1.thr96           no scan line
+   exit 0
+== abcheck: index cap 1536 at I16: slabs split
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --resieve-scan-cap 1536
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c194               cand IDENTICAL cand 106562 rel 400 (base cached)
+     nfs                cand IDENTICAL cand 110828 rel 391 (base cached)
+     nfs.single         cand IDENTICAL cand 27633 rel 103 (base cached)
+   relations (pipeline --cofactor)
+     c194               cof  IDENTICAL rel 2221 (base cached)
+     nfs                cof  IDENTICAL rel 2845 (base cached)
+   5 cases: 5 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c194                --resieve-scan: side 0 resieved from its own records; index 32768 x 1536 x 4 B = 0.19 GB, pair list 1048576; side 0 from its records 37 slab(s); walked: 43 index full, 0 pair list grown;
+      nfs.single          --resieve-scan: side 0 resieved from its own records; index 32768 x 1536 x 4 B = 0.19 GB, pair list 1048576; side 0 from its records 31 slab(s); walked: 9 index full, 0 pair list grown;
+      nfs                 --resieve-scan: side 0 resieved from its own records; index 32768 x 1536 x 4 B = 0.19 GB, pair list 1048576; side 0 from its records 115 slab(s); walked: 45 index full, 0 pair list grown;
+   exit 0
+== abcheck: index cap 3072 at c183: q split
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --resieve-scan-cap 3072
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c183               cand IDENTICAL cand 191426 rel 810 (base cached)
+     c183.slab          cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.sq0           cand IDENTICAL cand 80380 rel 249 (base cached)
+     c183.single        cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.norows        cand IDENTICAL cand 57297 rel 234 (base cached)
+   relations (pipeline --cofactor)
+     c183               cof  IDENTICAL rel 9053 (base cached)
+   6 cases: 6 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c183.norows         --resieve-scan: side 0 resieved from its own records; index 32768 x 3072 x 4 B = 0.38 GB, pair list 1048576; side 0 from its records 13 slab(s); walked: 17 index full, 0 pair list grown;
+      c183.single         --resieve-scan: side 0 resieved from its own records; index 32768 x 3072 x 4 B = 0.38 GB, pair list 1048576; side 0 from its records 13 slab(s); walked: 17 index full, 0 pair list grown;
+      c183.slab           --resieve-scan: side 0 resieved from its own records; index 8190 x 3072 x 4 B = 0.09 GB, pair list 1048576; side 0 from its records 131 slab(s); walked: 19 index full, 0 pair list grown;
+      c183.sq0            --resieve-scan: side 0 resieved from its own records; index 32768 x 3072 x 4 B = 0.38 GB, pair list 1048576; side 0 from its records 50 slab(s); walked: 0 index full, 0 pair list grown;
+      c183                --resieve-scan: side 0 resieved from its own records; index 32768 x 3072 x 4 B = 0.38 GB, pair list 1048576; side 0 from its records 101 slab(s); walked: 99 index full, 0 pair list grown;
+   exit 0
+== abcheck: index cap 768 at C143: q split
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --resieve-scan-cap 768
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 198457 rel 36684 (base cached)
+     c143.i14           cand IDENTICAL cand 67002 rel 12632 (base cached)
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 155108 (base cached)
+     c143.target        stop IDENTICAL rel 172909 (base cached)
+   4 cases: 4 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c143.i13            --resieve-scan: side 0 resieved from its own records; index 8192 x 768 x 4 B = 0.02 GB, pair list 1048576; side 0 from its records 736 slab(s); walked: 264 index full, 0 pair list grown;
+      c143.i14            --resieve-scan: side 0 resieved from its own records; index 8192 x 768 x 4 B = 0.02 GB, pair list 1048576; side 0 from its records 300 slab(s); walked: 0 index full, 0 pair list grown;
+      c143.target         --resieve-scan: side 0 resieved from its own records; index 8192 x 768 x 4 B = 0.02 GB, pair list 1048576; side 0 from its records 821 slab(s); walked: 294 index full, 0 pair list grown;
+      c143                --resieve-scan: side 0 resieved from its own records; index 8192 x 768 x 4 B = 0.02 GB, pair list 1048576; side 0 from its records 736 slab(s); walked: 264 index full, 0 pair list grown;
+   exit 0
+== abcheck: index cap 1: every slab falls back
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --resieve-scan-cap 1
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 59971 rel 11026 (base cached)
+     c143.i14           cand IDENTICAL cand 22393 rel 4235 (base cached)
+     c183               cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.slab          cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.sq0           cand IDENTICAL cand 24233 rel 71 (base cached)
+     c183.single        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.norows        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c194               cand IDENTICAL cand 31577 rel 138 (base cached)
+     nfs                cand IDENTICAL cand 27633 rel 103 (base cached)
+     nfs.single         cand IDENTICAL cand 11075 rel 27 (base cached)
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 46970 (base cached)
+     c183               cof  IDENTICAL rel 2242 (base cached)
+     c194               cof  IDENTICAL rel 680 (base cached)
+     nfs                cof  IDENTICAL rel 698 (base cached)
+     c143.target        stop IDENTICAL rel 86583 (base cached)
+   15 cases: 15 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c143.i13            --resieve-scan: side 0 resieved from its own records; index 8192 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 300 index full, 0 pair list grown;
+      c143.i14            --resieve-scan: side 0 resieved from its own records; index 8192 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 100 index full, 0 pair list grown;
+      c143.target         --resieve-scan: side 0 resieved from its own records; index 8192 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 556 index full, 0 pair list grown;
+      c143                --resieve-scan: side 0 resieved from its own records; index 8192 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 300 index full, 0 pair list grown;
+      c183.norows         --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 10 index full, 0 pair list grown;
+      c183.single         --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 10 index full, 0 pair list grown;
+      c183.slab           --resieve-scan: side 0 resieved from its own records; index 8190 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 50 index full, 0 pair list grown;
+      c183.sq0            --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 15 index full, 0 pair list grown;
+      c183                --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 50 index full, 0 pair list grown;
+      c194                --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 24 index full, 0 pair list grown;
+      nfs.single          --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 16 index full, 0 pair list grown;
+      nfs                 --resieve-scan: side 0 resieved from its own records; index 32768 x 1 x 4 B = 0.00 GB, pair list 1048576; side 0 from its records 0 slab(s); walked: 40 index full, 0 pair list grown;
+   exit 0
+== abcheck: pair list from 1: grows, then scans
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --resieve-scan-pairs 1
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 59971 rel 11026 (base cached)
+     c143.i14           cand IDENTICAL cand 22393 rel 4235 (base cached)
+     c183               cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.slab          cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.sq0           cand IDENTICAL cand 24233 rel 71 (base cached)
+     c183.single        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.norows        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c194               cand IDENTICAL cand 31577 rel 138 (base cached)
+     nfs                cand IDENTICAL cand 27633 rel 103 (base cached)
+     nfs.single         cand IDENTICAL cand 11075 rel 27 (base cached)
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 46970 (base cached)
+     c183               cof  IDENTICAL rel 2242 (base cached)
+     c194               cof  IDENTICAL rel 680 (base cached)
+     nfs                cof  IDENTICAL rel 698 (base cached)
+     c143.target        stop IDENTICAL rel 86583 (base cached)
+   15 cases: 15 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c143.i13            --resieve-scan: side 0 resieved from its own records; index 8192 x 3043 x 4 B = 0.09 GB, pair list 1; side 0 from its records 299 slab(s); walked: 0 index full, 1 pair list grown;
+      c143.i14            --resieve-scan: side 0 resieved from its own records; index 8192 x 2683 x 4 B = 0.08 GB, pair list 1; side 0 from its records 99 slab(s); walked: 0 index full, 1 pair list grown;
+      c143.target         --resieve-scan: side 0 resieved from its own records; index 8192 x 3043 x 4 B = 0.09 GB, pair list 1; side 0 from its records 555 slab(s); walked: 0 index full, 1 pair list grown;
+      c143                --resieve-scan: side 0 resieved from its own records; index 8192 x 3043 x 4 B = 0.09 GB, pair list 1; side 0 from its records 299 slab(s); walked: 0 index full, 1 pair list grown;
+      c183.norows         --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1; side 0 from its records 9 slab(s); walked: 0 index full, 1 pair list grown;
+      c183.single         --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1; side 0 from its records 9 slab(s); walked: 0 index full, 1 pair list grown;
+      c183.slab           --resieve-scan: side 0 resieved from its own records; index 8190 x 5658 x 4 B = 0.17 GB, pair list 1; side 0 from its records 49 slab(s); walked: 0 index full, 1 pair list grown;
+      c183.sq0            --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1; side 0 from its records 14 slab(s); walked: 0 index full, 1 pair list grown;
+      c183                --resieve-scan: side 0 resieved from its own records; index 32768 x 5657 x 4 B = 0.69 GB, pair list 1; side 0 from its records 49 slab(s); walked: 0 index full, 1 pair list grown;
+      c194                --resieve-scan: side 0 resieved from its own records; index 32768 x 5329 x 4 B = 0.65 GB, pair list 1; side 0 from its records 23 slab(s); walked: 0 index full, 1 pair list grown;
+      nfs.single          --resieve-scan: side 0 resieved from its own records; index 32768 x 5450 x 4 B = 0.67 GB, pair list 1; side 0 from its records 15 slab(s); walked: 0 index full, 1 pair list grown;
+      nfs                 --resieve-scan: side 0 resieved from its own records; index 32768 x 5450 x 4 B = 0.67 GB, pair list 1; side 0 from its records 39 slab(s); walked: 0 index full, 1 pair list grown;
+   exit 0
+== abcheck: --no-resieve-scan
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --no-resieve-scan
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 59971 rel 11026 (base cached)
+     c143.i14           cand IDENTICAL cand 22393 rel 4235 (base cached)
+     c183               cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.slab          cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.sq0           cand IDENTICAL cand 24233 rel 71 (base cached)
+     c183.single        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.concurrent    cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.norows        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c194               cand IDENTICAL cand 31577 rel 138 (base cached)
+     nfs                cand IDENTICAL cand 27633 rel 103 (base cached)
+     nfs.single         cand IDENTICAL cand 11075 rel 27 (base cached)
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 46970 (base cached)
+     c183               cof  IDENTICAL rel 2242 (base cached)
+     c194               cof  IDENTICAL rel 680 (base cached)
+     nfs                cof  IDENTICAL rel 698 (base cached)
+     c143.target        stop IDENTICAL rel 86583 (base cached)
+   16 cases: 16 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c143.i13           no scan line
+      c143.i14           no scan line
+      c143.target        no scan line
+      c143               no scan line
+      c183.concurrent    no scan line
+      c183.norows        no scan line
+      c183.single        no scan line
+      c183.slab          no scan line
+      c183.sq0           no scan line
+      c183               no scan line
+      c194               no scan line
+      nfs.single         no scan line
+      nfs                no scan line
+   exit 0
+== abcheck: does not fit: walked
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/abcheck/bench.9b9f314 (9b6919522084793c)
+            NEW  /home/kylea/code/cuda-sieve/work/rscan/exp/bench/bench (a7879711ac337138)
+            NEW's pipeline runs add: --resieve-scan-pairs 4000000000
+   survivor bitmaps (harness, c183)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c183               cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.slab          cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.sq0           cand IDENTICAL cand 24233 rel 71 (base cached)
+     c183.single        cand IDENTICAL cand 18922 rel 74 (base cached)
+     c183.norows        cand IDENTICAL cand 18922 rel 74 (base cached)
+   relations (pipeline --cofactor)
+   5 cases: 5 identical, 0 failed, 0 skipped, 0 with overflow warnings
+      c183.norows         --resieve-scan: side 0 is walked, because it needs 30.49 GB more and 8.52 GB is free;
+      c183.single         --resieve-scan: side 0 is walked, because it needs 30.49 GB more and 8.78 GB is free;
+      c183.slab           --resieve-scan: side 0 is walked, because it needs 29.97 GB more and 9.45 GB is free;
+      c183.sq0            --resieve-scan: side 0 is walked, because it needs 30.49 GB more and 8.52 GB is free;
+      c183                --resieve-scan: side 0 is walked, because it needs 30.49 GB more and 8.52 GB is free;
+   exit 0
+== refusals (each must exit nonzero with a message)
+   --pipeline --resieve-scan --no-fill-gate           exit 1: --resieve-scan reads side 0's gated fill records; it needs the gate, which is off (--no-fill-gate, or --fill-concurrent)
+   --pipeline --resieve-scan --fill-concurrent        exit 1: --resieve-scan reads side 0's gated fill records; it needs the gate, which is off (--no-fill-gate, or --fill-concurrent)
+   --pipeline --no-resieve-scan --resieve-scan-cap 8  exit 1: --resieve-scan-cap and --resieve-scan-pairs need the scan; it is off (--no-resieve-scan, or no fill gate)
+   --resieve-scan                                     exit 2: bench: --resieve-scan applies to --pipeline only
+   --resieve-scan-pairs 8                             exit 2: bench: --resieve-scan-pairs applies to --pipeline only
+== make check (snapshot)
+       FAIL   the ceiling is monotone non-increasing         affine, serial 950 (reachable) / floor 33792
+       FAIL   the chunk never rises once the valve spoke     affine, serial 950 (reachable) / floor 33792
+   all gates passed
+   exit 0
+== fillcheck.sh (snapshot)
+     ok   single
+     ok   default
+   fillcheck: all arms byte-identical
+   exit 0
+done: 0 failed
