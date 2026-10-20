@@ -1,0 +1,21 @@
+== c143-single: window 5.528 s, 21877 kernels
+  kernel busy 82.4%  (with copies/memsets 82.7%)   depth 0/1/2/3+: 17.6% / 82.4% / 0.0% / 0.0%
+  compression (summed kernel time / kernel-busy time): 1.00x
+  idle by gap length: <10us 0.9%  10-100us 4.2%  0.1-1ms 12.0%  >1ms 0.5%
+  kernel                                  share launches  mean us overlapped
+  k_apply                                 37.4%     1283   1327.0       0.0%
+  k_fill_atomic                           30.6%     1283   1085.5       0.0%
+  k_resieve_scatter                        8.7%      641    617.6       0.0%
+  k_cofac                                  5.5%       16  15573.4       0.0%
+  k_fill_rows                              5.4%     1284    192.6       0.0%
+  k_td                                     4.0%     1283    141.5       0.0%
+  k_transform                              3.3%     1284    118.7       0.0%
+  k_classify                               1.5%     1283     54.1       0.0%
+  k_td_record_warp                         0.8%     1284     29.7       0.0%
+  k_resieve_rows                           0.8%      641     58.4       0.0%
+  k_intersect_compact                      0.5%      641     32.4       0.0%
+  k_record_scan                            0.3%      641     21.7       0.0%
+  k_build_summary_g                        0.3%      641     21.0       0.0%
+  k_gate_fold                              0.2%      642     15.6       0.0%
+  k_emit_ranked                            0.1%      641      9.9       0.0%
+  k_cof_enqueue                            0.1%      642      7.0       0.0%

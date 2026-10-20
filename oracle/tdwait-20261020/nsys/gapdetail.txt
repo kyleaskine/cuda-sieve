@@ -1,0 +1,168 @@
+k_cof_enqueue -> k_transform: 308 gaps, mean 592.7 us; inside CUDA calls 37%, outside 63%
+  cudaMemcpyAsync                    123.8 us/gap
+  cudaMemsetAsync                     35.8 us/gap
+  cudaEventRecord                     26.2 us/gap
+  cudaLaunchKernel                    23.4 us/gap
+  cudaStreamSynchronize                3.6 us/gap
+  cudaEventSynchronize                 2.9 us/gap
+  cuKernelGetName                      0.7 us/gap
+  cudaMemset                           0.6 us/gap
+-- sample gap 499 us
+   +   77.7 us    14.0 us  cudaMemcpyAsync
+   +  181.8 us     7.4 us  cudaMemcpyAsync
+   +  189.7 us     1.3 us  cudaEventSynchronize
+   +  191.2 us     0.7 us  cudaEventSynchronize
+   +  352.7 us     7.1 us  cudaMemcpyAsync
+   +  360.1 us     4.9 us  cudaMemcpyAsync
+   +  365.2 us     5.0 us  cudaMemcpyAsync
+   +  370.4 us     5.7 us  cudaMemcpyAsync
+   +  376.3 us     4.9 us  cudaMemcpyAsync
+   +  383.1 us    16.1 us  cudaMemsetAsync
+   +  399.4 us     7.0 us  cudaMemsetAsync
+   +  406.8 us     6.8 us  cudaEventRecord
+   +  414.1 us     0.2 us  cuKernelGetName
+   +  414.5 us     8.4 us  cudaLaunchKernel
+   +  423.2 us     4.8 us  cudaEventRecord
+
+k_transform -> k_transform: 303 gaps, mean 134.4 us; inside CUDA calls 91%, outside 9%
+  cudaMemcpyAsync                     45.5 us/gap
+  cudaMemsetAsync                     23.5 us/gap
+  cudaEventRecord                     19.7 us/gap
+  cudaLaunchKernel                    16.9 us/gap
+  cudaMemset                           7.8 us/gap
+  cudaStreamSynchronize                5.9 us/gap
+  cudaEventSynchronize                 2.0 us/gap
+  cuKernelGetName                      1.0 us/gap
+-- sample gap 32 us
+   +   -0.0 us     6.2 us  cudaLaunchKernel
+   +    6.4 us     3.6 us  cudaEventRecord
+   +   10.3 us     4.2 us  cudaMemsetAsync
+   +   14.9 us     0.1 us  cuKernelGetName
+   +   15.2 us     6.2 us  cudaLaunchKernel
+   +   21.6 us     4.1 us  cudaEventRecord
+   +   26.0 us     7.9 us  cudaMemcpyAsync
+
+k_transform -> k_intersect_compact: 85 gaps, mean 268.8 us; inside CUDA calls 96%, outside 4%
+  cudaEventRecord                    160.9 us/gap
+  cudaLaunchKernel                    32.7 us/gap
+  cudaStreamSynchronize               27.3 us/gap
+  cudaMemset                          17.5 us/gap
+  cudaMemcpyAsync                     11.1 us/gap
+  cudaMemsetAsync                      5.8 us/gap
+  cudaEventSynchronize                 1.7 us/gap
+  cuKernelGetName                      0.4 us/gap
+-- sample gap 1 us
+   +   -0.1 us     8.0 us  cudaMemcpyAsync
+
+k_apply -> k_transform: 281 gaps, mean 180.4 us; inside CUDA calls 54%, outside 46%
+  cudaMemcpyAsync                     32.4 us/gap
+  cudaMemset                          20.8 us/gap
+  cudaLaunchKernel                    16.7 us/gap
+  cudaEventRecord                     12.6 us/gap
+  cudaMemsetAsync                     10.0 us/gap
+  cudaEventSynchronize                 2.6 us/gap
+  cudaStreamSynchronize                1.6 us/gap
+  cuKernelGetName                      0.5 us/gap
+-- sample gap 70 us
+   +    1.9 us    18.1 us  cudaMemset
+   +   20.2 us     5.2 us  cudaMemset
+   +   25.8 us     6.8 us  cudaEventRecord
+   +   33.6 us     0.5 us  cuKernelGetName
+   +   34.3 us    13.7 us  cudaLaunchKernel
+   +   48.3 us     3.7 us  cudaEventRecord
+   +   52.3 us     5.0 us  cudaMemsetAsync
+   +   57.9 us     0.2 us  cuKernelGetName
+   +   58.2 us     6.1 us  cudaLaunchKernel
+   +   64.5 us     3.5 us  cudaEventRecord
+   +   68.4 us    13.1 us  cudaMemcpyAsync
+
+k_record_scan -> k_fill_rows: 407 gaps, mean 130.9 us; inside CUDA calls 93%, outside 7%
+  cudaMemsetAsync                     36.7 us/gap
+  cudaLaunchKernel                    32.3 us/gap
+  cudaEventRecord                     23.5 us/gap
+  cudaMemcpyAsync                     18.2 us/gap
+  cudaStreamSynchronize                7.5 us/gap
+  cudaStreamWaitEvent                  2.2 us/gap
+  cuKernelGetName                      1.1 us/gap
+-- sample gap 117 us
+   + -164.6 us   166.4 us  cudaStreamSynchronize
+   +    5.4 us     2.4 us  cudaStreamWaitEvent
+   +    8.1 us    15.0 us  cudaEventRecord
+   +   23.5 us    14.9 us  cudaMemsetAsync
+   +   38.6 us     6.2 us  cudaMemsetAsync
+   +   45.7 us     0.5 us  cuKernelGetName
+   +   46.5 us    11.3 us  cudaLaunchKernel
+   +   58.4 us     0.2 us  cuKernelGetName
+   +   58.7 us     6.4 us  cudaLaunchKernel
+   +   65.3 us     4.6 us  cudaEventRecord
+   +   70.1 us     4.6 us  cudaMemsetAsync
+   +   75.3 us     0.2 us  cuKernelGetName
+   +   75.6 us     5.7 us  cudaLaunchKernel
+   +   81.5 us     3.5 us  cudaEventRecord
+   +   85.3 us    12.6 us  cudaMemcpyAsync
+   +   98.1 us     8.0 us  cudaMemcpyAsync
+   +  106.3 us     0.7 us  cudaEventRecord
+   +  107.3 us     0.9 us  cudaStreamWaitEvent
+   +  108.5 us     4.4 us  cudaEventRecord
+   +  113.1 us     7.0 us  cudaMemsetAsync
+
+k_td_record_warp -> k_cand_stats: 317 gaps, mean 93.4 us; inside CUDA calls 95%, outside 5%
+  cudaStreamSynchronize               36.2 us/gap
+  cudaLaunchKernel                    31.0 us/gap
+  cudaEventSynchronize                20.3 us/gap
+  cudaEventRecord                      0.7 us/gap
+  cuKernelGetName                      0.5 us/gap
+-- sample gap 68 us
+   +   -5.7 us    23.8 us  cudaLaunchKernel
+   +   19.4 us     0.4 us  cuKernelGetName
+   +   19.8 us     7.0 us  cudaLaunchKernel
+   +   27.3 us    40.4 us  cudaStreamSynchronize
+
+k_tdsmall_advance -> k_transform: 57 gaps, mean 977.9 us; inside CUDA calls 17%, outside 83%
+  cudaMemcpyAsync                     90.6 us/gap
+  cudaMemsetAsync                     37.4 us/gap
+  cudaLaunchKernel                    23.7 us/gap
+  cudaEventRecord                     16.1 us/gap
+  cuKernelGetName                      0.7 us/gap
+  cudaEventSynchronize                 0.3 us/gap
+-- sample gap 1011 us
+   +  604.9 us    51.8 us  cudaMemcpyAsync
+   +  657.6 us    39.4 us  cudaMemcpyAsync
+   +  698.0 us    37.1 us  cudaMemcpyAsync
+   +  736.1 us    37.1 us  cudaMemcpyAsync
+   +  774.1 us    46.1 us  cudaMemcpyAsync
+   +  826.3 us    71.0 us  cudaMemsetAsync
+   +  898.6 us    38.1 us  cudaMemsetAsync
+   +  937.7 us    31.6 us  cudaEventRecord
+   +  970.9 us     0.6 us  cuKernelGetName
+   +  972.0 us    42.7 us  cudaLaunchKernel
+
+k_cof_enqueue -> k_intersect_compact: 30 gaps, mean 1465.8 us; inside CUDA calls 15%, outside 85%
+  cudaMemcpyAsync                     75.8 us/gap
+  cudaMemset                          53.6 us/gap
+  cudaLaunchKernel                    32.2 us/gap
+  cudaStreamSynchronize               24.2 us/gap
+  cudaEventRecord                     20.5 us/gap
+  cudaMemsetAsync                      6.7 us/gap
+  cudaEventSynchronize                 4.7 us/gap
+  cuKernelGetName                      1.0 us/gap
+-- sample gap 1372 us
+   +  -51.9 us    58.0 us  cudaStreamSynchronize
+   +  592.7 us    48.2 us  cudaMemcpyAsync
+   + 1192.7 us    16.2 us  cudaMemcpyAsync
+   + 1210.4 us     4.2 us  cudaEventSynchronize
+   + 1218.0 us     1.9 us  cudaEventSynchronize
+   + 1222.5 us    30.1 us  cudaMemset
+   + 1252.9 us     8.5 us  cudaMemset
+   + 1261.8 us     7.1 us  cudaEventRecord
+   + 1270.6 us     0.8 us  cuKernelGetName
+   + 1271.8 us    23.3 us  cudaLaunchKernel
+   + 1295.6 us     3.4 us  cudaEventRecord
+   + 1299.8 us    16.4 us  cudaMemsetAsync
+   + 1317.3 us     0.4 us  cuKernelGetName
+   + 1317.8 us     7.9 us  cudaLaunchKernel
+   + 1326.2 us     3.0 us  cudaEventRecord
+   + 1329.4 us    15.8 us  cudaMemcpyAsync
+   + 1345.4 us    10.2 us  cudaMemcpyAsync
+   + 1356.1 us   713.0 us  cudaStreamSynchronize
+

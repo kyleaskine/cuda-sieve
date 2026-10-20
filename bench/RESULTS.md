@@ -12927,3 +12927,237 @@ Side 1's walk is now the resieve: 10.8 ms/q single-queued at NFS@Home. Its
 records are not gated, since side 1 is filled first. A scan would read all
 ~200M records per slab (809 MB) to find the ~1% on survivors, so the same
 trick does not carry over.
+
+<a id="finding-120"></a>
+## Finding 120 — re-traced after findings 116-119: card idle is 10.1% at C143 and 2.0% at I16 (host load ~10), and two thirds of C143's is host work at the q boundary, not TD's own waits. Two small waits removed: TD no longer waits for its record pass before `k_cof_enqueue` is queued, and the next sieve is issued before the intersection's wait. The two gaps they act on fell 68 µs/q at C143 pipelined (1.0% of its wall) and ~0.2 ms/q at I16 (0.1%); whole-trace idle read 10.1% -> 7.5% and 2.0% -> 1.7%, but most of that moved in gaps the change does not touch. Wall inside today's ±2-4% noise; relations and the candidate stream byte-identical
+
+**Date:** 2026-10-20. RTX 5070, WSL2, card free, client not running, host
+load 9.4-11.6 throughout (CPU ECM: one P-1 and eight stage-2 processes).
+Base: the committed `2128138` fat `bench/bench` (`77f1abab`, saved as
+`work/abcheck/bench.2128138`). New: a `GPU_ARCH=120` snapshot of this source
+(`ee5063ad`); the traces and timing below are of it. The fat `bench/bench`
+was rebuilt from it (`eab7283c`, 6 archs, 0 warnings): `--verify-only` and
+`fbtest` pass and the full `abcheck.sh` is 34 of 34 identical
+(`fat-check.txt`; run while msieve poly selection shared the card, which
+identity checks do not mind). After the review fixes ("After review"
+below) it was rebuilt again: `8a6d543a`, 6 archs, 0 warnings,
+`--verify-only` and `fbtest` pass, `abcheck.sh` 36 of 36 identical
+(`fat-check2.sh`, `fat-check2.txt`). Evidence in
+[`../oracle/tdwait-20261020/`](../oracle/tdwait-20261020/), the traces'
+text outputs under `nsys/`.
+
+The question was whether TD in asynchronous phases (finding 114's "what is
+left", finding 115's lead 4) is still worth building after findings
+116-119 made the kernels ~15-20% faster, and what it would cost in memory.
+
+### Memory: async TD needs no doubling
+
+Everything from the intersection to `k_cof_enqueue` runs in order on the
+legacy stream, so slab q+1's TD cannot start before slab q's finishes,
+whatever the host does. Async TD only removes host waits. TD's buffers stay
+single: the survivor-sized set is ~264 B per survivor (~11 MB at I16's
+~27,600 survivors per slab with the 1.5x headroom `pipe_td_grow` keeps), the
+candidate set ~640 B per candidate on the device and the same pinned. The
+small-prime table is 32 B per entry (`tdsmall_t`). A second `d_two` (64 MiB
+at I16's 2^29-position slabs, 8 MiB at C143) would only be needed to queue
+q+1's intersection before q's TD flags are read. For contrast, a 3-deep
+queue needs a third transform set: 0.82 GB at I16. The cost of async TD is
+correctness work, not memory: the survivor count, the TD flags (a truncated
+list must still keep its slab out of the queue) and the queue-full decision
+are host decisions made mid-TD today.
+
+### Where the card idles now (`nsys/trace.sh`, `nsys/*.gaps.txt`)
+
+The arms of findings 113 and 115 on `2128138`, cuda-sieve only: C143 I13 800
+q from 2200000, NFS@Home I16 80 q from 297000000, each pipelined and
+single-queued. Middle 80% of kernel launches, as before.
+
+| | C143 pipelined | C143 single | I16 pipelined | I16 single |
+|---|---:|---:|---:|---:|
+| wall in window, ms/q | 7.0 | 8.6 | 183.9 | 200.3 |
+| card idle | **10.1%** (0.71 ms/q) | 17.6% | **2.0%** (3.7 ms/q) | 3.0% |
+
+I16 is unchanged from finding 115 (2.1%). Its idle time fell with the
+kernels (~4.5 -> 3.7 ms/q), so the share did not rise. Finding 114's 6.5%
+at C143 was a quiet host; this is the load the box usually carries, so the
+two are not comparable. Finding 113's loaded figure, at the build before
+finding 114, was 1.32 ms/q.
+
+C143's pipelined 10.1%, by gap (each charged to the last kernel to finish
+and the next to start):
+
+| gap | share of wall | what it is |
+|---|---:|---|
+| `k_cof_enqueue -> k_transform`, `k_apply -> k_transform`, `k_transform -> k_transform`, `k_transform -> k_intersect_compact` | **6.6%** | the q boundary, below |
+| `k_record_scan -> k_fill_rows` | 1.2% | the next sieve issued only after the intersection's wait |
+| `k_td_record_warp -> k_cand_stats` | 0.7% | TD's wait for its record pass, then a launch |
+| the rest | ~1.6% | small gaps, two TD readbacks the other stream mostly covers |
+
+**The q boundary.** In 308 of 641 q (48%) the next q's sieve finishes
+before this q's TD. TD's kernels sum to ~1.6 ms/q, but its span from the
+intersection to the end of `k_cof_enqueue` is 5.8 ms (median): its small
+kernels wait for SMs behind the next q's fill and apply. When TD loses
+that race the card idles through host work (`gapdetail.py`, a ~500 µs
+sample): ~75 µs of end-of-q bookkeeping, ~110 µs building the next q's
+small-prime TD tables (`pipe_td_prepare_q` at the loop top) and ~230 µs
+preparing the q after that before its transform launches. 63% of the gap
+is outside any CUDA call. This is mostly not TD's internal waits, so full
+async TD is not the cheapest lever for it (see "What leads now").
+
+At I16 the largest gaps are 0.5% (end of q -> the next transform, 978 µs,
+83% outside CUDA calls) and 0.4% (around queue flushes).
+
+### The change (`change.diff`: `pipeline.cuh`, plus one launch check in `cofac.cuh`)
+
+1. **TD's record wait is paid after `k_cof_enqueue` is queued.** Under
+   inline cofactorisation nothing on the host reads the candidates, so
+   `pipe_td_perq` queues `k_cand_stats` behind the record pass and returns
+   with the wait owed (`rec_pending`). The caller queues `k_cof_enqueue`,
+   then pays it (`pipe_td_record_join`) before its stream sync; the card
+   has the next kernels queued through both waits. The wait and
+   `tm.record` are charged to trial division as before, not to the
+   cofactor bracket they now sit in. It is also paid before a queue flush,
+   so the flush is not charged with it. The error exits between TD and the
+   enqueue leave it owed; they end the band, and `pipe_td_free`'s
+   `cudaFree` waits the record pass out. `pipe_td_perq` pays a wait still
+   owed at entry, which no current path leaves. With `--candidates` or
+   without `--cofactor` it is paid inside TD as before. `cof_enqueue` now
+   checks its own launch (`cofac.cuh`), so a launch error there is not
+   reported as the record pass's.
+2. **The `--q-pipeline` issue point moved ahead of the intersection's
+   wait.** The next slab or q is issued right after the intersection, the
+   record scan and their counter copies are queued, not after the host has
+   waited for them. The next sieve overwrites what those read (both
+   survbits, the bucket array, its cursors and side 0's index, the index's
+   overflow word `d_rsc[1]`), so `st_sv` first waits on a new event,
+   `eisect`, recorded on the legacy stream after all of it, and only when
+   something is issued. The issue reads nothing that wait returns: the
+   joins and any bucket-overflow skip come before it, and TD reads none of
+   it. One decision after the wait does change what the issued sieve may
+   touch. The next fill is configured with side 0's index while the scan
+   is on, and a pair list that then fails to grow turns the scan off, so
+   that branch frees the index and `d_rsc` only after draining `st_sv`.
+   Growth itself may stall on `cudaFree` while the next sieve runs; it
+   happens on a band's first slab, if at all (1M pairs to start, 75K-210K
+   measured, never in any run here). A fault in the intersection or the
+   record scan can now surface in the issue's calls instead of the wait;
+   the issue then drains the legacy stream and says either may be the
+   source, as `views_and_prep` does for the next q's preparation.
+
+### Gates (`gates.sh`, `gates.txt`, `gates2.sh`, `gates2.txt`)
+
+| gate | result |
+|---|---|
+| `abcheck.sh`, default, every case | **34 of 34 identical**, survivor bitmaps, the candidate stream, relations, the stop with a q in flight |
+| `--resieve-scan-pairs 1` (grows with the next sieve in flight) | 15 of 15 |
+| `--resieve-scan-cap 1` (every slab walks) | 15 of 15 |
+| `--no-resieve-scan` | 16 of 16 |
+| `growfail.sh` (`-DPIPE_RS_TEST_GROW_FAIL=1`: growth fails, index freed after the drain) | 5 of 5 identical, warning printed, "1 pair list grown, then off" |
+| tdskip, `PIPE_K=8`, c183 in five slabs: single-queued against pipelined | identical, 6,875 relations, 11 slabs skipped, 600 slabs and 149 q issued ahead |
+| `make check` (snapshot) | 108 PASS, 0 FAIL |
+| `fillcheck.sh` (snapshot) | every arm byte-identical |
+
+`gates.txt` ran growfail and tdskip before their test builds existed, and
+counted both as failures (exit 127). `gates2.sh` reran them once the
+binaries were built. Base outputs for abcheck are now cached under
+`work/abcheck/cache/77f1abab...`.
+
+**After review** (`build2.sh`, `gates3.sh`, `gates3.txt`). A code review
+found no output-changing fault. Its fixes went in: two GPU-error reports
+that would name the wrong step, `eisect` recorded only when something is
+issued, a record-wait call that could never do anything removed, and the
+comments and this finding's attribution corrected. It also found that the
+deferral's single-queued arm was never compared against BASE (tdskip
+compares two arms of the new binary). `abcheck.sh` now has `c143.single`
+and `nfs.single` under `--cofactor`. All three test builds were rebuilt
+(`184d85c7`, growfail `b914d4f9`, pk8 `038e863f`, 0 warnings) and every
+gate rerun: `abcheck.sh` **36 of 36** identical, the knob arms 17, 17 and
+18 of the same, `growfail.sh` 5 of 5, tdskip identical (6,875), `make check`
+108/108, fillcheck identical. The new error paths are compiled, not
+exercised: no gate injects a fault there.
+
+### After (`nsys/trace-new.sh`, `nsys/new-*`)
+
+The same four arms on the snapshot, same host load:
+
+| card idle | before | after |
+|---|---:|---:|
+| C143 pipelined | 10.1% | **7.5%** |
+| C143 single-queued | 17.6% | 16.3% |
+| I16 pipelined | 2.0% | 1.7% |
+| I16 single-queued | 3.0% | 2.6% |
+
+Most of that is not the change. Summed over every gap, not only the
+twelve largest `gaps.py` lists (`nsys/gapsplit.py`, `nsys/gapsplit.txt`):
+
+| µs/q | idle fell | the two gaps the change acts on | of wall | the rest |
+|---|---:|---:|---:|---:|
+| C143 pipelined | 218 | **68** | 1.0% | 150 |
+| C143 single-queued | 174 | 43 | 0.5% | 130 |
+| I16 pipelined | 604 | 222 | 0.12% | 383 |
+| I16 single-queued | 818 | 263 | 0.13% | 554 |
+
+The rest moved in gaps the change does not act on, at C143 pipelined
+`k_transform -> k_intersect_compact` (22.8 -> 6.0 ms over the window) and
+`k_cof_enqueue -> k_transform` (182 -> 162 ms) above all. The single-queued
+arms have no issue point to move and show a similar unexplained share, so it
+reads as variation between the two traces rather than a side effect; a
+repeat trace of one binary would be needed to say more.
+
+- `k_td_record_warp -> k_cand_stats` fell to 0.1% or less in every arm; at
+  C143 pipelined 93 -> 9 µs per gap, the launch alone.
+- `k_record_scan -> k_fill_rows` at C143 fell from 131 µs per gap to 94
+  (1.2% -> 0.9%). What is left is launch overhead: at C143 the intersection
+  and the scan take ~150 µs on the card, about as long as the host's run of
+  5-15 µs API calls from the intersection to the first fill launch. Where
+  the host wins, the fill now waits on the card, ~1.1 ms between its launch
+  and its start (median).
+- The q-boundary gap (`k_cof_enqueue -> k_transform`) is untouched, as
+  expected: 4.1% -> 3.8%.
+
+### Timing (`timing.sh`, `timing.txt`)
+
+Three rounds, alternating order, all 36 runs exit 0.
+
+| ms/q | base | new | change | per round |
+|---|---:|---:|---:|---|
+| C143 pipelined | 6.79 | 6.65 | **−2.0%** | −5.3, −0.4, 0.0 |
+| C143 single-queued | 8.48 | 8.37 | −1.3% | −3.6, −1.1, +1.0 |
+| C194 pipelined | 214.57 | 210.70 | −1.8% | −1.4, −3.5, −0.4 |
+| c183 pipelined | 56.49 | 56.25 | −0.4% | +0.5, 0.0, −1.8 |
+| NFS@Home I16 pipelined | 191.03 | 192.64 | +0.8% | +4.5, +0.2, −2.1 |
+| NFS@Home I16 single-queued | 205.52 | 205.02 | −0.2% | +1.0, +1.0, −2.7 |
+
+**This day's wall noise is larger than the effect.** The final flush after
+the band, the same queue of candidates in every NFS@Home single-queued run
+and code this change does not touch, ran 14.93-16.15 ms/q (±4%). The card
+sat 1-10% busy before some runs. The two gaps the change acts on are the
+better instrument for an effect this size: 1.0% of C143's pipelined wall,
+0.5% single-queued, 0.1% at I16. C143's −2.0% mean is twice what they
+explain, inside the noise. The first two rounds of NFS@Home single-queued
+read +1.0% each and the third −2.7%, so there is no sign of a cost.
+
+### What leads now
+
+1. **The q boundary at small jobs (6.6% of C143's wall, in 48% of q).**
+   None of these needs async TD's risky parts or more than a few hundred KB:
+   - Build the next q's small-prime TD tables during the sieve-join wait,
+     into a second `d_sm`/`h_sm` (~110 µs of the gap).
+   - Prepare the q after next during this q's TD wait, holding its
+     transform on `st_sv` behind an event until this q's resieve finishes,
+     the only TD step that reads the transform set (~230 µs). At one slab
+     per q (C143) this needs no extra device memory, but two q pulled ahead
+     touches the stop and checkpoint logic. With several slabs it does not
+     hold as written: q+2's transform would write the walk cursors while
+     all three sets are in use (q's last-slab TD, q+1's slab-0 TD, q+1's
+     fill output), and its uploads would land in pside's single-buffered
+     per-q tables ahead of q+1's later slabs' applies. That needs a fourth
+     cursor set and double-buffered per-q state; multi-slab bands idle
+     least at the boundary (I16: 0.5%), so limiting it to one slab costs
+     little.
+   - Issue the next GPU work before the end-of-q bookkeeping (finding 113's
+     lead 3, never done; ~75 µs).
+2. **Async TD proper.** Worth it only if (1) falls short: at I16 its
+   ceiling is the 1.7% left.
+3. The issue point's remaining launch overhead (0.9% at C143) would need
+   fewer API calls, or a CUDA graph, for the issue.

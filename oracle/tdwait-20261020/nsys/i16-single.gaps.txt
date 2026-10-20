@@ -1,0 +1,23 @@
+== /home/kylea/code/cuda-sieve/work/nsys-20261020/i16-single.sqlite: idle 0.382 s of 12.817 s window (3.0%)
+  last kernel -> next kernel                                      idle   gaps  mean us
+  k_cof_enqueue -> k_transform                                    0.5%     64   1030.7
+  k_apply -> k_gate_fold                                          0.5%    257    256.7
+  k_apply -> k_intersect_compact                                  0.3%    257    173.7
+  k_scatter_sel -> k_gather_ab                                    0.3%    257    157.5
+  k_scan_pass3 -> k_emit_ranked                                   0.3%    258    145.7
+  k_record_scan -> k_group_counts                                 0.3%    257    141.2
+  k_td_record_warp -> k_cand_stats                                0.1%    257     70.0
+  k_tdsmall_advance -> k_fill_atomic                              0.1%    193     68.0
+  k_cof_enqueue -> k_tdsmall_advance                              0.1%    193     54.8
+  k_transform -> k_fill_atomic                                    0.1%     64    153.1
+  k_gather_ab -> k_td_record_warp                                 0.1%    257     29.0
+  k_cand_stats -> k_cof_enqueue                                   0.0%    256     17.3
+  host CUDA calls in progress during the idle time (share of idle):
+    cudaLaunchKernel_v7000                               20.6%
+    cudaEventRecord_v3020                                13.8%
+    cudaEventSynchronize_v3020                           12.6%
+    cudaStreamSynchronize_v3020                          10.6%
+    cudaMemsetAsync_v3020                                 8.7%
+    cudaMemset_v3020                                      5.9%
+    cudaMemcpyAsync_v3020                                 4.1%
+    cudaDeviceSynchronize_v3020                           1.9%

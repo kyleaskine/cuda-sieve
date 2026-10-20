@@ -1,0 +1,11 @@
+Same-source rebuild (work/tdwait, after build2b.sh): exp/bench rebuilt with bench_kernels.cu
+touched and nothing else changed.
+  build2b exp      bbca78de8533ab16   15525280 bytes (saved as exp-bench.bbca78de)
+  rebuild, same    1f003609424abea9   15525280 bytes
+  differing bytes: 5 (cmp -l)
+nvcc builds here are not byte-reproducible (a few bytes differ per build, size unchanged),
+so build2b.sh's premise -- equal hashes after the cofac.cuh realignment -- was never a
+usable test, and its differing hashes (184d85c7 -> bbca78de etc.) say nothing. The
+realignment touched only a comment and the whitespace before CF_ENQ's backslashes (same
+line count); the fat bench/bench (8a6d543a), whose nvcc started 20 s before that edit,
+passed fat-check2 (abcheck 36/36, verify-only, fbtest).

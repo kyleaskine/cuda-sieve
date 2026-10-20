@@ -1660,7 +1660,9 @@ static int cof_enqueue(int blocks, int threads,
         k_cof_enqueue<A, B><<<blocks, threads>>>(cof0, bits0, cof1, bits1,    \
                                                  a, b, f0, fn0, f1, fn1,      \
                                                  n, base, lpb0, lpb1, *Q);    \
-        return 0;                                                             \
+        /* checked here: the caller's next CUDA call is the record pass's     \
+         * owed wait, which would otherwise report this launch as its own */  \
+        return CUDA_CHECKED(cudaGetLastError()) ? -1 : 0;                     \
     } while (0)
     switch (Q->L0 * 8 + Q->L1) {
     case 3 * 8 + 3: CF_ENQ(3, 3);

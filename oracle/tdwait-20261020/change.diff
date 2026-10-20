@@ -1,0 +1,403 @@
+diff --git a/bench/abcheck.sh b/bench/abcheck.sh
+index 2d7c580..6b0005f 100755
+--- a/bench/abcheck.sh
++++ b/bench/abcheck.sh
+@@ -19,7 +19,10 @@
+ #         cofactorisation. A change that loses a candidate the cofactoriser
+ #         would not have split leaves the final relations identical and still
+ #         fails here.
+-#   cof   the pipeline with --cofactor: the relation file a client returns.
++#   cof   the pipeline with --cofactor: the relation file a client returns,
++#         pipelined and single-queued. Under inline cofactorisation TD's
++#         record wait is paid after k_cof_enqueue is queued, and the two arms
++#         drain differently after it (finding 120).
+ #   stop  the same, stopped by --target-rels with the next q already issued
+ #         under --q-pipeline, so a q in flight has to be discarded. Under
+ #         --cofactor the count advances only when a flush of cofactorisation
+@@ -264,10 +267,15 @@ fi
+ 
+ echo "relations (pipeline --cofactor)"
+ ab c143            cof $C143 --logI 13 --J 8192 --nq "$(q 1000 300)"
++ab c143.single     cof $C143 --logI 13 --J 8192 --no-q-pipeline --nq "$(q 1000 300)"
+ ab c183            cof $C183 --logI 15 --qrange 130000000: --nq "$(q 200 50)"
+ ab c194            cof $C194 --nq "$(q 20 6)"
+-if [ $have_nfs = 1 ]; then ab nfs cof $NFS --nq "$(q 40 10)"
+-else skip nfs cof "no NFS job"; fi
++if [ $have_nfs = 1 ]; then
++    ab nfs         cof $NFS --nq "$(q 40 10)"
++    ab nfs.single  cof $NFS --no-q-pipeline --nq "$(q 10 4)"
++else
++    skip nfs cof "no NFS job"; skip nfs.single cof "no NFS job"
++fi
+ ab c143.target     stop $C143 --logI 13 --J 8192 --nq 3000 --target-rels "$(q 100000 40000)"
+ 
+ echo "$ncase cases: $((ncase - nfail - nskip)) identical, $nfail failed, $nskip skipped, $nwarn with overflow warnings"
+diff --git a/bench/cofac.cuh b/bench/cofac.cuh
+index 02ffd3e..a5c5cb9 100644
+--- a/bench/cofac.cuh
++++ b/bench/cofac.cuh
+@@ -1660,7 +1660,9 @@ static int cof_enqueue(int blocks, int threads,
+         k_cof_enqueue<A, B><<<blocks, threads>>>(cof0, bits0, cof1, bits1,    \
+                                                  a, b, f0, fn0, f1, fn1,      \
+                                                  n, base, lpb0, lpb1, *Q);    \
+-        return 0;                                                             \
++        /* checked here: the caller's next CUDA call is the record pass's     \
++         * owed wait, which would otherwise report this launch as its own */  \
++        return CUDA_CHECKED(cudaGetLastError()) ? -1 : 0;                     \
+     } while (0)
+     switch (Q->L0 * 8 + Q->L1) {
+     case 3 * 8 + 3: CF_ENQ(3, 3);
+diff --git a/bench/pipeline.cuh b/bench/pipeline.cuh
+index 6075a73..568d297 100644
+--- a/bench/pipeline.cuh
++++ b/bench/pipeline.cuh
+@@ -1198,6 +1198,10 @@ typedef struct {
+     uint8_t  *d_cbits[2], *h_cbits[2];
+     uint32_t *d_cfac[2], *h_cfac[2], *d_cfn[2], *h_cfn[2];
+     cudaEvent_t ev[16];
++    /* The record pass's wait (ev[13]) is owed: pipe_td_perq returned without
++     * it so the caller could queue k_cof_enqueue first. pipe_td_record_join
++     * pays it. Left owed only by the error exits that end the band. */
++    int rec_pending;
+ } pipe_td_t;
+ 
+ static void pipe_td_free(pipe_td_t *C)
+@@ -1547,6 +1551,21 @@ typedef struct {
+     uint32_t n;
+ } pipe_rpairs_t;
+ 
++/* The record pass's wait, when pipe_td_perq left it owed. Under inline
++ * cofactorisation nothing on the host reads the candidates, so the caller
++ * queues k_cof_enqueue behind the record pass first and waits here after:
++ * the card goes straight from one to the other instead of idling through the
++ * host's wake-up and two launches (0.7% of C143's wall idle, finding 120).
++ * The wait and tm->record are charged where they were, to trial division. */
++static int pipe_td_record_join(pipe_td_t *C, pipe_tm_t *tm)
++{
++    if (!C->rec_pending) return 0;
++    C->rec_pending = 0;
++    CK(cudaEventSynchronize(C->ev[13])); CK(cudaGetLastError());
++    tm->record += time_kernel(C->ev[12], C->ev[13]);
++    return 0;
++}
++
+ /* rp: side 0's pairs from k_record_scan, or NULL to walk side 0's factor base
+  * as side 1's always is. */
+ template <bool SLABBED>
+@@ -1570,6 +1589,12 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
+     const uint32_t nb = (ngroup + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
+ 
+     S[0] = S0; S[1] = S1;
++    /* The caller pays the record wait it was left, after queueing
++     * k_cof_enqueue, so on every path that continues the band nothing is owed
++     * here. Paying it anyway costs one test, and a future caller that forgot
++     * would otherwise lose that slab's tm->record to ev[12]/ev[13] being
++     * recorded again. */
++    if (pipe_td_record_join(C, tm)) return -1;
+ 
+     if (!ngroup || nbitword % TD_GROUP_W) {
+         fprintf(stderr,
+@@ -1848,14 +1873,13 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
+                 C->d_cfac[side], C->d_cfn[side], TD_FMAX, j_base);
+     }
+     CK(cudaEventRecord(E[13]));
+-    CK(cudaEventSynchronize(E[13])); CK(cudaGetLastError());
+-    tm->record += time_kernel(E[12], E[13]);
+ 
+     /* Counts the host loop used to produce, computed where the data already is.
+      * They ACCUMULATE across the band and are read at flush points, because a
+      * blocking 12-byte readback per q costs about as much as the ~618 bytes per
+      * candidate this change removes -- a device round trip per q is the thing
+-     * the rest of this pipeline is built to avoid. */
++     * the rest of this pipeline is built to avoid. Queued behind the record
++     * pass, before any wait for it. */
+     if (accumulate_stats) {
+         k_cand_stats<<<blocks, threads>>>(nacc, C->d_cbits[0], C->d_cbits[1],
+                                           C->d_cfn[0], C->d_cfn[1],
+@@ -1864,12 +1888,17 @@ static int pipe_td_perq(pipe_td_t *C, const qlat_t *L, const bench_cfg_t *cfg,
+         CK(cudaGetLastError());
+     }
+ 
+-    const double rb0 = host_ms();
+     /* `want_host` is false under inline cofactorisation with no candidate file:
+-     * the queue has already taken everything it needs straight from device
+-     * memory, so the ~618 bytes per candidate this used to move existed only to
+-     * be counted. k_cand_stats counts them in place. */
+-    if (!want_host) { tm->readback += host_ms() - rb0; return 0; }
++     * the queue takes everything it needs straight from device memory, so the
++     * ~618 bytes per candidate this used to move existed only to be counted
++     * (k_cand_stats counts them in place). Nothing here needs the record pass
++     * finished either, so its wait is left owed: the caller queues
++     * k_cof_enqueue behind it and then pays it (pipe_td_record_join). */
++    if (!want_host) { C->rec_pending = 1; return 0; }
++    CK(cudaEventSynchronize(E[13])); CK(cudaGetLastError());
++    tm->record += time_kernel(E[12], E[13]);
++
++    const double rb0 = host_ms();
+     CK(cudaMemcpy(C->h_ca, C->d_ca, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
+     CK(cudaMemcpy(C->h_cb, C->d_cb, (size_t)nacc * 8, cudaMemcpyDeviceToHost));
+     for (int s = 0; s < 2; s++) {
+@@ -2109,6 +2138,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+     /* Initialised: the done: block destroys whatever is non-NULL, and a CUDA
+      * failure can jump there from any stage before these are created. */
+     cudaEvent_t ea = NULL, eb = NULL;
++    /* --q-pipeline: the next sieve's wait on this slab's intersection and
++     * record scan (the issue point) */
++    cudaEvent_t eisect = NULL;
+     /* Resume state. base_rel/base_nq are what earlier sessions already put on
+      * disk: they are added to the goal tests and the progress line, and kept
+      * OUT of the band summary, whose per-q figures describe this session. */
+@@ -2181,6 +2213,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+     }
+     PIPE_CK(cudaEventCreate(&ea));
+     PIPE_CK(cudaEventCreate(&eb));
++    PIPE_CK(cudaEventCreateWithFlags(&eisect, cudaEventDisableTiming));
+ 
+     if (qgen)
+         printf("\n=== pipeline: both sides in one process, streaming special-q ===\n");
+@@ -3388,8 +3421,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+             PIPE_CK(cudaEventRecord(eb));
+             /* --resieve-scan: side 0's records on two-sided survivors, copied
+              * out HERE because the issue point below hands the bucket array
+-             * to the next fill before this slab's TD runs. Its counters ride
+-             * the same wait as the count. d_rsc[1] is the fill's own. */
++             * to the next fill (behind eisect) before this slab's TD runs.
++             * Its counters ride the same wait as the count. d_rsc[1] is the
++             * fill's own. */
+             if (rs_on) {
+                 PIPE_CK(cudaMemsetAsync(d_rsc, 0, 4, 0));
+                 k_record_scan<<<xmax >> cfg->log_region, PIPE_SCAN_THREADS>>>(
+@@ -3406,6 +3440,89 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+              * after the wait (finding 113). */
+             PIPE_CK(cudaMemcpyAsync(&C.h_rb->isect, d_n, 4,
+                                     cudaMemcpyDeviceToHost, 0));
++
++            /* ---- --q-pipeline issue point ----
++             *
++             * The next unit of work -- the next slab of this q, or after the
++             * last slab the next q -- is sieved on st_sv while this slab is
++             * trial-divided on the legacy stream. It is issued HERE, before
++             * the wait for the intersection below, so the card does not idle
++             * through that wait's round trip and the issue's launches (1.2% of
++             * C143's wall, finding 120). The next sieve overwrites what the
++             * work just queued reads -- both survbits (the intersection), the
++             * bucket array, its cursors and side 0's index (k_record_scan)
++             * and the index's overflow word d_rsc[1] (its copy) -- so st_sv
++             * first waits on eisect, recorded on the legacy stream after all
++             * of it (issue_behind_isect).
++             *
++             * The issue reads nothing that wait returns: the joins and any
++             * bucket-overflow skip came before, and TD reads none of it. One
++             * thing decided after the wait does change what the issued sieve
++             * may touch: the next fill is configured with side 0's index
++             * while rs_on, and a pair list that then fails to grow turns the
++             * scan off, so that branch drains st_sv before freeing the index.
++             * Any other decision below the wait that would reconfigure the
++             * next sieve needs the same drain.
++             *
++             * TD's view of each side (tdS1/tdS0) was taken before this slab's
++             * last join (views_and_prep), before anything moved. A next slab
++             * turns the walk cursors here (pside_rotate_walk); a next q was
++             * already prepared there, which swapped plat/rowrt (its
++             * k_transform would otherwise overwrite them under this q's
++             * resieve), so here it is only issued.
++             *
++             * Everything the loop top checks for the next q -- stop, ceiling,
++             * checkpoints -- still runs there, before any of its output is
++             * consumed; a q issued here and then not processed is simply
++             * drained at the loop exit and resumed from, never counted. */
++            auto issue_behind_isect = [&](uint32_t sl) -> int {
++                if (!CUDA_CHECKED(cudaEventRecord(eisect, 0)) &&
++                    !CUDA_CHECKED(cudaStreamWaitEvent(st_sv, eisect, 0)) &&
++                    !issue_ahead(sl))
++                    return 0;
++                /* This slab's intersection and record scan are still queued
++                 * on the legacy stream, so a fault in either can surface in
++                 * the issue's calls as easily as in its own -- the case
++                 * views_and_prep reports the same way. */
++                const cudaError_t e = cudaStreamSynchronize(0);
++                fprintf(stderr, "  q=%llu slab %u: the error above surfaced"
++                        " while issuing the next %s, with this slab's"
++                        " intersection still running (%s); either may be its"
++                        " source\n", (unsigned long long)cur->q, slab,
++                        sl ? "slab" : "q", cudaGetErrorString(e));
++                return -1;
++            };
++            if (qpipe && slab + 1 < slab_plan->nslab) {
++                /* The next slab of this q. Its fill starts from this slab's
++                 * output cursor; the cursor this slab started from stays with
++                 * its TD (tdS1/tdS0 above), so the three turn. plat and rowrt
++                 * belong to the whole q and are not touched. No stop or
++                 * budget check: a q is never left half-sieved, single-queued
++                 * or not. */
++                pside_rotate_walk(&S1);
++                pside_rotate_walk(&S0);
++                rotated = 1;
++                wd_phase("slab.issue_next");
++                if (issue_behind_isect(slab + 1)) { rc = -1; break; }
++                ahead = 1;
++                n_ahead_slab++;
++            } else if (qpipe && next_prepared) {
++                /* The next q, after this q's last slab, prepared before its
++                 * join (views_and_prep). Issued only if the stop flag is still
++                 * clear: a q prepared and not issued is consumed at the loop
++                 * top like any other, after the end-of-q drain below. */
++                if (next_ready && !g_pipe_stop) {
++                    wd_q(next_wq, next_wrho, (unsigned long long)nqdone);
++                    wd_phase("q.issue_next");
++                    if (issue_behind_isect(0)) { rc = -1; break; }
++                    wd_q((unsigned long long)cur->q, (unsigned long long)cur->rho,
++                         (unsigned long long)nqdone);
++                    spec_issued = 1;
++                    n_ahead_q++;
++                }
++            }
++
++            wd_phase("slab.intersect_wait");
+             PIPE_CK(cudaStreamSynchronize(0));
+             PIPE_CK(cudaGetLastError());
+             tis += time_kernel(ea, eb);
+@@ -3424,6 +3541,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+                 } else if (np > rs_pcap) {
+                     const uint32_t ncap = np + np / 2 + 1024;
+                     n_rs_grow++;
++                    /* The sieve issued above never touches the pair list, but
++                     * cudaFree may still wait it out. Growth is a band's
++                     * first-slab event (1M pairs to start, 75K-210K measured
++                     * per slab, finding 118), so that stall is left alone. */
+                     cudaFree(rp_x); cudaFree(rp_p);
+                     rp_x = rp_p = NULL;
+                     cudaError_t e = PIPE_RS_TEST_GROW_FAIL
+@@ -3436,9 +3557,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+                         /* Off for the band, and everything only the scan
+                          * used goes back too -- the index is 0.67 GB at I16,
+                          * and the TD buffers that grow later want it more.
+-                         * Nothing still reads it: this slab's fill is joined
+-                         * and the next is issued only below, without it. */
++                         * The next sieve, issued above, still writes the
++                         * index and d_rsc[1]: drain it first. Then nothing
++                         * reads them -- this slab's scan is done, the next
++                         * slab is not scanned (rs_on), and later fills are
++                         * issued without the index. */
+                         cudaGetLastError();
++                        if (st_sv && CUDA_CHECKED(cudaStreamSynchronize(st_sv))) {
++                            rc = -1; break;
++                        }
+                         cudaFree(rp_x); cudaFree(rp_p);
+                         cudaFree(d_ridx); cudaFree(d_rsc);
+                         rp_x = rp_p = d_ridx = d_rsc = NULL;
+@@ -3456,53 +3583,6 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+                 }
+             }
+ 
+-            /* ---- --q-pipeline issue point ----
+-             *
+-             * This slab's sieve and intersection are complete and nothing
+-             * reads its survbits again, so the next unit of work -- the next
+-             * slab of this q, or after the last slab the next q -- can be
+-             * sieved on st_sv while this slab is trial-divided on the legacy
+-             * stream. TD's view of each side (tdS1/tdS0) was taken before this
+-             * slab's last join (views_and_prep), before anything moved. A next
+-             * slab turns the walk cursors here (pside_rotate_walk); a next q
+-             * was already prepared there, which swapped plat/rowrt (its
+-             * k_transform would otherwise overwrite them under this q's
+-             * resieve), so here it is only issued.
+-             *
+-             * Everything the loop top checks for the next q -- stop, ceiling,
+-             * checkpoints -- still runs there, before any of its output is
+-             * consumed; a q issued here and then not processed is simply
+-             * drained at the loop exit and resumed from, never counted. */
+-            if (qpipe && slab + 1 < slab_plan->nslab) {
+-                /* The next slab of this q. Its fill starts from this slab's
+-                 * output cursor; the cursor this slab started from stays with
+-                 * its TD (tdS1/tdS0 above), so the three turn. plat and rowrt
+-                 * belong to the whole q and are not touched. No stop or
+-                 * budget check: a q is never left half-sieved, single-queued
+-                 * or not. */
+-                pside_rotate_walk(&S1);
+-                pside_rotate_walk(&S0);
+-                rotated = 1;
+-                wd_phase("slab.issue_next");
+-                if (issue_ahead(slab + 1)) { rc = -1; break; }
+-                ahead = 1;
+-                n_ahead_slab++;
+-            } else if (qpipe && next_prepared) {
+-                /* The next q, after this q's last slab, prepared before its
+-                 * join (views_and_prep). Issued only if the stop flag is still
+-                 * clear: a q prepared and not issued is consumed at the loop
+-                 * top like any other, after the end-of-q drain below. */
+-                if (next_ready && !g_pipe_stop) {
+-                    wd_q(next_wq, next_wrho, (unsigned long long)nqdone);
+-                    wd_phase("q.issue_next");
+-                    if (issue_ahead(0)) { rc = -1; break; }
+-                    wd_q((unsigned long long)cur->q, (unsigned long long)cur->rho,
+-                         (unsigned long long)nqdone);
+-                    spec_issued = 1;
+-                    n_ahead_q++;
+-                }
+-            }
+-
+             td_start = host_ms();
+             tv_before = tv;
+             {
+@@ -3561,12 +3641,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+             nacc += nacc_s;
+ 
+             cf_start = host_ms();
++            /* The record pass's owed wait (pipe_td_record_join), charged to
++             * trial division as it was inside pipe_td_perq, not to the
++             * cofactor stage whose bracket it now sits in. A no-op when
++             * nothing is owed. */
++            double cf_td = 0;
++            auto td_record_join = [&]() -> int {
++                const double j0 = host_ms();
++                const int r = pipe_td_record_join(&C, &tm);
++                cf_td += host_ms() - j0;
++                return r;
++            };
+             /* A queue flush is safe inside a q, but it is NOT a new resume
+              * point once an earlier slab of this q has been emitted. Resume
+              * truncates to the previous whole-q checkpoint, so a crash still
+              * replays the q atomically. */
+             if (cfg->cofactor && nacc_s) {
+                 if (Q.n + nacc_s > Q.cap) {
++                    /* before the flush, so its synchronous work is not
++                     * charged with this slab's record pass */
++                    if (td_record_join()) { rc = -1; break; }
+                     wd_phase("slab.cofq_flush");
+                     if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0,
+                                    cfg->lim, cfg->lpb, cfg->cof_rounds,
+@@ -3595,6 +3689,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+                                 nacc_s, Q.n, cfg->lpb0, cfg->lpb, &Q)) {
+                     rc = -1; break;
+                 }
++                /* The enqueue is queued, so the card has work through this
++                 * wait and the one below. */
++                if (td_record_join()) { rc = -1; break; }
+                 /* Under --q-pipeline the next slab or q is usually sieving on
+                  * st_sv, which a device-wide sync would wait out; the enqueue
+                  * is all on the legacy stream, so that is the stream to drain. */
+@@ -3603,7 +3700,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
+                     CUDA_CHECKED(cudaGetLastError())) { rc = -1; break; }
+                 Q.n += nacc_s;
+             }
+-            tm.cofac += host_ms() - cf_start;
++            /* Nothing is owed here: pipe_td_perq leaves the record wait owed
++             * only when this slab has candidates and they are cofactored
++             * inline rather than written out (want_host == 0), which is the
++             * block above, and its one way through pays it. Its breaks leave
++             * it owed and end the band, where pipe_td_free's cudaFree waits
++             * the record pass out. */
++            acc_td += cf_td;
++            tm.cofac += host_ms() - cf_start - cf_td;
+ 
+             join_start = host_ms();
+             wd_phase("slab.join");
+@@ -4681,6 +4785,7 @@ done:
+     if (escan) cudaEventDestroy(escan);
+     if (ea) cudaEventDestroy(ea);
+     if (eb) cudaEventDestroy(eb);
++    if (eisect) cudaEventDestroy(eisect);
+     if (qspan0) cudaEventDestroy(qspan0);
+     if (qspan1) cudaEventDestroy(qspan1);
+     /* ONE place maps the band's four outcomes onto the return code, and it is

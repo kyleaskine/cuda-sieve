@@ -1,0 +1,10 @@
+bin sha256 ee5063ad250dab47  HEAD 2128138  load=10.13
+c143 qp: exit=0  wall clock per q, COMPLETE 6.71 ms load=10.27
+c143 single: exit=0  wall clock per q, COMPLETE 8.41 ms load=10.30
+i16 qp: exit=0  wall clock per q, COMPLETE 192.82 ms load=10.45
+i16 single: exit=0  wall clock per q, COMPLETE 207.87 ms load=10.64
+exported new-c143-qp.nsys-rep: 0
+exported new-c143-single.nsys-rep: 0
+exported new-i16-qp.nsys-rep: 0
+exported new-i16-single.nsys-rep: 0
+failures: 0

@@ -1,0 +1,10 @@
+bench/bench sha256 77f1ababdf8a14ba  HEAD 2128138  load=9.41
+c143 qp: exit=0  wall clock per q, COMPLETE 7.13 ms load=9.80
+c143 single: exit=0  wall clock per q, COMPLETE 8.67 ms load=10.05
+i16 qp: exit=0  wall clock per q, COMPLETE 193.56 ms load=10.16
+i16 single: exit=0  wall clock per q, COMPLETE 209.05 ms load=10.10
+exported c143-qp.nsys-rep: 0
+exported c143-single.nsys-rep: 0
+exported i16-qp.nsys-rep: 0
+exported i16-single.nsys-rep: 0
+failures: 0

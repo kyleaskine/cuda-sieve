@@ -19,7 +19,10 @@
 #         cofactorisation. A change that loses a candidate the cofactoriser
 #         would not have split leaves the final relations identical and still
 #         fails here.
-#   cof   the pipeline with --cofactor: the relation file a client returns.
+#   cof   the pipeline with --cofactor: the relation file a client returns,
+#         pipelined and single-queued. Under inline cofactorisation TD's
+#         record wait is paid after k_cof_enqueue is queued, and the two arms
+#         drain differently after it (finding 120).
 #   stop  the same, stopped by --target-rels with the next q already issued
 #         under --q-pipeline, so a q in flight has to be discarded. Under
 #         --cofactor the count advances only when a flush of cofactorisation
@@ -264,10 +267,15 @@ fi
 
 echo "relations (pipeline --cofactor)"
 ab c143            cof $C143 --logI 13 --J 8192 --nq "$(q 1000 300)"
+ab c143.single     cof $C143 --logI 13 --J 8192 --no-q-pipeline --nq "$(q 1000 300)"
 ab c183            cof $C183 --logI 15 --qrange 130000000: --nq "$(q 200 50)"
 ab c194            cof $C194 --nq "$(q 20 6)"
-if [ $have_nfs = 1 ]; then ab nfs cof $NFS --nq "$(q 40 10)"
-else skip nfs cof "no NFS job"; fi
+if [ $have_nfs = 1 ]; then
+    ab nfs         cof $NFS --nq "$(q 40 10)"
+    ab nfs.single  cof $NFS --no-q-pipeline --nq "$(q 10 4)"
+else
+    skip nfs cof "no NFS job"; skip nfs.single cof "no NFS job"
+fi
 ab c143.target     stop $C143 --logI 13 --J 8192 --nq 3000 --target-rels "$(q 100000 40000)"
 
 echo "$ncase cases: $((ncase - nfail - nskip)) identical, $nfail failed, $nskip skipped, $nwarn with overflow warnings"
