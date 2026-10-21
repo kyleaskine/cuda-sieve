@@ -1,0 +1,102 @@
+=== cuda-sieve bucket-fill benchmark ===
+polynomial c135.job: algebraic degree 5, skew 2.954e+04
+  job file: rlim 9000000, alim 12000000, lpbr 29, lpba 30, mfbr 55, mfba 58
+grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 4608 x 32 for fill (absolute, not per SM)
+band: generated prime special-q roots on side 1 in [7000000, 7100000]
+  norm setup: deg 5, A=1.4310e+09 B=9.0112e+04, log2(maxnorm)=157.37, scale=1.000  (sq side: log2(q) divided out)
+  normalised coeffs d[0..5] = -0.192 -1 -0.629 0.936 0.0931 0.00195
+  norm setup: deg 1, A=1.4310e+09 B=9.0112e+04, log2(maxnorm)=103.39, scale=1.000
+  normalised coeffs d[0..1] = -1 0.0315
+params from q=7000033: side 1 log2(maxnorm)=157.37 scale=1.600 allowance=58.20 bound=94
+                    side 0 log2(maxnorm)=103.39 scale=2.450 allowance=54.81 bound=135
+text factor base c135.roots1.m13: 788244 ideals (788145 prime, 99 prime-power) at scale 1.600
+rational factor base: 602539 ideals up to 9000000 (50 prime-power of which 1 projective, 7 projective primes) at scale 2.450
+
+side 1 (algebraic): bucketed 8192 <= p < 12000000 : 787081 entries, line-sieved 1163
+side 0 (rational) : bucketed 8192 <= p < 9000000 : 601461 entries, line-sieved 1078
+
+=== pipeline: both sides in one process, streaming special-q ===
+  bucket array 4096 x 5842 x 4 B = 0.09 GB, shared by both sides (10.76 GB free)
+  large-prime list 16 records per survivor (PIPE_K)
+  device memory by stage:
+    bucket array                   0.09 GB   (10.67 GB free)
+    factor bases + bitmaps         0.06 GB   (10.61 GB free)
+    trial division context         0.02 GB   (10.59 GB free)
+  cofactor width: side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
+  cofactor method: side 0 rho, side 1 rho
+    cofactor queue                 0.15 GB   (10.44 GB free)
+  --q-pipeline: two special-q in flight, a second transform set (0.03 GB)
+  NOTE: stage times now include sharing the card with the other q; only wall clock per q is additive, and `unaccounted` and GPU-accounted / wall are not reported
+    q-pipeline transform set       0.03 GB   (10.41 GB free)
+  --resieve-scan: side 0 resieved from its own records; index 4096 x 2921 x 4 B = 0.04 GB, pair list 1048576
+    side-0 record index            0.05 GB   (10.35 GB free)
+  --fill-rows 4: q < 4*I filled by row (side 1: 2478 entries, side 0: 2484), auto row bands
+  --resieve-rows: the same tier is resieved by row
+  --fill-gate: side 0 stores fill records only under side 1's survivors, 1 gate bit per 8 positions
+  norm setup: deg 5, A=1.4310e+09 B=9.0112e+04, log2(maxnorm)=157.37, scale=1.600  (sq side: log2(q) divided out)
+  normalised coeffs d[0..5] = -0.192 -1 -0.629 0.936 0.0931 0.00195
+  norm setup: deg 1, A=1.4310e+09 B=9.0112e+04, log2(maxnorm)=103.39, scale=2.450
+  normalised coeffs d[0..1] = -1 0.0315
+
+  --- first-q validation (excluded from the band timing) ---
+    side 1: factors x cofactor == norm  953 of 953  PASS   (most factors 24 of 64)
+    side 0: factors x cofactor == norm  989 of 989  PASS   (most factors 17 of 64)
+  --- validation took 3.6 ms ---
+
+  cofactor chunk: 73728 records/launch, 2 launches per round over 131070 records (auto)
+    q=7099991  6456 q  589819 rel +20690 cand  [q range exhausted]
+
+  device memory, steady state: 1.56 GB in use of 11.91 GB (10.35 GB free)
+
+
+  --- band of 6456 special-q ---
+  (first-q reconstruction gate: 3.6 ms, excluded below)
+  wall clock per q                       3.77 ms
+    sieve, both sides                    2.75 ms
+      transform + plattice              0.195 ms
+      fill                              1.346 ms
+      apply                             1.205 ms
+    intersect + gcd                     0.055 ms
+    side-0 record scan                  0.037 ms
+    host per-q (sieve tables, staging)    0.258 ms
+    TD + classify, wall                  2.05 ms   <- of which, on the device:
+      rank scan (shared)                0.102 ms
+      emit (x,a,b), rank order (shared)    0.085 ms
+      survivor filter (shared)          0.044 ms
+      resieve + scatter, both sides     0.543 ms
+      norms + trial division, both sides    0.516 ms
+      classify, both sides              0.384 ms
+      joint accept + compact            0.084 ms
+      record candidate factorisations    0.268 ms
+      = device total                    2.026 ms
+      host: small-prime tables          0.152 ms
+      host: readback of candidates      0.000 ms
+      host: unaccounted                -0.132 ms
+    join and emit                        0.00 ms
+    cofactorisation, in-loop flushes     0.48 ms
+    unaccounted                           n/a
+  GPU-accounted / wall (excl cofac)       n/a
+  issued ahead (--q-pipeline)        0 slab(s), 6455 q
+  prepared during trial division     2672 of those q (--q-prep auto)
+  side 0 from its records            6456 slab(s); walked: 0 index full, 0 pair list grown
+  two-sided primitive survivors/q      6099.2
+  cofactorisation candidates/q         124.70
+  COMPLETE RELATIONS/q                 20.542
+  total relations                      132617
+  total candidates                     805089
+
+  --- cofactorisation, cross-q queue ---
+  rational queue                         0.07 ms
+  algebraic queue                        0.16 ms
+  readback + emit of relations          0.200 ms
+    = device time per q                  0.43 ms
+  wall: in-loop flushes                  0.48 ms
+  wall: final flush after the band       0.02 ms
+  records enqueued                     937706  (of which 132617 needed no splitting)
+    side 0: split / dead / stuck       834766 / 102940 / 0
+    side 1: split / dead / stuck       630794 / 306912 / 0
+  ALL RELATIONS/q                       93.42
+    of which, from cofactorisation      72.88
+  total relations                      603136
+  wall clock per q, COMPLETE             3.79 ms

@@ -1,0 +1,18 @@
+C143 base r1 rc=0 6.69 ms  td-prep  load=14.71
+C143 join r1 rc=0 6.57 ms  td-prep 0 load=14.57
+C143 auto r1 rc=0 6.52 ms  td-prep 1139 load=14.67
+C135 base r1 rc=0 5.09 ms  td-prep  load=15.27
+C135 join r1 rc=0 4.87 ms  td-prep 0 load=15.11
+C135 auto r1 rc=0 3.96 ms  td-prep 2996 load=15.15
+C143 auto r2 rc=0 6.62 ms  td-prep 1147 load=15.18
+C143 base r2 rc=0 6.47 ms  td-prep  load=15.08
+C143 join r2 rc=0 7.73 ms  td-prep 0 load=15.00
+C135 auto r2 rc=0 4.10 ms  td-prep 3037 load=15.06
+C135 base r2 rc=0 4.65 ms  td-prep  load=14.92
+C135 join r2 rc=0 4.27 ms  td-prep 0 load=14.67
+C143 join r3 rc=0 7.01 ms  td-prep 0 load=14.91
+C143 auto r3 rc=0 6.80 ms  td-prep 1178 load=15.01
+C143 base r3 rc=0 6.71 ms  td-prep  load=15.18
+C135 join r3 rc=0 4.26 ms  td-prep 0 load=15.07
+C135 auto r3 rc=0 4.32 ms  td-prep 3076 load=14.71
+C135 base r3 rc=0 4.49 ms  td-prep  load=15.09

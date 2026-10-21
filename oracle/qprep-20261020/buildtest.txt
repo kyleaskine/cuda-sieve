@@ -1,0 +1,4 @@
+growfail: exit 0, 0 warning line(s), sha256 bfed750e20906dce
+pk8: exit 0, 0 warning line(s), sha256 cdfcf6dfb5740f35
+build failures: 0
+exit 0

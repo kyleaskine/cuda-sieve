@@ -1,0 +1,49 @@
+C143 base r1 wall     6.28 | td-prep       | sm=2873 p=176W load=10.58 idle=0% rc=0
+C143 join r1 wall     6.15 | td-prep     0 | sm=2889 p=191W load=10.50 idle=0% rc=0
+C143 auto r1 wall     6.07 | td-prep   925 | sm=2888 p=192W load=10.53 idle=0% rc=0
+C143 td   r1 wall     6.45 | td-prep  2999 | sm=2895 p=184W load=10.44 idle=0% rc=0
+C143 join r2 wall     6.11 | td-prep     0 | sm=2901 p=200W load=10.35 idle=0% rc=0
+C143 auto r2 wall     6.09 | td-prep   945 | sm=2901 p=199W load=10.55 idle=0% rc=0
+C143 td   r2 wall     6.32 | td-prep  2999 | sm=2903 p=193W load=10.45 idle=0% rc=0
+C143 base r2 wall     6.14 | td-prep       | sm=2901 p=199W load=10.48 idle=0% rc=0
+C143 auto r3 wall     6.07 | td-prep   891 | sm=2901 p=200W load=10.59 idle=0% rc=0
+C143 td   r3 wall     6.41 | td-prep  2999 | sm=2903 p=192W load=10.33 idle=0% rc=0
+C143 base r3 wall     6.11 | td-prep       | sm=2900 p=200W load=10.52 idle=0% rc=0
+C143 join r3 wall     6.12 | td-prep     0 | sm=2901 p=201W load=10.37 idle=0% rc=0
+C143 td   r4 wall     6.46 | td-prep  2999 | sm=2902 p=193W load=10.57 idle=0% rc=0
+C143 base r4 wall     6.11 | td-prep       | sm=2901 p=200W load=10.68 idle=0% rc=0
+C143 join r4 wall     6.43 | td-prep     0 | sm=2901 p=194W load=10.45 idle=0% rc=0
+C143 auto r4 wall     6.21 | td-prep   979 | sm=2899 p=197W load=10.32 idle=0% rc=0
+C143 base r5 wall     6.20 | td-prep       | sm=2900 p=199W load=10.30 idle=0% rc=0
+C143 join r5 wall     6.16 | td-prep     0 | sm=2900 p=200W load=10.21 idle=0% rc=0
+C143 auto r5 wall     6.12 | td-prep   951 | sm=2901 p=200W load=10.55 idle=0% rc=0
+C143 td   r5 wall     6.57 | td-prep  2999 | sm=2903 p=190W load=10.39 idle=0% rc=0
+NFS  base r1 wall   178.61 | td-prep       | sm=2789 p=166W load=10.20 idle=0% rc=0
+NFS  auto r1 wall   178.35 | td-prep    67 | sm=2785 p=167W load=10.13 idle=0% rc=0
+NFS  td   r1 wall   178.37 | td-prep    79 | sm=2788 p=167W load=10.35 idle=0% rc=0
+C194 base r1 wall   196.55 | td-prep       | sm=2830 p=185W load=10.71 idle=0% rc=0
+C194 auto r1 wall   195.64 | td-prep    59 | sm=2831 p=186W load=10.53 idle=0% rc=0
+C194 td   r1 wall   195.85 | td-prep    59 | sm=2824 p=184W load=10.97 idle=0% rc=0
+C183 base r1 wall    51.90 | td-prep       | sm=2867 p=198W load=10.75 idle=0% rc=0
+C183 auto r1 wall    51.24 | td-prep    96 | sm=2865 p=201W load=10.58 idle=0% rc=0
+C183 td   r1 wall    51.96 | td-prep   199 | sm=2865 p=201W load=10.45 idle=0% rc=0
+NFS  auto r2 wall   178.11 | td-prep    70 | sm=2793 p=168W load=10.59 idle=0% rc=0
+NFS  td   r2 wall   179.74 | td-prep    79 | sm=2796 p=168W load=10.52 idle=0% rc=0
+NFS  base r2 wall   179.91 | td-prep       | sm=2793 p=168W load=10.47 idle=0% rc=0
+C194 auto r2 wall   194.49 | td-prep    59 | sm=2821 p=184W load=10.44 idle=0% rc=0
+C194 td   r2 wall   198.18 | td-prep    59 | sm=2830 p=185W load=10.25 idle=0% rc=0
+C194 base r2 wall   196.38 | td-prep       | sm=2835 p=185W load=10.43 idle=0% rc=0
+C183 auto r2 wall    51.78 | td-prep    99 | sm=2854 p=200W load=10.33 idle=0% rc=0
+C183 td   r2 wall    51.96 | td-prep   199 | sm=2864 p=200W load=10.34 idle=0% rc=0
+C183 base r2 wall    52.24 | td-prep       | sm=2867 p=199W load=10.75 idle=0% rc=0
+NFS  td   r3 wall   178.83 | td-prep    79 | sm=2791 p=168W load=10.63 idle=0% rc=0
+NFS  base r3 wall   181.27 | td-prep       | sm=2788 p=168W load=10.41 idle=0% rc=0
+NFS  auto r3 wall   179.39 | td-prep    69 | sm=2792 p=168W load=10.27 idle=0% rc=0
+C194 td   r3 wall   195.06 | td-prep    59 | sm=2830 p=184W load=10.27 idle=0% rc=0
+C194 base r3 wall   197.17 | td-prep       | sm=2825 p=184W load=10.29 idle=0% rc=0
+C194 auto r3 wall   200.89 | td-prep    59 | sm=2822 p=177W load=10.89 idle=0% rc=0
+C183 td   r3 wall    53.15 | td-prep   199 | sm=2849 p=192W load=12.06 idle=0% rc=0
+C183 base r3 wall    52.84 | td-prep       | sm=2848 p=192W load=12.71 idle=0% rc=0
+C183 auto r3 wall    53.50 | td-prep   117 | sm=2838 p=184W load=13.28 idle=0% rc=0
+done: 0 failed run(s)
+timing exit 0

@@ -1,0 +1,10 @@
+base r1 total  31.48s |  6456 q | per q 4.53 ms, COMPLETE 4.56 ms | 603136 rels (93.42/q) | load=14.11 idle=0% rc=0
+join r1 total  29.52s |  6456 q | per q 4.21 ms, COMPLETE 4.23 ms | 603136 rels (93.42/q) | load=12.91 idle=0% rc=0
+auto r1 total  28.34s |  6456 q | per q 4.03 ms, COMPLETE 4.05 ms | 603136 rels (93.42/q) | load=12.48 idle=0% rc=0
+td   r1 total  29.67s |  6456 q | per q 4.27 ms, COMPLETE 4.29 ms | 603136 rels (93.42/q) | load=11.72 idle=0% rc=0
+td   r2 total  34.63s |  6456 q | per q 5.13 ms, COMPLETE 5.15 ms | 603136 rels (93.42/q) | load=11.78 idle=1% rc=0
+auto r2 total  44.60s |  6456 q | per q 6.92 ms, COMPLETE 6.95 ms | 603136 rels (93.42/q) | load=11.63 idle=1% rc=0
+join r2 total  41.49s |  6456 q | per q 6.35 ms, COMPLETE 6.37 ms | 603136 rels (93.42/q) | load=11.30 idle=1% rc=0
+base r2 total  26.28s |  6456 q | per q 4.01 ms, COMPLETE 4.03 ms | 603136 rels (93.42/q) | load=11.03 idle=2% rc=0
+done: 0 failed
+exit 0

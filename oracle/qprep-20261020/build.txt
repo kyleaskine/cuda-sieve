@@ -1,0 +1,18 @@
+tree: f09c2b4 (finding 120, committed) + this change; change.diff is this change alone, and
+      equals `git diff f09c2b4 -- bench/pipeline.cuh bench/bench.h bench/bench_main.cu`
+identity base: work/abcheck/bench.2128138 = the committed fat bench/bench, sha256 77f1ababdf8a14ba
+timing base:   work/tdwait/exp/bench/bench, finding 120's source, GPU_ARCH=120, sha256 1f003609424abea9
+new:   work/qprep/exp/bench/bench, GPU_ARCH=120, sha256 ee51a949a372bb29, 0 warnings
+growfail: work/qprep/growfail, DEFS=-DPIPE_RS_TEST_GROW_FAIL=1, sha256 bfed750e20906dce, 0 warnings
+pk8:   work/qprep/pk8, PIPE_K=8, sha256 cdfcf6dfb5740f35, 0 warnings
+bn4:   work/qprep/bn4, BN_LIMBS=4 (bench and normscan, for skipcheck), sha256 f36cd9ff899da772, 0 warnings
+fat:   built in a copy of the tree (work/qprep/fat/bench, the tree's objects carried over) while the
+       gates ran, installed only after they passed: bench/bench 5e975e96e700055e, 6 archs, 0 warnings,
+       built 2026-10-20 16:39:29; its objects and stamps copied back, so `make` in bench/ is up to date.
+       The first attempt stopped at boinc_support.cpp (not copied); the resumed build kept the objects.
+       Previous bench/bench (finding 120, 8a6d543a) saved as work/qprep/bench.8a6d543a.
+flags: -DCF_LMAX=4 -DBN_LIMBS=12 -DPIPE_K=16 (Makefile defaults) except where named
+c135:  Kyle's cado-gpu run in /home/kylea/cado-gpu/c136-934760359018 (c135.log, c135.poly,
+       c135.parameters_snapshot.0); cado-wu.txt is each workunit's q0, relations, r/sq and elapsed s
+       from that log. c135.job is ours for the same parameters.
+traces: nsys at host load 14-15, distorted (see RESULTS); .nsys-rep/.sqlite kept in work/qprep/nsys/

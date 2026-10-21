@@ -1,0 +1,48 @@
+=== cuda-sieve bucket-fill benchmark ===
+polynomial c135.job: algebraic degree 5, skew 2.954e+04
+  job file: rlim 9000000, alim 12000000, lpbr 29, lpba 30, mfbr 55, mfba 58
+grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 4608 x 32 for fill (absolute, not per SM)
+fill concurrency: 3 workspaces on 3 streams  [--fill-streams]
+text factor base c135.roots1.m13: 788244 ideals (788145 prime, 99 prime-power) at scale 1.000
+  bucketed  8192 <= p < 120000011 : 787081 entries
+  line-sieved       p < 8192 (plus every p^k, k>=2) : 1163 entries
+q-lattice q=120000011 basis (a0,a1,b0,b1) = (232193,-27,-4074656,-43), det=-120000011
+  NOTE: rho is synthetic (no root of f mod q computed here). The basis is
+  a genuine reduced q-lattice basis of the right shape, and transformed
+  roots are uniform mod p either way, so fill volume and distribution are
+  representative. Pass --rho to match a real las special-q.
+
+sieve area I=2^13 x J=4096 = 3.355e+07 positions; region 2^13; 4096 regions
+mode=atomic record=4B threads=256 reps=3
+
+  norm setup: deg 5, A=1.7641e+10 B=2.8672e+05, log2(maxnorm)=167.39, scale=1.000  (sq side: log2(q) divided out)
+  normalised coeffs d[0..5] = -0.00353 -0.0712 -0.174 1 0.385 0.0313
+  device memory: 10.76 GB free of 11.91 GB
+  factor base cut into 15 slices (padded to 16), log p in [13,24] bits
+  small sieve: 1163 entries (58 block-tier m<64, 196 warp-tier m<1024, 909 thread-tier), 12 with a row divisor, 15 projective, 2.546e+08 updates
+  init T at (i=0, j=J/2) = 161; survivor bound = 113 (scale 1.000 x 112.00 bits)
+  transformed roots: 0 row-confined (g > 1), 0 positions lost
+  analytic records : 1.989e+07   (sized with 1.15x margin)
+  single-level: 4096 buckets x cap 5842 x 4 B = 0.09 GB
+
+  --- fill concurrency, 3 workspaces (item 1) ---
+  extra workspaces need 0.21 GB of 10.64 GB free
+  best of 3 passes x 3 reps, arms interleaved
+  CONCURRENT  3 x  4608 blocks, 3 streams :    2.502 ms  =   0.834 ms per workspace
+  SERIAL      3 x  4608 blocks, one stream :    3.647 ms  =   1.216 ms per workspace
+  WIDE        1 x 13824 blocks, ONE workspace:    1.202 ms  =   1.202 ms per workspace
+  concurrent/serial 0.6861   (<1 = one kernel cannot feed this card; same work, only the streams differ)
+  concurrent vs the best single kernel: 0.7013  (wide 1.202, single 1.189 ms per workspace)
+  records landed   : 19876919   (max bucket 5083, mean 4853 -> imbalance 1.05x)
+
+  apply: 4096 regions x 8192 cells x 16 bit = 16416 B smem/block, 512 threads, smem atomicAdd, norm=horner
+  survivors: 7973834 of 33554432 positions (1 in 4.208e+00)
+
+  transform + plattice (T)      0.080 ms
+  fill: atomic single-level     1.189 ms
+  apply (init+add+scan)         0.801 ms
+  SIEVE CHAIN ms/special-q      2.071 ms
+  host per-q work               0.307 ms  (transform 0.069 + sort 0.021 + H2D 0.218)
+  ns per record (fill)           0.06
+  ns per record (apply)          0.04

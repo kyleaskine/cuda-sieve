@@ -1,0 +1,23 @@
+== ../fillahead/tr-two3.sqlite: idle 0.499 s of 5.281 s window (9.5%)
+  last kernel -> next kernel                                      idle   gaps  mean us
+  k_intersect_compact -> k_apply                                  2.0%   1398     73.9
+  k_cof_enqueue -> k_intersect_compact                            1.8%   1230     79.2
+  k_record_scan -> k_gate_fold                                    1.5%   1318     58.8
+  k_scatter_sel -> k_gather_ab                                    0.9%    617     73.9
+  k_scatter_sel -> k_transform                                    0.4%    118    187.6
+  k_fill_atomic -> k_intersect_compact                            0.3%    197     81.8
+  k_transform -> k_fill_rows                                      0.3%    168     88.6
+  k_apply -> k_gate_fold                                          0.3%    277     48.8
+  k_fill_atomic -> k_apply                                        0.2%    304     42.1
+  k_gate_fold -> k_fill_rows                                      0.2%   1577      7.7
+  k_gather_ab -> k_td_record_warp                                 0.2%    880     12.8
+  k_fill_atomic -> k_gather_ab                                    0.2%    260     42.5
+  host CUDA calls in progress during the idle time (share of idle):
+    cudaLaunchKernel_v7000                               27.6%
+    cudaEventRecord_v3020                                24.3%
+    cudaMemcpyAsync_v3020                                10.9%
+    cudaStreamSynchronize_v3020                           9.5%
+    cudaMemsetAsync_v3020                                 9.4%
+    cudaMemset_v3020                                      5.1%
+    cudaEventSynchronize_v3020                            3.9%
+    cudaStreamWaitEvent_v3020                             0.8%

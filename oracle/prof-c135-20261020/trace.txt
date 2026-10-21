@@ -1,0 +1,4 @@
+ours:  wall clock per q, COMPLETE 3.85 ms load=3.27
+cado: # Total 90924 reports [0.000035s/r, 71.65r/sq] in 3.21 elapsed s [678.0% CPU] load=3.17
+failures: 0
+exit 0

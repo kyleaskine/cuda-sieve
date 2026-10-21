@@ -309,6 +309,15 @@ static void usage(void)
 "                   special-q while this one is trial-divided. Falls back to\n"
 "                   one at a time when its extra VRAM does not fit\n"
 "                   [on, off under --fill-concurrent/--qspan]\n"
+"  --q-prep join|auto|td  where --q-pipeline prepares the next special-q:\n"
+"                   before this one's last join, during its trial division,\n"
+"                   or (auto) during TD only when the sieve has already\n"
+"                   finished by the join. Output-identical          [auto]\n"
+"  --fill-ahead / --no-fill-ahead  --q-pipeline, one slab per q: run the\n"
+"                   next special-q's transforms and side-1 fill as soon as\n"
+"                   it is prepared, under this one's sieve and TD. Costs a\n"
+"                   second bucket array; off when it does not fit or the\n"
+"                   plan has several slabs per q   [on with --q-pipeline]\n"
 "  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
@@ -1019,6 +1028,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
     cfg.resieve_scan = -1; cfg.resieve_scan_cap = 0; cfg.resieve_scan_pairs = 0;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
+    cfg.fill_ahead = -1;   /* resolved with --q-pipeline */
+    cfg.q_prep = PIPE_QPREP_AUTO;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
 
@@ -1077,6 +1088,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     int maxbits = 0, maxbits_set = 0;
     int sieve_skip_set = 0;
     int fill_row_bands_set = 0, fill_gate_shift_set = 0, resieve_scan_knob = 0;
+    int q_prep_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
@@ -1176,6 +1188,19 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-resieve-rows")) { cfg.resieve_rows = 0; }
         else if (!strcmp(argv[i], "--q-pipeline")) { cfg.q_pipeline = 1; }
         else if (!strcmp(argv[i], "--no-q-pipeline")) { cfg.q_pipeline = 0; }
+        else if (!strcmp(argv[i], "--q-prep") && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(v, "join")) cfg.q_prep = PIPE_QPREP_JOIN;
+            else if (!strcmp(v, "auto")) cfg.q_prep = PIPE_QPREP_AUTO;
+            else if (!strcmp(v, "td")) cfg.q_prep = PIPE_QPREP_TD;
+            else {
+                fprintf(stderr, "--q-prep %s: expected join, auto or td\n", v);
+                return 1;
+            }
+            q_prep_set = 1;
+        }
+        else if (!strcmp(argv[i], "--fill-ahead")) { cfg.fill_ahead = 1; }
+        else if (!strcmp(argv[i], "--no-fill-ahead")) { cfg.fill_ahead = 0; }
         else if (!strcmp(argv[i], "--fill-gate-shift") && i + 1 < argc) {
             if (parse_int_range_arg("--fill-gate-shift", argv[++i], 0, 5,
                                     &cfg.fill_gate_shift)) return 1;
@@ -1577,6 +1602,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (cfg.q_pipeline < 0)
         cfg.q_pipeline = (cfg.pipeline && !cfg.fill_concurrent && !cfg.qspan)
                          ? 1 : 0;
+    /* --fill-ahead (finding 123): wherever --q-pipeline is. run_pipeline_impl
+     * turns it off, and says why, on a plan of several slabs per q or when
+     * its VRAM does not fit; an explicit --fill-ahead without the pipeline
+     * is refused below. */
+    if (cfg.fill_ahead < 0)
+        cfg.fill_ahead = cfg.q_pipeline;
     /* Refused rather than ignored: a sub-option without its option, or a gate
      * whose side 0 would be issued before side 1's bitmap exists, is a run
      * quoted as something it was not. Under --pipeline only: without it these
@@ -1604,6 +1635,18 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (cfg.pipeline && fill_gate_shift_set && !cfg.fill_gate) {
         fprintf(stderr, "--fill-gate-shift needs the gate; it is off"
                 " (--no-fill-gate, or --fill-concurrent)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.fill_ahead && !cfg.q_pipeline) {
+        fprintf(stderr, "--fill-ahead fills the next special-q under this one;"
+                " the pipeline is off (--no-q-pipeline, --fill-concurrent or"
+                " --qspan)\n");
+        return 1;
+    }
+    if (cfg.pipeline && q_prep_set && !cfg.q_pipeline) {
+        fprintf(stderr, "--q-prep places --q-pipeline's next special-q; the"
+                " pipeline is off (--no-q-pipeline, --fill-concurrent or"
+                " --qspan)\n");
         return 1;
     }
     if (cfg.pipeline && cfg.q_pipeline && (cfg.fill_concurrent || cfg.qspan)) {
@@ -2226,7 +2269,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--slab-j", "--qspan", "--fill-concurrent",
             "--fill-rows", "--fill-row-bands", "--fill-gate", "--resieve-rows",
             "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
-            "--no-q-pipeline",
+            "--no-q-pipeline", "--q-prep", "--fill-ahead", "--no-fill-ahead",
             "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
             "--resieve-scan-cap", "--resieve-scan-pairs", NULL
         };

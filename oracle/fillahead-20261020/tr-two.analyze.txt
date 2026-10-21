@@ -1,0 +1,21 @@
+== tr-two: window 5.502 s, 54550 kernels
+  kernel busy 87.8%  (with copies/memsets 88.1%)   depth 0/1/2/3+: 12.2% / 63.6% / 22.4% / 1.9%
+  compression (summed kernel time / kernel-busy time): 1.30x
+  idle by gap length: <10us 0.7%  10-100us 3.6%  0.1-1ms 7.8%  >1ms 0.1%
+  kernel                                  share launches  mean us overlapped
+  k_apply                                 31.0%     3206    606.1      12.4%
+  k_fill_atomic                           30.3%     3205    593.2      46.1%
+  k_td                                     8.6%     3205    167.5      75.8%
+  k_resieve_scatter                        8.4%     1603    329.3      97.5%
+  k_fill_rows                              5.1%     3206    100.7      45.8%
+  k_transform                              4.3%     3206     84.3      76.9%
+  k_cofac                                  3.3%       16  13110.1       0.0%
+  k_classify                               3.3%     3205     65.1      70.0%
+  k_td_record_warp                         1.8%     3204     34.9      63.5%
+  k_resieve_rows                           0.9%     1603     36.0      96.6%
+  k_intersect_compact                      0.6%     1602     22.9      26.2%
+  k_record_scan                            0.4%     1602     17.2      12.0%
+  k_build_summary_g                        0.4%     1603     15.9      92.5%
+  k_group_counts                           0.3%     1603     11.5      99.9%
+  k_emit_ranked                            0.3%     1603     11.1      98.5%
+  k_gate_fold                              0.2%     1603      5.9       5.8%

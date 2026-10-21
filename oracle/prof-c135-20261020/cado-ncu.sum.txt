@@ -1,0 +1,10 @@
+kernel                      n       us   SM%  mem%  occ%    grid  blk  reg  waves L2hit   ms/q
+void <unnamed>::fill_ahea   5    828.8  10.6  41.9  74.8    3065  256   36  10.64  91.5    nan
+void <unnamed>::fill_ahea   1    499.5  13.6  23.3  61.0    2340  256   36   8.12  88.9    nan
+void <unnamed>::region_ke   4    475.8  33.3  36.7  66.5    1020 1024   60  21.24  17.8    nan
+<unnamed>::filter_kernel(   4    325.6  35.9  17.4  14.7      32  256  116   0.33  97.9    nan
+<unnamed>::resieve_small_   1    190.0  10.0   1.8  14.6     240  256   44   1.00  21.6    nan
+void <unnamed>::fill_row_   5    114.8  53.9  24.3  77.0     312  256   40   1.08  66.4    nan
+<unnamed>::filter_prime_k   5    106.0   8.0   0.7  16.5     128  256   70   0.89  63.4    nan
+<unnamed>::transform_kern  15     87.7  81.3  30.4  90.5    2693  256   38   9.35   0.4    nan
+isolated sum over the kernels given: 0.000 ms/q

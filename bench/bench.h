@@ -634,6 +634,17 @@ typedef struct {
      * Output-identical by construction. Default on (bench_main resolves -1);
      * off under --fill-concurrent and --qspan. */
     int      q_pipeline;
+    /* --q-prep: where --q-pipeline prepares the next special-q -- before this
+     * q's last join (JOIN), during its trial division (TD), or TD only when
+     * the sieve has already finished by then and there is no wait to hide
+     * the work in (AUTO). Output-identical; finding 121. */
+    int      q_prep;        /* PIPE_QPREP_* */
+    /* --fill-ahead: under --q-pipeline, one slab per q, the next q's
+     * transforms and side-1 fill run as soon as it is prepared, on their own
+     * stream into a second bucket array, under this q's sieve and TD.
+     * Output-identical; finding 123. Default on wherever --q-pipeline is
+     * (bench_main resolves -1). */
+    int      fill_ahead;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */
@@ -996,6 +1007,10 @@ static __device__ __forceinline__ uint64_t bench_grid_stride_x(void)
 #define STAGE_FILL    0
 #define STAGE_BOTH    1
 #define STAGE_APPLY   2     /* fill still runs; only apply is reported */
+
+#define PIPE_QPREP_JOIN 0   /* --q-prep: see bench_cfg_t.q_prep */
+#define PIPE_QPREP_AUTO 1
+#define PIPE_QPREP_TD   2
 
 #define NORM_CONST    0     /* flat initial value -- isolates apply cost */
 #define NORM_HORNER   1     /* real per-position log2|F(a,b)| in fp32    */

@@ -1,0 +1,8 @@
+cado r1 total 12.99s | 462878 rels | # Total 462878 reports [0.000027s/r, 71.70r/sq] in 12.70 elapsed s [839.7% CPU] | sm=2898 p=196W load=4.35 rc=0
+ours r1 total 25.23s | 603136 rels |  wall clock per q, COMPLETE 3.80 ms | sm=2905 p=166W load=3.55 rc=0
+ours r2 total 24.22s | 603136 rels |  wall clock per q, COMPLETE 3.78 ms | sm=2905 p=168W load=3.02 rc=0
+cado r2 total 12.47s | 462878 rels | # Total 462878 reports [0.000026s/r, 71.70r/sq] in 12.24 elapsed s [873.2% CPU] | sm=2911 p=203W load=4.33 rc=0
+cado r3 total 11.85s | 462878 rels | # Total 462878 reports [0.000026s/r, 71.70r/sq] in 12.14 elapsed s [878.6% CPU] | sm=2911 p=206W load=5.96 rc=0
+ours r3 total 24.63s | 603136 rels |  wall clock per q, COMPLETE 3.82 ms | sm=2905 p=169W load=4.80 rc=0
+done: 0 failed
+exit 0

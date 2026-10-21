@@ -1,0 +1,21 @@
+== tr-joinfa: window 5.997 s, 54551 kernels
+  kernel busy 83.3%  (with copies/memsets 83.6%)   depth 0/1/2/3+: 16.7% / 65.7% / 17.6% / 0.0%
+  compression (summed kernel time / kernel-busy time): 1.21x
+  idle by gap length: <10us 0.9%  10-100us 4.1%  0.1-1ms 11.6%  >1ms 0.1%
+  kernel                                  share launches  mean us overlapped
+  k_apply                                 31.9%     3206    602.4      13.8%
+  k_fill_atomic                           30.6%     3206    578.3      35.5%
+  k_resieve_scatter                        8.1%     1603    307.0      85.3%
+  k_td                                     7.5%     3206    142.4      67.9%
+  k_fill_rows                              5.3%     3205    100.2      37.5%
+  k_transform                              3.9%     3204     72.9       1.3%
+  k_cofac                                  3.5%       16  13424.3       0.0%
+  k_classify                               3.3%     3206     63.0      53.1%
+  k_td_record_warp                         1.5%     3204     27.5      13.3%
+  k_intersect_compact                      1.1%     1602     40.2      97.5%
+  k_resieve_rows                           1.0%     1603     38.5      85.0%
+  k_record_scan                            0.5%     1602     20.0      98.7%
+  k_build_summary_g                        0.4%     1603     14.1      74.7%
+  k_emit_ranked                            0.3%     1603     12.1      95.6%
+  k_gate_fold                              0.2%     1603      9.2      72.6%
+  k_cof_enqueue                            0.2%     1602      5.7       6.3%

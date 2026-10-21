@@ -13161,3 +13161,517 @@ read +1.0% each and the third −2.7%, so there is no sign of a cost.
    ceiling is the 1.7% left.
 3. The issue point's remaining launch overhead (0.9% at C143) would need
    fewer API calls, or a CUDA graph, for the issue.
+
+<a id="finding-121"></a>
+## Finding 121 — the q boundary at small jobs: when a q's sieve has already finished by the time the host reaches it, the next q is now prepared during that q's trial division (`--q-prep auto`, the default), and each q's small-prime TD tables are built when it is prepared. On a c135 workunit cado-gpu also sieved, −4.5% at host load ~10 and −12% at ~15; C143 −0.8%, I16/C194/c183 −0.5 to −0.9%; relations byte-identical. cado-gpu is still 1.38x ours in raw relations per second on that workunit, and 1.87x per special-q
+
+**Date:** 2026-10-20. RTX 5070, WSL2, client not running. Host load ~10.5
+for the main timing and ~15 for the second set (CPU ECM: ten processes at
+nice 0, four at 19, on 16 logical CPUs). Timing base: the finding-120
+snapshot (`work/tdwait/exp`, the tree before this change, sm_120). New: the
+sm_120 snapshot of this source (`ee51a949`). Identity base: the committed
+`2128138` fat build (`77f1abab`, outputs cached). The fat `bench/bench` is
+rebuilt from this source (`5e975e96`, 6 archs, 0 warnings): `--verify-only`
+and `fbtest` pass and `abcheck.sh` is 36 of 36 identical (`fat-check.txt`).
+The previous one (`8a6d543a`) is kept as `work/qprep/bench.8a6d543a`.
+Evidence in
+[`../oracle/qprep-20261020/`](../oracle/qprep-20261020/).
+
+Finding 120's lead 1. In 48% of C143's q the next q's sieve finished before
+this q's TD, and the card then idled ~0.5 ms through host work at the
+boundary (finding 120's sample gap): ~50 µs of end-of-q and loop-top work,
+~120 µs building this q's small-prime TD tables (`td_fill_small`, both
+sides), ~160 µs of host work preparing the q after it, and ~60 µs of
+uploads before that q's transform launched.
+
+### The change (`change.diff`: `pipeline.cuh`, `bench.h`, `bench_main.cu`)
+
+1. **TD tables built ahead.** `pipe_td_t` gets a second small-prime table
+   set (pinned and device, `nsmcap` × 32 B per side). `prepare_next_q`
+   builds the next q's tables into it (`pipe_td_prepare_next`) and uploads
+   them on the sieve stream, behind that q's transforms and ahead of its
+   fill, with an event (`ev_sm`) the next build into the same pinned staging
+   waits on. At the loop top a q that was issued ahead swaps them in
+   (`pipe_td_take_next`): its sieve was queued behind their upload, so its
+   join orders them before its TD. A q prepared and not issued builds its
+   own, as before.
+2. **`--q-prep join|auto|td`.** At `views_and_prep`, under `auto`, if this
+   slab's sieve has already finished (`cudaEventQuery` on side 0's `ev[5]`,
+   the last of it on its stream), the next q is not prepared there: there
+   is no wait to hide the work in. `pipe_td_perq` takes a callback it runs
+   once phase 2 is queued, before waiting for it, and the deferred
+   preparation runs there (`td_busy_wait`). It prepares, builds the tables,
+   and issues the next q as the issue point would have. The intersection
+   and record scan have already been waited for, so nothing the next sieve
+   overwrites is still read (no `eisect`), and TD reads none of it. A slab
+   with no survivors returns before phase 2 and pays it after. Its time
+   comes out of TD's wall. `join` is the old placement, `td` defers always.
+   The band summary adds `prepared during trial division N of those q`, on
+   its own line because `fillcheck.sh` parses the `issued ahead` line to
+   its end.
+
+Not done: preparing two q ahead (finding 120's lead 1b, which would need
+per-q double buffering) and moving the end-of-q bookkeeping.
+
+### Gates (`gates.sh`, `gates.txt`, `gates2.sh`, `gates2.txt`)
+
+| gate | result |
+|---|---|
+| `abcheck.sh`, default (`auto`), every case | **36 of 36 identical** |
+| `abcheck.sh` `--q-prep td` / `join` (cand, cof, stop; the cases that turn the pipeline off left out) | 13 of 13, 13 of 13 |
+| `--q-prep td` with `--resieve-scan-pairs 1` / `--resieve-scan-cap 1` | 13 of 13, 13 of 13 |
+| `growfail.sh` (the pair list cannot grow) | 5 of 5 |
+| tdskip, `PIPE_K=8`, c183 in five slabs: single-queued against `auto` and `td` | identical (6,875) under both, 11 slabs skipped, 149 q prepared during TD |
+| `make check` (snapshot) | 108 PASS, 0 FAIL |
+| `fillcheck.sh` | every arm byte-identical |
+| `degradecheck.sh` on the `PIPE_K=8` build, `auto` and `td` | 16 PASS each, no SKIP |
+| `skipcheck.sh` on a `BN_LIMBS=4` build (`f36cd9ff`), `auto` and `td` | 21 PASS each, no SKIP |
+
+`gates.sh` also ran `skipcheck.sh` and `degradecheck.sh` on the default
+build. There both print SKIP (each needs a deliberately narrow build) and
+exit 0, and `gates.sh` counted that as a pass. `gates2.sh` runs them on the
+builds they need and fails on any SKIP line.
+
+### Timing (`timing.sh`, `timing.txt`; `c135/h2h.sh`, `c135/h2h4.txt`; `load15.txt`)
+
+Medians, per q, COMPLETE (C143) or pipelined wall (the large jobs):
+
+| | base | `join` | **`auto`** | `td` |
+|---|---:|---:|---:|---:|
+| c135 workunit, load ~10.5 (4 rounds) | 4.03 ms | 4.01 | **3.85 (−4.5%)** | 4.20 (+4%) |
+| c135 workunit, load ~15 (3 rounds) | 4.65 | 4.27 | **4.10 (−12%)** | — |
+| C143 I13, load ~10.5 (5 rounds) | 6.14 | 6.15 | **6.09 (−0.8%)** | 6.45 (+5%) |
+| C143 I13, load ~15 (3 rounds) | 6.69 | 7.01 | **6.62 (−1%)** | — |
+| c183 (3 rounds) | 52.24 | — | 51.78 (−0.9%) | 51.96 |
+| C194 (3 rounds) | 196.55 | — | 195.64 (−0.5%) | 195.85 |
+| NFS@Home I16 (3 rounds) | 179.91 | — | 178.35 (−0.9%) | 178.83 |
+
+`auto` deferred 31% of C143's q at load ~10.5 and ~38% at ~15, and ~47% of
+the c135 workunit's at ~15: a slower host reaches the join later, finds the
+sieve done more often, and gains more. Deferring every time (`td`) loses at
+small sizes: the next q's sieve is then issued mid-TD, so TD's first phase
+and its host round trips lose the sieve that covered them. `join` (the
+tables alone) is within noise of base. Every run's relations were identical
+to base. Single rounds swing by up to 15% on this box (C143 `join` 6.57-7.73
+at load 15), so the small-job medians are the claim, not single rounds.
+
+The `nsys` traces (`trace.sh`) were taken at load 14-15 and ran 10-40%
+slower than the same arms untraced, `auto` more so. They are kept but not
+used; a trace at a quiet host would be needed to see the remaining
+boundary idle.
+
+### c135 against cado-gpu, on one of its own workunits
+
+Kyle's cado-gpu c135 run (`/home/kylea/cado-gpu/c136-934760359018`):
+I=13 (glas sieves J=4096 for most special-q, a little less for some),
+lim 9M/12M, lpb 29/30, mfb 55/58, lambdas
+1.89/1.94, side-1 special-q. Sieving took 14:41:12 to 15:08:52 (1660 s) for
+q 1.5M-12.9M: 114 workunits of 100K q, 55,019,981 raw relations, 37,138,676
+unique (67.5%). Per workunit (`c135/cado-wu.txt`, from `c135.log`): 12.6-17.5 s,
+2.23 ms per special-q over the run.
+
+Ours on the same parameters (`work/c135/c135.job`, `--logI 13 --J 4096`),
+over CADO's workunit 7,000,000-7,100,000:
+
+| | cado-gpu | cuda-sieve (`auto`) | ratio |
+|---|---:|---:|---:|
+| special-q | 6,456 | 6,456 | |
+| raw relations | 462,878 | 603,136 | 1.30x ours |
+| wall, whole workunit | 13.99 s (0.69 startup) | 25.1 s | 1.79x CADO |
+| per special-q | 2.06 ms (startup out) | 3.85 ms | 1.87x |
+| raw relations per second | 33.1K | 24.0K | **1.38x CADO** |
+
+We find 30% more relations per special-q, consistent with CADO's `p < 96`
+skip (finding 115: with it off CADO matches our yield). Whether that surplus
+survives duplicate removal at the same rate is not measured; the unique
+count needs a filter on our output.
+
+Where our 3.85 ms goes (band report, stages overlap): the sieve 2.75 ms
+(fill 1.35, apply 1.20, transform 0.20), TD's kernels 2.0 ms (resieve 0.45,
+trial division 0.54, classify 0.36, record 0.28), cofactorisation flushes
+0.55 ms. The sieve alone exceeds CADO's whole 2.06 ms per special-q.
+
+### What leads now, for small jobs
+
+1. **Fill and apply at I13**: 2.55 ms per c135 special-q, where CADO's
+   whole siever spends 2.06. Profile it at c135 (`ncu`) before guessing:
+   the fill tier and apply were tuned at I15-I16.
+2. **TD's small kernels at I13**: classify (0.36 ms) and record (0.28 ms)
+   are large next to trial division itself (0.54).
+3. Finding 120's lead 1b (two q ahead) and the end-of-q bookkeeping, for
+   what idle is left; a quiet-host trace first, to size it.
+4. The unique-relation comparison: filter our c135 workunit output with
+   CADO's own duplicate removal against its 67.5%.
+
+<a id="finding-122"></a>
+## Finding 122 — c135 profiled against cado-gpu on a quiet host: the two sievers' kernels cost about the same in isolation (3.7 against 3.6 ms per special-q), and cado-gpu's 2x comes from running several special-q's kernels at once (summed/busy 2.5x, the card never idle) where ours run one at a time (1.19x, idle 17%). Our fill is latency-bound at 9-11% SM and runs mostly alone; our apply is SM-bound at 90%, half of it the small sieve's tiniest primes
+
+**Date:** 2026-10-20, evening. RTX 5070, WSL2, host quiet (load 1-6; the
+ECM jobs had finished), client not running. Ours: `bench/bench` at finding
+121 (`5e975e96`, `--q-prep auto`). cado-gpu: `las-glas` from
+`~/code/cado-nfs-public/gpu-siever/scripts` beside `glas-gpu`, with the
+command its client ran (`client/localhost.work/localhost.log`: `-I 13`,
+lim 9M/12M, lpb 29/30, mfb 55/58, lambdas 1.89/1.94, ncurves 12/14,
+`-t 16`), on the run's poly and roots. Evidence in
+[`../oracle/prof-c135-20261020/`](../oracle/prof-c135-20261020/).
+
+### Head to head, quiet (`h2h-quiet.sh`, `h2h-quiet.txt`)
+
+CADO's workunit 7,000,000-7,100,000, three rounds each, alternating:
+
+| | cado-gpu | cuda-sieve |
+|---|---:|---:|
+| wall (median) | 12.47 s | 24.63 s |
+| relations | 462,878 | 603,136 |
+| relations per second | 37.1K | 24.5K |
+| per special-q | 1.90 ms (12.24 s elapsed, its own count) | 3.80 ms |
+| host CPU | ~850% | one core |
+| board power | 196-206 W | 166-169 W |
+
+On a quiet host cado-gpu is 1.51x ours, not finding 121's 1.38x: its run
+of this workunit took 13.99 s with ECM on the host, and it leans on ~8.5
+cores for host cofactorisation. Relations identical across our three runs;
+CADO's three gave the same relation set.
+
+### Timelines (`trace.sh`; `*.kernsum.txt`, `*.analyze.txt`, `*.gaps.txt`)
+
+q in [7,000,000, 7,020,000), middle 80% of launches:
+
+| | cuda-sieve | cado-gpu |
+|---|---:|---:|
+| wall in window | 3.8 ms/q | 1.8 ms/q |
+| summed kernel time | 3.8 ms/q | 4.5 ms/q |
+| card busy | 83.4% | 100.0% |
+| summed / busy | 1.19x | 2.51x |
+| time with 0 / 1 / 2 / 3+ kernels running | 16.6 / 67.9 / 15.5 / 0.0% | 0 / 31.7 / 25.6 / 42.6% |
+| fill overlapped with other kernels | 32% (`k_fill_atomic`) | 95% (`fill_ahead_kernel`) |
+| apply / region overlapped | 8% | 52% |
+
+CADO's summed kernel time is the larger. Its kernels stretch when they
+share the card, so that sum overstates their cost; the isolated profile
+below is the fair one. Our 16.6% idle is host latency between TD's kernel
+chains, in 0.1-1 ms gaps (`k_scan_pass3 -> k_emit_ranked` 2.1%,
+`k_transform -> k_fill_rows` 1.7%, `k_record_scan -> k_group_counts` 1.6%,
+...).
+
+### Isolated (`ncu.sh`, `ours-ncu.sum.txt`, `cado-ncu.sum.txt`)
+
+ncu serialises launches, so these are each kernel's cost alone. Per special-q:
+
+| | cuda-sieve | cado-gpu |
+|---|---|---|
+| fill, both sides | 1.23 ms: 697 + 533 µs, SM 9-11%, memory 31-45%, occupancy 30-42% | 1.33 ms: 829 + 500 µs, SM 11-14%, memory 23-42% |
+| row tier | 0.23 (2 x 113 µs) | 0.23 (2 x 115) |
+| apply / region | **1.24 (2 x 619 µs, SM 90%, occupancy 98%)** | **0.95 (2 x 476 µs, SM 33%)** |
+| transform | 0.16 | 0.18 |
+| TD side: resieve, trial division, classify, record / filter, resieve | 0.80 | 0.87 |
+| sum | 3.66 | 3.56 |
+
+Fill is latency-bound in both programs. Three fills on three streams in our
+harness (`--fill-streams 3`, `fillstreams3.out`) take 0.834 ms per
+workspace against 1.216 ms issued serially (0.69x): one fill cannot feed
+this card.
+
+Our apply is SM-bound, and about half of it is the small sieve
+(`smallsieve.txt`, harness, `--no-smallsieve` against default): side 1
+0.815 -> 0.351 ms (255M small-sieve updates per side per special-q), side 0
+0.550 -> 0.305 ms (108M). The updates are dominated by the tiniest primes,
+which CADO's `p < 96` skip does not sieve. That, rather than a better
+kernel, is the likely reason its region kernel sits at 33% SM, with room
+for the fills to run beside it.
+
+### What this means
+
+At I13 neither siever's kernels can fill the card one at a time. CADO
+recovers ~2x by keeping several special-q's work in flight. Its fills run
+ahead, so its sieve is not one serial chain. Ours is: per special-q, on one
+stream, transform, side-1 fill, apply, gated side-0 fill, apply, about
+2.8 ms, with only TD overlapping. The previous q's TD (~0.8 ms) is all
+`--q-pipeline` lays beside it.
+
+### What leads now, for small jobs
+
+1. **Fill ahead.** Run the next special-q's transform and side-1 fill on a
+   third stream, into a second bucket workspace, as soon as the q is
+   prepared, so they run under this q's applies and TD. The apply, gated
+   side-0 fill and apply stay on the sieve stream behind it. One slab per q
+   only (small jobs are), and the workspace costs 0.09 GB at c135. It takes
+   ~1 ms of the 2.8 ms serial chain off it. How much of that turns into wall
+   depends on how much fill can run beside an apply holding 98% occupancy;
+   the TD kernels (16-58% occupancy) are the other room.
+2. **TD's host latency** (16.6% idle at c135): fewer syncs in TD, or a CUDA
+   graph for its fixed kernel chain.
+3. **The tiny primes' share of apply**, waiting on the `p < 96` decision
+   (Kyle, 2026-10-20: one or two more cycles).
+
+<a id="finding-123"></a>
+## Finding 123 — fill ahead, two special-q ahead (`--fill-ahead`, one slab per q; opt-in as measured, made the default the same night): the q after next is prepared during this q's trial division, and its transforms and side-1 fill run on their own stream, beside the next q's sieve. C143 −7%, c135 −6%, c183 −1.3% on a quiet host; relations byte-identical. Prepared only one ahead, as first built, it gained ~1%
+
+**Date:** 2026-10-20, night, quiet host (load ~2, client not running).
+Snapshot `1d9a56b7` (sm_120, this source). The installed `bench/bench` is
+still finding 121's `5e975e96` and does not contain it. Evidence in
+[`../oracle/fillahead-20261020/`](../oracle/fillahead-20261020/).
+
+Finding 122 found cado-gpu's 2x at c135 is concurrency: its fills run
+ahead, beside other special-q's kernels, where ours run in one serial chain
+per q on the sieve stream. This puts the next fill beside an apply.
+
+### First form: one q ahead, ~1%
+
+The next q's transforms and side-1 fill were issued when it was prepared,
+on a third stream into a second bucket workspace. Byte-identical, and the
+traces show why it gained ~1% (c135, `--q-prep join`, 2,000 q):
+
+| | without | one ahead |
+|---|---:|---:|
+| card idle | 20.8% | 16.7% |
+| summed / busy | 1.26x | 1.21x |
+| `k_fill_atomic` overlapped | 43% | 36% |
+| `k_td` overlapped | 89% | 68% |
+
+The next q is prepared at the top of this q's slab loop, and in about half
+of q this q's sieve is already done by then (finding 120). The early fill
+filled the join wait and took the same work from beside this q's TD.
+
+### The change: two ahead
+
+In the steady state, iteration i:
+
+1. Join q_i's sieve, intersect, scan its records.
+2. Right after the intersection, issue q_{i+1}'s side-1 apply on the sieve
+   stream. It needs only the intersection to be done with side 1's
+   survivor bitmap (event `eb`); its fill ran earlier.
+3. At the issue point, behind `eisect`, issue q_{i+1}'s gated side-0 fill and
+   apply. That fill overwrites the index q_i's record scan reads.
+4. In q_i's trial division, once phase 2 is queued (`td_busy_wait`), prepare
+   q_{i+2}. Its uploads go on the sieve stream behind q_{i+1}'s sieve, which
+   reads the tables they replace. Its transforms and side-1 fill go on
+   `st_fa`, into the workspace q_i just freed. They run beside q_{i+1}'s
+   applies and q_i's TD. Then q_{i+1}'s small-prime TD tables are built,
+   still one ahead, on the legacy stream ahead of its TD.
+
+What that takes:
+
+- **Two bucket workspaces** owned per q, alternating at the loop top. A
+  fill into one waits on `ws_free`, recorded once its previous owner's
+  records are scanned.
+- **Three transform sets per side**, each with its own transform events
+  (`pside_t` `xplat`/`xrowrt`/`xev0`/`xev4`, `pside_use_set`). q_i's TD,
+  q_{i+1}'s side-0 fill and q_{i+2}'s transforms are live at once, and a
+  q's transform time is read from its own set at its end. Each prepare
+  takes the next set in turn.
+- **A second spec slot** (`spec2`). The loop top consumes the next q
+  (slot A) and promotes `spec2` into it, carrying its readiness and
+  watchdog name into the issue point. The one-ahead preparation (start-up,
+  and after a q prepared but not issued) is unchanged, so the stop,
+  ceiling and checkpoint paths see one q at a time as before. A stop
+  drains both streams at the loop exit and resumes from the loop top's
+  q.
+- **The split sieve issue, transform stream and `ev_up`** from the first
+  form. `pipe_side_sieve_issue` runs as a fill, an apply or both. Transforms
+  run on `st_fa`, uploads on the sieve stream. A per-side `ev_up` follows
+  the uploads. The drains that guard the pinned staging, and the
+  prepared-but-not-issued drain, wait on it, on the ahead fill and on the
+  q's own transform set.
+
+Memory: a second bucket array and its cursors, plus a third transform set
+(0.09 GB and ~20 MB at c135). Off, not refused, under several slabs per q,
+without `--q-pipeline`, or when it does not fit.
+
+### Timing (`timing.sh`, `timing.txt`)
+
+Medians of four rounds, order rotated, one binary with and without the
+option, and finding 121's binary for the default path:
+
+| ms/q, COMPLETE | finding 121 | this build, off | `--fill-ahead` |
+|---|---:|---:|---:|
+| c135 workunit (6,456 q) | 3.61 | 3.63 | **3.40 (−6.3%)** |
+| C143 I13 (3,000 q) | 6.18 | 6.20 | **5.76 (−7.0%)** |
+| c183 I15 (200 q, 2 rounds) | — | 52.32 | 51.65 (−1.3%) |
+
+Every round of each arm sits inside 0.1 ms of the others. The default path
+matches finding 121. Against cado-gpu on c135, finding 122's quiet 1.51x
+scaled by this −6% is about 1.42x. Finding 122's head-to-head read our
+binary at 3.80 ms/q where this run reads 3.61, so only the ratio carries
+over. A fresh head-to-head would pin it.
+
+A c135 trace (`tr-two3.*`, 2,000 q): card idle 9.5%, against 16.6-20.8%
+before. `k_transform` overlapped 92%, `k_fill_atomic` 43%. The largest gaps
+left are the side-1 apply's issue after the intersection
+(`k_intersect_compact -> k_apply`, 2.0%, 74 µs) and the end of q
+(`k_cof_enqueue -> k_intersect_compact`, 1.8%).
+
+### Gates (`gates2.sh`, `gates2.txt`)
+
+| gate | result |
+|---|---|
+| `abcheck.sh`, the default at the time (fill ahead off), every case | **36 of 36 identical** |
+| `abcheck.sh` `--fill-ahead`; with `--q-prep join`; with `--q-prep td` (cand, cof, stop; the cases that turn the pipeline off left out, slabbed ones report it off) | 13 of 13 each |
+| `--fill-ahead` with `--resieve-scan-pairs 1`, `--resieve-scan-cap 1`, `--no-resieve-scan` | 13 of 13 each |
+| `growfail.sh` (default path) | 5 of 5 |
+| tdskip, `PIPE_K=8`: c183 in five slabs and in one, single-queued against `auto`, `--fill-ahead`, `--fill-ahead --q-prep td` | identical (6,875 and 6,492), 11 slabs skipped in each; two-ahead engaged on the one-slab plan (148 q) |
+| `make check` (snapshot) | 108 PASS, 0 FAIL |
+| `fillcheck.sh` | every arm byte-identical |
+| `degradecheck.sh`, `PIPE_K=8` build: as built, `--fill-ahead`, `--fill-ahead --q-prep td` | 16 PASS each, no SKIP |
+| `skipcheck.sh`, `BN_LIMBS=4` build: the same three | 21 PASS each, no SKIP |
+
+Test builds: growfail `96c7900f`, pk8 `9e79115f`, bn4 `6962883e`, 0 warnings
+(`buildtest.sh`, `buildtest.txt`). The gates were held 20:15-20:30 for
+another session's GPU ECM run, so the card was free throughout.
+
+### What leads now, for small jobs
+
+1. **Make it the default** for one-slab plans, once Kyle has looked at it,
+   with the fat build and fat-check. Done the same night; see below.
+2. **Apply's SM cost**: 90% SM and 98% occupancy, about half of it the
+   tiniest primes (finding 122). The fills now run beside it as far as the
+   occupancy lets them. The `p < 96` decision is the larger lever left.
+3. **The host gaps** left at the issue and the end of q (~4% at c135),
+   and TD's syncs.
+
+### Made the default (2026-10-20, late; gates pending)
+
+Kyle approved making it the default for one-slab plans. `cfg.fill_ahead`
+now starts at -1, and `bench_main` resolves it to `--q-pipeline`'s setting:
+
+- **On** wherever the q-pipeline runs.
+- **Off, with the reason printed,** where `run_pipeline_impl` already turns
+  it off: a plan with several slabs per q (the NFS@Home I16 bands), or VRAM
+  that doesn't fit.
+- **Off, silently,** under `--no-q-pipeline`, `--fill-concurrent` or
+  `--qspan`.
+
+An explicit `--fill-ahead` without the pipeline is still refused, and
+`--no-fill-ahead` gives finding 121's path. No other code changed.
+
+The first fat build, `decc5bf2`, was built from the tree's sources at nice
+19 and never installed. The gates waited for the morning, because Kyle had
+started the nightly run.
+
+**Review fixes (`/code-review xhigh`, 2026-10-21).** Thirteen findings. Six
+were fixed in `pipeline.cuh`, none of them on a path a healthy run's output
+depends on:
+
+- **`pipe_event_done` could wipe a launch error** (finding 121's code). If a
+  side-0 launch had just failed, clearing the query's not-ready also cleared
+  that error, so the join reported success. It now peeks first, and an
+  error already latched reads as not done without a query.
+- **A `--fill-ahead` allocation failing partway** left the second bucket
+  array and the third transform set held for the band, and `st_fa` set, so
+  every transform still went to it with fill ahead off. It's now undone,
+  as `--q-pipeline`'s fallback is.
+- **`done:`** freed the TD tables before draining the streams that may still
+  be uploading into them. It now drains `st_sv`, `st_fa` and the legacy
+  stream first.
+- **The two preparation failure paths** drained `st_sv` and the legacy
+  stream but not `st_fa`, contrary to their comment. They drain it now.
+- **Watchdog labels:** after an ahead fill, the waits that followed were
+  labelled as the fill, and the early side-1 apply didn't name the next q.
+  Both are fixed.
+- **Two stale comments:** the fourth upload drain in `pipe_side_prepare_q`
+  (under `--fill-ahead`, side 1's join and the `ev_up` waits cover it, not
+  `ev[4]`), and `pipe_td_prepare_next`'s stream. Finding 123's heading and
+  gate row now say it was opt-in as measured.
+
+Declined:
+
+- **The quiet norm-width skip of a q prepared two ahead drains `st_sv`,**
+  waiting through the next q's sieve. It's real, but only on a skip, and
+  skips are capped at `PIPE_SKIP_MAX`. That drain is also what guards the
+  skipped q's staging, so it stays.
+- **The spare TD table set is allocated without the pipeline.** That's about
+  32 bytes per small prime per side, a few hundred KB.
+- **Three refactors:** the workspace derived from the q's parity, one slot
+  struct for both prepared q, and transform sets indexed by q ordinal.
+  They're worth doing before more state is added, not as part of this
+  change.
+- **"Ungated default".** That's the point of these gates.
+
+The fat build with the fixes is `014e752a`, built from the tree's sources.
+**Installed as `bench/bench` on 2026-10-21 after the gates below passed**,
+with the client not running. The previous binary is
+`work/qprep/bench.5e975e96`.
+
+The gates are in `work/fadefault/morning.sh`:
+
+- six archs and no warnings;
+- `--verify-only` and fbtest;
+- `abcheck` every case by default and again with `--no-fill-ahead`;
+- the resolution case by case (on for C143, off with its reason on five-slab
+  c183, absent under `--no-q-pipeline`/`--fill-concurrent`/`--qspan`, refused
+  for `--no-q-pipeline --fill-ahead`);
+- `make check` and fillcheck on the fat build.
+
+degradecheck and skipcheck aren't rebuilt for this, because they already ran
+the selected code under `--fill-ahead` above.
+
+Results (`morning.txt`, run 2026-10-21 06:46 on `014e752a`, card idle, host
+load ~14 from Kyle's CPU ECM): **0 failed**.
+
+| gate | result |
+|---|---|
+| build | the tree's sources, 6 archs, 0 warnings |
+| `--verify-only`, fbtest | 3 OK; all gates passed |
+| `abcheck.sh`, default (fill ahead on where one slab), every case | **36 of 36 identical** |
+| `abcheck.sh --no-fill-ahead`, every case | 36 of 36 identical |
+| resolution: C143 default | on; 299 q filled ahead, 298 prepared two ahead |
+| resolution: five-slab c183 default | off, "this plan has several slabs per q" |
+| resolution: `--no-fill-ahead`, `--no-q-pipeline`, `--fill-concurrent`, `--qspan` | not mentioned, exit 0 |
+| resolution: `--no-q-pipeline --fill-ahead` | refused, exit 1 |
+| C143 relations: default, `--no-fill-ahead`, `--no-q-pipeline` | identical (46,970) |
+| `make check` (fat build) | 108 PASS, 0 FAIL |
+| `fillcheck.sh` (fat build) | every arm byte-identical |
+
+Timing (`timing.sh`; `default-timing.txt` in the evidence directory): seven
+rotated rounds on the loaded host Kyle normally runs (load ~14.4 on 16
+threads, 13 CPU ECM processes at nice 0). Compared: the installed binary it
+replaced (`5e975e96`, base), and `014e752a` with `--no-fill-ahead` (off)
+and at its default.
+
+| ms/q, COMPLETE, median of 7 | base | off | default | default vs base |
+|---|---:|---:|---:|---:|
+| c135, CADO's workunit | 4.49 | 4.68 | 4.47 | −0.4% |
+| C143 I13, 3,000 q | 8.06 | 7.83 | 7.37 | **−8.6%** |
+| c183 I15, 200 q (one round) | 54.90 | 55.10 | 54.78 | −0.2% |
+
+Under this load each run varies by up to ±10%. base and off run the same
+path, yet differ by 3-4%, which marks the noise floor. Paired by round, the
+default against off is −10% at c135 and −6% at C143 (medians), in the
+direction of the quiet-host −6% and −7%. c135 against base doesn't show it.
+
+The load itself costs more than fill ahead gains: c135 is 4.5 ms/q here
+against 3.4-3.9 on a quiet host. Every run produced the same relations as
+base.
+
+<a id="finding-124"></a>
+## Finding 124 — at equal yield (cado-gpu's small-prime skip off), on a quiet host: cado-gpu is 1.12x ours in raw relations per second at the NFS@Home I16 geometry, and 1.37x at c135 against the two-ahead build (1.46x against the installed one). The skip is worth 1.13x per relation to CADO at c135, against 1.27x at I16
+
+**Date:** 2026-10-20, night. Quiet host (load 1.5-7, mostly CADO's own
+host threads), card free, client not running. cado-gpu as in findings 115
+and 122, with `GLAS_SKIP_BOUND=0`. Ours: the installed `bench/bench`
+(finding 121, `5e975e96`) and, at c135, the two-ahead snapshot with
+`--fill-ahead` (finding 123, `1d9a56b7`). Runs alternated. Relations are
+raw, not deduplicated. Evidence in
+[`../oracle/skipoff-20261020/`](../oracle/skipoff-20261020/) (`h2h.sh`,
+`h2h.txt`, CADO's stderr).
+
+| | cado-gpu, skip off | cuda-sieve | cado-gpu / ours |
+|---|---:|---:|---:|
+| **c135**, workunit 7,000,000-7,100,000 | 592,535 rel in 16.68 s (median of 3): 35.5K/s | two-ahead: 603,136 in 23.26 s (median of 3): 25.9K/s | **1.37x** |
+| | | installed: 603,136 in 24.73 s: 24.4K/s | 1.46x |
+| | skip on: 462,878 in 11.57 s: 40.0K/s | | 1.54x (two-ahead) |
+| **NFS@Home I16**, q 297,000,000-297,006,000 | 23,292 rel in 56.6 s (2 runs): 411/s | installed: 23,497 in 63.7 s (2 runs): 369/s | **1.12x** |
+
+- **Yield is equal with the skip off.** CADO finds 91.8 relations per
+  special-q at c135 against our 93.4, and 23,292 against our 23,497 at I16.
+- **The skip costs CADO less at c135.** It gains 1.13x per relation there
+  (25.0 against 28.2 µs per relation), against 1.27x at I16 (finding 115).
+- **I16 has moved.** Finding 115 read 1.22x, at host load 10-12 and before
+  findings 116-121. On a quiet host CADO's run of this band took 56.6 s,
+  against 68.2 s then; it keeps ~5.8 cores busy here (~8.6 at c135) for
+  host cofactorisation. A loaded host costs it more than us, as finding
+  121's c135 run under ECM showed (13.99 s, against 12.5 quiet).
+- **This session's two-ahead reading is slower.** Our two-ahead build read
+  3.64-3.66 ms per special-q here, interleaved with CADO's runs, against
+  3.36-3.41 in finding 123's own timing run, so the c135 ratio may be a
+  little pessimistic for us.

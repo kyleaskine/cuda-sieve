@@ -1,0 +1,51 @@
+base 5e975e96e700055e  new 014e752ab745207c
+C135 base r1    4.63 ms |  | load=14.35 card=0% rc=0
+C135 off  r1    4.53 ms |  | load=14.59 card=1% rc=0
+C135 def  r1    4.80 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.58 card=0% rc=0
+C143 base r1    7.23 ms |  | load=14.60 card=0% rc=0
+C143 off  r1    7.22 ms |  | load=14.55 card=0% rc=0
+C143 def  r1    7.50 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.71 card=6% rc=0
+C135 def  r2    4.47 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.43 card=0% rc=0
+C135 base r2    4.49 ms |  | load=14.40 card=0% rc=0
+C135 off  r2    4.68 ms |  | load=14.24 card=0% rc=0
+C143 def  r2    6.78 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.29 card=0% rc=0
+C143 base r2    7.35 ms |  | load=14.42 card=0% rc=0
+C143 off  r2    7.45 ms |  | load=14.43 card=5% rc=0
+C135 off  r3    5.11 ms |  | load=14.53 card=0% rc=0
+C135 def  r3    5.00 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.36 card=0% rc=0
+C135 base r3    4.40 ms |  | load=14.49 card=0% rc=0
+C143 off  r3    7.43 ms |  | load=14.46 card=0% rc=0
+C143 def  r3    7.53 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.44 card=0% rc=0
+C143 base r3    7.56 ms |  | load=14.48 card=0% rc=0
+C183 base r1   54.90 ms |  | load=14.44 card=0% rc=0
+C183 off  r1   55.10 ms |  | load=14.32 card=0% rc=0
+C183 def  r1   54.78 ms |  prepared two ahead (--fill-ahead) 198 q | load=14.82 card=0% rc=0
+done: 0 failed
+exit 0
+base 5e975e96e700055e  new 014e752ab745207c
+C135 base r4    4.61 ms |  | load=14.56 card=0% rc=0
+C135 off  r4    5.19 ms |  | load=14.48 card=4% rc=0
+C135 def  r4    4.47 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.40 card=0% rc=0
+C143 base r4    8.06 ms |  | load=14.42 card=0% rc=0
+C143 off  r4    7.86 ms |  | load=14.27 card=0% rc=0
+C143 def  r4    7.37 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.26 card=0% rc=0
+C135 def  r5    4.50 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.57 card=3% rc=0
+C135 base r5    4.80 ms |  | load=14.47 card=3% rc=0
+C135 off  r5    5.25 ms |  | load=14.39 card=0% rc=0
+C143 def  r5    8.50 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.37 card=10% rc=0
+C143 base r5    8.54 ms |  | load=14.52 card=9% rc=0
+C143 off  r5    8.72 ms |  | load=14.32 card=10% rc=0
+C135 off  r6    4.66 ms |  | load=14.25 card=0% rc=0
+C135 def  r6    4.11 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.30 card=0% rc=0
+C135 base r6    4.47 ms |  | load=14.24 card=0% rc=0
+C143 off  r6    7.83 ms |  | load=14.30 card=0% rc=0
+C143 def  r6    6.89 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.19 card=0% rc=0
+C143 base r6    8.67 ms |  | load=14.27 card=0% rc=0
+C135 base r7    4.36 ms |  | load=14.16 card=0% rc=0
+C135 off  r7    4.66 ms |  | load=14.30 card=0% rc=0
+C135 def  r7    4.21 ms |  prepared two ahead (--fill-ahead) 6454 q | load=14.42 card=1% rc=0
+C143 base r7    8.50 ms |  | load=14.35 card=0% rc=0
+C143 off  r7    8.26 ms |  | load=14.21 card=11% rc=0
+C143 def  r7    7.36 ms |  prepared two ahead (--fill-ahead) 2998 q | load=14.70 card=9% rc=0
+done: 0 failed
+exit 0
