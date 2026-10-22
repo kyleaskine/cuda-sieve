@@ -510,22 +510,19 @@ static inline int cf_limbs_for_mfb(uint32_t mfb)
 
 /* ---- cofactorisation METHOD, per side ----------------------------------- *
  *
- * Measured (RESULTS finding 70), cheapest configuration of each method that
- * reaches saturated relation yield, both swept from below:
+ * AUTO is ECM on every side since 2026-10-21 (RESULTS finding 125). Finding 70
+ * had rho winning 2LP by ~1.1x and ECM winning 3LP by 2-4x, so AUTO used to
+ * pick per side by large-prime count. Two things moved since: the PTX carry
+ * chains in cofac.cuh sped ECM up ~2.7x and rho ~1.8x, and finding 70 had
+ * priced 2LP only at lpb 29/30. Swept over lpb 29-35 at the effort below, ECM
+ * beats rho at 2LP too, by 1.2x at lpb 29 rising to 3.3x at 35, at the same
+ * relations.
  *
- *   2LP  (mfb ~ 2*lpb)      rho 2.4-2.8 ms/q vs ECM 2.6-3.2   -> rho, by ~1.1x
- *   3LP  (mfb ~ 3*lpb - 3)  ECM 12.6-394     vs rho 28-1226   -> ECM, by 2-4x
- *
- * The discriminant is the LARGE-PRIME COUNT, not lpb: at 2LP one split of a
- * semiprime costs rho ~sqrt(2^lpb) on a data-dependent cost, so easy lanes
- * exit early; at 3LP two successive splits of a much larger composite make rho
- * pay that square root twice while ECM's B1 barely moves.
- *
- * Per side, because a real job is usually one of each -- AS276 is 2LP rational
- * and 3LP algebraic -- so a per-job choice is wrong on one side of nearly
- * every job.
+ * The per-side machinery stays: --cof-rho still forces rho, the run still
+ * prints what each side resolved to, and the ECM parameters below still
+ * depend on each side's shape.
  */
-#define COF_METHOD_AUTO (-1)   /* per side, by the rule below       */
+#define COF_METHOD_AUTO (-1)   /* ECM on every side (finding 125)  */
 #define COF_METHOD_RHO    0    /* --cof-rho:  force rho, both sides */
 #define COF_METHOD_ECM    1    /* --cof-ecm:  force ECM, both sides */
 
@@ -535,19 +532,52 @@ static inline unsigned cof_parts(unsigned mfb, unsigned lpb)
     return lpb ? (mfb + lpb - 1u) / lpb : 0u;
 }
 
-static inline int cof_auto_method(unsigned mfb, unsigned lpb)
+/* ECM effort for one side, from the 2026-10-21 sweep (finding 125): 8 curves
+ * per round over 4 rounds, B2 = 30*B1, and B1 on a sqrt(2) ladder that climbs
+ * one step every two bits of lpb, with a 3LP side one step above a 2LP side of
+ * the same lpb (a 3LP side as cof_is_3lp below decides):
+ *
+ *   lpb    29   30-31  32-33  34-35  36-37  38-39  40-41  42+
+ *   2LP   100    140    200    280    400    560    800  1120
+ *   3LP   140    200    280    400    560    800   1120  1120
+ *
+ * Measured on c135, c183 and the NFS@Home I16 at every lpb 29-36: within
+ * 0.067% of saturated yield, at 0.66-0.92x the ECM time of the rule it
+ * replaced (12 curves; B1 200 to lpb 33, 300 at 34-35, 500 at 36). One ladder
+ * step lower, or 6 curves instead of 8, costs 4-16x as many relations. lpb 37
+ * shares 36's row as 31, 33 and 35 share theirs (all measured); 38 and up
+ * continue the ladder unmeasured -- too high a B1 only costs time. The rounds
+ * are the pipeline's default 4; standalone --cofac defaults to 6 and so does a
+ * little more. */
+#define COF_AUTO_CURVES 8u
+
+/* The abort rule's default (cf_sched_t's abort_after, finding 126): every
+ * unresolved record on a 3LP ECM side gets this many rounds, and after that
+ * only records that have split once are run again. 2 rather than 3: in
+ * finding 126 it was the most relations per second on every job with a 3LP
+ * side, for 0.09-0.24% of relations against 3's 0.01-0.04%. */
+#define COF_AUTO_ABORT 2
+
+/* Can this side's cofactor need TWO splits -- is it a 3LP side? Both:
+ * mfb above 2*lpb (cof_parts >= 3), so a relation can carry three large
+ * primes; and mfb above 3*log2(lim), so three primes above the factor-base
+ * bound fit at all. ceil(mfb/lpb) alone calls lpb 31 / mfb 64 3LP, but with
+ * every prime above lim ~2^27 its cofactors are at most two primes: a 2LP side
+ * in all but name, where the abort rule would drop unsplit records that go on
+ * to split ~60% of the time. */
+static inline int cof_is_3lp(unsigned mfb, unsigned lpb, uint64_t lim)
 {
-    return cof_parts(mfb, lpb) >= 3u ? COF_METHOD_ECM : COF_METHOD_RHO;
+    return cof_parts(mfb, lpb) >= 3u && lim > 1u &&
+           3.0 * log2((double)lim) < (double)mfb;
 }
 
-/* B1 for a side's lpb, from the measured optima: 200 at lpb 31-33, 300 at
- * 34-35, 500 at 36 and above. Flat below 31 because 2LP runs rho anyway and
- * never consults this. B2 = 30*B1 and 12 curves held across the whole range. */
-static inline uint32_t cof_auto_b1(unsigned lpb)
+static inline uint32_t cof_auto_b1(int three_lp, unsigned lpb)
 {
-    if (lpb >= 36u) return 500u;
-    if (lpb >= 34u) return 300u;
-    return 200u;
+    static const uint32_t ladder[] = { 100u, 140u, 200u, 280u, 400u, 560u, 800u, 1120u };
+    unsigned k = lpb <= 29u ? 0u : (lpb - 28u) / 2u;   /* 29:0 30-31:1 ... 36-37:4 */
+    if (three_lp) k++;
+    if (k > 7u) k = 7u;
+    return ladder[k];
 }
 
 /* ---- GPU entry points ------------------------------------------------- */
@@ -704,6 +734,7 @@ typedef struct {
     int      cofactor;      /* split the cofactors inline, cross-q queue        */
     int      cof_rounds;    /* rho requeue rounds                               */
     uint32_t cof_budget;    /* rho iterations in the first round                */
+    int      cof_budget_set;/* --cof-budget was given (it applies to rho only)  */
     /* Records per cofactor launch. 0 = AUTO: size it from the device and the
      * measured stage time, never below one record per thread. A positive value
      * pins it and disables the steering; any value at or above the batch is one
@@ -718,14 +749,22 @@ typedef struct {
      * floor. */
     uint32_t cof_chunk;
     uint64_t target_rels;   /* stop the band once this many relations exist     */
-    /* TRI-STATE, not a boolean: COF_METHOD_AUTO (-1) is the default and means
-     * "decide per side by LP count", so `if (cfg->cof_ecm)` is TRUE for AUTO
-     * and would force ECM on both sides. Read cof_meth0/cof_meth1 instead --
-     * this field is only the user's override. */
+    /* TRI-STATE, not a boolean: COF_METHOD_AUTO (-1) is the default and
+     * resolves to ECM on both sides (it was per side by LP count until
+     * finding 125), so `if (cfg->cof_ecm)` happens to agree with it today --
+     * do not rely on that. Read cof_meth0/cof_meth1 instead; this field is
+     * only the user's override. */
     int      cof_ecm;       /* COF_METHOD_AUTO / _RHO / _ECM                    */
-    uint32_t ecm_b1;        /* ECM stage-1 bound                                */
-    uint32_t ecm_b2;        /* ECM stage-2 bound (0 disables stage 2)            */
-    uint32_t ecm_curves;    /* ECM curves attempted per round                   */
+    /* ECM plan PER SIDE, [0] = side 0 (rational), [1] = side 1 (finding 126:
+     * a 2LP side next to a 3LP one needs about half the 3LP side's B1). */
+    uint32_t ecm_b1[2];     /* ECM stage-1 bound                                */
+    uint32_t ecm_b2[2];     /* ECM stage-2 bound (0 disables stage 2)            */
+    uint32_t ecm_curves;    /* ECM curves attempted per round, both sides       */
+    /* The abort rule (cf_sched_t's abort_after): after this many rounds a 3LP
+     * ECM side reruns only records that have split once. 0 = off. cof_abort
+     * is the setting, cof_abort_side[] what each side resolved to (0 on a 2LP
+     * or rho side, where it does not apply). */
+    int      cof_abort, cof_abort_set, cof_abort_side[2];
     uint32_t nq_max;        /* stop after this many q (0 = all)                 */
     int      td_verify;     /* run the factors x cofactor == norm reconstruction */
     double   scale0, allowance0;
@@ -736,13 +775,13 @@ typedef struct {
      * run can be measured against. See CF_LMAX above. */
     int      cof_limbs0, cof_limbs;
     /* Resolved cofactorisation method per side, 0 = rho, 1 = ECM. Filled in by
-     * resolve_and_check_cofactor_config from cof_method below; see cof_auto_method. */
+     * resolve_and_check_cofactor_config from cof_ecm above; see COF_METHOD_AUTO. */
     int      cof_meth0, cof_meth1;
     /* "The user asked for this", as distinct from "it is still zero". Needed
      * because 0 is already MEANINGFUL for these: --ecm-b2 0 is the documented
      * way to DISABLE stage 2, and --ecm-curves 0 must stay an error. Deriving
      * a default from "is it zero" silently overrode both. */
-    int      ecm_b1_set, ecm_b2_set, ecm_curves_set;
+    int      ecm_b1_set[2], ecm_b2_set[2], ecm_curves_set;
     const char *relations;  /* complete relations, needing no cofactorisation   */
     const char *candidates; /* the cofactorisation batch                        */
     uint32_t lim;           /* factor-base bound for this side (rlim / alim)    */
@@ -1094,9 +1133,10 @@ int check_relations_sample(const char *path, const poly_t *poly, uint32_t lpb0,
 
 int run_cofac(const char *path, const char *out, uint32_t lim0, uint32_t lpb0,
               uint32_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
-              int blocks, int threads, int meth0, int meth1, uint32_t ecm_b1,
-              uint32_t ecm_b2, uint32_t ecm_curves, int limbs0, int limbs1,
-              uint32_t chunk);
+              int blocks, int threads, int meth0, int meth1,
+              const uint32_t ecm_b1[2], const uint32_t ecm_b2[2],
+              uint32_t ecm_curves, const int abort_after[2], int limbs0,
+              int limbs1, uint32_t chunk);
 
 int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
               const poly_t *P, const bench_cfg_t *cfg);

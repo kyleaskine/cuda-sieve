@@ -754,25 +754,30 @@ for the simplicity of "always 4/3", and the selector costs nothing at run time
 the 3-limb kernels are register-identical in both builds. **This is the
 decision the width work was blocking, and it is now made.**
 
-**2. rho vs ECM. SHIPPED as the default 2026-08-19** — chosen per side from
-`ceil(mfb/lpb)`, rho at 2LP and ECM at 3LP, with ECM's `B1` derived from `lpb`
-and the requeue round default raised 2 -> 4 (ECM escalates in curves per
-round). Zero-flag effect: c183 17.21 -> 14.30 ms/q *and* 9,363 -> 9,394
-relations; C194 15.48 -> 13.95; AS276 3,443 -> 4,089 relations. `--cof-rho` /
-`--cof-ecm` force one method on both sides. Two gate cases pin the automatic
-choice and the overrides.
+**2. rho vs ECM. ECM on every side is the default since 2026-10-21**
+(finding 125), at 8 curves x 4 rounds, `B2 = 30 * B1`, and `B1` on a ladder
+by `lpb`, one step higher for a 3LP side: 2LP 100 / 140 / 200 / 280 / 400 at
+lpb 29 / 30-31 / 32-33 / 34-35 / 36-37, 3LP 140 / 200 / 280 / 400 / 560,
+continuing the ladder (unmeasured) at 38 and up to 1120, each side its own plan from
+its own lpb (`cof_auto_b1`, `COF_AUTO_CURVES`; per side since finding 126).
+On a 3LP ECM side, after round 2 only records that have split once are run
+again (`--cof-abort`, default 2, finding 126: +0.7-4.9% relations per second on
+C183 to C208 and SNFS-301 for 0.09-0.24% of relations). Measured
+within 0.067% of saturated yield at every lpb 29-36 on c135, c183 and I16, at
+0.66-0.92x the ECM time of the previous rule. `--cof-rho` forces rho on both
+sides; cofcheck pins the automatic method and the derived plan for a mixed and
+a 2LP-only shape.
 
-The measurement behind it: **ECM wins 2-4x at 3LP and loses narrowly at 2LP** — the
-discriminant is the large-prime count, not `lpb`. Measured cheapest-saturating
-config for each, both swept from below: c183 `lpb 32/mfb 92` 30.83 -> 15.38
-ms/q (2.00x), AS276 `lpb 35/mfb 101` 332.63 -> 123.22 (2.70x). Full sweep over
-`lpb 29-36` in RESULTS finding 70; guidance in RUNBOOK "Method: ECM for 3LP,
-rho for 2LP". *(This paragraph used to close by saying making it the default
-"has not been made". That predated the header above it and contradicted it:
-`cfg.cof_ecm = COF_METHOD_AUTO` is the default at `bench_main.cu:924` and
-resolves per side at 425-426. Corrected 2026-09-03 -- the `COF_METHOD_RHO` at
-`bench_main.cu:926` is a pre-resolution initial value, not a default, and has
-misled at least one reader into the opposite conclusion as well.)*
+Why it changed: the PTX carry chains (finding 125, `cofac.cuh`) cut ECM's
+time to ~0.37x and rho's to ~0.55x, and finding 70 had priced 2LP only at
+lpb 29/30. ECM now beats rho at 2LP by 1.2x (lpb 29) to 3.3x (lpb 35).
+
+History: from 2026-08-19 the method was per side from `ceil(mfb/lpb)`, rho at
+2LP and ECM at 3LP with `B1` 200/300/500 by `lpb` and 12 curves, and the
+requeue round default went 2 -> 4. Zero-flag effect then: c183 17.21 -> 14.30
+ms/q *and* 9,363 -> 9,394 relations; C194 15.48 -> 13.95; AS276 3,443 ->
+4,089 relations. The measurement behind it (finding 70): ECM 2-4x at 3LP,
+rho ~1.1x at 2LP lpb 29/30; guidance in RUNBOOK "Method".
 
 *(An earlier version of finding 70 reported 15-18x. That was wrong: rho had
 been priced at an over-large budget rather than swept from below — the same
@@ -945,6 +950,9 @@ required surplus.
 | 64-bit large-prime outputs and gates | **done 2026-08-17** | — |
 | per-side `mz<3>` / `mz<4>` dispatch | **done 2026-08-18**, gated and timed (+8-9% wall when forced wide) | — |
 | per-side rho/ECM dispatch, default | **done 2026-08-19**, gated and timed (finding 70) | — |
+| PTX carry chains for the cofactor arithmetic (L = 3, 4) | **done 2026-10-21**, byte-identical (abcheck 36/36), I16 1.10x end to end (finding 125) | — |
+| ECM on every side, effort ladder by `lpb` | **done 2026-10-21**, swept at lpb 29-36, <= 0.067% of relations for 0.66-0.92x the ECM time (finding 125) | — |
+| ECM plan per side, and the 3LP abort rule | **done 2026-10-21**, byte-identical when off (6 jobs), +0.7-4.9% rel/s on every job with a 3LP side at the default abort 2 (finding 126) | — |
 | cofactor outcome reporting (`split / dead / stuck`) | **done 2026-08-19** | — |
 | C208 validated against a 1.5B-relation GGNFS corpus | **done 2026-08-19**, 99.97% recall (finding 69) | — |
 | 384-bit exact norms, `BN_LIMBS` a build knob | **done 2026-08-27**, byte-identical gate on AS276, +0.45 ms of a 90 ms q | — |

@@ -89,9 +89,10 @@ expect_refused "zero ECM curves"               --cofactor --cof-ecm --ecm-curves
 # B2 is DERIVED (30*B1) when --ecm-b2 is absent, so --ecm-b1 alone now runs
 # stage 2 where it used to run stage 1 only. Deliberate, and pinned here
 # because it silently changes the cost and yield of any script passing B1 alone.
+# --ecm-b1 sets both sides, so both plans say so (one line per side).
 got=$(run --cofactor --cof-ecm --ecm-b1 2000 --relations $TMP/b2d.txt \
       | grep -c 'ECM B1 = 2000, .*B2 = 60000' || true)
-if [ "$got" = "1" ]; then
+if [ "$got" = "2" ]; then
     printf 'PASS   %-34s B2 = 30*B1\n' "B2 derived from B1"
 else
     printf 'FAIL   %-34s no derived B2 line\n' "B2 derived from B1"; fail=1
@@ -264,16 +265,85 @@ else
     printf 'FAIL   %-34s lpb 32 accepted a 33-bit factor\n' "lpb bound is enforced"; fail=1
 fi
 
-# ---- automatic per-side METHOD --------------------------------------------
-# rho for a 2LP side, ECM for a 3LP one. This job is mfbr 60 / lpbr 31 (2 parts)
-# and mfba 92 / lpba 32 (3 parts), so it must resolve to rho / ECM -- the same
-# mixed shape a real job has, and the reason the choice is per side at all.
-got=$(run --cofactor --relations $TMP/m.txt | grep -c 'cofactor method: side 0 rho, side 1 ECM' || true)
-if [ "$got" = "1" ]; then
-    printf 'PASS   %-34s rho / ECM\n' "auto method, 2LP and 3LP sides"
+# ---- automatic METHOD and ECM effort --------------------------------------
+# ECM on every side since finding 125 (it was rho for a 2LP side until then).
+# This job is mfbr 60 / lpbr 31 (2 parts) and mfba 92 / lpba 32 (3 parts), the
+# mixed shape a real job has. Each side gets its own plan (finding 126): 2LP at
+# lpb 31 is B1 140, 3LP at lpb 32 is B1 280; B2 = 30*B1, 8 curves. The abort
+# rule is on for the 3LP side only, after round 2 by default.
+out=$(run --cofactor --relations $TMP/m.txt || true)
+got=$(printf '%s\n' "$out" | grep -c 'cofactor method: side 0 ECM, side 1 ECM' || true)
+e0=$(printf '%s\n' "$out" | grep -c 'side 0 ECM B1 = 140, .* B2 = 4200 .* 8 curves per round' || true)
+e1=$(printf '%s\n' "$out" | grep -c 'side 1 ECM B1 = 280, .* B2 = 8400 .* 8 curves per round' || true)
+ab=$(printf '%s\n' "$out" | grep -c 'cofactor abort: side 1 .* after round 2' || true)
+ab0=$(printf '%s\n' "$out" | grep -c 'cofactor abort: side 0' || true)
+if [ "$got" = "1" ] && [ "$e0" = "1" ] && [ "$e1" = "1" ] && [ "$ab" = "1" ] && [ "$ab0" = "0" ]; then
+    printf 'PASS   %-34s ECM/ECM, B1 140 / 280, abort side 1\n' "auto method and effort, mixed"
 else
-    printf 'FAIL   %-34s did not resolve to rho / ECM\n' "auto method, 2LP and 3LP sides"; fail=1
+    printf 'FAIL   %-34s method=%s side0=%s side1=%s abort1=%s abort0=%s\n' \
+           "auto method and effort, mixed" "$got" "$e0" "$e1" "$ab" "$ab0"; fail=1
 fi
+# Both sides 2LP (mfba 64 / lpba 32): the 2LP ladder on each, and no abort.
+out=$(run --cofactor --mfb 64 --relations $TMP/m.txt || true)
+e0=$(printf '%s\n' "$out" | grep -c 'side 0 ECM B1 = 140, .* B2 = 4200 .* 8 curves per round' || true)
+e1=$(printf '%s\n' "$out" | grep -c 'side 1 ECM B1 = 200, .* B2 = 6000 .* 8 curves per round' || true)
+ab=$(printf '%s\n' "$out" | grep -c 'cofactor abort:' || true)
+if [ "$e0" = "1" ] && [ "$e1" = "1" ] && [ "$ab" = "0" ]; then
+    printf 'PASS   %-34s B1 140 / 200, no abort\n' "auto effort, 2LP both sides"
+else
+    printf 'FAIL   %-34s side0=%s side1=%s abort=%s\n' "auto effort, 2LP both sides" \
+           "$e0" "$e1" "$ab"; fail=1
+fi
+# One side's flag reaches that side only.
+out=$(run --cofactor --ecm-b1-0 100 --ecm-b2-1 9000 --relations $TMP/m.txt || true)
+e0=$(printf '%s\n' "$out" | grep -c 'side 0 ECM B1 = 100, .* B2 = 3000 ' || true)
+e1=$(printf '%s\n' "$out" | grep -c 'side 1 ECM B1 = 280, .* B2 = 9000 ' || true)
+if [ "$e0" = "1" ] && [ "$e1" = "1" ]; then
+    printf 'PASS   %-34s side 0 B1, side 1 B2\n' "per-side --ecm-b1-0 / --ecm-b2-1"
+else
+    printf 'FAIL   %-34s side0=%s side1=%s\n' "per-side --ecm-b1-0 / --ecm-b2-1" "$e0" "$e1"; fail=1
+fi
+# Each side's plan must reach that side's KERNEL, not just its banner: a B1 of
+# 2 on one side splits almost nothing there, so the count falls to what that
+# side needed no split for -- and a plan wired to the wrong side would leave
+# all 37. The two counts differ, so a swap is caught as well.
+expect_rel "side 1 plan reaches side 1"     10 --cofactor --ecm-b1-1 2
+expect_rel "side 0 plan reaches side 0"     17 --cofactor --ecm-b1-0 2
+# The abort rule. At or beyond the round count it never fires, so it must be
+# byte-identical to off. Earlier it can only DROP records -- a record that is
+# run sees the same sigmas whatever else was selected -- so its relations must
+# be a subset of the rule-off run's, and on a plan weak enough that late rounds
+# matter it must drop some: B1 70 x 2 curves on the 3LP side over 8 rounds,
+# where off finds 24 and after round 1 finds 13, abandoning 1,506 records.
+WEAK="--cofactor --ecm-b1-1 70 --ecm-curves 2 --cof-rounds 8"
+run $WEAK --cof-abort 0 --relations $TMP/ab0.txt >/dev/null || true
+run $WEAK --cof-abort 8 --relations $TMP/ab8.txt >/dev/null || true
+out=$(run $WEAK --cof-abort 1 --relations $TMP/ab1.txt || true)
+if [ -s $TMP/ab0.txt ] && cmp -s $TMP/ab0.txt $TMP/ab8.txt; then
+    printf 'PASS   %-34s identical to off\n' "--cof-abort at the round count"
+else
+    printf 'FAIL   %-34s differs from --cof-abort 0\n' "--cof-abort at the round count"; fail=1
+fi
+# Guarded: under set -e a sort of a file a refused run never wrote would end
+# the suite here with no FAIL line.
+n0=$(wc -l < $TMP/ab0.txt 2>/dev/null || echo 0)
+n1=$(wc -l < $TMP/ab1.txt 2>/dev/null || echo 0)
+extra=missing
+if [ -s $TMP/ab0.txt ] && [ -s $TMP/ab1.txt ]; then
+    sort $TMP/ab0.txt > $TMP/ab0.s; sort $TMP/ab1.txt > $TMP/ab1.s
+    extra=$(comm -23 $TMP/ab1.s $TMP/ab0.s | wc -l)
+fi
+abn=$(printf '%s\n' "$out" | grep -c 'left by the abort rule *1506 ' || true)
+if [ "$n0" = "24" ] && [ "$n1" = "13" ] && [ "$extra" = "0" ] && [ "$abn" = "1" ]; then
+    printf 'PASS   %-34s 13 of 24, a subset, 1506 abandoned\n' "--cof-abort 1 drops, and only drops"
+else
+    printf 'FAIL   %-34s off=%s abort1=%s not-in-off=%s abandoned-line=%s\n' \
+           "--cof-abort 1 drops, and only drops" "$n0" "$n1" "$extra" "$abn"; fail=1
+fi
+# Nothing to apply it to: refused, as --ecm-b2 is under rho. 0 stays legal.
+expect_refused "abort rule on a 2LP-only job"   --cofactor --mfb 64 --cof-abort 2
+expect_rel "--cof-abort 0 on a 2LP-only job" 23 --cofactor --mfb 64 --cof-abort 0
+expect_refused "abort rule out of range"       --cofactor --cof-abort 25
 # Forcing must override the automatic choice in both directions.
 got=$(run --cofactor --cof-rho --relations $TMP/m.txt | grep -c 'side 0 rho, side 1 rho' || true)
 got2=$(run --cofactor --cof-ecm --relations $TMP/m.txt | grep -c 'side 0 ECM, side 1 ECM' || true)
@@ -365,7 +435,9 @@ else
     printf 'SKIP   %-34s build is 3-limb only\n' "4-limb width cases"
 fi
 
-expect_refused "zero rho budget"              --cofactor --cof-budget 0
+# --cof-rho: the budget is validated only when a side runs rho, and since
+# finding 125 AUTO runs ECM on both.
+expect_refused "zero rho budget"              --cofactor --cof-rho --cof-budget 0
 expect_refused "rho rounds overflowing shift" --cofactor --cof-rounds 40
 expect_refused "lambda in the typo window"    --cofactor --lambda1 0.01
 expect_refused "lambda absurdly large"        --cofactor --lambda1 99

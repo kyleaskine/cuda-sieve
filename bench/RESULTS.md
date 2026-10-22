@@ -13675,3 +13675,516 @@ raw, not deduplicated. Evidence in
   3.64-3.66 ms per special-q here, interleaved with CADO's runs, against
   3.36-3.41 in finding 123's own timing run, so the c135 ratio may be a
   little pessimistic for us.
+
+## Finding 125 — PTX carry chains make the cofactor arithmetic 1.8x (rho) to 2.7x (ECM) faster with byte-identical relations, I16 1.10x end to end; with them ECM beats rho on every side, and its effort comes down to 8 curves on a B1 ladder by lpb, 0.66-0.92x the previous ECM time for at most 0.067% of relations at lpb 29-36. Both are the default now
+
+**Date:** 2026-10-20/21. Card free, client not running, host load 2-14
+(other work on the host; 9-10 for the sweep). Builds: the C and PTX
+arithmetic as `git archive` of `3537cdd` (`GPU_ARCH=120`), then the tree
+(fat build). Evidence, git-ignored: [`../work/ptx-ab/`](../work/ptx-ab/)
+(`NOTES.md`, `pipe.sh`, `csweep.sh`, `runs/`) for the arithmetic, and
+[`../work/lpbecm/`](../work/lpbecm/) (`gen.sh`, `sweep.py`, `analyze.py`,
+`group.py`, `matrix.py`, `retime.sh`, `e2e.sh`, `results.tsv`,
+`retime.tsv`, `e2e.txt`) for the effort sweep.
+
+### 1. The arithmetic
+
+`cofac.cuh` gains `mz_mul`, `mz_add_mod`, `mz_sub_mod` and `mz_dbl_mod`
+specialisations at L = 3 and L = 4 in PTX `add.cc`/`addc`/`mad.lo.cc`/`madc`
+carry chains, device only (the block after the generic `mz_mul` says why:
+the generic add/sub reduce through `mz_cmp`, a loop with an early return,
+which unrolled into every ladder step gave `k_cofac<3, ECM>` 4,965 divergent
+regions and ~4.7 MB of SASS; the PTX reduce is a borrow mask, 76 regions).
+Same registers under `__launch_bounds__(256, 2)`.
+
+Gates: `arithcheck.cu` (262,144 random moduli per width, 256 chained steps,
+identical output; injected carry bugs caught), `abcheck.sh` C build against
+the tree **36 cases, 36 identical**, `make cofcheck` passed (including its
+4-limb cases, which compare 4-limb rho and ECM output with 3-limb byte for
+byte).
+
+| batch queue, ms (`--cofac`) | C | PTX | |
+|---|---:|---:|---:|
+| I16 rational, rho 65536 x 4 | 325 | 180 | 0.55x |
+| I16 rational, ECM 300/9000 12 x 4 | 236 | 87 | 0.37x |
+| I16 algebraic, ECM 300/9000 12 x 4 | 711 | 268 | 0.38x |
+| c135 rational / algebraic, rho 65536 x 4 | 48 / 106 | 29.5 / 63 | 0.6x |
+
+| end to end, wall/q (zero flags) | C | PTX | relations |
+|---|---:|---:|---|
+| I16, q 297.000-297.006M, load 14 | 186.2 / 188.8 ms | 171.4 / 169.4 (**1.10x**) | 23,497, identical |
+| c135, WU 7.0-7.1M, load 2-6, 3 rounds | 3.81 ms (mean) | 3.73 (1.02x) | 603,136, identical |
+
+On I16 the in-loop flush fell 28.25 -> 12.85 ms/q and the wall 17 ms/q: the
+cofactor flush is entirely on the critical path.
+
+### 2. The cutover moved: ECM wins at 2LP too
+
+Finding 70 had rho winning 2LP by ~1.1x, but measured 2LP only at lpb 29/30
+on the c183 polynomial. Even with the C arithmetic that did not hold at
+lpb 33 (I16's rational side: ECM 1.38x). The PTX change sped ECM up more
+than rho (its ladder is add/sub-heavy, and those were the divergent paths),
+and with the effort of section 3 ECM beats rho at every 2LP shape measured:
+
+| 2LP batch | lpb | rho ms/q (65536 x 6) | ECM ms/q (new rule) | rho / ECM |
+|---|---:|---:|---:|---:|
+| c135 | 29 | 0.099 | 0.082 | 1.20 |
+| c135 | 30 | 0.245 | 0.159 | 1.54 |
+| c135 | 31 | 0.630 | 0.321 | 1.96 |
+| c183 | 31 | 0.097 | 0.045 | 2.14 |
+| c183 | 32 | 0.220 | 0.098 | 2.24 |
+| c183 | 33 | 0.508 | 0.209 | 2.43 |
+| I16 | 33 | 0.240 | 0.088 | 2.72 |
+| I16 | 34 | 0.972 | 0.386 | 2.52 |
+| I16 | 35 | 2.541 | 0.766 | 3.32 |
+
+(Both sides' queues; same yield within the loss column of section 3.)
+**AUTO is now ECM on both sides.** `--cof-rho` still forces rho.
+
+### 3. How far the ECM effort comes down, lpb 29-35
+
+**Batches** (`gen.sh`): candidate files from the pipeline without
+`--cofactor`, so every configuration sees the same input. Two shapes, so
+that every lost relation belongs to one side:
+
+- *2LP*: both sides 2LP at lpb L, mfb 2L-2, run `--cof-ecm`: c135
+  (lims 9M/12M, I13) at L 29-31, c183 (67M/134M, I15) at 31-33, NFS@Home I16
+  (200M/300M, I16) at 33-35. 26-146K candidates.
+- *3LP*: side 0 at its job's real 2LP shape on rho (held fixed), side 1 3LP
+  at L, mfb 3L-4, the `--ecm-*` flags reaching side 1 alone. Same three
+  polynomials. The c183 and I16 batches were then rebuilt five times larger
+  on disjoint q (520-766K candidates, 10-15K cofactor relations) because at
+  ~2,500 relations one relation was 0.03-0.04% and could not separate 0.02%
+  loss from 0.1%.
+
+**Loss** = (most relations any configuration found - this one's) / (that
+most + the batch's TD-complete relations): the share of the job's relations
+lost. The reference is a heavy ECM (B1 two ladder steps above the window,
+B2 50 B1, 16 x 8) and, at 2LP, saturated rho; the previous default matched
+it everywhere. **Cost** = the ECM queue's ms per q (both queues at 2LP).
+
+**Grid**: B1 35-800 on a ~sqrt(2) ladder, B2 = 20/30/50 B1, curves x rounds
+4x2 ... 16x4 (3,828 runs), then a focused pass (598 runs: curves 6-16 at
+4 rounds, 8x3, 12x3, B2 20/30 B1, the larger batches), then the candidate
+rule and the previous default re-timed with 3 repeats each (`retime.tsv`).
+Findings from the grid:
+
+- **Rounds and the B2 multiple hardly matter.** Holding 4 rounds costs at
+  most 6% against the best of 2-4 rounds at the same loss limit, about the
+  noise of a single-repeat timing. B2 = 20 B1 and 30 B1 trade places (the
+  best 30 B1 configuration costs a median 1.02x the best 20 B1, range
+  0.94-1.17) and 50 B1 is never the cheapest. So the rule keeps the
+  pipeline's 4 rounds and the previous 30 B1, and moves B1 and curves only.
+- **8 curves holds across the whole range** once B1 scales with lpb. Of the
+  36 cheapest configurations within 0.02% and within 0.05% (18 batches),
+  33 use 6-12 curves, median 8.
+- **The edge is steep.** One ladder step lower in B1, or 6 curves instead of
+  8, costs 4-16x the relations: I16 2LP lpb 33 0.055% -> 0.40% (B1 140),
+  I16 3LP lpb 34 0.016% -> 0.13% (B1 280) or 0.11% (6 curves), c135 2LP
+  lpb 31 0.013% -> 0.21% (B1 100).
+- **The lims barely matter.** At lpb 31 (c135 against c183) and lpb 33
+  (c183 against I16) the same configuration loses 0.002-0.055% on both
+  polynomials, and the cheapest-within-0.05% picks agree within one ladder
+  step.
+
+**The rule** (`cof_auto_b1`, `COF_AUTO_CURVES`): 8 curves x 4 rounds,
+B2 = 30 B1, B1 one sqrt(2) step every two bits of lpb, a 3LP side one step
+above a 2LP side of the same lpb. One plan serves both sides, taken from the
+side that asks the most. *(Each side has its own plan since finding 126.)*
+
+| lpb | 29 | 30-31 | 32-33 | 34-35 | 36-37 | 38-39 | 40-41 | 42+ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2LP B1 | 100 | 140 | 200 | 280 | 400 | 560 | 800 | 1120 |
+| 3LP B1 | 140 | 200 | 280 | 400 | 560 | 800 | 1120 | 1120 |
+
+8 curves throughout. lpb 36 was swept afterwards (below) and lands on the
+ladder's next step. lpb 37 shares 36's row as 31, 33 and 35 share theirs;
+38 and up continue the ladder unmeasured.
+
+**Re-timed** (3 repeats; the previous default is B1 200, or 300 at lpb
+34-35, B2 = 30 B1, 12 x 4):
+
+| batch | shape | rule | loss | ms/q | previous ms/q | x previous |
+|---|---|---|---:|---:|---:|---:|
+| c135 | 2LP 29 | 100/3000 | 0.004% | 0.082 | 0.096 | 0.85 |
+| c135 | 2LP 30 | 140/4200 | 0.000% | 0.159 | 0.194 | 0.82 |
+| c135 | 2LP 31 | 140/4200 | 0.013% | 0.321 | 0.437 | 0.74 |
+| c183 | 2LP 31 | 140/4200 | 0.023% | 0.045 | 0.051 | 0.88 |
+| c183 | 2LP 32 | 200/6000 | 0.003% | 0.098 | 0.115 | 0.86 |
+| c183 | 2LP 33 | 200/6000 | 0.038% | 0.209 | 0.256 | 0.82 |
+| I16 | 2LP 33 | 200/6000 | 0.055% | 0.088 | 0.110 | 0.80 |
+| I16 | 2LP 34 | 280/8400 | 0.016% | 0.386 | 0.446 | 0.86 |
+| I16 | 2LP 35 | 280/8400 | 0.067% | 0.766 | 0.932 | 0.82 |
+| c135 | 3LP 29 | 140/4200 | 0.000% | 2.864 | 4.373 | 0.66 |
+| c135 | 3LP 30 | 200/6000 | 0.000% | 5.824 | 6.741 | 0.86 |
+| c135 | 3LP 31 | 200/6000 | 0.002% | 8.772 | 10.648 | 0.82 |
+| c183 | 3LP 31 | 200/6000 | 0.017% | 1.583 | 1.995 | 0.79 |
+| c183 | 3LP 32 | 280/8400 | 0.016% | 3.256 | 3.562 | 0.91 |
+| c183 | 3LP 33 | 280/8400 | 0.011% | 5.357 | 5.848 | 0.92 |
+| I16 | 3LP 33 | 280/8400 | 0.021% | 4.175 | 4.647 | 0.90 |
+| I16 | 3LP 34 | 400/12000 | 0.016% | 27.201 | 30.347 | 0.90 |
+| I16 | 3LP 35 | 400/12000 | 0.035% | 41.980 | 47.009 | 0.89 |
+| I16 | 2LP 36 | 400/12000 | 0.022% | 1.456 | 2.008 | 0.73 |
+| I16 | 3LP 36 | 560/16800 | 0.024% | 78.156 | 91.772 | 0.85 |
+
+(3LP rows are side 1's queue alone. The c183 and I16 3LP rows are the
+five-times-larger batches. The previous default lost 0.009% on I16 3LP 35
+and 0.006% on I16 3LP 36, nothing elsewhere. The previous lpb-36 values
+were B1 500 x 12.)
+
+**lpb 36** (added later the same day; `gen.sh` `i16-36-2`, `i16-36-3`;
+441 grid runs plus the re-time). I16 only: 2LP 36/70 on both sides (117K
+candidates, 300 q) and 3LP 36/104 on side 1 (729K candidates, 100 q, a
+4-limb cofactor). Run with the previous binary, whose AUTO still resolved
+side 0 to rho, so that the `--ecm-*` flags reached side 1 alone; the
+arithmetic is identical. The cheapest configuration within 0.05% is 280/5600
+12 x 4 (2LP) and 560/11200 8 x 4 (3LP), and the ladder's next step at 8
+curves, 400 and 560, sits within 0.025% of saturation. rho on the 2LP batch
+costs 3.1x ECM (4.57 against 1.46 ms/q).
+
+**Not taken: trading relations for speed.** Counting relations per second
+with the batch's own sieving wall per q plus the queue, the best
+configuration on the 3LP batches loses 0.1-1.8% of relations for 0.5-12%
+more relations per second: I16 lpb 34/35 B1 280 at 6 curves, -1.3%/-1.6%
+of relations for +5%/+7%; c183 -0.3-0.7% for +2-3%; c135 -1.3-1.8% for
++11-12%, a 3LP shape no small job runs. Those batches overstate the cofactor share of a real
+job (mfb 3L-4; the real I16 algebraic side is 34/96 and spends 8 ms/q of
+~170), and the brief was not to lose relations, so the rule stops at
+~0.05%. It is the one lever left here if relations per second is all that
+counts.
+
+**Not done: separate ECM plans per side.** On a mixed job the 2LP side
+inherits the 3LP side's B1, which at lpb 31-35 is two ladder steps more
+than the 2LP side needs (3LP sits one step above 2LP at the same lpb, and
+the 3LP side's lpb is usually one bit higher). Measured end to end in
+section 4: 0.46% of wall on I16, 0.8% on c183.
+
+### 4. End to end
+
+`e2e.sh`, zero cofactor flags, three interleaved rounds per job at host load
+~10: the previous rule (the PTX build: rho at 2LP, ECM B1 200/300 x 12 at
+3LP), the same binary with `--cof-ecm` (ECM on both sides at the previous
+effort), and the new default. c135 is WU 7.0-7.1M, c183 q 130M + 400 q at
+I15, I16 q 297.000-297.006M. Mean wall per q (the three readings), mean
+queue and in-loop flush ms per q:
+
+| job | arm | plan | wall/q | rq | aq | flush | relations |
+|---|---|---|---:|---:|---:|---:|---|
+| c135 | previous | rho / rho | 3.89 (3.89/3.94/3.85) | 0.04 | 0.10 | 0.47 | 603,136 |
+| | `--cof-ecm` | B1 200 x 12 | 3.84 (-1.4%) | 0.05 | 0.08 | 0.46 | identical |
+| | **new** | B1 140 x 8 | **3.82 (-1.9%)** | 0.04 | 0.06 | **0.44** | 603,132 (-4) |
+| c183 | previous | rho / B1 200 x 12 | 45.96 (46.29/45.61/45.97) | 1.65 | 4.40 | 5.90 | 18,343 |
+| | `--cof-ecm` | B1 200 x 12 | 45.36 (-1.3%) | 1.06 | 4.41 | 5.35 | identical |
+| | **new** | B1 280 x 8 | **44.95 (-2.2%)** | 1.10 | 4.05 | **5.04** | 18,343 (one swapped) |
+| I16 | previous | rho / B1 300 x 12 | 168.21 (168.87/168.22/167.54) | 4.19 | 8.16 | 12.41 | 23,497 |
+| | `--cof-ecm` | B1 300 x 12 | 166.77 (-0.9%) | 2.39 | 8.14 | 10.70 | identical |
+| | **new** | B1 400 x 8 | **166.41 (-1.1%)** | 2.52 | 7.62 | **10.31** | 23,496 (-1) |
+
+- **Every arm is faster than the previous default, and the relations move
+  by at most 4 in 603,136 (c135) and 1 in 23,497 (I16).** c183 loses one
+  3LP relation and gains another (the higher B1 on the algebraic side
+  finds one the old plan missed). Run-to-run wall noise at this load is
+  ~0.1 ms/q at c135, so its -1.9% is the least certain; its flush,
+  0.47 -> 0.44 ms/q, is the cleaner reading.
+- **Most of the gain is the method change** (rho -> ECM on the 2LP side:
+  I16's rational queue 4.19 -> 2.39 ms/q). The lighter effort adds the
+  rest on the 3LP side (I16 aq 8.14 -> 7.62, c183 4.41 -> 4.05).
+- The new plan's rational queue costs a little *more* than `--cof-ecm`'s
+  (I16 2.39 -> 2.52, c183 1.06 -> 1.10): it inherits the 3LP side's B1 400
+  / 280, twice what a 2LP side at lpb 33 / 31 needs. See below.
+
+Gates on the final tree: `make cofcheck` passed (cases updated: the
+automatic method is now ECM / ECM; two new cases pin the derived plan for
+the mixed c183 shape, B1 280 / B2 8400 / 8 curves, and a 2LP-only one,
+B1 200 / 6000 / 8; the zero-rho-budget refusal now passes `--cof-rho`,
+since AUTO no longer validates a rho budget it does not use).
+`abcheck.sh` sets `sb` and `cand` against the previous binary: **29 cases,
+29 identical** -- the sieve and the candidate stream are untouched, as
+they should be (the `cof` and `stop` sets run AUTO and differ by design).
+
+**Separate plans per side, measured** (`perside.sh`): the rational queue at
+its own 2LP plan instead of the inherited one, both runs twice. I16
+(B1 200 x 8 against 400 x 8): rq 2.50 -> 1.73 ms/q, **0.46% of wall**. c183
+(B1 140 x 8 against 280 x 8): rq 1.10 -> 0.74 ms/q, **0.8% of wall**. The
+2LP batches put the rational side's own plan within 0.055% of its
+relations. Not implemented here: it needs a second stage-2 schedule and
+curve count in `cofq_t`, both flush schedules, the standalone path, the
+config, CLI and checkpoint fingerprint.
+
+The same runs set the algebraic side two ladder steps low as well, which
+is the relations-for-speed trade above, measured end to end: I16 -0.60% of
+relations for -2.1% wall (flush 10.3 -> 7.6 ms/q), c183 -0.56% for -3.5%.
+
+### 5. Checkpoints
+
+The ECM parameters are in the checkpoint fingerprint (`ckpt.h`), so a band
+checkpointed by a binary with the previous rule does not resume under this
+one: interactively it is refused as "a different job"; under BOINC
+(`BOINC_RECOVER_OR_RETURN`) the stale resume is discarded and the band
+restarts. Swapping the client's binary mid-WU costs that WU's progress, not
+the WU.
+
+## Finding 126 — an ECM plan per side, and dropping a 3LP record that has found nothing after round 2 (now the default): on every job with a 3LP side, from C183 to C208 and SNFS-301, +0.7-4.9% relations per second for 0.09-0.24% of relations. After round 3 instead: +0.4-2.8% for 0.01-0.04%
+
+**Date:** 2026-10-21, evening. Card free, client not running, host load
+~11 (other work on the host). Binaries: the tree before this change (one
+shared ECM plan, `4c40ee0a`, saved as `work/lpbecm/bench.shared`) and after
+it (`b81c5f0d`). Evidence, git-ignored: [`../work/lpbecm/`](../work/lpbecm/)
+(`NOTES.md`; `rounds2lp.sh`, `rounds.tsv`; `diagrun.sh`, `diag.py`, `diag/`;
+`idgate.sh`, `idgate.txt`; `e2e2.sh`, `e2e2.txt`), the instrumented scratch
+build in `../work/cofinstr/`, and the rebuilt SNFS-301 job in
+`../work/snfs301/`.
+
+### Why: what a record's first round says about it
+
+An instrumented scratch build (`mz_split` reports how many splits it made
+before its curves ran out; one code per record per round) ran every 3LP batch
+of finding 125 at the rule's B1, 8 curves, 6 rounds, and two 2LP batches at
+8 rounds. The share of records that go on to split:
+
+| after round 1 | goes on to split |
+|---|---:|
+| 2LP side, still unsplit | 58-63% (c135 lpb 30, I16 lpb 33) |
+| 3LP side, found one factor, missed the second | 22-44% |
+| 3LP side, found nothing | 0.08-0.14% |
+| 3LP side, found nothing in rounds 1 and 2 | 0.01-0.02% |
+
+A 3LP record that has found a factor is left with a two-prime composite, the
+same object a 2LP side splits, and behaves like one. One that has found
+nothing is several hundred times less likely to be a relation -- it is
+mostly the B40 x B45 kind no affordable ECM splits -- and it is >99% of what
+rounds 2-4 run on. Partly split records are 0.2-0.5% of round 1's records but
+supply 60-85% of the relations completed in round 2 or later. Simulated from
+the dumps, "every record gets A rounds, then only records that have split once
+continue" matched the 4-round yield within 0.03% at A = 3 and lost 0.05-0.23%
+at A = 2, at the cost of 8 x 3 and 8 x 2. (2LP: more rounds there recover at
+most the rule's remaining <= 0.067%, for +5-20% of a small queue --
+`rounds.tsv` -- so 2LP sides keep their rounds.)
+
+### The change
+
+- **A plan per side.** `cf_ecm_dev_t` holds one side's stage-1 powers and
+  stage-2 mask; `cofq_t` and the standalone `--cofac` path hold two. Each
+  side's B1 comes from its own lpb and large-prime count (`cof_auto_b1`), B2 =
+  30 B1 per side. `--ecm-b1` / `--ecm-b2` still set both sides; `--ecm-b1-0`,
+  `--ecm-b1-1`, `--ecm-b2-0`, `--ecm-b2-1` set one. Finding 125 had one plan
+  for both sides, the larger, so a 2LP side next to a 3LP one ran about twice
+  the B1 it needed.
+- **The abort rule** (`cf_sched_t.abort_after`, `--cof-abort N`, default 2
+  -- see "The default" below).
+  `mz_split` returns the number of splits it made when it runs out of curves;
+  `k_cofac` sets a per-record "has split once" byte (sticky); from round N on,
+  `k_cof_selflags` selects only records with it set. Applied only to a 3LP ECM
+  side (`cof_abort_side[]`); records it drops stay `CF_INCOMPLETE` and count as
+  stuck, with their own count beside it. Off -- `--cof-abort 0`, or N at or
+  above the round count -- the per-record byte is not written.
+- The checkpoint fingerprint carries both sides' B1/B2 and abort setting.
+
+### Gates
+
+- **Identity** (`idgate.sh`): the new binary told the old shared plan
+  (`--ecm-b1 B --ecm-b2 30B --cof-abort 0`) against the previous binary at its
+  defaults, pipeline `--cofactor`: **6 of 6 relation files byte-identical** --
+  c135, c147, c183, c194, I16 and AS276 (4-limb), 118,660 to 1,703 relations.
+- **The rule is the simulated rule.** The standalone path on the I16 lpb 34
+  3LP batch (B1 400 x 8, 6 rounds) gives 9,567 / 9,565 / 9,555 algebraic splits
+  at abort off / 3 / 2 and drops 141,217 / 180,758 records -- exactly the
+  counts the instrumented build predicted.
+- `make cofcheck`: 64 PASS. New cases pin both sides' derived plans for the
+  mixed c183 shape (B1 140 / 280, abort on side 1 only) and a 2LP-only one
+  (140 / 200, no abort), the one-side flags, `--cof-abort 4` (= the round
+  count) byte-identical to off, `--cof-abort 1` a subset of off, and 25
+  refused.
+- `k_cofac` stays at or under 128 registers on every target of the fat build
+  (+0 to +3), with no stack growth.
+
+### End to end
+
+`e2e2.sh`: zero flags beyond each arm's, three interleaved rounds per job,
+host load ~11. Wall ms/q is the mean of three; relations are deterministic
+(identical in all three rounds of every arm). **rel/s** is relations per
+second against the previous binary. rq / aq / flush are the rational and
+algebraic queues and the in-loop flush, ms per q.
+
+| job (shape) | arm | wall/q | relations | rel/s | rq | aq | flush |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **c135** (2LP/2LP) | previous | 3.86 | 603,132 | | 0.04 | 0.06 | 0.46 |
+| | per side | 3.79 | -8 | +1.7% | 0.04 | 0.06 | 0.44 |
+| | + abort 3 (no 3LP side: same as above) | 3.82 | -8 | +1.0% | | | |
+| **c147** (2LP/2LP) | previous | 9.84 | 237,627 | | 0.06 | 0.08 | 0.43 |
+| | per side | 9.93 | -6 | -0.9% | 0.05 | 0.08 | 0.41 |
+| | + abort 3 (same as above) | 9.83 | -6 | +0.1% | | | |
+| **c183** (2LP r, 3LP a 32/92) | previous | 45.09 | 27,593 | | 1.10 | 4.04 | 5.38 |
+| | per side | 44.49 | -0.011% | +1.3% | 0.74 | 4.07 | 5.00 |
+| | **+ abort 3** | 44.41 | -0.014% | **+1.5%** | 0.74 | 3.79 | 4.77 |
+| | + abort 2 | 44.05 | -0.087% | +2.3% | 0.74 | 3.47 | 4.46 |
+| **c194** (2LP r, 3LP a 33/95) | previous | 177.39 | 33,614 | | 3.71 | 11.49 | 16.80 |
+| | per side | 177.24 | -0.003% | +0.1% | 2.95 | 11.45 | 15.90 |
+| | **+ abort 3** | 176.65 | -0.030% | **+0.4%** | 2.95 | 10.82 | 15.36 |
+| | + abort 2 | 175.81 | -0.235% | +0.7% | 2.94 | 10.04 | 14.59 |
+| **I16** (2LP r, 3LP a 34/96) | previous | 167.37 | 23,496 | | 2.56 | 7.67 | 10.39 |
+| | per side | 166.40 | -0.026% | +0.6% | 1.70 | 7.61 | 9.58 |
+| | **+ abort 3** | 165.73 | -0.038% | **+1.0%** | 1.69 | 6.91 | 8.94 |
+| | + abort 2 | 165.30 | -0.132% | +1.1% | 1.67 | 6.33 | 8.32 |
+| **AS276** C208 (2LP r, 3LP a 35/101, 4-limb) | previous | 204.40 | 17,295 | | 4.07 | 37.48 | 44.84 |
+| | per side | 202.96 | -0.012% | +0.7% | 2.58 | 37.38 | 43.27 |
+| | **+ abort 3** | 198.80 | -0.023% | **+2.8%** | 2.58 | 34.30 | 40.01 |
+| | + abort 2 | 194.42 | -0.208% | +4.9% | 2.57 | 30.16 | 35.42 |
+| **SNFS-301** (rational q; 2LP r 33/65, 3LP a 34/98, 4-limb) | previous | 181.24 | 13,497 | | 5.77 | 22.97 | 27.64 |
+| | per side | 179.14 | -0.037% | +1.1% | 3.71 | 22.99 | 25.69 |
+| | **+ abort 3** | 176.79 | -0.044% | **+2.5%** | 3.71 | 21.02 | 23.77 |
+| | + abort 2 | 174.63 | -0.119% | +3.7% | 3.71 | 19.03 | 21.97 |
+| **SNFS-301, 3LP rational** (3LP r 33/95, 2LP a 34/66) | previous | 144.63 | 11,851 | | 6.69 | 1.10 | 7.45 |
+| | per side (same plan: 280 / 280) | 145.64 | 0 | -0.7% | 6.71 | 1.10 | 7.78 |
+| | + abort 3 | 145.18 | -0.008% | -0.4% | 6.31 | 1.09 | 7.30 |
+| | + abort 2 | 144.78 | -0.143% | -0.3% | 5.75 | 1.10 | 7.05 |
+
+c135 and c147 have no 3LP side, so their three new arms run the same
+configuration: **their spread, up to 1.1%, is this run's wall-clock noise.**
+The flush column is the cleaner reading.
+
+- **Per side** cuts the 2LP rational queue by 20-37% on every mixed job (c183
+  1.10 -> 0.74, I16 2.56 -> 1.70, AS276 4.07 -> 2.58, SNFS-301 5.77 -> 3.71
+  ms/q) for 0.003-0.037% of relations, the 2LP rule's own loss.
+- **Abort 3** takes a further 0.3-3.1 ms/q off the 3LP queue for at most
+  0.03% more. Together: flush -0.6 (c183) to -4.8 ms/q (AS276), relations
+  -0.014% to -0.044%, rel/s +0.4% to +2.8%. The gain grows with the 3LP
+  side's share of the wall, which is largest on the C208 and the SNFS.
+- **Abort 2** is the best relations per second on every job with a 3LP side
+  (+0.7% to +4.9%), for 0.09-0.24% of relations.
+- **3LP on the rational side** works: that side runs first on every
+  candidate, the abort rule applies to it (rq 6.69 -> 6.31 -> 5.75) and
+  nowhere else. Its per-side plan happens to equal the shared one (3LP at
+  lpb 33 and 2LP at 34 are both B1 280), and its wall differences (-0.7% to
+  +0.3%) are within the noise.
+
+**The default.** Abort 3 keeps relations within 0.05% of the previous rule
+everywhere; abort 2 trades another 0.07-0.21% of relations for another
+0.2-2.1% of relations per second, and is the most relations per second on
+every job with a 3LP side here. **Kyle chose 2** (2026-10-21), so it is the
+default (`COF_AUTO_ABORT`); `--cof-abort 3` restores the conservative one.
+
+### Code review, and what changed after the measurements above
+
+A `/code-review xhigh` of the change found no fault in the measured paths, and
+these fixes went in after the end-to-end runs (none changes what a measured
+job runs, except the default):
+
+- **Which side is 3LP.** `ceil(mfb/lpb) >= 3` alone calls lpb 31 / mfb 64 a
+  3LP side, though with every prime above lim ~2^27 its cofactors hold at most
+  two primes; the abort rule there would drop unsplit 2LP records (~60% of
+  which split). `cof_is_3lp` now also requires `mfb > 3*log2(lim)`. It decides
+  both the ladder's 3LP step and the abort rule. Every job measured here is
+  unchanged by it.
+- **Abandoned records are counted apart** (`k_cof_abandon_count`, a "has
+  split" buffer per side) and the stuck-rate warning reads only budget-
+  exhausted ones. Counted together, a healthy abort-2 band read 24-41% stuck
+  and the SNFS-301 rational-3LP variant tripped the one-third warning in all
+  three of its abort-2 runs; its advice (raise `--cof-budget`) no longer applied to an ECM side
+  either.
+- `--cof-abort N > 0` is refused where no side is 3LP ECM, as `--ecm-b2` is
+  under rho; `--cof-budget` with no rho side gets a note. The per-record byte
+  is not written when the rule cannot fire (N at or above the rounds).
+- `cf_sched_t` points at its side's `cf_ecm_dev_t` instead of four hand copies
+  of its fields; the eligibility rule is resolved once (`cof_abort_side[]`).
+- The cofcheck cases now fail if the feature breaks: one side's B1 of 2 must
+  cut that side's yield (10 and 17 relations, against 37 -- a plan wired to the
+  wrong side leaves 37), and on a weak plan abort 1 must give exactly 13 of the
+  rule-off run's 24, a subset, with 1,506 abandoned. 68 PASS.
+- The PTX carry chains' "bit for bit" claim now states its precondition
+  (operands reduced, < n -- the only kind passed); stale `--help`, comments,
+  the B1 table above lpb 41 (1120 from 42), and the checkpoint-refusal advice
+  (which now names the cofactor settings) were corrected.
+
+**Not done:** re-sweeping B1 and curves under the abort rule. Later rounds
+are now nearly free on a 3LP side, which may move the best round-1 effort.
+
+### Re-sweep under the abort rule: the defaults stand
+
+With abort 2 the default, Kyle asked for the 3LP effort to be swept again.
+Later rounds now carry only partly split records, so the best round-1 effort
+might have moved. Evidence in `../work/lpbecm/` (`sweepab.py`, `ab.tsv`;
+`retimeab.sh`, `abretime.tsv`; `e2e3.sh`, `e2e3.txt`).
+
+**Batches.** The ten 3LP batches (lpb 29-36: c135, c183, I16), side 1's plan
+alone. Side 0 is held at a saturating B1 (`--ecm-b1-0 1120`), and its
+split/dead/stuck was identical in every one of the 630 sweep and 180 re-time
+rows, so only side 1 moved. Re-timed against the default (the ladder B1, 8 x 4,
+abort 2), 3 repeats:
+
+| side 1 | 3LP queue cost | relations lost |
+|---|---:|---:|
+| 8 x 6 | +0-4% | 0-0.035% fewer |
+| 10 x 4 | +11-16% | 0.04-0.2% fewer |
+| 6 x 6 | -12-16% | 0.18-0.6% more |
+| one B1 step lower, 10 x 4 / 8 x 6 | -2-7% / -13-18% | 0.0-0.22% / 0.2-0.7% more |
+
+So the trade runs smoothly in both directions. Weighting the cost by each real
+job's 3LP-queue share of wall (I16 3.8%, c183 7.9%, SNFS-301 10.9%, AS276
+15.5%) suggested less 3LP effort might be worth 0.5-2.5% relations per second
+on the larger-share jobs. That is first order only: curves and rounds are
+shared with the 2LP side.
+
+**End to end** (`e2e3.sh`, eight jobs, three interleaved rounds, host load
+~1.4), relations per second and relations against the default:
+
+| | c183 | c194 | I16 | AS276 | SNFS-301 | SNFS-301, 3LP r | c135 / c147 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| no 3LP step, 8 x 4 | +0.6% / -0.32% | -0.2% / -0.72% | +0.1% / -0.38% | +2.1% / -0.88% | +1.5% / -0.38% | -0.4% / -0.73% | (no 3LP side) |
+| no 3LP step, 8 x 6 | -0.1% / -0.28% | -0.7% / -0.53% | 0.0% / -0.30% | +0.8% / -0.55% | +0.8% / -0.26% | -0.5% / -0.58% | rel/s +0.9% / -0.2% (noise) |
+| 6 x 6 | +0.6% / -0.23% | -0.4% / -0.46% | +0.1% / -0.33% | +0.7% / -0.44% | +0.7% / -0.26% | -0.6% / -0.45% | rel/s +1.2% / +0.8% (noise) |
+
+("No 3LP step" runs the 3LP side at the 2LP ladder B1 for its lpb. On a
+2LP-only job, 8 x 6 is just two more rounds.)
+
+**No alternative wins across the board,** and every one costs 0.2-0.9% of
+relations. Lower 3LP effort pays only where the 3LP queue is the largest share
+of the wall (AS276 +2.1%, SNFS-301 +1.5%). It loses on c194 and on SNFS-301
+with 3LP rational. Two more rounds also cost the 2LP side: under 8 x 6 its
+queue is +10-13% on every mixed job. **The defaults stay: the ladder
+B1 with the 3LP step, 8 curves, 4 rounds, abort 2.** If a job's 3LP queue is a
+large share of its wall, `--ecm-b1-1` (or `-0`) one ladder step lower is the
+knob to try. A rule that chose it from the measured share is possible, but is
+not built.
+
+## Finding 127 — after findings 125-126: cofactorisation 2.1-3.6x faster than HEAD 3537cdd, wall 11-25% faster on every job with a 3LP side, and the NFS@Home I16 now runs at 101.5% of cado-gpu's rate with its small-prime skip off (it was 89.9%). c135 is still behind, at 72.5%, and that figure is the least certain
+
+**Date:** 2026-10-21, evening. Card free, client not running. Builds: OLD =
+`git archive` of HEAD `3537cdd` (C cofactor arithmetic, rho on 2LP sides,
+ECM B1 200/300 x 12 on 3LP), NEW = the tree (`f37fe64d`: findings 125 and
+126, abort 2). cado-gpu as in finding 124, `GLAS_SKIP_BOUND=0`, same WU and
+q range, same commands. Evidence: [`../work/h2h-20261021/`](../work/h2h-20261021/)
+(`run.sh`, `run.txt`, `runs.csv`). Three interleaved rounds per job.
+
+| job | cofactor ms/q, old -> new | elapsed s, old -> new | relations | rel/s |
+|---|---:|---:|---:|---:|
+| c135 (2LP) | 0.23 -> 0.11 (-53%) | 24.76 -> 21.34 (-13.8%; per-q -3.2%) | -0.002% | +16.0% |
+| c147 (2LP) | 0.38 -> 0.14 (-62%) | 20.37 -> 20.07 (-1.5%) | -0.005% | +1.5% |
+| c183 | 13.97 -> 4.32 (-69%) | 35.74 -> 28.32 (-20.8%) | -0.087% | +26.1% |
+| c194 | 43.23 -> 13.10 (-70%) | 63.24 -> 54.58 (-13.7%) | -0.238% | +15.6% |
+| NFS@Home I16 | 29.03 -> 8.21 (-72%) | 64.42 -> 57.01 (-11.5%) | -0.136% | +12.8% |
+| AS276 (C208) | 112.26 -> 34.25 (-70%) | 58.69 -> 44.20 (-24.7%) | -0.289% | +32.4% |
+| SNFS-301 | 82.75 -> 23.52 (-72%) | 49.72 -> 37.18 (-25.2%) | -0.119% | +33.6% |
+| SNFS-301, 3LP rational | 24.87 -> 7.03 (-72%) | 34.53 -> 30.23 (-12.4%) | -0.169% | +14.0% |
+
+**Against cado-gpu, skip off** (host load 2-6 for these two jobs):
+
+| job | cado-gpu | old | new | new / cado-gpu |
+|---|---:|---:|---:|---:|
+| NFS@Home I16 | 23,292 rel in 57.45 s: 405.5/s | 364.7/s (89.9%) | 411.6/s | **101.5%** |
+| c135 | 592,535 rel in 15.20 s: 38,983/s | 24,363/s (62.5%) | 28,258/s | **72.5%** |
+
+- **Cofactor time is device time**, untouched by host load. The c147 to
+  SNFS-301 rows overlapped host load ~14 (other work started during the run).
+  Both builds were interleaved under it, so their ratios stand, but absolute
+  times are inflated.
+- **I16 is the clean comparison.** It is GPU-bound, ran quiet, has no
+  q-pipeline, and its per-q and elapsed figures agree (-11.6% / -11.5%).
+- **c135 is not clean.** Its elapsed gain (-13.8%) is four times its per-q gain
+  (-3.2%). Under `--q-pipeline` the per-q spans overlap, so their sum
+  over-counts and only elapsed is real throughput. But the sessions behind
+  findings 125-126 put the c135 elapsed gain at a few percent, and this
+  session's cado-gpu ran 9% faster and the old build 6% slower than in
+  finding 124 (1.37x then, 1.60x against the old build here). So read c135 as
+  cado-gpu 1.38x-1.5x ahead. A quiet re-run with ABBA ordering would settle
+  it.

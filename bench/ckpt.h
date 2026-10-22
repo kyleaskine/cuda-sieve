@@ -206,10 +206,11 @@ static inline void ckpt_job_text(const poly_t *P, const bench_cfg_t *cfg,
      * flush-anchored to a timer. The cofactor method and its bounds decide
      * which cofactors split at all, so they change the yield too. */
     ckpt_fp_cat(out, n, &k,
-                " maxbits=%d cofac=%d ecm=%d b1=%u b2=%u curves=%u"
-                " rounds=%d budget=%u",
+                " maxbits=%d cofac=%d ecm=%d b1=%u/%u b2=%u/%u curves=%u"
+                " abort=%d/%d rounds=%d budget=%u",
                 cfg->fb_maxbits, cfg->cofactor, cfg->cof_ecm,
-                cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,
+                cfg->ecm_b1[0], cfg->ecm_b1[1], cfg->ecm_b2[0], cfg->ecm_b2[1],
+                cfg->ecm_curves, cfg->cof_abort_side[0], cfg->cof_abort_side[1],
                 cfg->cof_rounds, cfg->cof_budget);
 }
 

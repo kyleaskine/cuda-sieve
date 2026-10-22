@@ -2569,6 +2569,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     if (cfg->cofactor && cofq_init(&Q, &QO, CQ_FLUSH,
                                    cfg->cof_meth0, cfg->cof_meth1,
                                    cfg->ecm_b1, cfg->ecm_b2, cfg->ecm_curves,
+                                   cfg->cof_abort_side,
                                    cfg->cof_limbs0, cfg->cof_limbs))
         { rc = -1; goto done; }
     if (cfg->cofactor) VRAM_MARK("cofactor queue");
@@ -5257,8 +5258,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * relations to give. Only a corpus comparison found it. Now the
              * run says so itself. */
             {
-                const unsigned long long st0 = Q.nst[0][CF_INCOMPLETE];
-                const unsigned long long st1 = Q.nst[1][CF_INCOMPLETE];
+                /* Budget-exhausted only: records the abort rule stopped
+                 * running (finding 126) are left unresolved by design and are
+                 * reported apart, below. Counting them here made a healthy
+                 * --cof-abort 2 band read 25-41% "stuck" and trip the warning. */
+                const unsigned long long st0 = Q.nst[0][CF_INCOMPLETE] - Q.nabandon[0];
+                const unsigned long long st1 = Q.nst[1][CF_INCOMPLETE] - Q.nabandon[1];
                 const unsigned long long stuck = st0 + st1;
                 for (int sd = 0; sd < 2; sd++) {
                     char lbl[40];
@@ -5276,6 +5281,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                         printf("  %-34s %8llu\n",
                                "    OVERFLOW (parts, or cofactor width)",
                                Q.nst[sd][CF_OVERFLOW]);
+                    if (Q.nabandon[sd])
+                        printf("  %-34s %8llu (found nothing in %d rounds)\n",
+                               "    of stuck, left by the abort rule",
+                               Q.nabandon[sd], Q.abort_after[sd]);
                 }
                 /* Warned, not merely printed, because the band otherwise
                  * exits 0 looking healthy.
@@ -5305,13 +5314,18 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * 55% when its budget was five times too small. Nothing inside
                  * a single run distinguishes the two, which is why the message
                  * names the actual test rather than asserting a fault. */
+                /* With the abort rule on, an under-effort ECM plan shows up
+                 * as abandoned records rather than as these, so this can only
+                 * catch a side running without it; the abandoned count is
+                 * printed above either way. */
                 if (Q.nseen && stuck * 3ull > Q.nseen)
                     runlog_warn("  %llu of %llu records (%.1f%%) left unresolved by"
                                 " the splitting budget. That is high; a healthy 3LP"
                                 " band runs ~20%%. These are cofactors of UNKNOWN"
                                 " status, so some may have been relations -- re-run"
-                                " a short band at a higher --cof-budget /"
-                                " --cof-rounds and see whether the yield moves.",
+                                " a short band with more ECM effort (--ecm-curves,"
+                                " --ecm-b1) or more --cof-rounds (--cof-budget under"
+                                " --cof-rho) and see whether the yield moves.",
                                 stuck, Q.nseen,
                                 100.0 * (double)stuck / (double)Q.nseen);
             }

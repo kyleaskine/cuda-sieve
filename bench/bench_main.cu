@@ -205,12 +205,18 @@ static void usage(void)
 "  --rlim N / --alim N  factor base bounds, side 0 / side 1\n"
 "  --lpb N / --lpb0 N   large-prime bound in bits  [32 side 1, 31 side 0]\n"
 "  --mfb N / --mfb0 N   max cofactor bits          [92 side 1, 60 side 0]\n"
-"  --cof-ecm / --cof-rho   force one method on BOTH sides. The default is\n"
-"                   per-side and automatic: rho for a 2LP side, ECM for a 3LP\n"
-"                   one (ceil(mfb/lpb) >= 3). Measured: rho wins ~1.1x at 2LP,\n"
-"                   ECM wins 2-4x at 3LP. A typical job is one of each.\n"
-"  --ecm-b1 N / --ecm-b2 N / --ecm-curves N   [derived from lpb: B1 200 at\n"
-"                   lpb<=33, 300 at 34-35, 500 at 36+; B2 = 30*B1; 12 curves]\n"
+"  --cof-ecm / --cof-rho   force one method on BOTH sides. The default is ECM\n"
+"                   on both: since the PTX arithmetic it beats rho 1.2-3.3x at\n"
+"                   2LP as well as 2-4x at 3LP (finding 125).\n"
+"  --ecm-b1 N / --ecm-b2 N / --ecm-curves N   [derived per side from its own\n"
+"                   lpb: B1 100 at lpb <=29, 140 at 30-31, 200 at 32-33, 280\n"
+"                   at 34-35, 400 at 36-37, up a sqrt(2) step per 2 bits\n"
+"                   beyond (unmeasured) to 1120, one step more for a 3LP side;\n"
+"                   B2 = 30*B1; 8 curves]. --ecm-b1/-b2 set both sides,\n"
+"                   --ecm-b1-0 / --ecm-b1-1 (and -b2-) one; later flags win\n"
+"  --cof-abort N    on a 3LP ECM side, after N rounds rerun only the records\n"
+"                   that have split once; 0 = off [2] (finding 126). Refused\n"
+"                   where no side is 3LP ECM, as it would do nothing\n"
 "  --cof-limbs N / --cof-limbs0 N   cofactor width in 32-bit limbs\n"
 "                   [narrowest that mfb needs: 3 up to 96 bits, 4 above].\n"
 "                   Force it UP to time the same job at both widths; forcing\n"
@@ -231,9 +237,11 @@ static void usage(void)
 "                   and should match the maxbits recorded by a cached --fb1 file\n"
 "\n"
 "COFACTORISATION\n"
-"  --cof-rounds N   rho requeue rounds, budget doubling each time\n"
+"  --cof-rounds N   requeue rounds: ECM runs --ecm-curves fresh curves per\n"
+"                   round (on a 3LP side only the first --cof-abort rounds\n"
+"                   rerun every record); rho doubles its budget each round\n"
 "                   [6 for --cofac; 4 for --pipeline --cofactor]\n"
-"  --cof-budget N   rho iterations in the first round\n"
+"  --cof-budget N   rho iterations in the first round (rho sides only)\n"
 "                   [4096 for --cofac; 65536 for --pipeline --cofactor]\n"
 "  --cof-chunk N    cofactor records per launch; 0 = auto [0], sized from the\n"
 "                   device and the measured stage time, never below one record\n"
@@ -243,11 +251,8 @@ static void usage(void)
 "                   launch. Results are identical whatever it is set to.\n"
 "                   Auto-steering is --pipeline only; under --cofac a value\n"
 "                   pins the slice and 0 means one launch per round\n"
-"  --cof-ecm        ECM instead of Pollard-Brent rho; stage 1 alone loses,\n"
-"                   while tuned stage 2 is near rho at matched yield\n"
-"  --ecm-b1 N       ECM stage-1 bound                              [1000]\n"
-"  --ecm-b2 N       ECM D=30 stage-2 bound; 0 disables stage 2         [0]\n"
-"  --ecm-curves N   ECM curves attempted per round                 [16]\n"
+"  --cof-ecm / --cof-rho / --ecm-* / --cof-abort   as under PARAMETERS above;\n"
+"                   the same derivation applies to --cofac\n"
 "  --candidates F   write the cofactorisation batch here\n"
 "  --cofac FILE     cofactorise a batch written by --candidates and emit the\n"
 "                   relations to --relations; needs no sieving\n"
@@ -477,39 +482,52 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
     }
     /* THE METHOD, per side. Same shape as the width resolution above and for
      * the same reason: this is the one function that has seen both the .job
-     * file and the command line. AUTO picks rho for a 2LP side and ECM for a
-     * 3LP one; --cof-ecm / --cof-rho force both sides, which is what an A/B
-     * measurement needs and what reproduces the pre-2026-08-19 default. */
+     * file and the command line. AUTO is ECM on every side since 2026-10-21
+     * (finding 125; it was rho at 2LP from 2026-08-19); --cof-rho forces rho
+     * on both sides, which is what an A/B measurement needs and what
+     * reproduces the pre-2026-08-19 default. */
     {
-        const int a1 = cof_auto_method(mfb1, lpb1);
-        const int a0 = cof_auto_method(cfg->mfb0, cfg->lpb0);
-        cfg->cof_meth1 = (cfg->cof_ecm == COF_METHOD_AUTO) ? a1 : cfg->cof_ecm;
-        cfg->cof_meth0 = (cfg->cof_ecm == COF_METHOD_AUTO) ? a0 : cfg->cof_ecm;
-        /* ECM parameters follow the lpb of whichever side actually runs ECM;
-         * when both do, the wider one, since a B1 too small loses relations
-         * and one too large only costs time. */
-        if (!cfg->ecm_b1_set) {
-            unsigned lp = 0;
-            if (cfg->cof_meth1 == COF_METHOD_ECM && lpb1 > lp) lp = lpb1;
-            if (cfg->cof_meth0 == COF_METHOD_ECM && cfg->lpb0 > lp) lp = cfg->lpb0;
-            cfg->ecm_b1 = cof_auto_b1(lp ? lp : lpb1);
+        cfg->cof_meth1 = (cfg->cof_ecm == COF_METHOD_AUTO) ? COF_METHOD_ECM : cfg->cof_ecm;
+        cfg->cof_meth0 = (cfg->cof_ecm == COF_METHOD_AUTO) ? COF_METHOD_ECM : cfg->cof_ecm;
+        /* An ECM plan PER SIDE (finding 126), each from that side's own lpb
+         * and large-prime count. Until then one plan served both sides and
+         * followed whichever asked the most, so a 2LP side next to a 3LP one
+         * ran about twice the B1 it needed: 0.46% of wall on I16, 0.8% on
+         * c183. A rho side's plan is derived too, and goes unused. */
+        int s;
+        for (s = 0; s < 2; s++) {
+            const unsigned l = s ? lpb1 : cfg->lpb0;
+            const unsigned m = s ? mfb1 : cfg->mfb0;
+            const uint64_t lm = s ? (cfg->lim ? cfg->lim : alim)
+                                  : (cfg->lim0 ? cfg->lim0 : rlim);
+            const int three = cof_is_3lp(m, l, lm);
+            const int ecm = (s ? cfg->cof_meth1 : cfg->cof_meth0) == COF_METHOD_ECM;
+            if (!cfg->ecm_b1_set[s]) cfg->ecm_b1[s] = cof_auto_b1(three, l);
+            /* Keyed on _set, not on the value: --ecm-b2 0 means "no stage 2"
+             * and must not be filled in merely because it is zero.
+             *
+             * 30*B1, CLAMPED INTO THE VALIDATOR'S OWN RANGE. A derived value
+             * must never be able to fail the check that follows it: B1 below
+             * 30 is outside the D=30 continuation's domain, and 30*B1 above
+             * 10^7 exceeds the B2 ceiling -- so an unclamped rule turned
+             * `--ecm-b1 2` and every `--ecm-b1` above 333,333 into a hard
+             * refusal citing an --ecm-b2 the user never passed. Two thirds of
+             * --ecm-b1's own documented range was unusable. Clamp, do not
+             * refuse: the user asked for a B1, not a B2. */
+            if (!cfg->ecm_b2_set[s]) {
+                const uint32_t b1 = cfg->ecm_b1[s];
+                if (b1 < 30u)                    cfg->ecm_b2[s] = 0u;
+                else if (b1 > 10000000u / 30u)   cfg->ecm_b2[s] = 10000000u;
+                else                             cfg->ecm_b2[s] = 30u * b1;
+            }
+            /* The abort rule only where a record that has found nothing is a
+             * lost cause: a 3LP ECM side. A 2LP side's unsplit records go on
+             * to split ~60% of the time and keep every round. */
+            cfg->cof_abort_side[s] = (ecm && three)
+                ? (cfg->cof_abort_set ? cfg->cof_abort : COF_AUTO_ABORT) : 0;
         }
-        /* Keyed on _set, not on the value: --ecm-b2 0 means "no stage 2" and
-         * --ecm-curves 0 must stay a refusal, so neither may be filled in
-         * merely because it is zero. */
-        /* 30*B1, CLAMPED INTO THE VALIDATOR'S OWN RANGE. A derived value must
-         * never be able to fail the check that follows it: B1 below 30 is
-         * outside the D=30 continuation's domain, and 30*B1 above 10^7 exceeds
-         * the B2 ceiling -- so an unclamped rule turned `--ecm-b1 2` and every
-         * `--ecm-b1` above 333,333 into a hard refusal citing an --ecm-b2 the
-         * user never passed. Two thirds of --ecm-b1's own documented range was
-         * unusable. Clamp, do not refuse: the user asked for a B1, not a B2. */
-        if (!cfg->ecm_b2_set) {
-            if (cfg->ecm_b1 < 30u)               cfg->ecm_b2 = 0u;
-            else if (cfg->ecm_b1 > 10000000u / 30u) cfg->ecm_b2 = 10000000u;
-            else                                 cfg->ecm_b2 = 30u * cfg->ecm_b1;
-        }
-        if (!cfg->ecm_curves_set) cfg->ecm_curves = 12u;
+        /* --ecm-curves 0 must stay a refusal, so it is keyed on _set too. */
+        if (!cfg->ecm_curves_set) cfg->ecm_curves = COF_AUTO_CURVES;
     }
     /* ceil(mfb/lpb) parts must fit in CF_MAXFAC. 3LP is what an SNFS job with
      * mfbr 88 / lpbr 31 asks for and is supported; 4LP is not, and it would
@@ -566,9 +584,10 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
         bad = 1;
     }
     /* Validate each method's knobs whenever ANY side uses it. Keyed on the
-     * pair and not on a single flag: the common auto case is rho on one side
-     * and ECM on the other, so an either/or here would skip the rho budget
-     * checks on exactly the jobs that still run rho. */
+     * pair and not on a single flag: AUTO was rho on one side and ECM on the
+     * other until finding 125, and an either/or here skipped the rho budget
+     * checks on exactly the jobs that ran rho. AUTO is ECM on both now, so
+     * the rho checks fire under --cof-rho. */
     if (cfg->cof_meth0 == COF_METHOD_RHO || cfg->cof_meth1 == COF_METHOD_RHO) {
         if (!cof_budget || (uint64_t)cof_budget << (cof_rounds - 1) > 0xFFFFFFFFull) {
             fprintf(stderr, "--cof-budget %u with %d rounds overflows uint32"
@@ -586,27 +605,48 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
         if (!cfg->ecm_curves) {
             fprintf(stderr, "--ecm-curves 0 attempts no curves\n"); bad = 1;
         }
-        if (cfg->ecm_b1 < 2 || cfg->ecm_b1 > 1000000u) {
-            fprintf(stderr, "--ecm-b1 %u: must be 2..1000000\n", cfg->ecm_b1);
-            bad = 1;
+        for (int s = 0; s < 2; s++) {
+            const uint32_t b1 = cfg->ecm_b1[s], b2 = cfg->ecm_b2[s];
+            if ((s ? cfg->cof_meth1 : cfg->cof_meth0) != COF_METHOD_ECM) continue;
+            if (b1 < 2 || b1 > 1000000u) {
+                fprintf(stderr, "--ecm-b1 %u (side %d): must be 2..1000000\n", b1, s);
+                bad = 1;
+            }
+            if (b2 && (b1 < 30u || b2 <= b1 || b2 > 10000000u)) {
+                fprintf(stderr, "--ecm-b2 %u (side %d): want 0 (disabled), or"
+                        " B1 < B2 <= 10000000 with B1 >= 30\n", b2, s);
+                bad = 1;
+            }
         }
-        if (cfg->ecm_b2 && (cfg->ecm_b1 < 30u ||
-                            cfg->ecm_b2 <= cfg->ecm_b1 ||
-                            cfg->ecm_b2 > 10000000u)) {
-            fprintf(stderr, "--ecm-b2 %u: want 0 (disabled), or B1 < B2 <="
-                    " 10000000 with B1 >= 30\n", cfg->ecm_b2);
-            bad = 1;
-        }
-    } else if (cfg->ecm_b2_set) {
+    } else if (cfg->ecm_b2_set[0] || cfg->ecm_b2_set[1]) {
         /* Keyed on _set ALONE. Gating this on --cof-rho as well meant a
          * 2LP/2LP job that resolved to rho automatically accepted --ecm-b2 and
          * silently ignored it, which is the failure the diagnostic exists to
          * prevent. _set is already 1 only when the user typed the flag, so a
          * derived value can never reach here. */
-        fprintf(stderr, "--ecm-b2 has no effect: both sides resolved to rho"
-                " (2 large primes each)\n");
+        fprintf(stderr, "--ecm-b2 has no effect: both sides run rho"
+                " (--cof-rho)\n");
         bad = 1;
     }
+    if (cfg->cof_abort < 0 || cfg->cof_abort > 24) {
+        fprintf(stderr, "--cof-abort %d: must be 0 (off) .. 24\n", cfg->cof_abort);
+        bad = 1;
+    } else if (cfg->cof_abort_set && cfg->cof_abort &&
+               !cfg->cof_abort_side[0] && !cfg->cof_abort_side[1]) {
+        /* Same reasoning as --ecm-b2 under rho above: an A/B arm passing it
+         * here would measure nothing. 0 (off) is true of such a job anyway
+         * and stays accepted, so one script can pass it to every job. */
+        fprintf(stderr, "--cof-abort %d has no effect: no side is a 3LP ECM"
+                " side (ceil(mfb/lpb) >= 3 and mfb > 3*log2(lim))\n",
+                cfg->cof_abort);
+        bad = 1;
+    }
+    /* Warned, not refused: scripts across the tree pass --cof-budget with
+     * ECM, and every 3LP-only job ignored it before AUTO went all-ECM. */
+    if (cfg->cof_budget_set && cfg->cof_meth0 != COF_METHOD_RHO &&
+        cfg->cof_meth1 != COF_METHOD_RHO)
+        fprintf(stderr, "note: --cof-budget has no effect: no side runs rho"
+                " (only --cof-rho does)\n");
     return bad;
 }
 
@@ -1056,11 +1096,14 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.relations = NULL; cfg.candidates = NULL;
     cfg.qlist = NULL; cfg.nq_max = 0; cfg.verbose_q = 0; cfg.td_verify = 1;
     cfg.qmin = 0; cfg.qmax = 0; cfg.target_rels = 0;
-    /* 4 rounds, not 2. ECM is the default method on a 3LP side now and its
-     * escalation is CURVES-per-round, so 2 rounds is 24 curves and reaches
-     * only 4,050 of AS276's 4,089 relations; 4 rounds is 48 and reaches all.
+    /* 4 rounds, not 2. ECM escalates by CURVES-per-round, and on 2026-08-19
+     * (12 curves) 2 rounds reached only 4,050 of AS276's 4,089 relations, 4
+     * all. Since finding 126 a 3LP side reruns every record only for the first
+     * --cof-abort rounds (2), and rounds 3-4 there carry only records that have
+     * split once; a 2LP side runs all 4 for every unresolved record.
      *
-     * IT IS NOT FREE FOR A RHO SIDE, and an earlier version of this comment
+     * IT IS NOT FREE FOR A RHO SIDE (--cof-rho; AUTO runs no rho since finding
+     * 125), and an earlier version of this comment
      * wrongly said it was. rho escalates by DOUBLING (`budget << r`), so a
      * lane that stays stuck costs 65536+131072 = 196,608 iterations at 2
      * rounds and 983,040 at 4 -- 5x. Only already-resolved records fall
@@ -1071,12 +1114,16 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * to tune ECM multiplies a rho side's budget exponentially. If that ever
      * bites, the fix is a separate curve-escalation count, not a bigger
      * shared one. */
-    cfg.cofactor = 0; cfg.cof_rounds = 4; cfg.cof_budget = 65536;
+    cfg.cofactor = 0; cfg.cof_rounds = 4; cfg.cof_budget = 65536; cfg.cof_budget_set = 0;
     cfg.cof_chunk = 0;
-    cfg.cof_ecm = COF_METHOD_AUTO;  /* per side, by LP count; --cof-ecm/--cof-rho force */
-    cfg.ecm_b1 = 0; cfg.ecm_b2 = 0; cfg.ecm_curves = 0;   /* 0 = derive */
+    cfg.cof_ecm = COF_METHOD_AUTO;  /* ECM on both sides; --cof-rho/--cof-ecm force */
+    cfg.ecm_b1[0] = cfg.ecm_b1[1] = 0; cfg.ecm_b2[0] = cfg.ecm_b2[1] = 0;
+    cfg.ecm_curves = 0;                                    /* 0 = derive */
+    cfg.cof_abort = 0; cfg.cof_abort_set = 0;
     cfg.cof_meth0 = cfg.cof_meth1 = COF_METHOD_RHO;
-    cfg.ecm_b1_set = cfg.ecm_b2_set = cfg.ecm_curves_set = 0;
+    cfg.ecm_b1_set[0] = cfg.ecm_b1_set[1] = 0;
+    cfg.ecm_b2_set[0] = cfg.ecm_b2_set[1] = 0;
+    cfg.ecm_curves_set = 0;
     cfg.fb_maxbits = 0;
     cfg.resume = 0; cfg.restart = 0; cfg.stopfile = NULL;
     /* 300 s is ~864 records over a three-day band, which is why runlog.h needs
@@ -1335,7 +1382,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         }
         else if (!strcmp(argv[i], "--cofactor")) cfg.cofactor = 1;
         else if (!strcmp(argv[i], "--cof-rounds") && i + 1 < argc) { cof_rounds = atoi(argv[++i]); cfg.cof_rounds = cof_rounds; }
-        else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; }
+        else if (!strcmp(argv[i], "--cof-budget") && i + 1 < argc) { cof_budget = (uint32_t)strtoul(argv[++i], 0, 10); cfg.cof_budget = cof_budget; cfg.cof_budget_set = 1; }
         else if (!strcmp(argv[i], "--cof-chunk") && i + 1 < argc) {
             /* Through the shared parser, not a bare strtoul: strtoul maps
              * "abc" and "-1" to 0 and 4294967295 silently, and 0 is AUTO --
@@ -1395,8 +1442,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--check-relations") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--check-relations", argv[++i], &check_rel)) return 1;
         }
-        else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) { cfg.ecm_b1 = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b1_set = 1; }
-        else if (!strcmp(argv[i], "--ecm-b2") && i + 1 < argc) { cfg.ecm_b2 = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b2_set = 1; }
+        else if (!strcmp(argv[i], "--ecm-b1") && i + 1 < argc) { cfg.ecm_b1[0] = cfg.ecm_b1[1] = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b1_set[0] = cfg.ecm_b1_set[1] = 1; }
+        else if (!strcmp(argv[i], "--ecm-b2") && i + 1 < argc) { cfg.ecm_b2[0] = cfg.ecm_b2[1] = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b2_set[0] = cfg.ecm_b2_set[1] = 1; }
+        else if ((!strcmp(argv[i], "--ecm-b1-0") || !strcmp(argv[i], "--ecm-b1-1")) && i + 1 < argc) { const int sd = argv[i][9] - '0'; cfg.ecm_b1[sd] = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b1_set[sd] = 1; }
+        else if ((!strcmp(argv[i], "--ecm-b2-0") || !strcmp(argv[i], "--ecm-b2-1")) && i + 1 < argc) { const int sd = argv[i][9] - '0'; cfg.ecm_b2[sd] = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_b2_set[sd] = 1; }
+        else if (!strcmp(argv[i], "--cof-abort") && i + 1 < argc) { cfg.cof_abort = atoi(argv[++i]); cfg.cof_abort_set = 1; }
         else if (!strcmp(argv[i], "--ecm-curves") && i + 1 < argc) { cfg.ecm_curves = (uint32_t)strtoul(argv[++i], 0, 10); cfg.ecm_curves_set = 1; }
         else if (!strcmp(argv[i], "--qlist") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--qlist", argv[++i], &cfg.qlist)) return 1;
@@ -2247,7 +2297,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                          cfg.lim, cfg.lpb, cof_rounds, cof_budget,
                          cfg.blocks ? cfg.blocks : 48 * 6, cfg.threads,
                          cfg.cof_meth0, cfg.cof_meth1, cfg.ecm_b1,
-                         cfg.ecm_b2, cfg.ecm_curves,
+                         cfg.ecm_b2, cfg.ecm_curves, cfg.cof_abort_side,
                          cfg.cof_limbs0, cfg.cof_limbs,
                          cfg.cof_chunk) ? 1 : 0;
     }
@@ -2572,7 +2622,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                         "  Appending would produce a file whose lines all"
                         " verify and whose yield means\n"
                         "  nothing. Check the polynomial, lim/lpb/mfb, logI/J"
-                        " and --sq-side, or --restart.\n",
+                        " and --sq-side, and the cofactor\n"
+                        "  method, ECM plan, --cof-abort and --cof-rounds"
+                        " (a different binary's defaults\n"
+                        "  change those too), or --restart.\n",
                         cpath, ck.fp, fp);
                     return 1;
                 }

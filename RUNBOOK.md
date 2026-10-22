@@ -393,39 +393,91 @@ Two knobs exist, and neither is tuning advice:
   Lowering it to 8 is how `make degradecheck` drives the degradation ceiling;
   the running binary reports its value in the pipeline allocation banner.
 
-#### Method: ECM for 3LP, rho for 2LP — AUTOMATIC since 2026-08-19
+#### Method: ECM on every side — AUTOMATIC since 2026-10-21
 
-**This is the default; nothing needs passing.** The method is chosen **per
-side** from `ceil(mfb/lpb)`: 2 parts (2LP) runs rho, 3 parts (3LP) runs ECM.
-Per side because a real job is usually one of each — AS276 is 2LP rational and
-3LP algebraic, so a per-job choice is wrong on one side of nearly every job.
-Every run prints what it picked:
+**This is the default; nothing needs passing.** Both sides run ECM. From
+2026-08-19 to 2026-10-21 the default was per side, rho for a 2LP side and ECM
+for a 3LP one (finding 70). The PTX carry chains in `cofac.cuh` sped ECM up
+more than rho, and finding 70 had priced 2LP only at lpb 29/30. Swept over
+lpb 29-35, ECM now beats rho at 2LP by 1.2x (lpb 29) to 3.3x (lpb 35) at
+the same relations (finding 125). Every run prints what it picked:
 
-    cofactor method: side 0 rho, side 1 ECM
+    cofactor method: side 0 ECM, side 1 ECM
 
-ECM parameters are derived from the lpb of whichever side runs ECM: **B1 = 200**
-at `lpb <= 33`, **300** at 34–35, **500** at 36+; `B2 = 30 * B1`; 12 curves;
-4 rounds. Override any of them with `--ecm-b1 / --ecm-b2 / --ecm-curves /
---cof-rounds`.
+ECM parameters come from each side's own `lpb` and large-prime count
+(`ceil(mfb/lpb)`) -- each side has its own plan since finding 126:
 
-Measured effect of the default change, zero flags, against the previous
-default (rho on both sides, `--cof-rounds 2 --cof-budget 65536`):
+| lpb | 29 | 30-31 | 32-33 | 34-35 | 36-37 | 38-39 | 40-41 | 42+ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2LP side, B1 | 100 | 140 | 200 | 280 | 400 | 560 | 800 | 1120 |
+| 3LP side, B1 | 140 | 200 | 280 | 400 | 560 | 800 | 1120 | 1120 |
 
-| job | stage ms/q | wall ms/q | relations |
-|---|---|---|---|
-| c183 | 17.21 → **14.30** | 113.35 → **109.86** | 9,363 → **9,394** |
-| C194 | 15.48 → **13.95** | 116.30 → **109.36** | unchanged |
-| AS276 | — | — | 3,443 → **4,089** |
+`B2 = 30 * B1`; 8 curves; 4 rounds. So c135 (29/55, 30/58) runs B1 100 /
+140, c183 (31/60, 32/92) 140 / 280, I16 (33/64, 34/96) 200 / 400. Measured within
+0.067% of saturated yield at every lpb 29-36 on c135, c183 and I16, at
+0.66-0.92x the ECM time of the previous rule (B1 200, 300 at 34-35, 500 at
+36, 12 curves). One ladder step lower costs 4-16x the relations. lpb 37
+shares 36's row; 38 and up continue the ladder unmeasured. Override any of
+them with `--ecm-b1 / --ecm-b2 / --ecm-curves / --cof-rounds`; `--ecm-b1` and
+`--ecm-b2` set both sides, `--ecm-b1-0 / --ecm-b1-1 / --ecm-b2-0 / --ecm-b2-1`
+one. Every run prints each side's plan:
 
-Cheaper *and* higher-yielding on all three. AS276's +18.8% is the old rho
-budget having been far too small for a 3LP side at `lpb 35` — see finding 69.
+    cofactor queue: side 0 ECM B1 = 140, 34 prime powers, B2 = 4200 (135 giant steps), 8 curves per round
+    cofactor queue: side 1 ECM B1 = 280, 59 prime powers, B2 = 8400 (272 giant steps), 8 curves per round
+    cofactor abort: side 1 reruns only records that have split once after round 2
+
+**The abort rule** (`--cof-abort N`, default 2, 0 = off; finding 126): on a
+3LP side, every unresolved record gets N rounds, and after that only records
+that have already split once are run again. A 3LP side is one where
+`ceil(mfb/lpb) >= 3` AND three primes above lim fit under mfb
+(`mfb > 3*log2(lim)`); `--cof-abort N` (N > 0) is refused on a job with no
+such side. A 3LP record that has found
+nothing in a round goes on to split ~0.1% of the time, one that has found a
+factor 22-44%. A 2LP side never aborts: its unsplit records split ~60% of the
+time.
+
+Measured effect of the change, zero flags, against the previous default
+(finding 125; three interleaved rounds, host load ~10):
+
+| job | plan now | wall ms/q | flush ms/q | relations |
+|---|---|---|---|---|
+| c135 | ECM B1 140 x 8 (was rho / rho) | 3.89 → **3.82** | 0.47 → 0.44 | 603,136 → 603,132 |
+| c183 | ECM B1 280 x 8 (was rho / B1 200 x 12) | 45.96 → **44.95** | 5.90 → 5.04 | 18,343 → 18,343 |
+| I16 | ECM B1 400 x 8 (was rho / B1 300 x 12) | 168.21 → **166.41** | 12.41 → 10.31 | 23,497 → 23,496 |
+
+And of the per-side plan with the abort rule, against that (finding 126;
+three interleaved rounds, host load ~11):
+
+| job | wall ms/q | flush ms/q | relations | rel/s |
+|---|---|---|---|---|
+| c183 | 45.09 → **44.41** | 5.38 → 4.77 | -0.014% | +1.5% |
+| c194 | 177.39 → **176.65** | 16.80 → 15.36 | -0.030% | +0.4% |
+| I16 | 167.37 → **165.73** | 10.39 → 8.94 | -0.038% | +1.0% |
+| AS276 (C208) | 204.40 → **198.80** | 44.84 → 40.01 | -0.023% | +2.8% |
+| SNFS-301 | 181.24 → **176.79** | 27.64 → 23.77 | -0.044% | +2.5% |
+
+That table is `--cof-abort 3`. **The default is 2,** which was the most
+relations per second on every one of these (c183 +2.3%, c194 +0.7%, I16
++1.1%, AS276 +4.9%, SNFS-301 +3.7%) for 0.09-0.24% of relations; `--cof-abort
+3` keeps relations within 0.05% for about half the gain. 2LP-only jobs (c135,
+c147) are unaffected beyond their 2LP side's own plan.
+
+Records the rule stops running stay unresolved and are reported apart from
+budget-exhausted ones, under the per-side stuck count (I16, 60 q):
+
+    side 1: split / dead / stuck         4578 / 114831 / 48140
+      of stuck, left by the abort rule    48140 (found nothing in 2 rounds)
+
+The stuck-rate warning reads only the budget-exhausted kind. So with the rule
+on, an under-effort ECM plan shows up as a high abandoned count, not as the
+warning.
 
 To force one method on both sides, for A/B work or to reproduce the old
 behaviour:
 
 ```sh
 --cof-rho     # rho on both sides (the pre-2026-08-19 default)
---cof-ecm     # ECM on both sides
+--cof-ecm     # ECM on both sides (the same as the default now)
 ```
 
 The `B1 = 1000-2000` values in `cofcheck.sh` are correctness fixtures, not

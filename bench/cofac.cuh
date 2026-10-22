@@ -277,6 +277,229 @@ CF_FN void mz_mul(mz<L> *r, const mz<L> *a, const mz<L> *b,
     if (t[L] || mz_cmp<L>(r, n) >= 0) mz_sub<L>(r, n);
 }
 
+/* ---- PTX carry chains for the two widths that run: L = 3 and L = 4 ------ *
+ *
+ * Specialisations of mz_mul, mz_add_mod, mz_sub_mod and mz_dbl_mod above, bit
+ * for bit the same results FOR REDUCED OPERANDS, a, b < n -- the only kind any
+ * caller passes, since every value here lives in [0, n) (work/gpuecm-probe/mul/
+ * arithcheck.cu: 262,144 random moduli per width from 2 to 32L bits, 256
+ * chained steps, output files identical; an injected borrow bug and an
+ * injected madc->mad bug each make them differ). They are NOT the generic
+ * code on unreduced input: with a >= n, or a + b >= R + n, the final reduce
+ * keeps the truncated value where the generic `t[L] || cmp >= 0` subtracts n.
+ * Reduce first before feeding anything raw to them. Device only: CF_FN is __device__ under nvcc, and a host build
+ * of this header keeps the generic templates.
+ *
+ * WHY. The generic add/sub end in mz_cmp, a loop with an early return. Inlined
+ * into every x_add/x_dbl of the ECM ladder and unrolled, that is one divergent
+ * region per add or sub: k_cofac<3, ECM>'s SASS was 293,632 instructions with
+ * 4,965 BSSY regions, ~4.7 MB, far past the instruction cache. Here the reduce
+ * is a borrow mask (sub) or a select on the borrow of sum - n (add): 18,224
+ * instructions, 76 BSSY. The 64-bit C products also lowered to IADD.64 plus a
+ * MOV/HFMA2 per zeroed high half; mad/madc with carry is about 2/3 of that.
+ * Registers unchanged under __launch_bounds__(256, 2). Measured on the I16
+ * NFS@Home batch: ECM 0.37x and rho 0.56x the time, I16 end to end 187.5 ->
+ * 170.4 ms/q with byte-identical relations (work/ptx-ab/NOTES.md). */
+#if defined(__CUDACC__)
+template <>
+CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
+                      const mz<3> *n, uint32_t n0inv)
+{
+    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4, m;
+    const uint32_t a0 = a->v[0], a1 = a->v[1], a2 = a->v[2];
+    const uint32_t n0 = n->v[0], n1 = n->v[1], n2 = n->v[2];
+    #pragma unroll
+    for (int i = 0; i < 3; i++) {
+        const uint32_t bi = b->v[i];
+        asm("mad.lo.cc.u32  %0, %5, %8, %0;\n\t"
+            "madc.lo.cc.u32 %1, %6, %8, %1;\n\t"
+            "madc.lo.cc.u32 %2, %7, %8, %2;\n\t"
+            "addc.u32       %3, %3, 0;\n\t"
+            "mad.hi.cc.u32  %1, %5, %8, %1;\n\t"
+            "madc.hi.cc.u32 %2, %6, %8, %2;\n\t"
+            "madc.hi.cc.u32 %3, %7, %8, %3;\n\t"
+            "addc.u32       %4, 0, 0;"
+            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "=r"(t4)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(bi));
+        m = t0 * n0inv;
+        asm("mad.lo.cc.u32  %0, %5, %6, %0;\n\t"
+            "madc.lo.cc.u32 %1, %5, %7, %1;\n\t"
+            "madc.lo.cc.u32 %2, %5, %8, %2;\n\t"
+            "addc.cc.u32    %3, %3, 0;\n\t"
+            "addc.u32       %4, %4, 0;\n\t"
+            "mad.hi.cc.u32  %1, %5, %6, %1;\n\t"
+            "madc.hi.cc.u32 %2, %5, %7, %2;\n\t"
+            "madc.hi.cc.u32 %3, %5, %8, %3;\n\t"
+            "addc.u32       %4, %4, 0;"
+            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4)
+            : "r"(m), "r"(n0), "r"(n1), "r"(n2));
+        t0 = t1; t1 = t2; t2 = t3; t3 = t4;
+    }
+    {
+        uint32_t s0, s1, s2, bw;
+        asm("sub.cc.u32  %0, %4, %7;\n\t"
+            "subc.cc.u32 %1, %5, %8;\n\t"
+            "subc.cc.u32 %2, %6, %9;\n\t"
+            "subc.u32    %3, %10, 0;"
+            : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(bw)
+            : "r"(t0), "r"(t1), "r"(t2), "r"(n0), "r"(n1), "r"(n2), "r"(t3));
+        const bool keep = bw != 0;
+        r->v[0] = keep ? t0 : s0; r->v[1] = keep ? t1 : s1; r->v[2] = keep ? t2 : s2;
+    }
+}
+
+template <>
+CF_FN void mz_sub_mod<3>(mz<3> *a, const mz<3> *b, const mz<3> *n)
+{
+    uint32_t d0, d1, d2, m;
+    asm("sub.cc.u32  %0, %4, %7;\n\t"
+        "subc.cc.u32 %1, %5, %8;\n\t"
+        "subc.cc.u32 %2, %6, %9;\n\t"
+        "subc.u32    %3, 0, 0;"            /* m = 0 or 0xffffffff (borrow) */
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(m)
+        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
+    asm("add.cc.u32  %0, %0, %3;\n\t"
+        "addc.cc.u32 %1, %1, %4;\n\t"
+        "addc.u32    %2, %2, %5;"
+        : "+r"(d0), "+r"(d1), "+r"(d2)
+        : "r"(n->v[0] & m), "r"(n->v[1] & m), "r"(n->v[2] & m));
+    a->v[0] = d0; a->v[1] = d1; a->v[2] = d2;
+}
+
+template <>
+CF_FN void mz_add_mod<3>(mz<3> *a, const mz<3> *b, const mz<3> *n)
+{
+    uint32_t s0, s1, s2, s3, r0, r1, r2, bw;
+    asm("add.cc.u32  %0, %4, %7;\n\t"
+        "addc.cc.u32 %1, %5, %8;\n\t"
+        "addc.cc.u32 %2, %6, %9;\n\t"
+        "addc.u32    %3, 0, 0;"
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3)
+        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
+    asm("sub.cc.u32  %0, %4, %7;\n\t"
+        "subc.cc.u32 %1, %5, %8;\n\t"
+        "subc.cc.u32 %2, %6, %9;\n\t"
+        "subc.u32    %3, %10, 0;"          /* borrow out of (s3:s) - n */
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(bw)
+        : "r"(s0), "r"(s1), "r"(s2), "r"(n->v[0]), "r"(n->v[1]), "r"(n->v[2]), "r"(s3));
+    const bool keep = bw != 0;              /* s < n: keep the sum */
+    a->v[0] = keep ? s0 : r0; a->v[1] = keep ? s1 : r1; a->v[2] = keep ? s2 : r2;
+}
+
+template <>
+CF_FN void mz_dbl_mod<3>(mz<3> *a, const mz<3> *n)
+{
+    const mz<3> b = *a;
+    mz_add_mod<3>(a, &b, n);
+}
+
+template <>
+CF_FN void mz_mul<4>(mz<4> *r, const mz<4> *a, const mz<4> *b,
+                      const mz<4> *n, uint32_t n0inv)
+{
+    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5, m;
+    const uint32_t a0 = a->v[0], a1 = a->v[1], a2 = a->v[2], a3 = a->v[3];
+    const uint32_t n0 = n->v[0], n1 = n->v[1], n2 = n->v[2], n3 = n->v[3];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const uint32_t bi = b->v[i];
+        asm("mad.lo.cc.u32  %0, %6, %10, %0;\n\t"
+            "madc.lo.cc.u32 %1, %7, %10, %1;\n\t"
+            "madc.lo.cc.u32 %2, %8, %10, %2;\n\t"
+            "madc.lo.cc.u32 %3, %9, %10, %3;\n\t"
+            "addc.u32       %4, %4, 0;\n\t"
+            "mad.hi.cc.u32  %1, %6, %10, %1;\n\t"
+            "madc.hi.cc.u32 %2, %7, %10, %2;\n\t"
+            "madc.hi.cc.u32 %3, %8, %10, %3;\n\t"
+            "madc.hi.cc.u32 %4, %9, %10, %4;\n\t"
+            "addc.u32       %5, 0, 0;"
+            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "=r"(t5)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bi));
+        m = t0 * n0inv;
+        asm("mad.lo.cc.u32  %0, %6, %7, %0;\n\t"
+            "madc.lo.cc.u32 %1, %6, %8, %1;\n\t"
+            "madc.lo.cc.u32 %2, %6, %9, %2;\n\t"
+            "madc.lo.cc.u32 %3, %6, %10, %3;\n\t"
+            "addc.cc.u32    %4, %4, 0;\n\t"
+            "addc.u32       %5, %5, 0;\n\t"
+            "mad.hi.cc.u32  %1, %6, %7, %1;\n\t"
+            "madc.hi.cc.u32 %2, %6, %8, %2;\n\t"
+            "madc.hi.cc.u32 %3, %6, %9, %3;\n\t"
+            "madc.hi.cc.u32 %4, %6, %10, %4;\n\t"
+            "addc.u32       %5, %5, 0;"
+            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5)
+            : "r"(m), "r"(n0), "r"(n1), "r"(n2), "r"(n3));
+        t0 = t1; t1 = t2; t2 = t3; t3 = t4; t4 = t5;
+    }
+    {
+        uint32_t s0, s1, s2, s3, bw;
+        asm("sub.cc.u32  %0, %5, %9;\n\t"
+            "subc.cc.u32 %1, %6, %10;\n\t"
+            "subc.cc.u32 %2, %7, %11;\n\t"
+            "subc.cc.u32 %3, %8, %12;\n\t"
+            "subc.u32    %4, %13, 0;"
+            : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(bw)
+            : "r"(t0), "r"(t1), "r"(t2), "r"(t3), "r"(n0), "r"(n1), "r"(n2), "r"(n3), "r"(t4));
+        const bool keep = bw != 0;
+        r->v[0] = keep ? t0 : s0; r->v[1] = keep ? t1 : s1;
+        r->v[2] = keep ? t2 : s2; r->v[3] = keep ? t3 : s3;
+    }
+}
+
+template <>
+CF_FN void mz_sub_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
+{
+    uint32_t d0, d1, d2, d3, m;
+    asm("sub.cc.u32  %0, %5, %9;\n\t"
+        "subc.cc.u32 %1, %6, %10;\n\t"
+        "subc.cc.u32 %2, %7, %11;\n\t"
+        "subc.cc.u32 %3, %8, %12;\n\t"
+        "subc.u32    %4, 0, 0;"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3), "=r"(m)
+        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
+          "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
+    asm("add.cc.u32  %0, %0, %4;\n\t"
+        "addc.cc.u32 %1, %1, %5;\n\t"
+        "addc.cc.u32 %2, %2, %6;\n\t"
+        "addc.u32    %3, %3, %7;"
+        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+        : "r"(n->v[0] & m), "r"(n->v[1] & m), "r"(n->v[2] & m), "r"(n->v[3] & m));
+    a->v[0] = d0; a->v[1] = d1; a->v[2] = d2; a->v[3] = d3;
+}
+
+template <>
+CF_FN void mz_add_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
+{
+    uint32_t s0, s1, s2, s3, s4, r0, r1, r2, r3, bw;
+    asm("add.cc.u32  %0, %5, %9;\n\t"
+        "addc.cc.u32 %1, %6, %10;\n\t"
+        "addc.cc.u32 %2, %7, %11;\n\t"
+        "addc.cc.u32 %3, %8, %12;\n\t"
+        "addc.u32    %4, 0, 0;"
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(s4)
+        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
+          "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
+    asm("sub.cc.u32  %0, %5, %9;\n\t"
+        "subc.cc.u32 %1, %6, %10;\n\t"
+        "subc.cc.u32 %2, %7, %11;\n\t"
+        "subc.cc.u32 %3, %8, %12;\n\t"
+        "subc.u32    %4, %13, 0;"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(bw)
+        : "r"(s0), "r"(s1), "r"(s2), "r"(s3),
+          "r"(n->v[0]), "r"(n->v[1]), "r"(n->v[2]), "r"(n->v[3]), "r"(s4));
+    const bool keep = bw != 0;
+    a->v[0] = keep ? s0 : r0; a->v[1] = keep ? s1 : r1;
+    a->v[2] = keep ? s2 : r2; a->v[3] = keep ? s3 : r3;
+}
+
+template <>
+CF_FN void mz_dbl_mod<4>(mz<4> *a, const mz<4> *n)
+{
+    const mz<4> b = *a;
+    mz_add_mod<4>(a, &b, n);
+}
+#endif
+
 /* Binary GCD. Both arguments are destroyed. n is odd, which removes half the
  * usual bookkeeping: the common power of two is always 1. */
 template <int L> CF_FN void mz_gcd(mz<L> *g, mz<L> a, mz<L> b)
@@ -923,7 +1146,11 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
 /* METHOD 0 is Pollard-Brent rho and `budget` is an iteration count; METHOD 1 is
  * ECM and `budget` is a CURVE count. Both are bounded per launch and
  * neither turns an exhausted budget into a proof, so the requeue structure
- * around them is unchanged. */
+ * around them is unchanged.
+ *
+ * On CF_INCOMPLETE, *nout is the number of splits this call made before the
+ * budget ran out (0: it found nothing). The round driver's abort rule reads
+ * it; see cf_sched_t's abort_after. */
 template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, uint64_t *out, int *nout,
@@ -950,13 +1177,13 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
         }
         if (mz_sprp2<L>(&m)) return CF_DEAD;        /* prime, and >= lim2 > 2^lpb */
         if constexpr (METHOD == 0) {
-            if (!mz_rho<L>(&g, &m, c0, budget, acc)) return CF_INCOMPLETE;
+            if (!mz_rho<L>(&g, &m, c0, budget, acc)) { *nout = nf + sp; return CF_INCOMPLETE; }
         } else {
             uint32_t cv = 0;
             for (; cv < budget; cv++)
                 if (mz_ecm<L, STAGE2>(&g, &m, c0 * 1000u + cv + 6u, s, ns,
                                       s2mask, s2vmin, s2nv, acc)) break;
-            if (cv == budget) return CF_INCOMPLETE;
+            if (cv == budget) { *nout = nf + sp; return CF_INCOMPLETE; }
         }
         mz_divexact<L>(&h, &m, &g);
         if (sp + 2 > CF_MAXFAC) return CF_OVERFLOW;
@@ -1023,7 +1250,8 @@ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         unsigned long long *__restrict iters,
                         const uint32_t *__restrict s, uint32_t ns,
                         const uint8_t *__restrict s2mask, uint32_t s2vmin,
-                        uint32_t s2nv, uint32_t ibeg, uint32_t iend)
+                        uint32_t s2nv, uint32_t ibeg, uint32_t iend,
+                        uint8_t *__restrict part)
 {
     /* [ibeg, iend) is this launch's slice of the compacted list; cf_sched_t's
      * `chunk` comment says why the caller may split a round this way. The
@@ -1046,6 +1274,9 @@ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
         st = mz_split<L, METHOD, STAGE2>(&v, &lim2, lpb, c0, budget, o, &k,
                                          &acc, s, ns, s2mask, s2vmin, s2nv);
         if (iters) iters[t] += (unsigned long long)acc;   /* summed over rounds */
+        /* Sticky: a record that has split once is a record worth more rounds.
+         * NULL when the side has no abort rule, so nothing is stored. */
+        if (part && st == CF_INCOMPLETE && k) part[t] = 1;
         status[t] = (uint8_t)st;
         if (st == CF_OK) {
             nfac[t] = (uint8_t)k;
@@ -1061,12 +1292,13 @@ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
  * before every round, so round r+1 sees only what round r left unresolved --
  * which on the algebraic side is where the requeue cost actually lives. */
 __global__ void k_cof_selflags(uint32_t n, const uint8_t *__restrict st,
-                               uint32_t *__restrict flag)
+                               uint32_t *__restrict flag,
+                               const uint8_t *__restrict part, int only_part)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
         const uint32_t t = (uint32_t)tt;
-        flag[t] = (st[t] == CF_INCOMPLETE) ? 1u : 0u;
+        flag[t] = (st[t] == CF_INCOMPLETE && (!only_part || part[t])) ? 1u : 0u;
     }
 }
 
@@ -1095,15 +1327,35 @@ __global__ void k_cof_selscatter(uint32_t n, const uint32_t *__restrict flag,
  * So the schedule lives in one place now, parameterised by the two things that
  * actually differ between callers: which method, and how much of it.
  */
+/* One side's ECM plan on the device: stage 1's prime powers up to B1 and the
+ * D=30 stage-2 mask for (B1, B2]. One per side since finding 126 -- a 2LP side
+ * next to a 3LP one needs about half the 3LP side's B1 -- and shared by the
+ * inline queue and the standalone --cofac path, which used to build one plan
+ * each, inline. */
+typedef struct {
+    uint32_t  b1, b2;
+    uint32_t *d_s, ns;
+    uint8_t  *d_s2mask;
+    uint32_t  s2vmin, s2nv;
+} cf_ecm_dev_t;
+
 typedef struct {
     int      method;        /* 0 = Pollard-Brent rho, 1 = ECM                */
     int      rounds;
     uint32_t budget;        /* rho iterations in round 0; doubles each round */
     uint32_t curves;        /* ECM curves attempted per round                */
-    const uint32_t *d_s;    /* ECM stage-1 prime powers, on device           */
-    uint32_t ns;
-    const uint8_t *d_s2mask;/* D=30 stage-2 prime-pair mask per giant step   */
-    uint32_t s2vmin, s2nv;
+    /* This side's plan, by pointer so that no caller copies its fields: four
+     * hand copies of them is how one side would end up with the other's. */
+    const cf_ecm_dev_t *ecm;
+    /* THE ABORT RULE (finding 126): from round `abort_after` on (0-based, so
+     * the first abort_after rounds run every unresolved record), only records
+     * that have split at least once in some earlier round are run again. 0 =
+     * never. Set only on a 3LP ECM side: there a record that has found nothing
+     * in a round goes on to split ~0.1% of the time and one that has found a
+     * factor 22-44%, while a 2LP side's unsplit records split ~60% of the time
+     * and must keep every round. Records dropped by it stay CF_INCOMPLETE and
+     * are counted as stuck, which is what they are. */
+    int      abort_after;
     /* Records per launch. ALWAYS A CONCRETE COUNT, never a sentinel: a value
      * at or above the batch means one launch (the original behaviour,
      * bit-for-bit), and callers with nothing to say pass UINT32_MAX rather
@@ -1145,6 +1397,7 @@ typedef struct {
  * reallocate them per flush. */
 typedef struct {
     uint32_t *d_flag, *d_off, *d_bsum, *d_sel, *d_nsel;
+    uint8_t  *d_part;   /* per record: has split at least once (abort rule) */
 } cf_work_t;
 
 /* Run one side of one batch to exhaustion of its round budget. Records that
@@ -1205,12 +1458,17 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
 {
     const uint32_t nb = (n + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
     if (!n) return;
+    /* Zeroed per side per batch, on the stream every launch here uses. NULL
+     * -- nothing written -- unless the rule can actually fire. */
+    uint8_t *part = (S->abort_after && S->abort_after < S->rounds) ? W->d_part : NULL;
+    if (part) cudaMemsetAsync(part, 0, n, 0);
     for (int r = 0; r < S->rounds; r++) {
         /* Ordered prefix scan, not an atomic append: the job order is then a
          * function of the status array alone and the output stays reproducible
          * byte for byte. Three small kernels over the batch -- microseconds
          * against a stage that runs for tens of milliseconds. */
-        k_cof_selflags<<<blocks, threads>>>(n, d_status, W->d_flag);
+        k_cof_selflags<<<blocks, threads>>>(n, d_status, W->d_flag, part,
+                                            part && r >= S->abort_after);
         k_scan_pass1<<<nb, TD_SCAN_BLK>>>(W->d_flag, n, W->d_off, W->d_bsum);
         k_scan_pass2<<<1, 1024>>>(W->d_bsum, nb);
         k_scan_pass3<<<nb, TD_SCAN_BLK>>>(W->d_off, n, W->d_bsum);
@@ -1234,21 +1492,22 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
                                && g_cof_peak->armed);
             if (_peak) cudaEventRecord(g_cof_peak->a);
             if (S->method) {
-                if (S->s2nv)
+                if (S->ecm->s2nv)
                     k_cofac<L, 1, 1><<<blocks, kth>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                        S->d_s, S->ns, S->d_s2mask, S->s2vmin, S->s2nv, b, e);
+                        S->ecm->d_s, S->ecm->ns, S->ecm->d_s2mask,
+                        S->ecm->s2vmin, S->ecm->s2nv, b, e, part);
                 else
                     k_cofac<L, 1, 0><<<blocks, kth>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                        S->d_s, S->ns, NULL, 0, 0, b, e);
+                        S->ecm->d_s, S->ecm->ns, NULL, 0, 0, b, e, part);
             } else {
                 k_cofac<L, 0, 0><<<blocks, kth>>>(
                     d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
                     W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                    NULL, 0, NULL, 0, 0, b, e);
+                    NULL, 0, NULL, 0, 0, b, e, part);
             }
             if (_peak) {
                 cudaEventRecord(g_cof_peak->b);
@@ -1347,10 +1606,11 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  */
 #define COF_CHUNK_TARGET_MS   250.0f
 
-/* Giant steps per curve above which cofq_init warns that record chunking can
- * no longer bound a launch. ~40x the derived default's ~500 and ~16x below the
- * ~320,000 of the one configuration known to trip a watchdog; see the warning
- * site in cofq_init for why this is a judgement rather than a measurement. */
+/* Giant steps per curve above which cf_ecm_dev_init warns that record
+ * chunking can no longer bound a launch. ~18x the derived default's largest
+ * (~1,120, at B1 1120) and ~16x below the ~320,000 of the one configuration
+ * known to trip a watchdog; see the warning site for why this is a judgement
+ * rather than a measurement. */
 #define COF_S2NV_WATCHDOG_WARN  20000u
 
 /* The floor is `blocks * threads`: one record per thread, and never less.
@@ -1405,6 +1665,87 @@ static void cof_report_chunk(uint32_t chunk, uint32_t n, int pinned)
             pinned ? "pinned by --cof-chunk" : "auto");
 }
 
+static void cf_ecm_dev_free(cf_ecm_dev_t *E)
+{
+    if (E->d_s) cudaFree(E->d_s);
+    if (E->d_s2mask) cudaFree(E->d_s2mask);
+    memset(E, 0, sizeof(*E));
+}
+
+/* Build the plan for (b1, b2) and report it on stdout as side `side`. b2 = 0
+ * leaves stage 2 off. Returns -1 on an empty plan or a device failure, with
+ * nothing left allocated. */
+static int cf_ecm_dev_init(cf_ecm_dev_t *E, uint32_t b1, uint32_t b2,
+                           uint32_t curves, int side)
+{
+    uint32_t *h_s = NULL;
+    uint8_t *h_s2mask = NULL;
+    memset(E, 0, sizeof(*E));
+    E->b1 = b1; E->b2 = b2;
+    E->ns = cf_ecm_plan(b1, &h_s);
+    if (!E->ns) {
+        fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", b1);
+        return -1;
+    }
+    if (CUDA_CHECKED(cudaMalloc(&E->d_s, (size_t)E->ns * 4)) ||
+        CUDA_CHECKED(cudaMemcpy(E->d_s, h_s, (size_t)E->ns * 4,
+                                cudaMemcpyHostToDevice)))
+        goto fail;
+    free(h_s); h_s = NULL;
+    if (b2) {
+        E->s2nv = cf_ecm_stage2_plan(b1, b2, &E->s2vmin, &h_s2mask);
+        if (!E->s2nv) {
+            fprintf(stderr, "  cofac: empty ECM stage-2 plan for B1=%u B2=%u\n",
+                    b1, b2);
+            goto fail;
+        }
+        if (CUDA_CHECKED(cudaMalloc(&E->d_s2mask, E->s2nv)) ||
+            CUDA_CHECKED(cudaMemcpy(E->d_s2mask, h_s2mask, E->s2nv,
+                                    cudaMemcpyHostToDevice)))
+            goto fail;
+        free(h_s2mask); h_s2mask = NULL;
+    }
+    printf("  cofactor queue: side %d ECM B1 = %u, %u prime powers, B2 = %u"
+           " (%u giant steps), %u curves per round\n", side, b1, E->ns, b2,
+           E->s2nv, curves);
+    /* The one thing --cof-chunk cannot bound.
+     *
+     * Chunking splits the RECORD list, so the smallest launch it can make
+     * is one record per thread. A launch therefore never gets shorter than
+     * ONE record's own splitting work, and stage 2 is where that can grow
+     * without limit: the giant-step count is B2/30, so a large B2 buys a
+     * per-record cost no slice size can divide.
+     *
+     * The auto-derived configuration is nowhere near this -- cof_auto_b1
+     * returns 100..1120, so B2 is 3,000..33,600 and s2nv is ~100..1,120
+     * giant steps -- which is why the default path needs no warning. The
+     * one configuration observed to actually trip a device watchdog is
+     * --ecm-b1 400000 (B2 clamped to 10^7, ~320,000 giant steps), which
+     * reproducibly kills the stage-2 kernel on gfx1103 and is why
+     * cofcheck.sh skips that case on HIP.
+     *
+     * THE THRESHOLD IS A JUDGEMENT, NOT A MEASUREMENT. The real boundary
+     * is per-device and nobody has measured it; this sits well above the
+     * derived default and well below the one value known to fail, and it
+     * warns rather than refuses because a fast card runs these settings
+     * perfectly well. Do not restate it as a supported limit. */
+    if (E->s2nv > COF_S2NV_WATCHDOG_WARN)
+        fprintf(stderr, "  cofactor queue: WARNING: side %d: %u giant steps/curve"
+                " x %u curves is far above the derived default (~100-1,120"
+                " steps at B1 100-1120). --cof-chunk bounds a launch by"
+                " RECORDS and cannot go below one record, so this much"
+                " stage-2 work per record can still exceed a slow device's"
+                " GPU watchdog and be killed mid-launch"
+                " (cudaErrorLaunchTimeout, or \"unspecified launch"
+                " failure\" on AMD). Lower --ecm-b2 if tasks fail that"
+                " way.\n", side, E->s2nv, curves);
+    return 0;
+fail:
+    free(h_s); free(h_s2mask);
+    cf_ecm_dev_free(E);
+    return -1;
+}
+
 typedef struct {
     uint32_t cap, n, rcap;
     /* The two cofactors, narrowed from the 256-bit norm residual to L0/L1
@@ -1443,6 +1784,7 @@ typedef struct {
     uint64_t *d_sp0,  *d_sp1;             /* cap * CF_MAXFAC split primes */
     uint8_t  *d_nsp0, *d_nsp1;
     uint32_t *d_flag, *d_off, *d_bsum, *d_idx, *d_nrel;
+    uint8_t  *d_part[2];                  /* cf_work_t's, per side, cap    */
     uint32_t *d_sel, *d_nsel;             /* compacted job list per round  */
     /* Records whose residual did not fit L0/L1 limbs. Unreachable while
      * resolve_and_check_cofactor_config holds -- cof_classify has already rejected
@@ -1542,16 +1884,17 @@ typedef struct {
     uint32_t eff_prev_valve;
     float    ms_prev_valve;
     int      valve_parked;
-    uint32_t *d_s, ns, ecm_curves;
-    /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side and not per
-     * job because the two sides of a real job are usually different shapes:
-     * AS276 is mfbr 64 / lpbr 33 on the rational side (2LP) and
-     * mfba 101 / lpba 35 on the algebraic (3LP), and the measured winner
-     * differs between exactly those two cases -- rho by ~1.1x at 2LP, ECM by
-     * 2-4x at 3LP (RESULTS finding 70). A per-job choice would get one of the
-     * two sides wrong on nearly every job. */
+    cf_ecm_dev_t ecm[2];                  /* per side; empty on a rho side */
+    uint32_t ecm_curves;
+    int      abort_after[2];              /* cf_sched_t's, per side        */
+    /* Method PER SIDE, 0 = Pollard-Brent rho, 1 = ECM. Per side because the
+     * two sides of a real job are usually different shapes -- AS276 is
+     * mfbr 64 / lpbr 33 (2LP) and mfba 101 / lpba 35 (3LP) -- and the winner
+     * used to differ between them: rho by ~1.1x at 2LP, ECM by 2-4x at 3LP
+     * (RESULTS finding 70). Since the PTX arithmetic ECM wins both (finding
+     * 125) and the default is ECM on both sides, but --cof-rho and A/B runs
+     * still need the two to be independent. */
     int meth[2];
-    uint8_t  *d_s2mask; uint32_t s2vmin, s2nv;/* ECM stage-2 schedule      */
     double ms_rat, ms_alg, ms_host;
     unsigned long long nseen, nrel;
     /* Per side, per CF_* status, accumulated over flushes. `ndead`/`nstuck`
@@ -1564,7 +1907,11 @@ typedef struct {
      * up early", and those look identical in every other number the run
      * prints. */
     unsigned long long nst[2][4];
-    unsigned long long *d_nst;            /* 8 counters, device side       */
+    /* Of nst[sd][CF_INCOMPLETE], the records the abort rule stopped running
+     * because they had found nothing -- by design, not for want of budget.
+     * Kept apart so the stuck-rate warning reads only the second kind. */
+    unsigned long long nabandon[2];
+    unsigned long long *d_nst;            /* 10 counters, device side      */
 } cofq_t;
 
 /* Append one special-q's joint candidates. Everything the relation will need
@@ -1728,6 +2075,21 @@ __global__ void k_cof_status_hist(uint32_t n, const uint8_t *__restrict st0,
         atomicAdd(&out[threadIdx.x], (unsigned long long)bin[threadIdx.x]);
 }
 
+/* Records the abort rule left unresolved: still CF_INCOMPLETE, and never
+ * split once (so never selected after round abort_after). One counter. */
+__global__ void k_cof_abandon_count(uint32_t n, const uint8_t *__restrict st,
+                                    const uint8_t *__restrict part,
+                                    unsigned long long *__restrict out)
+{
+    unsigned int c = 0;
+    const uint64_t stride = bench_grid_stride_x();
+    for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
+        const uint32_t t = (uint32_t)tt;
+        c += (st[t] == CF_INCOMPLETE && !part[t]) ? 1u : 0u;
+    }
+    if (c) atomicAdd(out, (unsigned long long)c);
+}
+
 __global__ void k_rel_flags(uint32_t n, const uint8_t *__restrict st0,
                             const uint8_t *__restrict st1, uint32_t *__restrict flag)
 {
@@ -1814,8 +2176,9 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
     cudaFree(Q->d_flag); cudaFree(Q->d_off); cudaFree(Q->d_bsum);
     cudaFree(Q->d_idx); cudaFree(Q->d_nrel);
     cudaFree(Q->d_sel); cudaFree(Q->d_nsel); cudaFree(Q->d_ovf); cudaFree(Q->d_nst);
-    cudaFree(Q->d_s);
-    cudaFree(Q->d_s2mask);
+    cudaFree(Q->d_part[0]); cudaFree(Q->d_part[1]);
+    cf_ecm_dev_free(&Q->ecm[0]);
+    cf_ecm_dev_free(&Q->ecm[1]);
     cudaFree(O->d_a); cudaFree(O->d_b); cudaFree(O->d_f0); cudaFree(O->d_f1);
     cudaFree(O->d_fn0); cudaFree(O->d_fn1); cudaFree(O->d_sp0); cudaFree(O->d_sp1);
     cudaFree(O->d_nsp0); cudaFree(O->d_nsp1);
@@ -1832,23 +2195,25 @@ static void cofq_free(cofq_t *Q, cofq_out_t *O)
     memset(Q, 0, sizeof(*Q)); memset(O, 0, sizeof(*O));
 }
 
-/* `ecm`/`ecm_b1`/`ecm_curves` come from the caller's configuration. They used
- * to be left at the memset's zero, which silently pinned the inline path to rho
- * no matter what the CLI asked for -- the two schedulers had diverged so that
- * only the standalone one could run ECM at all. */
+/* The method and ECM plan come from the caller's configuration, per side:
+ * b1[s]/b2[s] and abort_after[s] are side s's. They used to be left at the
+ * memset's zero, which silently pinned the inline path to rho no matter what
+ * the CLI asked for -- the two schedulers had diverged so that only the
+ * standalone one could run ECM at all. */
 static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
-                     int meth0, int meth1, uint32_t ecm_b1, uint32_t ecm_b2,
-                     uint32_t ecm_curves, int limbs0, int limbs1)
+                     int meth0, int meth1, const uint32_t b1[2],
+                     const uint32_t b2[2], uint32_t ecm_curves,
+                     const int abort_after[2], int limbs0, int limbs1)
 {
     const uint32_t nb = (cap + TD_SCAN_BLK - 1) / TD_SCAN_BLK;
-    uint32_t *h_s = NULL;
-    uint8_t *h_s2mask = NULL;
     int rc = -1;
 
 #define COF_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     memset(Q, 0, sizeof(*Q)); memset(O, 0, sizeof(*O));
     Q->cap = cap;
     Q->meth[0] = meth0; Q->meth[1] = meth1; Q->ecm_curves = ecm_curves;
+    Q->abort_after[0] = abort_after[0];   /* resolved upstream: 0 where it */
+    Q->abort_after[1] = abort_after[1];   /* does not apply                */
     Q->L0 = limbs0; Q->L1 = limbs1;
     /* Refused here rather than clamped: every caller derives these from mfb,
      * so a width outside the build is a configuration the run cannot honour,
@@ -1866,64 +2231,14 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
            " (%d bits); this build carries %d..%d\n",
            Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
-    if (meth0 || meth1) {          /* one plan serves whichever sides use ECM */
-        Q->ns = cf_ecm_plan(ecm_b1, &h_s);
-        if (!Q->ns) {
-            fprintf(stderr, "  cofac queue: empty ECM plan for B1=%u\n", ecm_b1);
-            goto done;
-        }
-        COF_INIT_CK(cudaMalloc(&Q->d_s, (size_t)Q->ns * 4));
-        COF_INIT_CK(cudaMemcpy(Q->d_s, h_s, (size_t)Q->ns * 4,
-                               cudaMemcpyHostToDevice));
-        free(h_s); h_s = NULL;
-        if (ecm_b2) {
-            Q->s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &Q->s2vmin,
-                                         &h_s2mask);
-            if (!Q->s2nv) {
-                fprintf(stderr, "  cofac queue: empty ECM stage-2 plan for"
-                        " B1=%u B2=%u\n", ecm_b1, ecm_b2);
-                goto done;
-            }
-            COF_INIT_CK(cudaMalloc(&Q->d_s2mask, Q->s2nv));
-            COF_INIT_CK(cudaMemcpy(Q->d_s2mask, h_s2mask, Q->s2nv,
-                                   cudaMemcpyHostToDevice));
-            free(h_s2mask); h_s2mask = NULL;
-        }
-        printf("  cofactor queue: ECM B1 = %u, %u prime powers, B2 = %u"
-               " (%u giant steps), %u curves per round\n", ecm_b1, Q->ns,
-               ecm_b2, Q->s2nv, ecm_curves);
-        /* The one thing --cof-chunk cannot bound.
-         *
-         * Chunking splits the RECORD list, so the smallest launch it can make
-         * is one record per thread. A launch therefore never gets shorter than
-         * ONE record's own splitting work, and stage 2 is where that can grow
-         * without limit: the giant-step count is B2/30, so a large B2 buys a
-         * per-record cost no slice size can divide.
-         *
-         * The auto-derived configuration is nowhere near this -- cof_auto_b1
-         * returns 200..500, so B2 is 6,000..15,000 and s2nv is ~194..500 giant
-         * steps -- which is why the default path needs no warning at all. The
-         * one configuration observed to actually trip a device watchdog is
-         * --ecm-b1 400000 (B2 clamped to 10^7, ~320,000 giant steps), which
-         * reproducibly kills the stage-2 kernel on gfx1103 and is why
-         * cofcheck.sh skips that case on HIP.
-         *
-         * THE THRESHOLD IS A JUDGEMENT, NOT A MEASUREMENT. The real boundary
-         * is per-device and nobody has measured it; this sits well above the
-         * derived default and well below the one value known to fail, and it
-         * warns rather than refuses because a fast card runs these settings
-         * perfectly well. Do not restate it as a supported limit. */
-        if (Q->s2nv > COF_S2NV_WATCHDOG_WARN)
-            fprintf(stderr, "  cofactor queue: WARNING: %u giant steps/curve x"
-                    " %u curves is far above the derived default (~194-500"
-                    " steps at B1 200-500). --cof-chunk bounds a launch by"
-                    " RECORDS and cannot go below one record, so this much"
-                    " stage-2 work per record can still exceed a slow device's"
-                    " GPU watchdog and be killed mid-launch"
-                    " (cudaErrorLaunchTimeout, or \"unspecified launch"
-                    " failure\" on AMD). Lower --ecm-b2 if tasks fail that"
-                    " way.\n", Q->s2nv, ecm_curves);
-    }
+    /* A plan per ECM side (finding 126). Two identical plans when both sides
+     * ask for the same B1 cost a few KB, not worth a sharing scheme. */
+    if (meth0 && cf_ecm_dev_init(&Q->ecm[0], b1[0], b2[0], ecm_curves, 0)) goto done;
+    if (meth1 && cf_ecm_dev_init(&Q->ecm[1], b1[1], b2[1], ecm_curves, 1)) goto done;
+    for (int sd = 0; sd < 2; sd++)
+        if (Q->abort_after[sd])
+            printf("  cofactor abort: side %d reruns only records that have split"
+                   " once after round %d\n", sd, Q->abort_after[sd]);
     {
         static const char *nm[2] = { "rho", "ECM" };
         printf("  cofactor method: side 0 %s, side 1 %s\n",
@@ -1955,6 +2270,8 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     COF_INIT_CK(cudaMalloc(&Q->d_nsp0, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_nsp1, cap));
     COF_INIT_CK(cudaMalloc(&Q->d_flag, (size_t)cap * 4));
+    COF_INIT_CK(cudaMalloc(&Q->d_part[0], cap));
+    COF_INIT_CK(cudaMalloc(&Q->d_part[1], cap));
     COF_INIT_CK(cudaMalloc(&Q->d_off, (size_t)cap * 4));
     COF_INIT_CK(cudaMalloc(&Q->d_bsum, (size_t)nb * 4));
     COF_INIT_CK(cudaMalloc(&Q->d_idx, (size_t)Q->rcap * 4));
@@ -1963,8 +2280,8 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     COF_INIT_CK(cudaMalloc(&Q->d_nsel, 4));
     COF_INIT_CK(cudaMalloc(&Q->d_ovf, 4));
     COF_INIT_CK(cudaMemset(Q->d_ovf, 0, 4));
-    COF_INIT_CK(cudaMalloc(&Q->d_nst, 8 * sizeof(unsigned long long)));
-    COF_INIT_CK(cudaMemset(Q->d_nst, 0, 8 * sizeof(unsigned long long)));
+    COF_INIT_CK(cudaMalloc(&Q->d_nst, 10 * sizeof(unsigned long long)));
+    COF_INIT_CK(cudaMemset(Q->d_nst, 0, 10 * sizeof(unsigned long long)));
     COF_INIT_CK(cudaMalloc(&O->d_a, (size_t)Q->rcap * 8));
     COF_INIT_CK(cudaMalloc(&O->d_b, (size_t)Q->rcap * 8));
     COF_INIT_CK(cudaMalloc(&O->d_f0, (size_t)Q->rcap * TD_FMAX * 4));
@@ -2007,8 +2324,6 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
     rc = 0;
 
 done:
-    free(h_s);
-    free(h_s2mask);
     if (rc) cofq_free(Q, O);
 #undef COF_INIT_CK
     return rc;
@@ -2074,10 +2389,10 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     cf_work_t W;
     cf_sched_t S, S1;
     W.d_flag = Q->d_flag; W.d_off = Q->d_off; W.d_bsum = Q->d_bsum;
-    W.d_sel = Q->d_sel;   W.d_nsel = Q->d_nsel;
+    W.d_sel = Q->d_sel;   W.d_nsel = Q->d_nsel;   W.d_part = Q->d_part[0];
     S.method = Q->meth[0]; S.rounds = rounds; S.budget = budget;
-    S.curves = Q->ecm_curves; S.d_s = Q->d_s; S.ns = Q->ns;
-    S.d_s2mask = Q->d_s2mask; S.s2vmin = Q->s2vmin; S.s2nv = Q->s2nv;
+    S.curves = Q->ecm_curves; S.ecm = &Q->ecm[0];
+    S.abort_after = Q->abort_after[0];
     /* chunk 0 is AUTO, not off: a volunteer cannot be asked to pick a number
      * for hardware nobody has measured, and picking none is what the field
      * failures were. An explicit value is honoured as given and never steered,
@@ -2104,7 +2419,9 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
         }
         S.chunk = Q->chunk_cur;
     }
-    S1 = S; S1.method = Q->meth[1];   /* differs only in method */
+    /* Side 1 differs in method, ECM plan and abort rule. */
+    S1 = S; S1.method = Q->meth[1];
+    S1.ecm = &Q->ecm[1]; S1.abort_after = Q->abort_after[1];
 
     COF_FLUSH_CK(cudaEventCreate(&e0));
     COF_FLUSH_CK(cudaEventCreate(&e1));
@@ -2122,6 +2439,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     k_cof_gate<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1);
     COF_FLUSH_CK(cudaEventRecord(e1));
     pk1.armed = 1; g_cof_peak = &pk1;
+    W.d_part = Q->d_part[1];      /* side 0's flags stay for the count below */
     if (cf_run_rounds_dyn(Q->L1, Q->d_c1, lim1, lpb1, n, Q->d_st1,
                           Q->d_sp1, Q->d_nsp1, &S1, &W, NULL, blocks, threads))
         goto done;
@@ -2131,6 +2449,10 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     /* Instrumentation, not accounting: recorded after e2 so it cannot land in
      * the per-side timings this same flush reports. */
     k_cof_status_hist<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_nst);
+    if (S.abort_after && S.abort_after < rounds)
+        k_cof_abandon_count<<<blocks, threads>>>(n, Q->d_st0, Q->d_part[0], Q->d_nst + 8);
+    if (S1.abort_after && S1.abort_after < rounds)
+        k_cof_abandon_count<<<blocks, threads>>>(n, Q->d_st1, Q->d_part[1], Q->d_nst + 9);
 
     k_rel_flags<<<blocks, threads>>>(n, Q->d_st0, Q->d_st1, Q->d_flag);
     k_scan_pass1<<<nb, TD_SCAN_BLK>>>(Q->d_flag, n, Q->d_off, Q->d_bsum);
@@ -2389,10 +2711,12 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     Q->nseen += n; Q->nrel += nr;
     {   /* cumulative on the device, so this is a snapshot of the total rather
          * than a per-flush delta -- assign, do not add. */
-        unsigned long long h[8];
+        unsigned long long h[10];
         if (!CUDA_CHECKED(cudaMemcpy(h, Q->d_nst, sizeof h, cudaMemcpyDeviceToHost)))
-            for (int sd = 0; sd < 2; sd++)
+            for (int sd = 0; sd < 2; sd++) {
                 for (int k = 0; k < 4; k++) Q->nst[sd][k] = h[sd * 4 + k];
+                Q->nabandon[sd] = h[8 + sd];
+            }
     }
     if (!nr) { Q->n = 0; rc = 0; goto done; }
 
@@ -2521,6 +2845,7 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaMalloc(&W.d_bsum, (size_t)nb * 4));
     CK(cudaMalloc(&W.d_sel,  (size_t)nj * 4));
     CK(cudaMalloc(&W.d_nsel, 4));
+    CK(cudaMalloc(&W.d_part, nj));
     CK(cudaMemcpy(d_n, h_n, (size_t)nj * sizeof(mz<L>), cudaMemcpyHostToDevice));
     CK(cudaMemset(d_status, CF_INCOMPLETE, nj));
     CK(cudaMemset(d_nfac, 0, nj));
@@ -2540,7 +2865,7 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
         cudaFree(d_n); cudaFree(d_status); cudaFree(d_nfac); cudaFree(d_fac);
         cudaFree(d_iters);
         cudaFree(W.d_flag); cudaFree(W.d_off); cudaFree(W.d_bsum);
-        cudaFree(W.d_sel); cudaFree(W.d_nsel);
+        cudaFree(W.d_sel); cudaFree(W.d_nsel); cudaFree(W.d_part);
         cudaEventDestroy(e0); cudaEventDestroy(e1);
         return -1;
     }
@@ -2558,6 +2883,20 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     CK(cudaMemcpy(h_status, d_status, nj, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_nfac, d_nfac, nj, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h_fac, d_fac, (size_t)nj * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
+    /* The abort rule's share of the stuck count, as the inline queue reports
+     * it: unresolved, and never split once. */
+    if (verbose && S->abort_after && S->abort_after < S->rounds) {
+        uint8_t *h_part = (uint8_t *)malloc(nj);
+        if (h_part) {
+            uint32_t nab = 0;
+            CK(cudaMemcpy(h_part, W.d_part, nj, cudaMemcpyDeviceToHost));
+            for (uint32_t k = 0; k < nj; k++)
+                nab += (h_status[k] == CF_INCOMPLETE && !h_part[k]);
+            printf("  %s: %u records abandoned by the abort rule after round %d\n",
+                   side_name ? side_name : "cofactor", nab, S->abort_after);
+            free(h_part);
+        }
+    }
 
     /* Where does the bounded splitting work actually go? Rho reports loop
      * iterations. ECM reports ladder bits plus every stage-2 giant step and
@@ -2591,7 +2930,7 @@ static int cf_run_side(mz<L> *h_n, uint32_t nj, uint64_t lim, uint32_t lpb,
     cudaFree(d_n); cudaFree(d_status); cudaFree(d_nfac); cudaFree(d_fac);
     cudaFree(d_iters);
     cudaFree(W.d_flag); cudaFree(W.d_off); cudaFree(W.d_bsum);
-    cudaFree(W.d_sel); cudaFree(W.d_nsel);
+    cudaFree(W.d_sel); cudaFree(W.d_nsel); cudaFree(W.d_part);
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     return 0;
 }
@@ -3098,14 +3437,13 @@ static int cf_rec_build(cf_rec_t *r, const char *f0, const uint64_t *e0, int n0,
 extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
                          uint32_t lpb0, uint32_t lim1, uint32_t lpb1,
                          int rounds, uint32_t budget, int blocks, int threads,
-                         int meth0, int meth1, uint32_t ecm_b1, uint32_t ecm_b2,
-                         uint32_t ecm_curves, int limbs0, int limbs1,
+                         int meth0, int meth1, const uint32_t ecm_b1[2],
+                         const uint32_t ecm_b2[2], uint32_t ecm_curves,
+                         const int abort_after[2], int limbs0, int limbs1,
                          uint32_t chunk)
 {
     FILE *f = fopen(path, "rb");
-    uint32_t *h_s = NULL, *d_s = NULL, ns = 0;
-    uint8_t *h_s2mask = NULL, *d_s2mask = NULL;
-    uint32_t s2vmin = 0, s2nv = 0;
+    cf_ecm_dev_t ecm[2];
     cf_sched_t sched;
     char *buf = NULL;
     size_t sz = 0;
@@ -3224,34 +3562,21 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
 
     st0 = (uint8_t *)malloc(n0 ? n0 : 1); nf0 = (uint8_t *)calloc(n0 ? n0 : 1, 1);
     fac0 = (uint64_t *)malloc((size_t)(n0 ? n0 : 1) * CF_MAXFAC * 8);
-    if (meth0 || meth1) {
-        ns = cf_ecm_plan(ecm_b1, &h_s);
-        if (!ns) { fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", ecm_b1); return -1; }
-        CK(cudaMalloc(&d_s, (size_t)ns * 4));
-        CK(cudaMemcpy(d_s, h_s, (size_t)ns * 4, cudaMemcpyHostToDevice));
-        free(h_s);
-        if (ecm_b2) {
-            s2nv = cf_ecm_stage2_plan(ecm_b1, ecm_b2, &s2vmin, &h_s2mask);
-            if (!s2nv) {
-                fprintf(stderr, "  cofac: empty ECM stage-2 plan for B1=%u"
-                        " B2=%u\n", ecm_b1, ecm_b2);
-                free(h_s2mask); cudaFree(d_s);
-                free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
-                free(small0); free(small1); free(side0ok); free(alg_job);
-                free(st0); free(nf0); free(fac0);
-                return -1;
-            }
-            CK(cudaMalloc(&d_s2mask, s2nv));
-            CK(cudaMemcpy(d_s2mask, h_s2mask, s2nv, cudaMemcpyHostToDevice));
-            free(h_s2mask);
-        }
-        printf("  ECM: B1 = %u, %u prime powers, B2 = %u (%u giant steps),"
-               " %u curves per round, %d rounds\n", ecm_b1, ns, ecm_b2,
-               s2nv, ecm_curves, rounds);
+    memset(ecm, 0, sizeof(ecm));
+    if ((meth0 && cf_ecm_dev_init(&ecm[0], ecm_b1[0], ecm_b2[0], ecm_curves, 0)) ||
+        (meth1 && cf_ecm_dev_init(&ecm[1], ecm_b1[1], ecm_b2[1], ecm_curves, 1))) {
+        cf_ecm_dev_free(&ecm[0]); cf_ecm_dev_free(&ecm[1]);
+        free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
+        free(small0); free(small1); free(side0ok); free(alg_job);
+        free(st0); free(nf0); free(fac0);
+        return -1;
     }
+    if (meth0 || meth1)
+        printf("  ECM: %d rounds; abort after round %d (side 0) / %d (side 1),"
+               " 0 = never\n", rounds, abort_after[0], abort_after[1]);
     sched.method = meth0; sched.rounds = rounds; sched.budget = budget;
-    sched.curves = ecm_curves; sched.d_s = d_s; sched.ns = ns;
-    sched.d_s2mask = d_s2mask; sched.s2vmin = s2vmin; sched.s2nv = s2nv;
+    sched.curves = ecm_curves; sched.ecm = &ecm[0];
+    sched.abort_after = abort_after[0];
     /* cf_sched_t's chunk is a concrete count with no sentinel, so cfg's 0
      * becomes UINT32_MAX -- "larger than any batch", i.e. one launch per
      * round, which is what this path has always done.
@@ -3288,6 +3613,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     st1 = (uint8_t *)malloc(n1 ? n1 : 1); nf1 = (uint8_t *)calloc(n1 ? n1 : 1, 1);
     fac1 = (uint64_t *)malloc((size_t)(n1 ? n1 : 1) * CF_MAXFAC * 8);
     sched.method = meth1;                 /* per side; see cofq_t.meth */
+    sched.ecm = &ecm[1]; sched.abort_after = abort_after[1];
     if (cf_run_side_dyn(limbs1, j1, n1, lim1, lpb1, st1, fac1, nf1,
                         blocks, threads, 1, &ms1, &sched, "algebraic")) return -1;
     for (uint32_t k = 0; k < n1; k++) {
@@ -3389,7 +3715,7 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
     free(buf); free(rest); free(j0); free(j1); free(i0); free(i1);
     free(small0); free(small1); free(side0ok); free(alg_job);
     free(st0); free(st1); free(nf0); free(nf1); free(fac0); free(fac1);
-    cudaFree(d_s); cudaFree(d_s2mask);
+    cf_ecm_dev_free(&ecm[0]); cf_ecm_dev_free(&ecm[1]);
     /* Same discipline as novf: a batch that silently dropped records is not a
      * clean batch, and the caller must not read it as one. */
     return (novf || nover) ? -1 : 0;
