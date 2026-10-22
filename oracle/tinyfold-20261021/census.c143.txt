@@ -1,0 +1,18 @@
+text factor base /home/kylea/code/cuda-sieve/work/tinytab/c143.roots1.m13: 1152179 ideals (1152075 prime, 104 prime-power) at scale 1.550
+rational factor base: 910127 ideals up to 14000000 (50 prime-power of which 4 projective, 8 projective primes) at scale 2.375
+job /home/kylea/code/cuda-sieve/oracle/c143.job  logI 13 J 8192 region 2^13 threads 512 sieve-skip on maxbits 13
+  line-sieved entries: side 1 1133, side 0 1078 (bkthresh 8192)
+  nslice_pow2: side 1 32, side 0 32 -> apply smem 16448 B per block
+  30 special-q from q >= 2200000
+  side 1: line-sieved hits/position 4.682  (block 3.979, warp 0.505, thread 0.198)
+  side 1: entries/q  block 69.8, warp 198.9, thread 864.3;  in T420 18.0, T840 19.0
+  side 1: T420 share  of all hits 52.4%, of block hits 61.6%, of block warp-iterations 60.3%, of block entry visits 18.5%
+  side 1: T840 share  of all hits 53.5%, of block hits 62.9%, of block warp-iterations 61.6%, of block entry visits 19.2%
+  side 1: block warp-iterations per position 0.1281, block entry visits per 2^14 positions 116.2
+  side 1: block hits/position by effective m: 1:0.438 2:0.457 3:0.629 4:0.104 5:0.533 7:0.290 8:0.052 9:0.210 11:0.126 13:0.058 16:0.026 17:0.205 19:0.149 23:0.095 25:0.077 27:0.070 29:0.126 31:0.047 32:0.013 37:0.020 41:0.054 43:0.052 47:0.032 49:0.041 53:0.014 59:0.037 61:0.025
+  side 0: line-sieved hits/position 2.174  (block 1.568, warp 0.407, thread 0.199)
+  side 0: entries/q  block 29.9, warp 170.3, thread 877.8;  in T420 8.9, T840 9.9
+  side 0: T420 share  of all hits 46.4%, of block hits 64.4%, of block warp-iterations 63.1%, of block entry visits 17.0%
+  side 0: T840 share  of all hits 47.7%, of block hits 66.1%, of block warp-iterations 64.8%, of block entry visits 18.1%
+  side 0: block warp-iterations per position 0.0502, block entry visits per 2^14 positions 42.0
+  side 0: block hits/position by effective m: 1:0.449 2:0.111 3:0.188 4:0.055 5:0.124 7:0.082 8:0.028 9:0.063 11:0.060 13:0.058 16:0.014 17:0.044 19:0.039 23:0.032 25:0.025 27:0.021 29:0.024 31:0.023 32:0.007 37:0.020 41:0.018 43:0.017 47:0.016 49:0.012 53:0.014 59:0.013 61:0.012

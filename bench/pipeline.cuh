@@ -191,7 +191,7 @@ typedef struct {
     uint32_t *sp, *srt, *sg;
     uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
-    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nsplit, nfb;
+    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nsplit, nfold, nfb;
     size_t    apply_smem;
     norm_t    N;
     uint32_t  CINIT, BOUND, tconst, nsurv;
@@ -620,9 +620,10 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                 goto done;
             }
             for (uint32_t i = 0; i < k; i++) idx[i] = i;
+            const int fold = cfg->tiny_fold;
             std::stable_sort(idx, idx + k,
-                             [hsp](uint32_t x, uint32_t y) {
-                                 return hsp[x] < hsp[y];
+                             [hsp, fold](uint32_t x, uint32_t y) {
+                                 return ss_order_before(hsp[x], hsp[y], fold);
                              });
             for (uint32_t i = 0; i < k; i++) {
                 const uint32_t z = idx[i];
@@ -645,7 +646,9 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
          * key is the modulus, so building them earlier would only mean
          * permuting them too. And after the tiers: the thread tier's
          * two-step range starts at nsplit, and each magic is proved for the
-         * form its index gets (ss_bound_ok in td.cuh). */
+         * form its index gets (ss_bound_ok in td.cuh). The sort put the
+         * entries k_apply adds at init (--tiny-fold) first: ss_order_before. */
+        S->nfold = ss_fold_count(hsp, k, cfg->tiny_fold);
         ss_tiers(hsp, k, &S->nblk, &S->nwrp);
         S->nsplit = ss_two_step_from(hsp, k, S->nwrp, cfg->J, cfg->logI);
         for (uint32_t i = 0; i < k; i++)
@@ -1042,7 +1045,7 @@ apply:
             S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
             S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
             S->sp, S->srt, S->sg, S->slp, S->smag,
-            S->nsmall, S->nblk, S->nwrp, S->nsplit,
+            S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold,
             0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
             j_base);
     }
@@ -2533,6 +2536,24 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
         PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+        /* Apply's blocks per SM, and whether shared memory is what limits
+         * them. Losing the third block used to be silent: finding 128's
+         * 2,1147+ ran apply 16-18% slower with clean output, and the k_apply
+         * comment's budget leaves ~192 B. The count is the device's own
+         * occupancy calculation, so it holds on every architecture. */
+        {
+            const int apply_thr = cfg->apply_threads ? cfg->apply_threads : 512;
+            int nb = 0, nb_nosmem = 0;
+            PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb,
+                k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
+                apply_thr, apply_smem));
+            PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb_nosmem,
+                k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
+                apply_thr, 0));
+            printf("  apply: %d block%s of %d threads per SM, %zu B shared memory"
+                   " each%s\n", nb, nb == 1 ? "" : "s", apply_thr, apply_smem,
+                   nb < nb_nosmem ? " -- shared memory is the limit" : "");
+        }
     }
     VRAM_MARK("factor bases + bitmaps");
     PIPE_CK(cudaMalloc(&d_two, (size_t)nbitword_alloc * 4));
@@ -2864,6 +2885,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  --fill-gate: side 0 stores fill records only under side 1's"
                " survivors, 1 gate bit per %u positions\n",
                1u << cfg->fill_gate_shift);
+    if (cfg->small_sieve)
+        printf("  --tiny-fold: %s\n", cfg->tiny_fold
+               ? "small-sieve moduli that are powers of two <= 32 are added at"
+                 " apply's init, not walked"
+               : "off, every small-sieve modulus is walked");
 
     /* Serial mode points BOTH sides at the one workspace on the legacy default
      * stream, which is what the two sides have always shared -- so the slab

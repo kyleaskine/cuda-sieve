@@ -693,6 +693,7 @@ typedef struct {
      * comparison is worth being able to make in one binary. */
     int      td_record_scalar;
     int      small_sieve;   /* 1 = line-sieve p < bkthresh into the region      */
+    int      tiny_fold;     /* 1 = moduli 2^k <= 32 folded into apply's init     */
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
     double   scale;         /* las byte scale for this side; 1.0 = raw bits    */

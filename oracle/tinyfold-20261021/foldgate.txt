@@ -1,0 +1,107 @@
+base a76581fc957132f5  fold f29e8d71256d537d  load=13.86
+== build: exit 0, no warnings, every k_apply instance <= 40 registers and no spill
+   exit=0 | k_apply instances 11, spilling 0, over 40 registers 0 | warnings 0
+== --verify-only
+   OK lines: 3 (3 expected)
+== apply cell parity (--verify: one region replayed on the CPU, every small-sieve entry)
+   PASS s1.I15: exit 0, regions checked 1, with 0 cells differing 1, folded entries 24
+   PASS s0.I15: exit 0, regions checked 1, with 0 cells differing 1, folded entries 8
+   PASS s1.I15.r10: exit 0, regions checked 1, with 0 cells differing 1, folded entries 24
+   PASS s1.I13.r13: exit 0, regions checked 1, with 0 cells differing 1, folded entries 24
+   PASS s0.I16: exit 0, regions checked 1, with 0 cells differing 1, folded entries 8
+   PASS s1.I16.t96: exit 0, regions checked 1, with 0 cells differing 1, folded entries 25
+   PASS s0.I14.t160: exit 0, regions checked 1, with 0 cells differing 1, folded entries 8
+   PASS s1.I15.nofold: exit 0, regions checked 1, with 0 cells differing 1, folded entries none
+== abcheck: fold on (default), every case
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/tinytab/base/bench/bench (a76581fc957132f5)
+            NEW  /home/kylea/code/cuda-sieve/work/tinytab/fold/bench/bench (f29e8d71256d537d)
+   survivor bitmaps (harness, c183)
+     s1.default         sb   IDENTICAL survivors 35467390
+     s0.default         sb   IDENTICAL survivors 33386694
+     s1.nbe             sb   IDENTICAL survivors 23470851
+     s0.nbe             sb   IDENTICAL survivors 24408652
+     s1.region6         sb   IDENTICAL survivors 23470851
+     s1.thr96           sb   IDENTICAL survivors 23470851
+     s1.thr32           sb   IDENTICAL survivors 35467390
+     s1.cells8          sb   IDENTICAL survivors 23470468
+     s1.I12.r12         sb   IDENTICAL survivors 966034
+     s1.I12.r6          sb   IDENTICAL survivors 966034
+     s0.I12.r6          sb   IDENTICAL survivors 473111
+     s1.I12.r5          sb   IDENTICAL survivors 966034
+     s1.I12.r4          sb   IDENTICAL survivors 1426883
+     s1.I6.r6           sb   IDENTICAL survivors 44394
+     s1.I7.r9.nss       sb   IDENTICAL survivors 13956
+     s1.I6.r8.nss       sb   IDENTICAL survivors 13082
+     s0.I6.r8.nss       sb   IDENTICAL survivors 33038
+     s1.I5.r8.nss       sb   IDENTICAL survivors 15100
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 198457 rel 36684
+     c143.i14           cand IDENTICAL cand 67002 rel 12632
+     c183               cand IDENTICAL cand 191426 rel 810
+     c183.slab          cand IDENTICAL cand 57297 rel 234
+     c183.sq0           cand IDENTICAL cand 80380 rel 249
+     c183.single        cand IDENTICAL cand 57297 rel 234
+     c183.concurrent    cand IDENTICAL cand 57297 rel 234
+     c183.norows        cand IDENTICAL cand 57297 rel 234
+     c194               cand IDENTICAL cand 106562 rel 400
+     nfs                cand IDENTICAL cand 110828 rel 391
+     nfs.single         cand IDENTICAL cand 27633 rel 103
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 155105
+     c143.single        cof  IDENTICAL rel 155105
+     c183               cof  IDENTICAL rel 9041
+     c194               cof  IDENTICAL rel 2218
+     nfs                cof  IDENTICAL rel 2840
+     nfs.single         cof  IDENTICAL rel 698
+     c143.target        stop IDENTICAL rel 172906
+   36 cases: 36 identical, 0 failed, 0 skipped, 0 with overflow warnings
+   exit 0
+== abcheck: --no-tiny-fold on NEW's pipeline runs (harness cases still fold)
+   abcheck: BASE /home/kylea/code/cuda-sieve/work/tinytab/base/bench/bench (a76581fc957132f5)
+            NEW  /home/kylea/code/cuda-sieve/work/tinytab/fold/bench/bench (f29e8d71256d537d)
+            NEW's pipeline runs add: --no-tiny-fold
+   survivor bitmaps (harness, c183)
+     s1.default         sb   IDENTICAL survivors 35467390 (base cached)
+     s0.default         sb   IDENTICAL survivors 33386694 (base cached)
+     s1.nbe             sb   IDENTICAL survivors 23470851 (base cached)
+     s0.nbe             sb   IDENTICAL survivors 24408652 (base cached)
+     s1.region6         sb   IDENTICAL survivors 23470851 (base cached)
+     s1.thr96           sb   IDENTICAL survivors 23470851 (base cached)
+     s1.thr32           sb   IDENTICAL survivors 35467390 (base cached)
+     s1.cells8          sb   IDENTICAL survivors 23470468 (base cached)
+     s1.I12.r12         sb   IDENTICAL survivors 966034 (base cached)
+     s1.I12.r6          sb   IDENTICAL survivors 966034 (base cached)
+     s0.I12.r6          sb   IDENTICAL survivors 473111 (base cached)
+     s1.I12.r5          sb   IDENTICAL survivors 966034 (base cached)
+     s1.I12.r4          sb   IDENTICAL survivors 1426883 (base cached)
+     s1.I6.r6           sb   IDENTICAL survivors 44394 (base cached)
+     s1.I7.r9.nss       sb   IDENTICAL survivors 13956 (base cached)
+     s1.I6.r8.nss       sb   IDENTICAL survivors 13082 (base cached)
+     s0.I6.r8.nss       sb   IDENTICAL survivors 33038 (base cached)
+     s1.I5.r8.nss       sb   IDENTICAL survivors 15100 (base cached)
+   candidates entering cofactorisation (pipeline, no --cofactor)
+     c143.i13           cand IDENTICAL cand 198457 rel 36684 (base cached)
+     c143.i14           cand IDENTICAL cand 67002 rel 12632 (base cached)
+     c183               cand IDENTICAL cand 191426 rel 810 (base cached)
+     c183.slab          cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.sq0           cand IDENTICAL cand 80380 rel 249 (base cached)
+     c183.single        cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.concurrent    cand IDENTICAL cand 57297 rel 234 (base cached)
+     c183.norows        cand IDENTICAL cand 57297 rel 234 (base cached)
+     c194               cand IDENTICAL cand 106562 rel 400 (base cached)
+     nfs                cand IDENTICAL cand 110828 rel 391 (base cached)
+     nfs.single         cand IDENTICAL cand 27633 rel 103 (base cached)
+   relations (pipeline --cofactor)
+     c143               cof  IDENTICAL rel 155105 (base cached)
+     c143.single        cof  IDENTICAL rel 155105 (base cached)
+     c183               cof  IDENTICAL rel 9041 (base cached)
+     c194               cof  IDENTICAL rel 2218 (base cached)
+     nfs                cof  IDENTICAL rel 2840 (base cached)
+     nfs.single         cof  IDENTICAL rel 698 (base cached)
+     c143.target        stop IDENTICAL rel 172906 (base cached)
+   36 cases: 36 identical, 0 failed, 0 skipped, 0 with overflow warnings
+   exit 0
+== make check (fold build)
+   117 PASS, 0 FAIL; all gates passed
+   exit 0
+done: 0 failed

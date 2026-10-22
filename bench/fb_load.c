@@ -339,15 +339,24 @@ int fb_fill_logp(fb_t *fb, double scale)
  * both permits an exactly-sized allocation and guarantees that malformed or
  * unsorted input cannot write past either the slice-ID range or the log table.
  *
- * The forced cut at each 262,144-entry boundary preserves the original layout
- * used by the CUDA path. The second pass is deliberately identical to the
- * counting pass; output handles stay fail-closed until every size check and
- * allocation has succeeded. */
+ * A slice starts only where the log changes, so a factor base sorted by
+ * modulus cuts into one slice per distinct log: 15-26 per side on every job
+ * measured, c135 to 2,1147+, whatever its size. It also used to cut every
+ * 262,144 entries, "the original layout used by the CUDA path", which nothing
+ * reads: the slice ID is only ever turned back into a log, by k_apply's table
+ * and by the CPU replay behind --verify (verify_cpu.c). Bucket records carry
+ * it in their high bits; the side-0 resieve and the harness's layout B index
+ * the factor base their own way. That cut made the count grow with the
+ * factor base, ~entries/262,144 + 14, and past 128 slices the padded log
+ * table cost k_apply its third block per SM: 2,1147+ (alim = rlim = 600M,
+ * 138 and 137 slices) ran apply 16-18% slower on a 5070 (finding 128).
+ * fbtest's slice-cut case keeps it that way. The second pass is deliberately
+ * identical to the counting pass; output handles stay fail-closed until every
+ * size check and allocation has succeeded. */
 int32_t fb_build_slices(const fb_t *fb, uint16_t **slice_out,
                         uint16_t **logp_tab_out, uint32_t *nslice_pow2)
 {
     const uint32_t max_slices = (uint32_t)UINT16_MAX + 1u;
-    const uint32_t forced_cut = 262144u;
     uint16_t *slice = NULL, *tab = NULL;
     uint32_t k, ns = 0, counted, p2 = 1;
     int cur = -1;
@@ -367,7 +376,7 @@ int32_t fb_build_slices(const fb_t *fb, uint16_t **slice_out,
 
     for (k = 0; k < fb->n; k++) {
         const int lp = fb->logp[k];
-        if (lp != cur || (ns && (k % forced_cut) == 0)) {
+        if (lp != cur) {
             if (ns == max_slices) {
                 errno = EOVERFLOW;
                 return -1;
@@ -402,7 +411,7 @@ int32_t fb_build_slices(const fb_t *fb, uint16_t **slice_out,
     cur = -1;
     for (k = 0; k < fb->n; k++) {
         const int lp = fb->logp[k];
-        if (lp != cur || (ns && (k % forced_cut) == 0)) {
+        if (lp != cur) {
             cur = lp;
             tab[ns++] = (uint16_t)lp;
         }

@@ -1,0 +1,3 @@
+   PASS base: Block Limit Shared Mem 2 (want 2), dynamic smem/block 33.28 KB (expect ~33.28), theoretical occupancy 66.67%
+   PASS new: Block Limit Shared Mem 3 (want 3), dynamic smem/block 32.83 KB (expect ~32.83), theoretical occupancy 100%
+done: 0 failed

@@ -1,0 +1,106 @@
+=== cuda-sieve bucket-fill benchmark ===
+polynomial /home/kylea/code/cuda-sieve/work/c1147/c1147.job: algebraic degree 7, skew 1.389
+  job file: rlim 600000000, alim 600000000, lpbr 36, lpba 37, mfbr 72, mfba 111
+grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 4608 x 32 for fill (absolute, not per SM)
+band: generating prime special-q roots on side 1 from 300000000 upward
+  norm setup: deg 7, A=3.4865e+08 B=1.2475e+09, log2(maxnorm)=184.35, scale=1.000  (sq side: log2(q) divided out)
+  normalised coeffs d[0..7] = 1 0 0 0 0 0 0 6.66e-05
+  norm setup: deg 1, A=3.4865e+08 B=1.2475e+09, log2(maxnorm)=194.22, scale=1.000
+  normalised coeffs d[0..1] = -1 0
+params from q=300000007: side 1 log2(maxnorm)=184.35 scale=1.375 allowance=112.50 bound=155
+                    side 0 log2(maxnorm)=194.22 scale=1.300 allowance=73.54 bound=96
+text factor base /home/kylea/code/cuda-sieve/work/c1147/c1147.roots1.m16: 31322524 ideals (31322459 prime, 65 prime-power) at scale 1.375
+rational factor base: 31324796 ideals up to 600000000 (93 prime-power of which 0 projective, 0 projective primes) at scale 1.300
+
+side 1 (algebraic): bucketed 65536 <= p < 600000000 : 31316005 entries, line-sieved 6519
+side 0 (rational) : bucketed 65536 <= p < 600000000 : 31318161 entries, line-sieved 6635
+  j-slabbing: 4 slabs, up to 8192 rows/slab (auto target 32768 bucket regions at --region 14; safety bounds may reduce it further)
+
+=== pipeline: both sides in one process, streaming special-q ===
+  bucket array 32768 x 11575 x 4 B = 1.41 GB, shared by both sides (10.76 GB free)
+  large-prime list 16 records per survivor (PIPE_K)
+  device memory by stage:
+    bucket array                   1.41 GB   (9.34 GB free)
+    factor bases + bitmaps         3.05 GB   (6.29 GB free)
+    trial division context         0.10 GB   (6.20 GB free)
+  cofactor width: side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+  cofactor queue: side 0 ECM B1 = 400, 78 prime powers, B2 = 12000 (388 giant steps), 8 curves per round
+  cofactor queue: side 1 ECM B1 = 560, 102 prime powers, B2 = 16800 (542 giant steps), 8 curves per round
+  cofactor abort: side 1 reruns only records that have split once after round 2
+  cofactor method: side 0 ECM, side 1 ECM
+    cofactor queue                 0.15 GB   (6.04 GB free)
+  --q-pipeline: each slab's sieve under the previous slab's trial division, across q too; a second transform set and a third walk-cursor set (1.87 GB)
+  NOTE: stage times now include sharing the card with the other q; only wall clock per q is additive, and `unaccounted` and GPU-accounted / wall are not reported
+    q-pipeline transform set       1.87 GB   (4.17 GB free)
+  --fill-ahead: off, because this plan has several slabs per q
+  --resieve-scan: side 0 resieved from its own records; index 32768 x 11574 x 4 B = 1.41 GB, pair list 1048576
+    side-0 record index            1.42 GB   (2.75 GB free)
+  --fill-gate: side 0 stores fill records only under side 1's survivors, 1 gate bit per 8 positions
+  norm setup: deg 7, A=3.4865e+08 B=1.2475e+09, log2(maxnorm)=184.35, scale=1.375  (sq side: log2(q) divided out)
+  normalised coeffs d[0..7] = 1 0 0 0 0 0 0 6.66e-05
+  norm setup: deg 1, A=3.4865e+08 B=1.2475e+09, log2(maxnorm)=194.22, scale=1.300
+  normalised coeffs d[0..1] = -1 0
+
+  --- first-q validation (excluded from the band timing) ---
+    side 1: factors x cofactor == norm  14050 of 14050  PASS   (most factors 22 of 64)
+    side 0: factors x cofactor == norm  5469 of 5469  PASS   (most factors 22 of 64)
+  --- validation took 18.6 ms ---
+
+  cofactor chunk: 40210 records/launch, 1 launch per round over 40210 records (auto)
+    q=300000149  10 q  0 rel +40210 cand  [--nq 10 reached]
+
+  device memory, steady state: 10.13 GB in use of 11.91 GB (1.79 GB free)
+
+
+  --- band of 10 special-q ---
+  (first-q reconstruction gate: 18.6 ms, excluded below)
+  wall clock per q                     190.56 ms
+    sieve, both sides                  161.89 ms
+      transform + plattice              9.241 ms
+      fill                             86.343 ms
+      apply                            66.305 ms
+    intersect + gcd                     1.737 ms
+    side-0 record scan                  2.930 ms
+    host per-q (sieve tables, staging)    1.774 ms
+    TD + classify, wall                137.80 ms   <- of which, on the device:
+      rank scan (shared)               31.134 ms
+      emit (x,a,b), rank order (shared)    2.350 ms
+      survivor filter (shared)          5.473 ms
+      resieve + scatter, both sides    19.224 ms
+      norms + trial division, both sides   27.483 ms
+      classify, both sides             30.112 ms
+      joint accept + compact            1.706 ms
+      record candidate factorisations    9.343 ms
+      = device total                  126.825 ms
+      host: small-prime tables          1.363 ms
+      host: readback of candidates      0.000 ms
+      host: unaccounted                 9.610 ms
+    join and emit                        0.00 ms
+    cofactorisation, in-loop flushes     1.03 ms
+    unaccounted                           n/a
+  GPU-accounted / wall (excl cofac)       n/a
+  issued ahead (--q-pipeline)        30 slab(s), 9 q
+  prepared during trial division     8 of those q (--q-prep auto)
+  side 0 from its records            40 slab(s); walked: 0 index full, 0 pair list grown
+  two-sided primitive survivors/q     84214.9
+  cofactorisation candidates/q        4016.30
+  COMPLETE RELATIONS/q                  4.700
+  total relations                          47
+  total candidates                      40163
+
+  --- cofactorisation, cross-q queue ---
+  rational queue                        12.83 ms
+  algebraic queue                       36.95 ms
+  readback + emit of relations          0.411 ms
+    = device time per q                 50.19 ms
+  wall: in-loop flushes                  1.03 ms
+  wall: final flush after the band      54.58 ms
+  records enqueued                      40210  (of which 47 needed no splitting)
+    side 0: split / dead / stuck        21496 / 18692 / 22
+    side 1: split / dead / stuck          688 / 30575 / 8947
+      of stuck, left by the abort rule     8931 (found nothing in 2 rounds)
+  ALL RELATIONS/q                       56.70
+    of which, from cofactorisation      52.00
+  total relations                         567
+  wall clock per q, COMPLETE           245.14 ms

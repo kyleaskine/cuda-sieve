@@ -1,0 +1,19 @@
+I16     pl base   r4  wall   164.48  apply   81.312  rels    4341 | load=1.97 rc=0
+I16     pl new    r4  wall   149.48  apply   71.867  rels    4341 | load=2.05 rc=0
+I16     pl slices r4  wall   155.32  apply   75.875  rels    4341 | load=2.04 rc=0
+I16     pl slices r5  wall   158.65  apply   77.553  rels    4341 | load=1.97 rc=0
+I16     pl base   r5  wall   153.19  apply   76.180  rels    4341 | load=2.00 rc=0
+I16     pl new    r5  wall   149.39  apply   70.810  rels    4341 | load=2.15 rc=0
+I16     pl new    r6  wall   151.76  apply   71.827  rels    4341 | load=2.27 rc=0
+I16     pl slices r6  wall   158.06  apply   77.374  rels    4341 | load=2.19 rc=0
+I16     pl base   r6  wall   160.58  apply   76.954  rels    4341 | load=2.20 rc=0
+I16     pl base   r7  wall   156.11  apply   78.095  rels    4341 | load=2.08 rc=0
+I16     pl new    r7  wall   155.57  apply   72.083  rels    4341 | load=2.00 rc=0
+I16     pl slices r7  wall   156.83  apply   77.673  rels    4341 | load=1.94 rc=0
+I16     pl slices r8  wall   161.53  apply   79.357  rels    4341 | load=2.10 rc=0
+I16     pl base   r8  wall   158.45  apply   77.958  rels    4341 | load=2.07 rc=0
+I16     pl new    r8  wall   149.07  apply   70.696  rels    4341 | load=2.24 rc=0
+I16     pl new    r9  wall   150.97  apply   71.507  rels    4341 | load=2.17 rc=0
+I16     pl slices r9  wall   156.21  apply   76.429  rels    4341 | load=2.13 rc=0
+I16     pl base   r9  wall   154.90  apply   77.451  rels    4341 | load=2.10 rc=0
+done: 0 failed

@@ -14188,3 +14188,351 @@ q range, same commands. Evidence: [`../work/h2h-20261021/`](../work/h2h-20261021
   finding 124 (1.37x then, 1.60x against the old build here). So read c135 as
   cado-gpu 1.38x-1.5x ahead. A quiet re-run with ABBA ordering would settle
   it.
+
+<a id="finding-128"></a>
+## Finding 128 — the factor base's 262,144-entry slice cut took apply's third block per SM on any factor base past ~30M entries a side: 2,1147+ (alim = rlim = 600M, the NFS@Home Cunningham job Greg is running with this code) lost 16-18% of apply and 5-6% of wall on a 5070. Slices now start only where the log changes, 15-26 a side on every job measured, and the cells are identical by construction. The same job also overflows the side-0 record index
+
+**Date:** 2026-10-21, evening. RTX 5070, card free for the measurements,
+host load ~14 (CPU ECM). Builds: sm_120 copies of `2e05b9d` plus the k_apply
+comment fix below (`base/`) and the same with the cut off (`nocut/`).
+Evidence: [`../oracle/slicecut-20261021/`](../oracle/slicecut-20261021/),
+which also holds the landed build's gates, timing, ncu readings and review
+for both findings (work dirs `work/tinytab/`, `work/land127/`). The slice
+counter `hitcount.c` and the working notes (`NOTES.md`, sections 2, 7 and 8)
+are in [`../oracle/tinyfold-20261021/`](../oracle/tinyfold-20261021/).
+
+### Apply's shared-memory budget, read from the card
+
+k_apply's dynamic shared memory is `2^log_region * 2 + nslice_pow2 * 2`: the
+cells, plus the log table indexed by the slice ID each bucket record carries.
+Three 512-thread blocks per SM is what `__launch_bounds__(512, 3)` and finding
+75's −12.6% assume. The card reports 102,400 B of shared memory per SM and
+1,024 B reserved per block (`devattr.c`, driver API, no context), and NVIDIA's
+`cuda_occupancy.h` rounds each block's total up to 128 B (`occ.cpp`). So three
+blocks need at most **33,024 B** of dynamic shared memory: at `--region 14`,
+`nslice_pow2 <= 128`. The comment above k_apply said 512 slices fit; it left
+out the reserve and is corrected. sm_86 and sm_89 have the same 100 KB,
+reserve and granule, so every consumer Ampere, Ada and Blackwell card in a
+>= 9 GB NFS@Home queue is in the same position (`occarch.cpp`); a Turing
+2080 Ti (64 KB per SM) runs one block whatever the slices, an A100 three.
+(cuobjdump shows `SHARED:1024` for k_apply on sm_90 and sm_120 only and 0 on
+sm_75-sm_89: that is the reserve recorded in the cubin, not a second
+kilobyte. Finding 110's 99.5% of warp slots at I16 and the cliff below both
+agree with one reserve.)
+
+### Slice counts grew with the factor base
+
+`fb_build_slices` started a slice at every log change and every 262,144
+entries, "the original layout used by the CUDA path". Counted by
+`hitcount --slices-only` (the bench's own loaders, `fb_restrict`, the job's
+scales):
+
+| job | bucketed entries, side 1 / side 0 | slices, old | slices, new |
+|---|---|---:|---:|
+| c135 | 0.79M / 0.60M | -- | 18 / 26 |
+| c183 | 7.60M / 3.95M | 44 / 37 | 16 / 22 |
+| C194 | 13.2M / 8.97M | 65 / 55 | -- |
+| AS276 (C208) | 14.6M / 10.1M | 70 / 59 | 15 / 21 |
+| SNFS-301 | 12.4M / 12.4M | 65 / 66 | -- |
+| NFS@Home I16 | 16.3M / 11.1M | 76 / 63 | 15 / 21 |
+| 2,1147+ | 31.3M / 31.3M | **138 / 137** | 19 / 18 |
+
+Old: entries/262,144 plus the 14-20 log changes, so 128 slices came at ~30M
+entries on a side, a bound of ~580M. I16, C194 and AS276 sat at 128 (padded)
+with zero bytes to spare; 2,1147+ padded to 256, 33,280 B per block, two
+blocks per SM.
+
+### Nothing reads the cut
+
+The slice ID's only consumer is k_apply's log lookup: fill writes it into each
+bucket record's high bits (`(xl & offmask) | (sl << 16)`), apply reads
+`lut[(r >> 16) & (nslice - 1)]`, and the CPU replay behind `--verify` maps it
+through the same table. The side-0 resieve finds primes through its own
+record index (finding 119), the harness's layout B cuts its own slices
+(`build_slices_b`, comments updated), and fbtest tests only the 16-bit ID
+limit. So a slice now starts only where the log changes: one per distinct
+log, padding to 32 at most, **32,832 B per block at `--region 14` on every
+job above, 192 B under the cap**, and a larger factor base no longer moves it.
+
+### What it cost 2,1147+ (`cliff.sh`, `cliff.txt`)
+
+10 special-q from q = 300M, base against nocut, median of 3 rotated rounds,
+relations byte-identical in every run (567):
+
+| | base | slices at log changes | change |
+|---|---:|---:|---:|
+| 2,1147+ apply, single-queued | 73.0 ms/q | 59.6 | **−18.4%** |
+| 2,1147+ wall, pipelined | 265.4 | 251.5 | **−5.2%** (−4.6, −5.3, −4.5) |
+| NFS@Home I16 apply (control: three blocks either way) | 70.9 | 71.5 | +0.8% |
+| NFS@Home I16 wall | 169.3 | 168.2 | −0.6% |
+
+The loss is larger than finding 75's 12.6% for the third block (that was a
+C194 under different code); the control is flat within the ~1% difference two
+binaries of the same path show.
+
+### The side-0 record index runs out on 2,1147+ (`rs.*.out`)
+
+Finding 119's index holds `cap / 2` = 5,787 records per region on this job
+and was full in 28 of 40 slabs, which walk the factor base instead (I16 120
+of 120 and AS276 800 of 800 from records). `--resieve-scan-cap 11574` (= cap):
+40 of 40 from records, resieve + scatter 29.0 -> 18.6 ms/q, wall 252.1 ->
+245.3 (−2.7%), relations identical -- but device memory 8.48 -> 10.13 GB of
+11.91 pipelined. 2,1147+ runs in a >= 9 GB queue (Kyle), where the second q
+is granted only when `cudaMemGetInfo` shows it fits with `PIPE_VRAM_MARGIN`,
+and this job needs 6.6 GB single-queued, 8.5 pipelined. So the index wants
+sizing from what regions actually hold, not doubling. Not done here.
+
+### Landed (2026-10-21, night), with finding 129
+
+Both changes in one fat build of the tree, `38bb3d30` (`land.diff`, 5 files),
+gated overnight on a card shared with msieve, so correctness only
+(`night.sh`, `night.txt`):
+
+- build: the tree's sources, six archs, no warnings; every k_apply entry on
+  every arch (66) at <= 40 registers with no stack;
+- `--verify-only` 3 OK; fbtest passes;
+- 2,1147+ recounted from the built source: 19 / 18 slices, padded 32 / 32,
+  32,832 B per block. (`night.sh` itself scored this check FAIL: it parsed the
+  "bucketed entries" line instead of the `nslice_pow2` line. Fixed afterwards;
+  `slicecheck.sh` re-ran it on the same output, PASS. It is the run's only
+  failure.)
+- apply cell parity (`--verify`): 0 cells differ in 11 cases -- the 8 above
+  plus 2,1147+'s 600M factor base on both sides, folded and not;
+- 2,1147+, 10 q at 300M: relations byte-identical to the base build's,
+  single-queued and pipelined, fold on and off (567);
+- abcheck 36/36 identical at the default and 36/36 with `--no-tiny-fold` on
+  NEW's pipeline runs;
+- `make check` 117 PASS, 0 FAIL; fillcheck all arms byte-identical.
+
+Installed as `bench/bench` with no client running; the binary it replaced,
+`f37fe64d` (the fat build of `2e05b9d`), is kept as
+`work/land127/bench.f37fe64d`.
+
+**ncu, one 2,1147+ apply launch** (`ncuocc.sh`, `ncu.base.txt`,
+`ncu.new.txt`): `f37fe64d` 33.28 KB dynamic shared memory per block, Block
+Limit Shared Mem **2**, theoretical occupancy 66.67%; `38bb3d30` 32.83 KB,
+Block Limit Shared Mem **3** (registers and warps also 3), theoretical 100%,
+achieved 99.41%.
+
+**Timing, 2026-10-22 morning** (`timing.sh`, `timing.txt`,
+`timing.summary.txt`, `i16more.txt`, `c1147more.txt`): card free, host load
+2-5, client not running. base = `f37fe64d`; slices = `38bb3d30
+--no-tiny-fold` (this finding alone); new = `38bb3d30` (with finding 129).
+Rotated order; relations byte-identical across the arms in every run.
+
+| single-queued apply, median of 3 | base | slices | new |
+|---|---:|---:|---:|
+| c135 | 1.163 ms | −0.6% | −4.0% |
+| NFS@Home I16 | 72.45 | −2.3% | −7.8% |
+| 2,1147+ | 72.00 | −15.8% | −18.2% |
+
+| pipelined wall (COMPLETE) | base | slices | new | new against base, by round |
+|---|---:|---:|---:|---|
+| c135, 3 x 1500 q | 3.55 ms | −0.6% | +0.6% | −0.8, +0.6, −8.5 |
+| C143, 3 x 1000 q | 5.89 | +0.2% | −1.2% | −3.3, −1.2, +2.8 |
+| c183, 3 x 100 q | 42.45 | +1.9% | −2.9% | −3.0, −4.1, −0.1 |
+| NFS@Home I16, 6 x 60 q | 157.3 | +0.1% | **−4.5%** | −9.1, −2.5, −5.5, −0.3, −5.9, −2.5 |
+| C194, 3 x 20 q | 167.5 | −0.6% | −3.1% | −3.1, −3.7, −5.7 |
+| AS276 (C208), 3 x 20 q | 187.0 | +0.6% | −3.6% | −13.2, −3.6, −6.9 |
+| SNFS-301, 3 x 20 q | 170.6 | −1.1% | −1.6% | −1.7, −2.9, +3.1 |
+| 2,1147+, 4 x 40 q | 241.9 | **−6.0%** | **−6.8%** | −9.1, −5.8, −6.8, −6.3 |
+
+- **Only 2,1147+ moves on slices alone**, as the occupancy says: every other
+  job already had three blocks, and their slices arm reads within ±2%.
+- **The short runs could not resolve the wall.** I16 at 3 x 30 q read +0.7%
+  (−3.9, +1.2, +3.7: in-loop wall scattered 145-152 ms/q for one binary)
+  although its apply stage fell ~6% in every round; six rotated rounds of
+  60 q settled it. 2,1147+ at 3 x 10 q read −8.6% (−0.4, −11.3, −2.3): the
+  final cofactor flush is ~50 ms/q of a 10 q band; 40 q settled it. Both
+  short-run tables are kept in `timing.summary.txt`.
+- One 2,1147+ single-queued run (slices, round 1) spent 106 ms/q
+  "unaccounted" on the host against ~5 in every other; GPU stages normal, so
+  a one-off host stall. The median is unaffected.
+
+<a id="finding-129"></a>
+## Finding 129 — the small sieve's power-of-two moduli <= 32 are added at apply's init as one word per thread instead of walked (`--tiny-fold`, now the default): apply −3.8% (c135) to −7.8% (I16), pipelined wall −2.8% to −3.5% on c183, I16 and C194, cells identical by construction. Behind it, a census of which tiny moduli carry the hits, what removing them is worth at most (−10% / −15% of apply), and why a full periodic table for them cannot fit at I16
+
+**Date:** 2026-10-21. Card free, host load ~14 (CPU ECM). Builds: sm_120
+copies of `2e05b9d` plus the k_apply comment fix (`base/`), with the fold
+(`fold/`), and with entries dropped for timing only (`omit/`). Evidence:
+[`../oracle/tinyfold-20261021/`](../oracle/tinyfold-20261021/) (work dir
+`work/tinytab/`, `NOTES.md`); the landed build's gates, timing and review are
+with finding 128's, in [`../oracle/slicecut-20261021/`](../oracle/slicecut-20261021/).
+
+### Where this came from
+
+STATUS item 8b (pattern-sieve the tiniest moduli) was "open, and harder than
+it looks": one modulus composed word-wide saves nothing at two 16-bit cells
+per word, and summing all tiny moduli per word was expected to pay residue
+arithmetic per (entry, word). An outside review proposed combined periodic
+tables for 2, 3, 5 and 7 (period 420 cells, 840 B) and a gated side-0 apply
+(norms evaluated only under side 1's survivors -- STATUS item 10's lazy norm
+with side 1's bitmap as the floor, never tried). This finding measures the
+first before building anything.
+
+### Which moduli carry the hits (`hitcount.c`, `census.sh`, `census.*.txt`)
+
+A host-only census builds each side's line-sieved table per real special-q
+as `pipe_side_prepare_q` does (`fb_split_small`, `pl_transform_fast` to the
+effective modulus m, row divisor g) and counts sieve_small's hits under
+`ss_setup`'s rules, `--sieve-skip` even rows included. It reproduces the
+harness's update count exactly (c135 q 7000033, skip off: 254.7M / 108.4M
+against 2.546e8 / 1.084e8). T420 = m in {1,2,3,4,5,7}; pow2 = m in
+{1,2,4,8,16,32}:
+
+| job | side | block-tier hits/pos | T420 share of block hits | of block entries | pow2 share of block hits |
+|---|---|---:|---:|---:|---:|
+| c135 | 1 / 0 | 4.32 / 1.56 | 67.7% / 61.0% | 32.6% / 26.3% | 37.9% / 39.3% |
+| C143 | 1 / 0 | 3.98 / 1.57 | 61.6% / 64.4% | 25.8% / 29.8% | 27.4% / 42.3% |
+| c183 | 1 / 0 | 5.41 / 1.56 | 61.7% / 62.7% | 30.7% / 29.5% | 35.9% / 38.7% |
+| I16 | 1 / 0 | 5.07 / 1.56 | 66.0% / 58.6% | 30.7% / 25.0% | 44.1% / 34.0% |
+| C194 | 1 / 0 | 4.58 / 1.56 | 61.7% / 59.9% | 29.4% / 25.0% | 38.5% / 38.6% |
+| AS276 | 1 / 0 | 5.44 / 1.57 | 62.0% / 66.4% | 30.2% / 32.7% | 39.7% / 45.4% |
+
+Entries with m = 1 (every position of the rows g divides) alone are 0.44-0.95
+hits per position on side 1. **Hit share is not instruction share:** finding
+110's per-line export (`work/applyprof/c183_apply_L0.csv`) puts the block
+tier's per-entry lines at ~16 warp instructions per (entry, warp) per region
+and the hit loop at ~11-12 per warp-iteration (its 95.6M iterations against
+the census's 91.8M for c183 side 1). Per-entry work is ~40% of the block
+tier, so T420 is about half its instructions, ~10% of apply before any
+replacement cost.
+
+### Headroom (`ptxas.txt`; `devattr.txt` and `occ.txt` are in slicecut-20261021)
+
+Registers: every pipeline k_apply instance at 40 of 40 under
+`__launch_bounds__(512, 3)`, no spill. Shared memory: finding 128's budget --
+at the time I16, C194 and AS276 had **zero** bytes to spare and c183 one 128 B
+granule, so neither an 840 B table nor one in place of the log table
+(32,768 + 840 B) kept three blocks. Only c135 and C143 (2^13 regions, 16 KB
+free) had room.
+
+### What removing them is worth at most (`omit.sh`, `omit.summary.txt`)
+
+`TINY_OMIT` drops entries by effective modulus (wrong output, timing only).
+Single-queued apply, median of 3 rotated rounds:
+
+| job | base | without pow2 | without T420 |
+|---|---:|---:|---:|
+| c135 | 1.151 ms | 1.041 (−9.6%) | 0.980 (−14.9%) |
+| c183 | 16.402 | 14.772 (−9.9%) | 13.909 (−15.2%) |
+| I16 | 70.086 | 62.890 (−10.3%) | 60.019 (−14.4%) |
+
+### The fold
+
+In k_apply's init loop thread `tid` writes cells `CPW*tid + c + k*CPW*nth`.
+An entry whose step in a row divides `CPW*nth` therefore meets the same cells
+of every word that thread writes: its hits are ONE constant word per thread.
+Powers of two up to 32 have step m in every row (an even modulus keeps it
+under `--sieve-skip`), and m = 1 has step 1, or 2 in a skipped even row;
+`nth` is a multiple of 32, so 64 divides `CPW*nth`. `ss_fold_front` (host,
+both callers, after the sort, before the tiers) moves those entries to the
+front of the table; `ss_fold_word` sets them up lane-parallel with `ss_setup`
+and reads them by shuffle, as the block tier does, and returns the thread's
+word; k_apply adds it as init stores each word, and the block tier starts
+after them. Integer adds, so the cells are identical. No shared memory, no
+barrier; every k_apply instance still at 40 registers (38 for two 8-bit
+ones), no spill. `--no-tiny-fold` leaves the table and path exactly as before.
+
+The fold still pays each entry's setup and a per-entry loop in every warp,
+about what the walk's per-entry work cost, so it saves the hit loop and not
+the per-entry overhead the ceiling also removed: about three quarters of the
+ceiling at I16, under half at c135, whose 2^13 regions pay per-entry work
+twice as often per position.
+
+### The sm_120 prototype (`foldgate.txt`, `foldtime.summary.txt`)
+
+Gates, 0 failed: `--verify-only`; apply cell parity (`--verify`: one region
+replayed on the CPU from every small-sieve entry) 0 cells differ in 8 cases,
+both sides, I13/I15/I16, a 2^10 region, 96- and 160-thread blocks, 8-25
+entries folded, and a `--no-tiny-fold` control; abcheck 36/36 identical fold
+on and 36/36 with `--no-tiny-fold`; `make check` 117 PASS.
+
+Timing, median of 3 rotated rounds, relations identical in every arm:
+
+| job | apply, single-queued | pipelined wall | wall by round |
+|---|---:|---:|---|
+| c135 | 1.151 -> 1.102 (−4.3%) | 3.91 -> 3.86 (−1.3%) | −0.3, −0.3, −3.6 |
+| C143 | 2.348 -> 2.258 (−3.8%) | 6.45 -> 6.38 (−1.1%) | −4.2, +10.4, −1.1 |
+| c183 | 16.400 -> 15.329 (−6.5%) | 44.49 -> 43.25 (−2.8%) | −3.3, −2.5, −3.0 |
+| I16 | 70.060 -> 64.589 (−7.8%) | 164.88 -> 159.07 (−3.5%) | −3.8, −2.2, −3.3 |
+| C194 | 68.721 -> 63.946 (−6.9%) | 175.95 -> 171.05 (−2.8%) | −3.4, −2.8, −2.4 |
+
+The fold binary with `--no-tiny-fold` read 0.3-1.3% under base in apply on
+every job: the code-layout floor between two binaries of one path.
+
+### Next
+
+- **3, 5 and 7** (another ~5% of apply at the ceiling) rotate per step and need
+  a table. Finding 128 leaves 192 B per block at `--region 14`, room for
+  {3,5} (15 words) and {7} (7 words) with one barrier after the build.
+- **Side 0's norm only under side 1's survivors** (item 10 with side 1's bitmap
+  as the floor): measure side 1's survivor density first. Lazy-norm designs
+  4-5 lost on issue efficiency with no new barrier, so that is the risk.
+- **The per-entry overhead** the fold keeps (the rest of its ceiling).
+
+### Landed
+
+With finding 128, in fat build `38bb3d30`, installed as `bench/bench`; its
+gates and timing are listed there. The fold is on by default wherever the
+small sieve runs, the pipeline's banner says so (`--tiny-fold: ...`), and
+`--no-tiny-fold` walks every modulus as before. On the landed fat build the
+fold's own share (new against slices) is apply c135 −3.4%, I16 −5.6%, 2,1147+
+−2.8%, and pipelined wall I16 −4.6% over six 60 q rounds; 2,1147+ gains
+little from it (−0.8% wall) because x^7 + 2 gives it few power-of-two
+entries (4 folded on side 1 in the `--verify` case, against 24 on c183).
+
+### Review (`/code-review xhigh`, 2026-10-22), for findings 128 and 129
+
+No live correctness bug: the review traced the fold against the walk (entry
+sets, row and offset setup, `--sieve-skip` even rows, both-even cells, slabbed
+rows, carries, every launch site) and found nothing beyond the log lookup and
+the CPU replay reading the removed cut. Eleven hazards and cleanups; nine
+fixed:
+
+1. **nfold <= nblk was assumed, not enforced.** A folded m <= 32 must sit in the
+   block tier's leading run, or the warp tier walks entries init already
+   added (silent double counting if SS_BLOCK_CUT were tuned to 32).
+   `static_assert(SS_FOLD_MAX < SS_BLOCK_CUT)`.
+2. **`ss_fold_front` turned the fold off silently on a failed malloc** while the
+   banner said it was on, and (5) repeated the sort's scatter. Gone: both
+   callers' stable sort now takes the key `ss_order_before` (folded entries
+   first, then modulus), which gives exactly its output with no allocation,
+   and `ss_fold_count` reads nfold off the front.
+3. **A comment claimed `--verify` runs the pipeline's whole path.** The harness
+   passes `sieve_skip` 0, so the fold's even-row branches are covered only by
+   relation-level identity (abcheck's pipeline cases, the 2,1147+ runs). Said
+   so.
+4. **The third-block cliff was still undetectable at run time.** The pipeline's
+   banner now prints apply's blocks per SM from the device's occupancy
+   calculation, with "shared memory is the limit" when it is.
+8. **`--no-tiny-fold` under `--no-smallsieve` changed nothing** and was
+   accepted; refused now, like bench_main's other no-op flags.
+9. **No test guarded finding 128.** fbtest's "slices cut only at log changes":
+   600,000 entries in three log runs must be three slices, 300,000 of one log
+   one. It fails on the old fb_load.c and passes on the new.
+10-11. **Stale comments:** fill's slice hint "would recover the prime" (a slice
+   is now every prime with one log); fb_load.c named apply as the slice ID's
+   only reader (the CPU replay also decodes it). Two over-long lines wrapped.
+
+Deferred: (6) the fold's setup could compute c0 for its power-of-two moduli
+directly, without `ss_first` and its 64-bit fallback for m = 1, and load
+`slp` with the other four words -- a cut to the per-entry cost that keeps
+the fold under its ceiling; it needs timing, so with stage B. (7) With slices
+one per log, fill could write the log itself into each record's high bits:
+apply would read `r >> 16` and need no table, and the 2 B-per-entry slice
+array (62 MB per side at 2,1147+) would go. A separate change.
+
+Gates for the reviewed tree (slicecut-20261021's `review/review.sh` and
+`review/review.txt`, fat
+build `47f20cc2`, card shared with another process, correctness only), 0
+failed: night.sh's checks unchanged -- six archs, no warnings, all 66 k_apply
+entries <= 40 registers with no stack; `--verify-only`; fbtest; 2,1147+
+recounted at 19 / 18 slices; cell parity 11/11; 2,1147+ relations identical
+four ways; abcheck 36/36 at the default and 36/36 with `--no-tiny-fold`;
+`make check` 118 PASS; fillcheck -- plus the new fbtest case, the banner
+reading "apply: 3 blocks of 512 threads per SM, 32832 B shared memory each"
+on 2,1147+ (both modes) and I16, and `--no-smallsieve --no-tiny-fold`
+refused. The table the sort now produces is the one `ss_fold_front` did, so
+the timing above stands. Installed as `bench/bench`; `38bb3d30` is kept as
+`work/land127/bench.38bb3d30`, and `f37fe64d` as before.

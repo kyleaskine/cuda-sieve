@@ -1,0 +1,75 @@
+fb_fill_logp: modulus 4294967295 at entry 1 has no finite 8-bit log at scale 8
+fb_split_small: refusing an unvalidated factor base
+fb_restrict: refusing an unvalidated factor base
+fb_validate(/tmp/cuda-sieve-afb-CcVvN6): entry 1: .afb.0 modulus 4 is a proper prime power, not a base prime
+fb_validate(/tmp/cuda-sieve-cado-9NaAti): entry 0: modulus 6 is neither prime nor a power of one prime
+fb_load_cado: /tmp/cuda-sieve-cado-strict-DY89e9:1: modulus must be a complete unsigned 32-bit integer >= 2
+fb_validate(/tmp/cuda-sieve-cado-strict-Ns6b04): entry 0: modulus 6 is neither prime nor a power of one prime
+fb_validate(/tmp/cuda-sieve-cado-strict-XvMpIx): entry 0: ispow=0 disagrees with modulus 4 (proper prime power)
+fb_validate(/tmp/cuda-sieve-cado-strict-ed1SUL): entry 0: ispow=0 disagrees with modulus 4 (proper prime power)
+fb_load_cado: /tmp/cuda-sieve-cado-strict-1FZCjM:1: exponents must satisfy 0 <= oldexp < nexp and nexp >= v_p(q)
+fb_load_cado: /tmp/cuda-sieve-cado-strict-s6gwNH:1: entry has no roots
+fb_load_cado: /tmp/cuda-sieve-cado-strict-LYqET4:1: root must be smaller than 2*q
+fb_load_cado: /tmp/cuda-sieve-cado-strict-GVknir:1: missing root after ','
+fb_load_cado: /tmp/cuda-sieve-cado-strict-PhT6WI:1: trailing characters after root list
+fb_load_cado: /tmp/cuda-sieve-cado-strict-hmXYfl: base primes not ascending at entry 1
+fb_load_cado: /tmp/cuda-sieve-cado-strict-R2fBD3:1: malformed # maxbits comment (want 1..32)
+fb_load_cado: /tmp/cuda-sieve-cado-strict-BzRqk8: prime-power modulus 9 exceeds # maxbits = 2
+fb_load_cado: /tmp/cuda-sieve-cado-strict-JiWfGN:2: conflicting # maxbits declarations
+fb_load_cado: /tmp/cuda-sieve-cado-strict-daBl3B:1: trailing characters after root list
+poly_load: /tmp/cuda-sieve-poly-strict-SOGFVh: missing skew field
+poly_load: /tmp/cuda-sieve-poly-strict-JOAYYk:1: skew must be finite and positive
+poly_load: /tmp/cuda-sieve-poly-strict-aDbx23: both Y0 and Y1 are required
+poly_load: /tmp/cuda-sieve-poly-strict-BM27QG: Y0 and Y1 cannot both be zero
+poly_load: /tmp/cuda-sieve-poly-strict-4od3xW:3: c1 must be a decimal integer of at most 79 characters
+poly_load: /tmp/cuda-sieve-poly-strict-iGYdub:3: malformed coefficient name
+poly_load: /tmp/cuda-sieve-poly-strict-3zAunX:3: degree 9 exceeds supported maximum 8
+poly_load: /tmp/cuda-sieve-poly-strict-itexCA:4: duplicate c1 coefficient
+poly_load: /tmp/cuda-sieve-poly-strict-sr8WvD:6: rlim must be a complete unsigned 32-bit integer
+poly_load: /tmp/cuda-sieve-poly-strict-XC4dnL:1: skew must be finite and positive
+poly_load: /tmp/cuda-sieve-poly-strict-WOXJLd:1: skew must be finite and positive
+q=120000053 rho=112625526  basis (a0,a1,b0,b1)=(-7374527,1,120000053,0)
+  b(i,j) = 1*i + 0*j   ->  a projective ideal above p hits i == 0 (mod p) on EVERY row
+
+[0] bucket slice-table bounds
+PASS   16-bit slice ID boundary           65,536 slices accepted; 65,537 rejected fail-closed
+PASS   slices cut only at log changes     600,000 entries in 3 log runs -> 3 slices; 300,000 of one log -> 1
+PASS   64-bit grid-stride product         16,777,216 x 256 remains 2^32 rather than wrapping to zero
+PASS   strict finite decimal parser       junk, range errors, NaN and infinities rejected without assignment
+PASS   strict unsigned decimal parser     signs, whitespace, junk and overflow rejected without assignment
+PASS   checked survivor threshold         truncation preserved; invalid values and BOUND > CINIT rejected
+PASS   8-bit factor-base logs             out-of-range logs fail without publishing a partial array
+PASS   strict --qrange parser             open/closed ranges accepted; junk, overflow and reversed bounds rejected
+
+[1] production factor-base validation
+PASS   validator fail-closed cases        mixed composites, flags, roots, ordering, .afb.0 powers
+PASS   validator dense fast path          65,536 distinct moduli checked by sieve; injected composite rejected
+PASS   file loaders invoke validator      .afb.0 and text inputs reject malformed moduli and clean up
+text factor base /tmp/cuda-sieve-cado-strict-NnVx2d: 6 ideals (4 prime, 2 prime-power) at scale 1.000
+text factor base /tmp/cuda-sieve-cado-strict-XtyFX3: 1 ideals (0 prime, 1 prime-power) at scale 1.000
+PASS   strict CADO text parser            numeric bounds, metadata, roots, ordering and trailing input checked
+PASS   strict polynomial parser           fields, exact integers, finite values, duplicates, pasted Unicode
+
+[2] transform vs definition, set equality, q <= 200, all roots in [0,2q)
+PASS   synthetic moduli                   primes, prime powers, even moduli, affine + projective
+PASS   fast path == general path          45765270 (m, rt, g) compared exactly, 43487736 by the fast path; small special-q x prime powers to 2000, random moduli to 2^32
+
+[3] transform vs definition, driven by the real factor bases
+text factor base ../oracle/c183.fb1: 7605616 ideals (7605409 prime, 207 prime-power) at scale 1.000
+PASS   side 1 small part                  3840 entries checked
+PASS   side 1 fast path == general path   every entry exact, 7605406 of 7605616 by the fast path
+PASS   side 1 moduli are prime powers     7605616 ideals
+PASS   side 1 projective entries seen     41 projective, 35 with a NONZERO reciprocal
+PASS   side 1 sum(logp/q)                 42.2913 (independent expectation 42.2913)
+rational factor base: 3957374 ideals up to 67100000 (78 prime-power of which 3 projective, 7 projective primes) at scale 1.000
+PASS   side 0 small part                  3590 entries checked
+PASS   side 0 fast path == general path   every entry exact, 3957293 of 3957374 by the fast path
+PASS   side 0 moduli are prime powers     3957374 ideals
+PASS   side 0 projective ladder           10 projective, 3 with a NONZERO reciprocal (expect >= 3: 59^2, 101^2, 127^2)
+PASS   side 0 sum(logp/q)                 25.2037 (independent expectation 25.2037)
+
+[4] exact-norm width admission
+PASS   octic below 256-bit bound          upper bound 255.17 bits
+PASS   octic above 256-bit bound          upper bound 256.17 bits refused
+
+all gates passed

@@ -1,0 +1,112 @@
+#!/bin/sh
+# Overnight gates for landing --tiny-fold (finding 127) and slices cut only at
+# log changes (finding 128): the fat build in fat/bench, which is the binary to
+# install as bench/bench once these pass. Base: work/tinytab/base (2e05b9d +
+# the k_apply comment fix, sm_120, abcheck outputs cached). The card is shared
+# with msieve tonight (Kyle), so this checks correctness only; timing waits
+# for the morning. A FAIL line, a missing PASS or a nonzero exit fails a
+# check; every check counts toward the exit status.
+R=/home/kylea/code/cuda-sieve; W=$R/work/land127; T=$R/work/tinytab
+F=$W/fat/bench/bench; B=$T/base/bench/bench
+fail=0
+echo "base $(sha256sum $B | cut -c1-16)  new $(sha256sum $F | cut -c1-16)  load=$(cut -d' ' -f1 /proc/loadavg)  card $(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader)"
+if ps -eo args | grep -v grep | grep -qE 'ggnfs-sieve-client|run-cuda-client'; then echo "   client running"; fail=$((fail+1)); fi
+
+echo "== build: the tree's sources (docs aside), six archs, no warnings"
+nd=0
+for f in $(git -C $R ls-files bench | grep -v '^bench/attic/' | grep -v '\.md$'); do
+  cmp -s $R/$f $W/fat/$f || { echo "   differs from the tree: $f"; nd=$((nd+1)); }
+done
+archs=$(grep -o 'arch=compute_[0-9]*,code=sm_[0-9]*' $W/fat.build.log | sort -u | wc -l)
+warns=$(grep -i warning $W/fat.build.log | grep -vc minnctapersm)
+echo "   $(cat $W/fat.done) | sources differing $nd | archs $archs | warnings $warns"
+grep -q 'exit=0' $W/fat.done && [ $nd -eq 0 ] && [ "$archs" -eq 6 ] && [ "$warns" -eq 0 ] || fail=$((fail+1))
+
+echo "== k_apply on every arch: <= 40 registers, no stack (no spill)"
+cuobjdump -res-usage $F 2>/dev/null | awk '/^ *Function _Z7k_apply/ {f=1; next} f && /REG:/ {print; f=0}' > $W/resusage.txt
+nk=$(wc -l < $W/resusage.txt)
+nbad=$(awk '{for(i=1;i<=NF;i++){if($i ~ /^REG:/){split($i,a,":"); if(a[2]>40) b=1} if($i ~ /^STACK:/){split($i,a,":"); if(a[2]>0) b=1}} if(b) n++; b=0} END {print n+0}' $W/resusage.txt)
+echo "   k_apply entries $nk, over 40 registers or with stack $nbad"
+[ "$nk" -ge 30 ] && [ "$nbad" -eq 0 ] || fail=$((fail+1))
+
+cd $W/fat/bench || exit 1
+echo "== --verify-only and fbtest"
+v=$($F --verify-only 2>&1 | grep -c '\[verify\] OK')
+echo "   verify-only OK lines: $v (3 expected)"; [ "$v" -eq 3 ] || fail=$((fail+1))
+./fbtest --fb1 ../oracle/c183.fb1 > $W/fbtest.log 2>&1; rc=$?
+echo "   fbtest exit=$rc $(tail -1 $W/fbtest.log)"; [ $rc -eq 0 ] || fail=$((fail+1))
+
+echo "== slices, recounted from the built source: 2,1147+ pads to <= 32 per side"
+gcc -O2 -std=c11 -c fb_load.c -o $W/fb_load.o && mkdir -p $W/obj && cp $T/obj/*.o $W/obj/ && cp $W/fb_load.o $W/obj/fb_load.o \
+  && gcc -O2 -std=c11 -I. -o $W/hitcount $T/hitcount.c $W/obj/*.o -Wl,--gc-sections -ldl -lm
+$W/hitcount --poly $R/work/c1147/c1147.job --fb1 $R/work/c1147/c1147.roots1.m16 --logI 16 --J 32768 --maxbits 16 \
+  --qmin 1 --scale1 1.375 --scale0 1.300 --slices-only > $W/slices.c1147.txt 2>&1
+grep -E 'slices counted|nslice_pow2' $W/slices.c1147.txt | sed 's/^/  /'
+# (Fixed after the 2026-10-21 run, which read the "bucketed entries" line here
+# and so failed on correct values; slicecheck.sh re-ran the check, PASS 32/32.)
+l=$(grep 'nslice_pow2:' $W/slices.c1147.txt)
+p1=$(echo "$l" | sed -n 's/.*side 1 \([0-9]*\), side 0 \([0-9]*\) .*/\1/p')
+p0=$(echo "$l" | sed -n 's/.*side 1 \([0-9]*\), side 0 \([0-9]*\) .*/\2/p')
+[ "${p1:-999}" -le 32 ] && [ "${p0:-999}" -le 32 ] && echo "   PASS" || { echo "   FAIL"; fail=$((fail+1)); }
+
+echo "== apply cell parity (--verify: one region replayed on the CPU from every small-sieve entry)"
+C183="--poly ../oracle/input.job --fb1 ../oracle/c183.fb1"
+C1147="--poly $R/work/c1147/c1147.job --fb1 $R/work/c1147/c1147.roots1.m16 --maxbits 16"
+vf() {  # name want-fold(y|n) args...
+  name=$1; wantf=$2; shift 2; o=$W/vf.$name.out
+  $F "$@" --verify > $o 2>&1; rc=$?
+  ok0=$(grep -c ' 0 cells differ' $o); nd=$(grep -c 'cells differ' $o)
+  nf=$(grep -h -- '--tiny-fold:' $o | awk '{print $2}' | sort -n | head -1)
+  r=PASS
+  [ $rc -eq 0 ] && [ "$nd" -ge 1 ] && [ "$ok0" -eq "$nd" ] || r=FAIL
+  if [ $wantf = y ]; then [ "${nf:-0}" -gt 0 ] || r=FAIL; else [ -z "$nf" ] || r=FAIL; fi
+  [ $r = FAIL ] && fail=$((fail+1))
+  echo "   $r $name: exit $rc, regions checked $nd, with 0 cells differing $ok0, folded entries ${nf:-none}"
+}
+vf s1.I15        y $C183 --logI 15 --side 1
+vf s0.I15        y $C183 --logI 15 --side 0
+vf s1.I15.r10    y $C183 --logI 15 --side 1 --region 10
+vf s1.I13.r13    y $C183 --logI 13 --J 4096 --side 1 --region 13
+vf s0.I16        y $C183 --logI 16 --J 2048 --side 0
+vf s1.I16.t96    y $C183 --logI 16 --J 2048 --side 1 --apply-threads 96
+vf s0.I14.t160   y $C183 --logI 14 --J 8192 --side 0 --apply-threads 160
+vf s1.I15.nofold n $C183 --logI 15 --side 1 --no-tiny-fold
+vf c1147.s1.I16  y $C1147 --logI 16 --J 2048 --side 1
+vf c1147.s0.I16  y $C1147 --logI 16 --J 2048 --side 0
+vf c1147.s1.nofold n $C1147 --logI 16 --J 2048 --side 1 --no-tiny-fold
+
+echo "== 2,1147+: relations byte-identical to base (10 q at 300M; base from work/tinytab/cliff.sh)"
+A="--pipeline --cofactor --poly $R/work/c1147/c1147.job --fb1 $R/work/c1147/c1147.roots1.m16 --logI 16 --J 32768 --maxbits 16 --qrange 300000000: --nq 10"
+for mode in sq pl; do for arm in def off; do
+  ex=; [ $mode = sq ] && ex=--no-q-pipeline; ax=; [ $arm = off ] && ax=--no-tiny-fold
+  o=$W/id.c1147.$mode.$arm
+  $F $A $ex $ax --relations $o.rel > $o.out 2>&1; rc=$?
+  ref=$T/cl.C1147.$mode.base.1.rel
+  if [ $rc -eq 0 ] && [ -s $o.rel ] && cmp -s $o.rel $ref; then r=PASS; else r=FAIL; fail=$((fail+1)); fi
+  echo "   $r $mode $arm: exit $rc, $(wc -l < $o.rel) relations against $(wc -l < $ref) | $(grep -h -- '--q-pipeline:' $o.out | cut -c1-70)"
+done; done
+
+cd $R/bench || exit 1
+ab() {
+  label=$1; shift
+  echo "== abcheck: $label"
+  rm -rf "$T/abcheck/run"
+  env ABDIR=$T/abcheck "$@" ./abcheck.sh "$B" "$F" > "$W/ab.tmp" 2>&1
+  rc=$?
+  sed 's/^/   /' "$W/ab.tmp"
+  echo "   exit $rc"; [ $rc -eq 0 ] || fail=$((fail+1))
+}
+ab "default (fold on, new slices), every case"
+ab "--no-tiny-fold on NEW's pipeline runs (new slices; harness cases still fold)" NEWARGS="--no-tiny-fold"
+
+echo "== make check (fat build)"
+(cd $W/fat/bench && nice make check > $W/check.log 2>&1); rc=$?
+echo "   $(grep -c '^PASS' $W/check.log) PASS, $(grep -c '^FAIL' $W/check.log) FAIL; $(tail -1 $W/check.log)"
+echo "   exit $rc"; [ $rc -eq 0 ] || fail=$((fail+1))
+echo "== fillcheck.sh (fat build; fill writes the slice IDs)"
+(cd $W/fat/bench && ./fillcheck.sh > $W/fillcheck.log 2>&1); rc=$?
+tail -2 $W/fillcheck.log | sed 's/^/   /'
+echo "   exit $rc"; [ $rc -eq 0 ] || fail=$((fail+1))
+
+echo "done: $fail failed"
+[ "$fail" -eq 0 ]

@@ -219,9 +219,10 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
             if constexpr (SLABBED) walk_next[k] = walk_cur[k];
             continue;
         }
-        /* one read per prime, not per record: the slice hint is what the apply
-         * kernel turns back into log p (and what resieve would use to recover
-         * the prime itself), exactly as CADO's shorthint does */
+        /* one read per prime, not per record: the slice ID is what the apply
+         * kernel turns back into log p. A slice is every prime with one log
+         * (finding 128), so it cannot recover the prime itself, as CADO's
+         * shorthint can; the side-0 resieve keeps its own index for that. */
         const uint32_t sl = slice[k];
         /* MEASURED 2026-08-24: the walk runs in 64 bits in BOTH specialisations,
          * and the legacy 32-bit form is the slow one. pl_next routes every
@@ -600,6 +601,87 @@ static inline void ss_tiers(const uint32_t *hsp, uint32_t n,
     *nblk = b; *nwrp = w;
 }
 
+/* --tiny-fold (STATUS 8b stage A, finding 129): the moduli whose hits are one constant
+ * word per thread. In k_apply's init loop thread tid writes the cells
+ * CPW*tid + c + k*CPW*nth, so an entry whose step in a row divides CPW*nth
+ * meets the same cells of every word that thread writes. A power of two up to
+ * 32 has step m in every row (an even modulus keeps its step under
+ * --sieve-skip), and m == 1 has step 1, or 2 in a skipped even row; nth is a
+ * multiple of 32 and CPW >= 2, so 64 divides CPW*nth and every such step does. */
+#define SS_FOLD_MAX 32u
+static_assert(SS_FOLD_MAX < SS_BLOCK_CUT,
+              "every folded modulus must sit in the block tier's leading run, or"
+              " the warp tier walks entries k_apply already added (nfold > nblk)");
+static inline int ss_folds(uint32_t m)
+{
+    return m <= SS_FOLD_MAX && !(m & (m - 1u));
+}
+
+/* The small-sieve table's order, for BOTH callers' stable sort: by modulus,
+ * with --tiny-fold's entries (ss_folds) first, so k_apply can skip them as a
+ * leading run [0, nfold). The rest stay sorted, so ss_tiers' leading runs and
+ * ss_two_step_from see what they saw before (every folded m is below
+ * SS_BLOCK_CUT), and the reciprocals are built afterwards by index as always.
+ * Without the fold it is the plain modulus order. One definition, so the two
+ * callers cannot drift. */
+static inline bool ss_order_before(uint32_t ma, uint32_t mb, int fold)
+{
+    const int fa = fold && ss_folds(ma), fb = fold && ss_folds(mb);
+    return fa != fb ? fa > fb : ma < mb;
+}
+
+/* nfold: the length of that leading run (0 without the fold). */
+static inline uint32_t ss_fold_count(const uint32_t *hsp, uint32_t n, int fold)
+{
+    uint32_t f = 0;
+    if (fold) while (f < n && ss_folds(hsp[f])) f++;
+    return f;
+}
+
+/* The folded entries' hits for this thread, as the word its init writes are
+ * offset by. Per-row setup is ss_setup, as in every tier, so the position set
+ * cannot differ from the walk's: hits are the cells c == c0 (mod mm) of the
+ * region, c0 < mm, and the thread owns cell CPW*tid + c of every word it
+ * writes. Lane k sets up entry base+k and the warp reads them by shuffle, as
+ * the block tier does; callers launch whole warps. Sums are integer adds, so
+ * adding them at init rather than by atomics is output-identical. */
+template <int CELLBITS>
+__device__ __forceinline__ uint32_t ss_fold_word(const uint32_t *__restrict sp,
+                                                 const uint32_t *__restrict srt,
+                                                 const uint32_t *__restrict sg,
+                                                 const uint16_t *__restrict slp,
+                                                 const uint32_t *__restrict smag,
+                                                 uint32_t nfold, uint32_t j,
+                                                 int32_t ilo, int logI,
+                                                 int evenrow, uint32_t tid)
+{
+    const uint32_t CPW = 32 / CELLBITS;
+    const uint32_t kshift = SS_KSHIFT(logI);
+    const uint32_t lane = tid & 31u;
+    uint32_t fw = 0;
+    for (uint32_t base = 0; base < nfold; base += 32u) {
+        const uint32_t e = base + lane;
+        uint32_t pk = 0;
+        if (e < nfold) {
+            uint32_t mm;
+            const uint32_t c0 = ss_setup(e, sp, srt, sg, smag, j, ilo, kshift,
+                                         evenrow, &mm);
+            if (mm) pk = c0 | (mm << 8) | ((uint32_t)slp[e] << 16);
+        }
+        const uint32_t ne = (nfold - base < 32u) ? nfold - base : 32u;
+        for (uint32_t k = 0; k < ne; k++) {
+            const uint32_t q  = __shfl_sync(0xFFFFFFFFu, pk, k);
+            const uint32_t mm = (q >> 8) & 0xFFu;
+            if (!mm) continue;
+            const uint32_t d = CPW * tid - (q & 0xFFu);
+            #pragma unroll
+            for (uint32_t c = 0; c < CPW; c++)
+                if (!((d + c) & (mm - 1u))) fw += (q >> 16) << (c * CELLBITS);
+        }
+    }
+    return fw;
+}
+
 template <int CELLBITS, int ATOMIC, bool SLABBED = false, bool SSTAIL = true>
 __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_region,
                             const uint32_t *__restrict sp,
@@ -608,7 +690,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
                             const uint16_t *__restrict slp,
                             const uint32_t *__restrict smag,
                             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
-                            uint32_t nsplit,
+                            uint32_t nsplit, uint32_t nfold,
                             uint32_t tid, uint32_t nth, uint32_t j_base,
                             int skipeven)
 {
@@ -661,9 +743,13 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      *
      * Leftover hits always land on the lowest tids, so warp 0 runs the most
      * iterations of each entry. Rotating the start thread per entry evens that
-     * out and was measured SLOWER (apply +3.6%, finding 102): leave it. */
+     * out and was measured SLOWER (apply +3.6%, finding 102): leave it.
+     *
+     * Entries [0, nfold) are not walked: k_apply added them at init
+     * (--tiny-fold, ss_fold_word). nfold <= nblk: both are leading runs of
+     * the same table and SS_FOLD_MAX < SS_BLOCK_CUT is a static_assert. */
     static_assert(SS_BLOCK_CUT <= 128u, "block-tier fields are packed in 8 bits");
-    for (uint32_t base = 0; base < nblk; base += 32u) {
+    for (uint32_t base = nfold; base < nblk; base += 32u) {
         const uint32_t e = base + lane;
         uint32_t pk = 0;
         if (e < nblk) {
@@ -877,11 +963,21 @@ template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
  *
  * **VALIDITY WINDOW -- the three-block premise is not universal.** Apply's
  * dynamic shared memory is (1 << log_region) * 2 + nslice_pow2 * 2, and three
- * blocks must fit the 100 KB per-SM budget. At the default --region 14 that
- * allows nslice_pow2 <= 512, which is exactly where the C194 sits today
- * (33792 B/block): one more slice tier doubles it to 1024, smem/block goes to
- * 34816, and only two blocks fit -- the whole -12.6% evaporates silently, with
- * no diagnostic. At --region 15 (~66 KB/block) only ONE block ever fits, so
+ * blocks must fit the SM's 102,400 B AFTER the driver adds 1,024 B to each
+ * block and rounds it up to a 128 B granule (the 5070 reports both; NVIDIA's
+ * cuda_occupancy.h applies them; sm_86 and sm_89 have the same 100 KB, reserve
+ * and granule). That caps a block at 33,024 B of dynamic shared memory, so the
+ * default --region 14 allows nslice_pow2 <= 128. Slices now start only where
+ * the log changes (fb_build_slices, finding 128): 15-26 per side on every job
+ * measured, c135 to 2,1147+, padding to 32 at most -- so a block is 32,832 B
+ * at --region 14, 192 B under the cap, and a larger factor base no longer
+ * moves it. Until then the count grew with the factor base: I16, C194 and
+ * AS276 sat at 128 slices with zero bytes to spare, and 2,1147+ (138) ran on
+ * two blocks, apply 18% slower. (This comment once said 512 slices fit, which
+ * left out the reserve.) Anything that takes more than those 192 B costs the
+ * third block and the whole -12.6% with clean output -- run_pipeline's banner
+ * now prints apply's blocks per SM and says when shared memory is the limit.
+ * At --region 15 (~66 KB/block) only ONE block ever fits, so
  * the cap constrains ptxas for no occupancy gain there. It costs nothing in
  * either case, since there is no spill at 40, but do not assume the win
  * survives a larger region or a factor base that cuts to more slices --
@@ -904,7 +1000,7 @@ void k_apply(const uint32_t *__restrict buckets,
                         const uint32_t *__restrict sg, const uint16_t *__restrict slp,
                         const uint32_t *__restrict smag,
                         uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
-                        uint32_t nsplit,
+                        uint32_t nsplit, uint32_t nfold,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
                         int sieve_skip, uint32_t j_base)
@@ -927,6 +1023,15 @@ void k_apply(const uint32_t *__restrict buckets,
     const int drop_both_even = not_both_even || sieve_skip;
 
     for (uint32_t i = tid; i < nslice; i += nth) lut[i] = slice_logp[i];
+
+    /* --tiny-fold: the small sieve's power-of-two moduli <= 32, as one word
+     * this thread adds to every word it initialises (ss_fold_word). nfold is
+     * 0 without small primes or under --no-tiny-fold. */
+    const uint32_t fw = nfold
+        ? ss_fold_word<CELLBITS>(sp, srt, sg, slp, smag, nfold, jblk,
+                                 (int32_t)(xbase & Imask) - Ihalf, logI,
+                                 sieve_skip && !(jblk & 1u), tid)
+        : 0u;
 
     /* ---- init: log-norm bound, computed in shared memory ---- */
     for (uint32_t w = tid; w < nword; w += nth) {
@@ -1024,7 +1129,7 @@ report spurious cell mismatches. Pricing builds only, never for relations."
             if (probe_out && x == probe_x) probe_out[0] = t;
             word |= (CINIT - t) << (c * CELLBITS);
         }
-        S[w] = word;
+        S[w] = word + fw;
     }
     __syncthreads();
 
@@ -1032,8 +1137,8 @@ report spurious cell mismatches. Pricing builds only, never for relations."
     if (nsmall)
         sieve_small<CELLBITS, ATOMIC, SLABBED, SSTAIL>(S, b, logI, log_region, sp, srt, sg, slp,
                                                smag,
-                                               nsmall, nblk, nwrp, nsplit, tid, nth,
-                                               j_base,
+                                               nsmall, nblk, nwrp, nsplit, nfold,
+                                               tid, nth, j_base,
                                                sieve_skip);
 
     /* ---- apply ---- */
@@ -1597,15 +1702,16 @@ __global__ void k_purge(const uint32_t *__restrict recs,
 /* Slice cut for LAYOUT B. Two differences from fb_build_slices(), and both
  * are forced by the record format rather than chosen:
  *
- *  - the cap is 65536, not 262144, because the record's high 16 bits hold the
+ *  - slices hold at most 65536 entries (fb_build_slices cuts only where the
+ *    log changes, finding 128), because the record's high 16 bits hold the
  *    offset WITHIN the slice. CADO has the same constraint and asserts on it
  *    (`fb.hpp:356`: size() <= numeric_limits<slice_offset_t>::max()).
  *  - the slice start indices are kept, because the fill is launched one slice
  *    at a time and the purge needs them to turn (slice, offset) back into a
  *    factor-base index.
  *
- * The tighter cap is what makes B's segment count ~3x the 39 that the looser
- * cut produces -- see the launch-cost discussion.
+ * The cap is what makes B's segment count ~3x the 39 that fb_build_slices'
+ * old 262,144-entry cut produced -- see the launch-cost discussion.
  */
 static uint32_t build_slices_b(const fb_t *fb, uint32_t **starts_out)
 {
@@ -2797,7 +2903,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
     /* ---- small primes: transform on the host (a few thousand entries) and
      * split into the three load-balance tiers. Entries arrive sorted by p, so
      * the tier boundaries are just two indices. ---- */
-    uint32_t nsmall = 0, nblk = 0, nwrp = 0, nsplit = 0;
+    uint32_t nsmall = 0, nblk = 0, nwrp = 0, nsplit = 0, nfold = 0;
     uint32_t *hsp = NULL, *hsrt = NULL, *hsg = NULL; uint16_t *hslp = NULL;
     uint32_t *hsmag = NULL;
     /* per-q HOST work, billed separately: it is invisible to cudaEvent timing
@@ -2853,8 +2959,11 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
              * stable, and ties in m are common (many entries share a modulus).
              * Stability keeps the output bit-identical to the old code, which
              * is what makes the bitmap regression test meaningful. */
+            const int fold = cfg->tiny_fold;
             std::stable_sort(idx, idx + nsmall,
-                             [hsp](uint32_t a, uint32_t b) { return hsp[a] < hsp[b]; });
+                             [hsp, fold](uint32_t a, uint32_t b) {
+                                 return ss_order_before(hsp[a], hsp[b], fold);
+                             });
             for (i = 0; i < nsmall; i++) {
                 uint32_t s = idx[i];
                 tp[i] = hsp[s]; trt[i] = hsrt[s]; tg[i] = hsg[s]; tlp[i] = hslp[s];
@@ -2871,7 +2980,13 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
          * building them earlier would mean permuting them too, for no gain.
          * And after the tiers, because the thread tier's two-step range
          * starts at nsplit and each magic is proved for the form its index
-         * gets (ss_bound_ok). */
+         * gets (ss_bound_ok). The sort put --tiny-fold's entries first, as
+         * the pipeline's does, so --verify's cell parity and the survivor-bitmap
+         * gates run the fold -- all of it except --sieve-skip's even-row rule:
+         * this harness passes sieve_skip 0, so ss_fold_word's even-row branches
+         * are covered only by relation-level identity (abcheck's pipeline
+         * cases, finding 129's 2,1147+ runs). */
+        nfold = ss_fold_count(hsp, nsmall, cfg->tiny_fold);
         ss_tiers(hsp, nsmall, &nblk, &nwrp);
         nsplit = ss_two_step_from(hsp, nsmall, nwrp, cfg->J, cfg->logI);
         for (i = 0; i < nsmall; i++)
@@ -2904,6 +3019,9 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                    " %.3e updates\n",
                    nsmall, nblk, SS_BLOCK_CUT, nwrp - nblk, SS_WARP_CUT,
                    nsmall - nwrp, nrow, nprj, upd);
+            if (nfold)
+                printf("  --tiny-fold: %u block-tier entries (power-of-two m <= 32)"
+                       " added at init, not walked\n", nfold);
         }
     }
 
@@ -3375,7 +3493,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         D.nsurv,                                               \
                         D.dbg, dbgreg, D.sp, D.srt, D.sg, D.slp,             \
                         D.smag,                                               \
-                        nsmall, nblk, nwrp, nsplit, probe_x, D.probe,          \
+                        nsmall, nblk, nwrp, nsplit, nfold, probe_x, D.probe,   \
                         D.survbits, cfg->not_both_even, 0, 0u);                   \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
@@ -3634,7 +3752,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                             float tfillB = 1e30f, tpurgeB = 1e30f;
 
                             printf("\n  --- layout B, built ---\n");
-                            printf("  slices at the 65536 cap: %u  (the 262144 cut"
+                            printf("  slices at the 65536 cap: %u  (fb_build_slices"
                                    " gives %u, but a 16-bit within-slice offset\n"
                                    "    cannot address it -- CADO asserts the same"
                                    " bound at fb.hpp:356)\n", nsl, nslice);

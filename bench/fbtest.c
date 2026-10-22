@@ -69,6 +69,47 @@ static uint32_t count_proj(const fb_t *fb, uint32_t *nonzero)
     return n;
 }
 
+/* Slices start only where the log changes (finding 128). A size-based cut --
+ * fb_build_slices used to cut every 262,144 entries -- made the count grow
+ * with the factor base, and past 128 slices the padded log table cost k_apply
+ * its third block per SM. 600,000 entries in three constant-log runs must be
+ * three slices (padded to 4), each entry in its run's slice, and one log over
+ * 300,000 entries one slice. */
+static int verify_slice_cuts(void)
+{
+    const uint32_t n = 600000u;
+    fb_t fb;
+    uint8_t *logp = (uint8_t *)malloc(n);
+    uint16_t *slice = NULL, *tab = NULL;
+    uint32_t p2 = 0, i;
+    int32_t ns;
+    int good = 0;
+
+    if (!logp) return 0;
+    memset(&fb, 0, sizeof(fb));
+    for (i = 0; i < n; i++) logp[i] = (uint8_t)(20u + (i >= 100000u) + (i >= 400000u));
+    fb.n = n;
+    fb.logp = logp;
+    ns = fb_build_slices(&fb, &slice, &tab, &p2);
+    if (ns != 3 || p2 != 4 || !slice || !tab ||
+        tab[0] != 20 || tab[1] != 21 || tab[2] != 22 ||
+        slice[99999] != 0 || slice[100000] != 1 || slice[399999] != 1 ||
+        slice[400000] != 2 || slice[n - 1] != 2)
+        goto done;
+    free(slice); free(tab);
+    slice = NULL; tab = NULL;
+
+    memset(logp, 25, n);
+    fb.n = 300000u;
+    ns = fb_build_slices(&fb, &slice, &tab, &p2);
+    good = ns == 1 && p2 == 1 && slice && tab && tab[0] == 25 &&
+           slice[0] == 0 && slice[fb.n - 1] == 0;
+
+done:
+    free(slice); free(tab); free(logp);
+    return good;
+}
+
 /* The bucket record reserves 16 bits for a slice ID. Exercise both sides of
  * that exact boundary: all 65,536 IDs are usable, while a 65,537th slice must
  * be rejected before either output allocation is exposed to the caller. */
@@ -759,6 +800,8 @@ int main(int argc, char **argv)
     printf("[0] bucket slice-table bounds\n");
     ok("16-bit slice ID boundary", verify_slice_bounds(),
        "65,536 slices accepted; 65,537 rejected fail-closed");
+    ok("slices cut only at log changes", verify_slice_cuts(),
+       "600,000 entries in 3 log runs -> 3 slices; 300,000 of one log -> 1");
     ok("64-bit grid-stride product",
        bench_grid_product_u64(1u << 24, 256u) == (UINT64_C(1) << 32),
        "16,777,216 x 256 remains 2^32 rather than wrapping to zero");
