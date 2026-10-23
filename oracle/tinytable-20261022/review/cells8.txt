@@ -1,0 +1,43 @@
+=== cuda-sieve bucket-fill benchmark ===
+polynomial ../oracle/input.job: algebraic degree 5, skew 1.154e+08
+  job file: rlim 67100000, alim 134200000, lpbr 31, lpba 32, mfbr 60, mfba 92
+  job file: alambda 3.5 -> 94.50 bits (side 1), reported only; the allowance is derived below
+  job file: rlambda 2.35 -> 61.10 bits (side 0), reported only; the allowance is derived below
+grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
+grid: 4608 x 32 for fill (absolute, not per SM)
+text factor base ../oracle/c183.fb1: 7605616 ideals (7605409 prime, 207 prime-power) at scale 1.000
+  bucketed  32768 <= p < 120000011 : 6840490 entries
+  line-sieved       p < 32768 (plus every p^k, k>=2) : 3840 entries
+q-lattice q=120000011 basis (a0,a1,b0,b1) = (-22230824,1,120000011,0), det=-120000011
+  NOTE: rho is synthetic (no root of f mod q computed here). The basis is
+  a genuine reduced q-lattice basis of the right shape, and transformed
+  roots are uniform mod p either way, so fill volume and distribution are
+  representative. Pass --rho to match a real las special-q.
+
+sieve area I=2^15 x J=16384 = 5.369e+08 positions; region 2^14; 32768 regions
+mode=atomic record=4B threads=256 reps=3
+
+  norm setup: deg 5, A=2.3303e+12 B=1.6384e+04, log2(maxnorm)=196.73, scale=1.000  (sq side: log2(q) divided out)
+  normalised coeffs d[0..5] = -0.0136 -0.0605 1 -0.419 -0.00539 0.381
+  device memory: 10.76 GB free of 11.91 GB
+  log p in [15,27], carried in each bucket record
+  small sieve: 3840 entries (92 block-tier m<64, 226 warp-tier m<1024, 3522 thread-tier), 46 with a row divisor, 41 projective, 5.025e+09 updates
+  --tiny-fold: 24 block-tier entries (power-of-two m <= 32) added at init, not walked
+  --tiny-table: 16 block-tier entries (m = 3, 5, 7, 9) added at init from two tables, not walked
+  init T at (i=0, j=J/2) = 189; survivor bound = 113 (scale 1.000 x 112.00 bits)
+  transformed roots: 3 row-confined (g > 1), 0 positions lost
+  analytic records : 3.119e+08   (sized with 1.15x margin)
+  single-level: 32768 buckets x cap 11202 x 4 B = 1.37 GB
+  records landed   : 311960613   (max bucket 9881, mean 9520 -> imbalance 1.04x)
+  las `not_both_even` filter ON: positions with i and j both even cannot survive
+
+  apply: 32768 regions x 16384 cells x 8 bit = 16592 B smem/block, 512 threads, smem atomicAdd, norm=horner
+  survivors: 23470468 of 536870912 positions (1 in 2.287e+01)
+
+  transform + plattice (T)      0.747 ms
+  fill: atomic single-level    12.865 ms
+  apply (init+add+scan)        10.774 ms
+  SIEVE CHAIN ms/special-q     24.386 ms
+  host per-q work               0.640 ms  (transform 0.245 + sort 0.041 + H2D 0.354)
+  ns per record (fill)           0.04
+  ns per record (apply)          0.03

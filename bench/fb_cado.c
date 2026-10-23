@@ -18,7 +18,7 @@
  *
  * The file is grouped by base prime with the powers of each listed inside the
  * group, so it is NOT globally sorted by q -- and everything downstream
- * (fb_split_small, fb_restrict, the slice builder) needs ascending q. The k==1
+ * (fb_split_small, fb_restrict, the fill's row tier) needs ascending q. The k==1
  * entries do arrive in ascending order and the powers are few (with the usual
  * maxbits 15, every power is <= 32768), so a merge is enough and a
  * full sort of 7.6M entries is not.

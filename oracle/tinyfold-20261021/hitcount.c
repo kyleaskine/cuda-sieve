@@ -14,7 +14,10 @@
  *   T420: effective m in {1, 2, 3, 4, 5, 7}   (period 420 cells = 210 words)
  *   T840: T420 plus m == 8                    (period 840 cells = 420 words)
  * Also each side's nslice_pow2 for apply's dynamic shared memory, computed by
- * fb_build_slices on the bucketed factor base at the job's scale.
+ * on the bucketed factor base at the job's scale, both ways the production
+ * path cut them: with the 262,144-entry cut it had until finding 128, and at
+ * log changes only (findings 128-129). Counted here, not by fb_build_slices,
+ * which finding 130 removed, so the tool still builds against the tree.
  *
  * Usage: hitcount --poly JOB [--fb1 FILE] --logI N [--J N] [--region N]
  *        [--maxbits N] [--sq-side S] --qmin Q [--nq N] --scale1 X --scale0 Y
@@ -118,12 +121,27 @@ static void report(const char *name, const tally_t *T, double npos, int nq)
 }
 
 static int32_t last_slices;          /* the count before padding, for --slices-only */
+static int32_t last_slices_logonly;  /* the same at log changes only */
+/* fb_build_slices' counting pass as it was: a new slice at every log change
+ * and, with forced_cut, every forced_cut entries. Returns the count padded to
+ * a power of two, as k_apply's log table was. */
+static uint32_t count_slices(const fb_t *fb, uint32_t forced_cut, int32_t *counted)
+{
+    uint32_t ns = 0, p2 = 1; int cur = -1;
+    if (!fb->logp || !fb->n) { fprintf(stderr, "no log table\n"); exit(1); }
+    for (uint32_t k = 0; k < fb->n; k++) {
+        const int lp = fb->logp[k];
+        if (lp != cur || (forced_cut && ns && (k % forced_cut) == 0)) { cur = lp; ns++; }
+    }
+    while (p2 < ns) p2 <<= 1;
+    *counted = (int32_t)ns;
+    return p2;
+}
 static uint32_t slices_pow2(fb_t *fb)
 {
-    uint16_t *s = NULL, *t = NULL; uint32_t p2 = 0;
-    if ((last_slices = fb_build_slices(fb, &s, &t, &p2)) < 0) { perror("fb_build_slices"); exit(1); }
-    free(s); free(t);
-    return p2;
+    int32_t c;
+    count_slices(fb, 0, &c); last_slices_logonly = c;
+    return count_slices(fb, 262144u, &last_slices);
 }
 
 int main(int argc, char **argv)
@@ -168,8 +186,9 @@ int main(int argc, char **argv)
     if (fb_fill_logp(&fb0, scale0) != 0) return 1;
     if (fb_split_small(&fb0, bkthresh, &fbs0) != 0) return 1;
     if (fb_restrict(&fb0, bkthresh, P.rlim) != 0) return 1;
-    const uint32_t ns1 = slices_pow2(&fb1); const int32_t c1 = last_slices;
-    const uint32_t ns0 = slices_pow2(&fb0); const int32_t c0 = last_slices;
+    const uint32_t ns1 = slices_pow2(&fb1); const int32_t c1 = last_slices, l1 = last_slices_logonly;
+    const uint32_t ns0 = slices_pow2(&fb0); const int32_t c0 = last_slices, l0 = last_slices_logonly;
+    printf("  slices at log changes only (findings 128-129): side 1 %d, side 0 %d\n", l1, l0);
     printf("  bucketed entries: side 1 %u, side 0 %u; slices counted: side 1 %d, side 0 %d\n",
            fb1.n, fb0.n, c1, c0);
     const uint32_t nsl = ns1 > ns0 ? ns1 : ns0;

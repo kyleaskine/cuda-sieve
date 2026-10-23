@@ -1,0 +1,13 @@
+
+single-queued apply, median over rounds (ms/q); change against base
+  C135   base    1.101 | notable    1.095 ( -0.5%) | new    1.054 ( -4.3%) | new by round -4.6 -4.2 -4.1 -4.4
+  C183   base   15.264 | notable   15.185 ( -0.5%) | new   14.497 ( -5.0%) | new by round -5.1 -5.0 -5.0 -5.1
+  I16    base   64.344 | notable   64.820 ( +0.7%) | new   63.158 ( -1.8%) | new by round -1.9 -1.8 -1.9 -1.9
+  C194   base   63.809 | notable   64.383 ( +0.9%) | new   62.171 ( -2.6%) | new by round -2.4 -2.6 -2.5 -2.9
+  C1147  base   56.622 | notable   56.793 ( +0.3%) | new   56.778 ( +0.3%) | new by round +0.2 +0.3 +0.3 +0.2
+
+pipelined wall (COMPLETE), median over rounds (ms/q); change against base
+  C183   base   41.955 | notable   42.460 ( +1.2%) | new   41.800 ( -0.4%) | new by round -3.5 +1.5 +2.6 -0.9
+  I16    base  154.180 | notable  152.700 ( -1.0%) | new  152.575 ( -1.0%) | new by round -0.3 -2.1 -1.3 -1.3
+  C194   base  164.280 | notable  164.170 ( -0.1%) | new  164.240 ( -0.0%) | new by round +1.6 +4.3 -2.2 -3.4
+  C1147  base  232.645 | notable  234.575 ( +0.8%) | new  232.845 ( +0.1%) | new by round +0.6 -0.8 -1.0 +1.9

@@ -712,7 +712,6 @@ int verify_walk_slab_cases(void)
  * >= CINIT -- so a mismatch means a real kernel bug and not a modelling
  * difference. */
 uint32_t verify_apply_region(const uint32_t *records, uint32_t nrec,
-                             const uint16_t *slice_logp,
                              const norm_t *N, int logI, int log_region,
                              uint32_t region, int norm_mode,
                              uint32_t Cinit, uint32_t tconst,
@@ -760,7 +759,7 @@ uint32_t verify_apply_region(const uint32_t *records, uint32_t nrec,
     }
     for (c = 0; c < nrec; c++) {
         uint32_t r = records[c];
-        cells[r & (ncell - 1)] += slice_logp[r >> 16];
+        cells[r & (ncell - 1)] += r >> 16;      /* the record carries log p (finding 130) */
     }
     for (c = 0; c < ncell; c++) if (cells[c] >= Cinit) surv++;
     return surv;

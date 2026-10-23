@@ -93,15 +93,6 @@ static inline int fb_log_delta_checked(uint32_t p, int nexp, int oldexp,
     return 0;
 }
 
-/* Build the bucket-record slice map. Each record carries a 16-bit slice ID,
- * so at most 65,536 slices can be represented. On success, returns the actual
- * slice count and allocates both output arrays for the caller to free. The log
- * table is zero-padded to a power of two for the device-side mask. With valid
- * output arguments, failure returns -1, leaves both pointers NULL and
- * nslice_pow2 zero, and sets errno. */
-int32_t fb_build_slices(const fb_t *fb, uint16_t **slice_out,
-                        uint16_t **logp_tab_out, uint32_t *nslice_pow2);
-
 /* The root transform is only valid for prime-power moduli; these keep that
  * assumption honest. fb_check_prime_powers returns the first bad index, or -1. */
 int     fb_is_prime_power(uint32_t q);
@@ -694,6 +685,7 @@ typedef struct {
     int      td_record_scalar;
     int      small_sieve;   /* 1 = line-sieve p < bkthresh into the region      */
     int      tiny_fold;     /* 1 = moduli 2^k <= 32 folded into apply's init     */
+    int      tiny_table;    /* 1 = moduli 3, 5, 7, 9 from per-region tables      */
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
     double   scale;         /* las byte scale for this side; 1.0 = raw bits    */
@@ -1146,7 +1138,6 @@ int run_bench(const fb_t *fb, const fb_t *small, const qlat_t *L,
  * This is the ground truth for the apply kernel, including the norm init and
  * the threshold test. Returns the number of survivors found. */
 uint32_t verify_apply_region(const uint32_t *records, uint32_t nrec,
-                             const uint16_t *slice_logp,
                              const norm_t *N, int logI, int log_region,
                              uint32_t region, int norm_mode,
                              uint32_t Cinit, uint32_t tconst,

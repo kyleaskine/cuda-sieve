@@ -1,0 +1,6 @@
+logrec   side 1: Duration 10.76 ms; Executed Instructions 4738503113 inst; Issue Slots Busy 90.12 %; Achieved Occupancy 99.50 %; Block Limit Shared Mem 3 block; Dynamic Shared Memory Per Block 32.77 Kbyte/block
+logrec   side 0: Duration 7.90 ms; Executed Instructions 3278936126 inst; Issue Slots Busy 90.02 %; Achieved Occupancy 99.29 %; Block Limit Shared Mem 3 block; Dynamic Shared Memory Per Block 32.77 Kbyte/block
+notable  side 1: Duration 10.82 ms; Executed Instructions 4718620681 inst; Issue Slots Busy 89.25 %; Achieved Occupancy 99.53 %; Block Limit Shared Mem 3 block; Dynamic Shared Memory Per Block 32.77 Kbyte/block
+notable  side 0: Duration 7.37 ms; Executed Instructions 3264131774 inst; Issue Slots Busy 90.05 %; Achieved Occupancy 99.31 %; Block Limit Shared Mem 3 block; Dynamic Shared Memory Per Block 32.77 Kbyte/block
+new      side 1: Duration 10.57 ms; Executed Instructions 4455932262 inst; Issue Slots Busy 85.84 %; Achieved Occupancy 99.50 %; Block Limit Shared Mem 3 block; Dynamic Shared Memory Per Block 32.98 Kbyte/block
+new      side 0: Duration 7.62 ms; Executed Instructions 3288095646 inst; Issue Slots Busy 87.61 %; Achieved Occupancy 99.33 %; Block Limit Shared Mem 3 block; Dynamic Shared Memory Per Block 32.98 Kbyte/block

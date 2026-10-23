@@ -783,9 +783,10 @@ __global__ void k_resieve_rows(const uint32_t *__restrict primes,
  * resieve walk the same entries from the same cursors. So side 0's records
  * on two-sided survivors are exactly the pairs its walk would find: equal
  * survivor by survivor on five jobs (finding 118). Yet they are 1-6% of side
- * 0's records, which are themselves a few percent of side 1's. A record names
- * a slice, not a prime, so side 0's fill also stores each record's
- * factor-base index at the same (region, slot) of `index` (fill_store_index).
+ * 0's records, which are themselves a few percent of side 1's. A record
+ * carries log p, not the prime (finding 130), so side 0's fill also stores
+ * each record's factor-base index at the same (region, slot) of `index`
+ * (fill_store_index).
  *
  * k_record_scan runs right after the intersection. Under --q-pipeline the
  * next slab's fill reuses the bucket array before this slab's TD, so the scan

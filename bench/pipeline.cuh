@@ -187,11 +187,12 @@ typedef struct {
     uint32_t *rowrt_alt;
     uint64_t *walk_spare;
     uint32_t *survbits;
-    uint16_t *slice, *slice_logp;
+    uint8_t  *logp;             /* each entry's log, which fill writes into its bucket records */
     uint32_t *sp, *srt, *sg;
     uint32_t *smag;             /* ss_first reciprocals; see ss_magic_build */
     uint16_t *slp;
-    uint32_t  nslice_pow2, nsmall, nblk, nwrp, nsplit, nfold, nfb;
+    uint32_t  nsmall, nblk, nwrp, nsplit, nfold, ntab, nfb;
+    unsigned long long tab_q, prep_q;   /* --tiny-table: q it was used for, of q prepared */
     size_t    apply_smem;
     norm_t    N;
     uint32_t  CINIT, BOUND, tconst, nsurv;
@@ -259,7 +260,7 @@ static void pside_free(pside_t *S)
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->rowrt);
     cudaFree(S->plat_alt); cudaFree(S->rowrt_alt); cudaFree(S->walk_spare);
-    cudaFree(S->survbits); cudaFree(S->slice); cudaFree(S->slice_logp);
+    cudaFree(S->survbits); cudaFree(S->logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->smag);
     cudaFree(S->d_nsurv);
@@ -373,8 +374,8 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
     return fraction > 1.0 ? 1.0 : fraction;
 }
 
-/* Everything that does NOT depend on the special-q: the factor base upload,
- * the slice tables, and the pinned staging. Hoisted out of the per-q path so a
+/* Everything that does NOT depend on the special-q: the factor base upload
+ * (primes, roots, each entry's log), and the pinned staging. Hoisted out of the per-q path so a
  * band of q measures sieving rather than allocation churn. */
 template <bool SLABBED>
 static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
@@ -383,7 +384,6 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
                           pside_t *S)
 {
     const uint32_t nbitword = xmax_alloc >> 5;
-    uint16_t *hslice = NULL, *hlogp = NULL;
     int rc = -1;
 
 #define SIDE_INIT_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -424,18 +424,25 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMemcpy(S->roots, fb->roots, (size_t)fb->n * 4,
                             cudaMemcpyHostToDevice));
 
-    if (fb_build_slices(fb, &hslice, &hlogp, &S->nslice_pow2) < 0) {
-        report_slice_build_error();
+    /* Each bucket record carries its prime's log in the high 16 bits (finding
+     * 130): fill reads it from here, one byte per entry, and k_apply adds
+     * `r >> 16`. So apply's shared memory (k_apply_smem) is the cells and,
+     * under --tiny-table, its 208 B of tables, whatever the factor base. */
+    if (!fb->logp || !fb->n) {
+        fprintf(stderr, "  pipeline: %s\n", fb->n ? "factor base has no log table"
+                : "no bucket-sieved primes (the factor base ends below --bkthresh)");
         goto done;
     }
     {
-        const size_t smem = ((size_t)1 << cfg->log_region) * (PIPE_CELLBITS / 8) +
-                            (size_t)S->nslice_pow2 * sizeof(*hlogp);
+        /* --tiny-table's two tables sit past the cells; sized whenever the
+         * option is on, since which q have tabled entries is not known yet. */
+        const size_t smem = k_apply_smem(cfg->log_region, PIPE_CELLBITS,
+                                         cfg->tiny_table && cfg->small_sieve &&
+                                         fbs && fbs->n);
         if (smem > optin_smem_limit) {
-            fprintf(stderr, "  apply needs %zu B of shared memory for %u"
-                    " padded slices; selected device supports at most %zu B"
-                    " opt-in per block\n",
-                    smem, S->nslice_pow2, optin_smem_limit);
+            fprintf(stderr, "  apply needs %zu B of shared memory; selected device"
+                    " supports at most %zu B opt-in per block\n",
+                    smem, optin_smem_limit);
             goto done;
         }
         /* cudaFuncSetAttribute is a property of the kernel specialization, not
@@ -443,15 +450,9 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
          * k_apply once, after both sides are initialized, to the larger value. */
         S->apply_smem = smem;
     }
-    SIDE_INIT_CK(cudaMalloc(&S->slice, (size_t)fb->n * 2));
-    SIDE_INIT_CK(cudaMalloc(&S->slice_logp, (size_t)S->nslice_pow2 * 2));
-    SIDE_INIT_CK(cudaMemcpy(S->slice, hslice, (size_t)fb->n * 2,
+    SIDE_INIT_CK(cudaMalloc(&S->logp, (size_t)fb->n));
+    SIDE_INIT_CK(cudaMemcpy(S->logp, fb->logp, (size_t)fb->n,
                             cudaMemcpyHostToDevice));
-    SIDE_INIT_CK(cudaMemcpy(S->slice_logp, hlogp,
-                            (size_t)S->nslice_pow2 * 2,
-                            cudaMemcpyHostToDevice));
-    free(hslice); hslice = NULL;
-    free(hlogp); hlogp = NULL;
 
     /* PINNED staging for the per-q small-sieve tables, allocated ONCE. The
      * 2026-08-04 review measured pageable staging here at 6.2 ms per side for
@@ -484,8 +485,6 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     rc = 0;
 
 done:
-    free(hslice);
-    free(hlogp);
 #undef SIDE_INIT_CK
     return rc;
 }
@@ -620,10 +619,10 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                 goto done;
             }
             for (uint32_t i = 0; i < k; i++) idx[i] = i;
-            const int fold = cfg->tiny_fold;
+            const int fold = cfg->tiny_fold, tab = cfg->tiny_table;
             std::stable_sort(idx, idx + k,
-                             [hsp, fold](uint32_t x, uint32_t y) {
-                                 return ss_order_before(hsp[x], hsp[y], fold);
+                             [hsp, fold, tab](uint32_t x, uint32_t y) {
+                                 return ss_order_before(hsp[x], hsp[y], fold, tab);
                              });
             for (uint32_t i = 0; i < k; i++) {
                 const uint32_t z = idx[i];
@@ -647,8 +646,13 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
          * permuting them too. And after the tiers: the thread tier's
          * two-step range starts at nsplit, and each magic is proved for the
          * form its index gets (ss_bound_ok in td.cuh). The sort put the
-         * entries k_apply adds at init (--tiny-fold) first: ss_order_before. */
+         * entries k_apply adds at init first (--tiny-fold's, then
+         * --tiny-table's): ss_order_before. */
         S->nfold = ss_fold_count(hsp, k, cfg->tiny_fold);
+        S->ntab = ss_tab_count(hsp, hsg, k, S->nfold, cfg->tiny_table,
+                               cfg->sieve_skip);
+        S->tab_q += S->ntab > 0;
+        S->prep_q++;
         ss_tiers(hsp, k, &S->nblk, &S->nwrp);
         S->nsplit = ss_two_step_from(hsp, k, S->nwrp, cfg->J, cfg->logI);
         for (uint32_t i = 0; i < k; i++)
@@ -986,7 +990,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
             auto *const rows_kern = bk->index ? k_fill_rows<SLABBED, true>
                                               : k_fill_rows<SLABBED, false>;
             rows_kern<<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
-                S->primes, S->rowrt, S->slice, nrow, nband, rows, cfg->logI,
+                S->primes, S->rowrt, S->logp, nrow, nband, rows, cfg->logI,
                 log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
                 cfg->sieve_skip, j_base, gate, gshift,
                 bk->index, bk->icap, bk->index_ovf);
@@ -1003,7 +1007,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
             auto *const fill_kern = bk->index ? k_fill_atomic<4, SLABBED, true>
                                               : k_fill_atomic<4, SLABBED, false>;
             fill_kern<<<fblocks, fthreads, 0, st>>>(
-                S->plat + nrow, S->slice + nrow, fb->n - nrow, xmax, cfg->logI,
+                S->plat + nrow, S->logp + nrow, fb->n - nrow, xmax, cfg->logI,
                 log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
                 SLABBED ? S->walk_cur + nrow : NULL,
                 SLABBED ? S->walk_next + nrow : NULL,
@@ -1042,10 +1046,10 @@ apply:
             : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>;
         apply_kern<<<nregion, athr, S->apply_smem, st>>>(
             (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
-            S->slice_logp, S->nslice_pow2, S->N, S->CINIT, S->CINIT - S->BOUND,
+            S->N, S->CINIT, S->CINIT - S->BOUND,
             S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
             S->sp, S->srt, S->sg, S->slp, S->smag,
-            S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold,
+            S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold, S->ntab,
             0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
             j_base);
     }
@@ -2539,7 +2543,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* Apply's blocks per SM, and whether shared memory is what limits
          * them. Losing the third block used to be silent: finding 128's
          * 2,1147+ ran apply 16-18% slower with clean output, and the k_apply
-         * comment's budget leaves ~192 B. The count is the device's own
+         * comment's budget leaves 48 B with --tiny-table's tables (256 B
+         * without). The count is the device's own
          * occupancy calculation, so it holds on every architecture. */
         {
             const int apply_thr = cfg->apply_threads ? cfg->apply_threads : 512;
@@ -2885,11 +2890,17 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  --fill-gate: side 0 stores fill records only under side 1's"
                " survivors, 1 gate bit per %u positions\n",
                1u << cfg->fill_gate_shift);
-    if (cfg->small_sieve)
+    if (cfg->small_sieve) {
         printf("  --tiny-fold: %s\n", cfg->tiny_fold
                ? "small-sieve moduli that are powers of two <= 32 are added at"
                  " apply's init, not walked"
-               : "off, every small-sieve modulus is walked");
+               : "off, those moduli are walked");
+        printf("  --tiny-table: %s\n", cfg->tiny_table
+               ? "small-sieve moduli 3, 5, 7 and 9 are added at apply's init"
+                 " from two per-region tables where they carry >= 1 hit per"
+                 " position, walked elsewhere (the band summary says where)"
+               : "off, those moduli are walked");
+    }
 
     /* Serial mode points BOTH sides at the one workspace on the legacy default
      * stream, which is what the two sides have always shared -- so the slab
@@ -5205,6 +5216,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  %-34s %llu slab(s); walked: %llu index full, %llu pair"
                    " list grown%s\n", "side 0 from its records", n_rs_scan,
                    n_rs_idx, n_rs_grow, rs_on ? "" : ", then off");
+        /* Where --tiny-table was used: ss_tab_count keeps it off where the
+         * tabled moduli carry too few hits (rational sides, x^7 + 2), so
+         * the banner's "on" does not say it engaged. Counted over the q
+         * prepared, which under --fill-ahead can run ahead of those sieved. */
+        if (cfg->small_sieve && cfg->tiny_table)
+            printf("  %-34s side 1 in %llu of %llu q, side 0 in %llu of %llu q\n",
+                   "--tiny-table used", S1.tab_q, S1.prep_q, S0.tab_q, S0.prep_q);
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
                (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",

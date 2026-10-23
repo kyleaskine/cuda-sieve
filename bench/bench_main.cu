@@ -348,6 +348,8 @@ static void usage(void)
 "  --no-smallsieve  skip the p < bkthresh line sieve\n"
 "  --no-tiny-fold   walk the small sieve's power-of-two moduli <= 32 like the\n"
 "                   rest instead of adding them as apply's init writes\n"
+"  --no-tiny-table  walk the small sieve's moduli 3, 5, 7 and 9 instead of\n"
+"                   adding them at apply's init from per-region tables\n"
 "  --not-both-even  apply las's filter: i,j both even can never survive\n"
 "  --sieve-skip N   pipeline: skip sieve work gcd(i,j) rules out [2]\n"
 "                   0 = off, 1 = both-even positions, 2 = also 3|i and 3|j\n"
@@ -1079,7 +1081,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
     cfg.apply_atomic = 1; cfg.apply_threads = 0; cfg.allowance = 3.5 * 32.0;
     cfg.td_record_scalar = 0;
-    cfg.small_sieve = 1; cfg.tiny_fold = 1; cfg.side = 1;
+    cfg.small_sieve = 1; cfg.tiny_fold = 1; cfg.tiny_table = 1; cfg.side = 1;
     cfg.scale = 1.0; cfg.dump = NULL; cfg.cadofb = NULL;
     cfg.probe_i = 0; cfg.probe_j = 0xFFFFFFFFu;
     cfg.survbits = NULL; cfg.not_both_even = 0; cfg.sieve_skip = 2;
@@ -1135,7 +1137,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.resume_rel_bytes = 0; cfg.resume_cand_bytes = 0;
     cfg.resume_nrel = 0; cfg.resume_nq = 0;
     int maxbits = 0, maxbits_set = 0;
-    int sieve_skip_set = 0, tiny_fold_set = 0;
+    int sieve_skip_set = 0, tiny_fold_set = 0, tiny_table_set = 0;
     int fill_row_bands_set = 0, fill_gate_shift_set = 0, resieve_scan_knob = 0;
     int q_prep_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
@@ -1327,6 +1329,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         }
         else if (!strcmp(argv[i], "--no-smallsieve")) cfg.small_sieve = 0;
         else if (!strcmp(argv[i], "--no-tiny-fold")) { cfg.tiny_fold = 0; tiny_fold_set = 1; }
+        else if (!strcmp(argv[i], "--no-tiny-table")) { cfg.tiny_table = 0; tiny_table_set = 1; }
         else if (!strcmp(argv[i], "--side") && i + 1 < argc) {
             if (parse_int_range_arg("--side", argv[++i], 0, 1, &cfg.side))
                 return 1;
@@ -1630,6 +1633,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * with the flag would claim a configuration it did not have. */
     if (tiny_fold_set && !cfg.small_sieve) {
         fprintf(stderr, "--no-tiny-fold changes nothing under --no-smallsieve\n");
+        return 1;
+    }
+    if (tiny_table_set && !cfg.small_sieve) {
+        fprintf(stderr, "--no-tiny-table changes nothing under --no-smallsieve\n");
         return 1;
     }
     /* Defaults of record (RESULTS finding 107), resolved only under --pipeline

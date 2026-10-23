@@ -1,0 +1,5 @@
+ncu --set full, 2,1147+ q index 1, slab 0 (side 1, side 0), single-queued; base = 47f20cc2 (HEAD), notable = b7d0608f --no-tiny-table
+base     side 1: Duration 8.45 ms; Executed Instructions 3795127687 inst; Issue Slots Busy 91.28 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.83 Kbyte/block; Block Limit Shared Mem 3 block
+base     side 0: Duration 7.57 ms; Executed Instructions 3329424302 inst; Issue Slots Busy 89.50 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.83 Kbyte/block; Block Limit Shared Mem 3 block
+notable  side 1: Duration 8.42 ms; Executed Instructions 3770817666 inst; Issue Slots Busy 90.93 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.77 Kbyte/block; Block Limit Shared Mem 3 block
+notable  side 0: Duration 7.63 ms; Executed Instructions 3339186535 inst; Issue Slots Busy 89.02 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.77 Kbyte/block; Block Limit Shared Mem 3 block

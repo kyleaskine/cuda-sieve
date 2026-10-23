@@ -14536,3 +14536,225 @@ on 2,1147+ (both modes) and I16, and `--no-smallsieve --no-tiny-fold`
 refused. The table the sort now produces is the one `ss_fold_front` did, so
 the timing above stands. Installed as `bench/bench`; `38bb3d30` is kept as
 `work/land127/bench.38bb3d30`, and `f37fe64d` as before.
+
+<a id="finding-130"></a>
+## Finding 130 — bucket records carry log p: fill writes each prime's log into the record's high bits and apply adds `r >> 16`, so the slices, their table in apply's shared memory and the 2 B-per-entry slice array are gone. Output identical, speed unchanged within ~1%; apply's shared memory is the cells alone (256 B spare at `--region 14`), which is what makes room for finding 131
+
+**Date:** 2026-10-22. Builds: sm_120 copies of `3ca7fc7` (`work/logrec/`,
+`work/stageb2/`), then the fat build of the tree (`work/land130/`). Evidence:
+[`../oracle/logrec-20261022/`](../oracle/logrec-20261022/); the timings and the landed
+build's gates are with finding 131's, in [`../oracle/tinytable-20261022/`](../oracle/tinytable-20261022/).
+
+Finding 128 left slices one per log value, 15-26 a side, so a slice ID had
+become an index into a table of at most 32 logs (finding 129's review, item
+7). The record now carries the log itself (8 bits, in the field that held the
+16-bit slice ID; fill reads it from a 1-byte array of `fb->logp`); `k_apply`
+reads `r >> 16`, the CPU replay behind `--verify` likewise. Gone:
+`fb_build_slices` and its two fbtest cases (a test of a format that no longer
+exists), `report_slice_build_error`, the per-block log table and its load
+loop, the `uint16_t` slice array (now `uint8_t` logs: 31 MB less per side at
+2,1147+). Layout B, a harness experiment with its own record format, keeps
+its own slicing.
+
+- **apply's dynamic shared memory is the cells**, 32,768 B at `--region 14`,
+  256 B under the three-block cap (finding 128), whatever the factor base.
+- **gates** (`work/logrec/gate.txt`, sm_120), 0 failed: cell parity 11/11,
+  2,1147+ relations identical four ways, abcheck 36/36 at the default and
+  36/36 with `--no-tiny-fold`, `make check` 116 PASS (118 less the two slice
+  cases), fillcheck, the banner at 32,768 B and three blocks.
+- **speed**: single-queued apply against the installed fat HEAD over two
+  four-round timings, c135 +0.1 / −0.5%, c183 −0.9 / −0.5%, I16 +0.8 / +0.7%,
+  C194 −0.1 / +0.9%, 2,1147+ 0.0 / +0.3% (`work/stageb/timing/summary.txt`,
+  `work/stageb2/timing/summary.txt`, both sm_120-only builds against a fat
+  one). Fewer instructions per bucket record, but nothing measurable.
+
+### Landed (2026-10-22), with finding 131
+
+In fat build `b7d0608f` of the tree (`work/land130/`), installed as
+`bench/bench`; gates and timing are listed under finding 131. With
+`--no-tiny-table` (this finding alone) the landed build read +0.4% to +2.9%
+of single-queued apply against HEAD's fat build in every round at I16 and
+2,1147+ -- but on 2,1147+ the default runs the very same path (its tables
+are off by finding 131's rule) and beat that arm in every round, and ncu at
+locked clocks put the kernel within 0.2% of HEAD's on a 2,1147+ slab (side 1
+−0.6% instructions, side 0 +0.3%; `../oracle/tinytable-20261022/landed/ncu.c1147.txt`). Read it as
+neutral, with a ~1-2% floor between arms in this harness.
+
+<a id="finding-131"></a>
+## Finding 131 — the small sieve's moduli 3, 5, 7 and 9 from two per-region tables added at apply's init (`--tiny-table`, now the default): apply −2.6% (I16) to −4.5% (c183) where they engage, every round, output identical. The first build lost its saving to a barrier where two warps built while fourteen waited; every warp now takes an equal share, and the tables go only where they carry at least one hit per position
+
+**Date:** 2026-10-22. Card shared with msieve for the gates, free for timing
+and ncu. Builds: sm_120 (`work/stageb/`, first build; `work/stageb2/`,
+second), then the fat build of the tree (`work/land130/`). Evidence:
+[`../oracle/tinytable-20261022/`](../oracle/tinytable-20261022/).
+
+### The tables
+
+Finding 129's census put 3, 5 and 7 at 24-33% of block-tier hits and 9 at
+another 1-7%. Odd moduli rotate through a thread's init words, so unlike the
+powers of two they need a table; finding 130's 256 B fit two: A, 45 words,
+for m in {3, 5, 9} (period lcm(9, 5) = 45), and B, 7 words, for m = 7 --
+208 B. Every step such an entry can have in a row (m, or 2m in a
+`--sieve-skip` even row: 3, 5, 9, 6, 10, 18 and 7, 14) divides CPW*45 or
+CPW*7, so init's word w adds `A[w % 45] + B[w % 7]`. The sort key gains a
+third group so these entries sit right after the folded ones and the block
+tier starts past both; per-row setup is `ss_setup`, so even rows and row
+divisors are the walk's. `--no-tiny-table` walks them.
+
+### First build: saved instructions, lost issue slots (`work/stageb/`)
+
+Warps 0-1 built all 52 words (one per lane, the entries shuffled as in the
+fold) behind a barrier. Timing, four rounds, apply against HEAD: c135
++1.0%, c183 −1.6%, I16 +0.4%, C194 +0.1%, **2,1147+ +2.9%** (every round
++2.8 to +3.0). ncu on I16's slab 0 (`work/stageb/prof/`): side 1's
+instructions fell 6.0% (4.74e9 -> 4.46e9) but issue slots busy fell
+90.1% -> 85.8%, and the barrier's share of stall samples rose 5.8% -> 9.5%
+(side 0: 4.7% -> 8.7%), on the lines of the build's barrier: fourteen warps
+waited while two built. The pattern of finding 104's lazy norms, with the
+cause in plain sight this time.
+
+### Second build (`work/stageb2/`)
+
+- **Every warp takes a share**: clear the 52 words, barrier, warp w takes
+  entries w, w + nwarps, ...; each lane runs the same setup and lane k adds
+  hit k with a shared atomic (<= 30 per entry at CPW 2); the caller's
+  barrier follows. Balanced work, so the warps reach the barriers together.
+- **Tables only where they pay**: init reads two table words per word
+  whatever they hold, so `ss_tab_count` returns 0 unless the tabled entries'
+  expected hits, sum of 1/(m g), reach 1 per position. One root each of 3,
+  5, 7 and 9 is 0.79: a rational side, or both sides of 2,1147+'s x^7 + 2.
+  In practice the tables go to algebraic sides with several roots (c183's
+  side 1: 16 entries); below the bar the entries stay put and are walked.
+- Shared memory 32,976 B with the tables (sized whenever the option is on),
+  three blocks; every k_apply instance at <= 40 registers, no spill.
+
+ncu, I16 slab 0 (`work/stageb2/prof/`): side 1 instructions −5.5%
+(4.75e9 -> 4.49e9), issue slots 89.9% -> 88.3%, barrier share 5.8% -> 6.5%,
+the launch 4.3% faster (10.81 -> 10.34 ms); side 0 identical (tables off).
+
+Timing (`work/stageb2/timing/`), four rotated rounds, sm_120 builds,
+relations identical in all 108 runs. The tables' own effect (same binary,
+`--no-tiny-table` against default), single-queued apply:
+
+| job | tables | by round |
+|---|---:|---|
+| c135 | −3.8% | −3.8, −3.8, −3.9, −3.8 |
+| c183 | −4.5% | −4.7, −4.5, −4.6, −4.5 |
+| NFS@Home I16 | −2.6% | −2.5, −2.6, −2.5, −2.6 |
+| C194 | −3.4% | −3.6, −3.2, −3.5, −3.3 |
+| 2,1147+ | 0.0% (off by the rule) | |
+
+Pipelined wall moves about a third as much and sits inside four rounds'
+noise (c183 −1.6%, I16 −0.6%, C194 +0.3%, 2,1147+ −0.6%).
+
+### Gates
+
+Second build (`work/stageb2/gate.txt`), 0 failed: cell parity 14/14 (both
+sides, I13/I15/I16, region 2^10, 96 and 160 threads, the tables on and off;
+a 32-thread block also checked by hand), 2,1147+ relations identical with
+everything on and everything off, abcheck 36/36 at the default and 36/36
+with `--no-tiny-table`, `make check` 116, fillcheck, the banner at 32,976 B
+and three blocks, `--no-smallsieve --no-tiny-table` refused.
+
+### Not landed: the fold's own setup (finding 129's review, item 6)
+
+A power-of-two `ss_fold_setup` (no reciprocal, no 64-bit fallback for m = 1,
+`slp` loaded with the other words) measured −0.1% to +1.1% of apply against
+the shared setup across five jobs (`work/stageb/timing/`), and ncu showed
+more long-scoreboard stall with it. Dropped.
+
+### Landed (2026-10-22)
+
+Findings 130 and 131 together, fat build `b7d0608f` of the tree
+(`work/land130/`, `land.diff`, 7 files, 327 lines out and 241 in),
+installed as `bench/bench` with no client running; HEAD's `47f20cc2` is kept
+as `work/land130/timing/bench.47f20cc2`.
+
+**Gates** (`landed/gate.sh`, `landed/gate.txt`), 0 failed: the tree's
+sources, six archs, no warnings; all 66 k_apply entries <= 40 registers with
+no stack; `--verify-only`; fbtest; cell parity 14/14; 2,1147+ relations
+identical four ways; abcheck 36/36 at the default and 36/36 with
+`--no-tiny-table`; `make check` 116; fillcheck; the banner at 32,976 B and
+three blocks on 2,1147+ and I16; both no-op flags refused.
+
+**Timing, fat against fat** (`landed/timing.txt`, `landed/timing.summary.txt`):
+card free, host load 2-5, four rotated rounds, relations identical in all
+108 runs. base = HEAD (`47f20cc2`), new = `b7d0608f`:
+
+| | apply, single-queued | by round | pipelined wall |
+|---|---:|---|---:|
+| c135 | **−4.3%** | −4.3, −4.3, −4.5, −4.0 | -- |
+| c183 | **−4.4%** | −4.0, −3.0, −4.9, −5.3 | −0.2% |
+| NFS@Home I16 (60 q) | **−1.6%** | −1.1, −2.0, −2.4, −2.1 | **−2.1%** |
+| C194 | **−2.7%** | −2.4, −2.7, −4.0, −2.7 | +0.3% |
+| 2,1147+ (40 q; tables off by the rule) | +0.9% | +0.3, +1.6, +1.3, +0.1 | +0.8% |
+
+The tables' own effect in the same binary (default against
+`--no-tiny-table`): apply c135 −3.9%, c183 −4.2%, I16 −3.0%, C194 −3.6%,
+matching the sm_120 prototype. 2,1147+'s +0.9% is the finding 130 floor
+discussed there, not the kernel.
+
+### Review (`/code-review xhigh`, 2026-10-22), for findings 130 and 131
+
+No correctness bug: the review traced the record format (apply runs only on
+4 B records, and `--region > 16` already requires 8 B ones), the table
+periods against every step a tabled entry can take, `c0 < mm`, the barriers'
+block-uniformity, `nfold + ntab <= nblk` and fill-ahead's ordering of
+`S->ntab`. Thirteen findings; eleven fixed:
+
+1. **The tables' even-row path is never checked cell by cell** (the harness
+   runs without `--sieve-skip`), and the gates did not check the tables
+   engaged where they were meant to. The harness comment now says so for the
+   tables as for the fold; the gates check, case by case, that the tables
+   engaged on c183's side 1 and stayed off elsewhere (see below).
+2. **The shared-memory budget comments still said 256 B.** With the tables a
+   block is 32,976 B, 48 B under the cap; said so in k_apply's comment and
+   the pipeline's.
+3. **Which table a modulus went to was hard-coded** (`sp[e] == 7`) and nothing
+   tied the tabled set to the periods: adding 25, 27 or 49 would compile and
+   mis-sieve. One `ss_tab_of`, read by host and device, and a constexpr
+   check over every modulus below 2048 (`ss_tab_set_ok`) that each tabled m
+   sits in the block tier and that m and 2m divide its table's period.
+4. **8-bit cells take the build's second pass** (m = 3 has 60 hits in 180
+   cells) -- already covered: abcheck's `s1.cells8` is c183's side 1 with
+   the tables engaged (16 entries, checked by hand and now by the gates),
+   its survivor bitmap byte-identical to base over 537M positions.
+5. **The empty-factor-base guard went with `fb_build_slices`.** Restored in
+   run_bench and pipe_side_init with a message for a factor base that ends
+   below `--bkthresh`.
+6. **The rule's `>=` on a double sum** could round a sum of exactly 1 below
+   the bar; compared against 1 - 1e-9.
+7. **The banner said the tables were used wherever the option was on.** It now
+   says they apply where they pay, and the band summary prints
+   `--tiny-table used  side 1 in X of Y q, side 0 in ...` from per-side
+   counts.
+8. **The engagement estimate ignored `--sieve-skip`**, which halves an odd
+   modulus's hits in even rows. Now times 3/4 under it (every tabled m and
+   its g are odd), so the bar is in real hits; no measured job changes sides.
+9. **The table's shared memory was sized two ways.** One `k_apply_smem` for
+   run_bench and pipe_side_init. (Folding the two callers' small-sieve setup
+   into one function is left for later.)
+10. **The committed census tool called the removed `fb_build_slices`.**
+    `oracle/tinyfold-20261021/hitcount.c` now counts slices itself, both the
+    old way and at log changes only; it builds against the tree and gives
+    I16's 76/63 and 15/21.
+11. **Stale slice comments** in td.cuh, bench_kernels.cu (layout A) and
+    fb_cado.c.
+13. **The build hand-rolled `ss_add`**; it calls `ss_add<CELLBITS, 1>` now.
+
+Deferred: (12) init's `w % 45`, `w % 7` and a 2-way bank conflict in table A
+-- a speed change that wants timing, and stepping the indices per thread
+needs registers k_apply does not have at 40.
+
+Gates for the reviewed tree (`review/gate.sh`, `review/gate.txt`, fat build
+`3fca6f92`, card free), 0 failed: the landing's checks unchanged (six archs,
+no warnings, 66 k_apply entries <= 40 registers with no stack, `--verify-only`,
+fbtest, cell parity 14/14, 2,1147+ identical four ways, abcheck 36/36 twice,
+`make check` 116, fillcheck, banner and refusals), plus: the tables engaged
+(16 entries) in every c183 side-1 parity case and stayed off in the other
+nine; 16 entries with 8-bit cells; the band summary reads "side 1 in 2 of 2
+q, side 0 in 0 of 2 q" for I16 and "0 of 10" on both sides of 2,1147+.
+The review changes no table, kernel path or engagement decision on any
+measured job, so the timing above stands. Installed as `bench/bench`;
+`b7d0608f` is kept as `work/land130/bench.b7d0608f`, and HEAD's `47f20cc2`
+as before.
