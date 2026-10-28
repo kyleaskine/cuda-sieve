@@ -797,11 +797,13 @@ __global__ void k_resieve_rows(const uint32_t *__restrict primes,
  * them in any order, and both writers sort each factor list.
  *
  * One block per region, whole warps per pass so the ballot has every lane.
- * Slots past icap have no index. The fill counted them, and the host walks
- * that slab instead, so the scan stops at icap. *npair is the true total even
- * past pcap, so the host can grow the list. */
+ * The index shares the bucket's layout (finding 132); a test's
+ * --resieve-scan-cap limits it to icap slots a region. Slots past that have no
+ * index. The fill counted them, and the host walks that slab instead, so the
+ * scan stops there. *npair is the true total even past pcap, so the host can
+ * grow the list. */
 __global__ void k_record_scan(const uint32_t *__restrict bucket,
-                              const uint32_t *__restrict cursor, uint32_t cap,
+                              const uint32_t *__restrict cursor, bklay_t lay,
                               const uint32_t *__restrict index, uint32_t icap,
                               int log_region,
                               const uint32_t *__restrict two,
@@ -812,9 +814,11 @@ __global__ void k_record_scan(const uint32_t *__restrict bucket,
     const uint32_t b = blockIdx.x;
     const uint32_t offmask = (1u << log_region) - 1u;
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t *rec = bucket + (size_t)b * cap;
-    const uint32_t *idx = index + (size_t)b * icap;
-    const uint32_t m = min(cursor[b], icap);
+    uint32_t cap;
+    const uint32_t at = bklay_base(lay, b, &cap);
+    const uint32_t *rec = bucket + at;
+    const uint32_t *idx = index + at;
+    const uint32_t m = min(cursor[b], min(cap, icap));
 
     for (uint32_t base = threadIdx.x & ~31u; base < m; base += blockDim.x) {
         const uint32_t k = base + lane;

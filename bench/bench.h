@@ -640,12 +640,16 @@ typedef struct {
      * those records ARE the walk's pairs. A slab whose index or pair list ran
      * out of room is resieved by the walk instead. Needs the gate: default on
      * with it, off without, and refused explicitly without it.
-     * --resieve-scan-cap is the index slots per region (0 = half the bucket
-     * capacity) and --resieve-scan-pairs the pair list's first capacity
-     * (0 = PIPE_RS_PAIRS_INIT); both exist to drive the fallback and the
-     * growth in tests. */
+     * --resieve-scan-cap is the most index slots a region has (0 = all of
+     * the bucket region's, finding 132) and --resieve-scan-pairs the pair
+     * list's first capacity (0 = PIPE_RS_PAIRS_INIT); both exist to drive the
+     * fallback and the growth in tests. */
     int      resieve_scan;
     uint32_t resieve_scan_cap, resieve_scan_pairs;
+    /* --row-cap (default; --no-row-cap): each bucket region holds its row
+     * class's share of the capacity, by the positions --sieve-skip keeps in
+     * its row (slab.h, bklay_t; finding 132). Output-identical. */
+    int      row_cap;
     /* --q-pipeline: the next unit of sieving is issued on its own stream
      * after this one's intersection -- the next slab of a slabbed q, or the
      * next q -- so it runs under this one's trial division, cofactorisation

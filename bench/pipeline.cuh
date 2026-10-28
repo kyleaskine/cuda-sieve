@@ -875,11 +875,12 @@ typedef struct {
     uint8_t     *bucket;
     uint32_t    *cursor;
     uint32_t    *overflow;
-    uint32_t     cap;
+    bklay_t      lay;           /* each region's slots (--row-cap, slab.h) */
     cudaStream_t stream;        /* 0 = legacy default stream */
-    /* --resieve-scan, side 0 only: each record's factor-base index, icap
-     * slots per region, and the count of records that found no slot
-     * (fill_store_index). NULL everywhere else. */
+    /* --resieve-scan, side 0 only: each record's factor-base index, in the
+     * bucket's layout, and the count of records that found no slot
+     * (fill_store_index). icap is a region's index slots, UINT32_MAX for all
+     * of them; a test's --resieve-scan-cap gives fewer. NULL everywhere else. */
     uint32_t    *index, *index_ovf;
     uint32_t     icap;
 } pbkt_t;
@@ -938,6 +939,9 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
     const cudaStream_t st = bk->stream;
     const int do_fill = !part || part->part == PIPE_PART_FILL;
     const int do_apply = !part || part->part == PIPE_PART_APPLY;
+    /* the layout at this slab, whose rows are pos_row's: global under
+     * SLABBED only */
+    const bklay_t lay = bklay_at(bk->lay, SLABBED ? j_base : 0u);
     int rc = -1;
 
 #define SLAB_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
@@ -991,7 +995,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                               : k_fill_rows<SLABBED, false>;
             rows_kern<<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
                 S->primes, S->rowrt, S->logp, nrow, nband, rows, cfg->logI,
-                log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
+                log_region, bk->cursor, bk->bucket, lay, bk->overflow,
                 cfg->sieve_skip, j_base, gate, gshift,
                 bk->index, bk->icap, bk->index_ovf);
             /* Only k_resieve_scatter reads the row tier's walk state, and only
@@ -1008,7 +1012,7 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                               : k_fill_atomic<4, SLABBED, false>;
             fill_kern<<<fblocks, fthreads, 0, st>>>(
                 S->plat + nrow, S->logp + nrow, fb->n - nrow, xmax, cfg->logI,
-                log_region, bk->cursor, bk->bucket, bk->cap, bk->overflow,
+                log_region, bk->cursor, bk->bucket, lay, bk->overflow,
                 SLABBED ? S->walk_cur + nrow : NULL,
                 SLABBED ? S->walk_next + nrow : NULL,
                 cfg->sieve_skip, j_base, gate, gshift,
@@ -1045,7 +1049,7 @@ apply:
             ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>
             : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>;
         apply_kern<<<nregion, athr, S->apply_smem, st>>>(
-            (const uint32_t *)bk->bucket, bk->cursor, bk->cap, cfg->logI, log_region,
+            (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
             S->N, S->CINIT, S->CINIT - S->BOUND,
             S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
             S->sp, S->srt, S->sg, S->slp, S->smag,
@@ -2305,6 +2309,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     unsigned long long *d_pre = NULL;
     uint64_t est1, est0, est;
     uint32_t cap, nqdone = 0, bound1 = 0, bound0 = 0;
+    bklay_t lay = bklay_uniform(0u);
     /* Slabs abandoned to a soft failure (bucket overflow, or trial division
      * this slab cannot be trusted). Counted rather than fatal: see
      * pipe_side_sieve_join. Reported at end of band so the rate-limited
@@ -2451,7 +2456,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     est1 = pipe_est_records(fb1, xmax_alloc);
     est0 = pipe_est_records(fb0, xmax_alloc);
     est = est1 > est0 ? est1 : est0;
-    cap = (uint32_t)(est / nregion_alloc) + 256;
+    cap = (uint32_t)(est / nregion_alloc) + BKLAY_MARGIN;
     /* TEST-ONLY (PIPE_CAP_PCT, 100 everywhere else): cut the bucket capacity
      * so that some slabs overflow. No real job reaches the bucket-overflow
      * soft skip (degradecheck.sh), and finding 114's review needed it driven
@@ -2465,15 +2470,42 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (e && *e) pm = strtoul(e, NULL, 10);
         cap = (uint32_t)((uint64_t)cap * pm / 1000);
         printf("  TEST BUILD: bucket capacity cut to %lu per mille of the"
-               " estimate's (%u records per region)\n", pm, cap);
+               " estimate's (%u records per region before the row-class"
+               " layout; each class keeps its margin)\n", pm, cap);
+    }
+    /* --row-cap (finding 132): cap is the estimate for a row that keeps all
+     * of its positions, and each region gets its row class's share of it */
+    lay = bklay_make(cap, cfg->row_cap, cfg->sieve_skip, cfg->logI,
+                     cfg->log_region);
+    if (!bklay_fits(lay, nregion_alloc)) {
+        fprintf(stderr, "  pipeline: a bucket array of %u regions of up to %u"
+                " records reaches 2^32 slots, past its 32-bit addressing; use a"
+                " larger --region or a smaller --slab-j\n", nregion_alloc, cap);
+        rc = -1;
+        goto done;
     }
     {
         size_t freeB = 0, totalB = 0;
-        need = (size_t)nregion_alloc * cap * 4;
+        char capdesc[96];
+        uint32_t cmin = UINT32_MAX, cmax = 0;
+        for (uint32_t j = 0; j < 6; j++) {
+            const uint32_t c = lay.s * bklay_f(lay, j) + lay.m;
+            if (c < cmin) cmin = c;
+            if (c > cmax) cmax = c;
+        }
+        if (lay.s)
+            snprintf(capdesc, sizeof capdesc, "%u to %u records by row class"
+                     " (--row-cap)", cmin, cmax);
+        else
+            snprintf(capdesc, sizeof capdesc, "%u records each (uniform%s)",
+                     cmax, cfg->row_cap ? "" : ", --no-row-cap");
+        need = (size_t)bklay_slots_max(lay, nregion_alloc) * 4;
         PIPE_CK(cudaMemGetInfo(&freeB, &totalB));
-        printf("  bucket array %u x %u x 4 B = %.2f GB, shared by both sides"
-               " (%.2f GB free)\n", nregion_alloc, cap, need / 1073741824.0,
-               freeB / 1073741824.0);
+        printf("  bucket array %u regions, %s, 4 B = %.2f GB, shared by both"
+               " sides (%.2f GB free)\n", nregion_alloc, capdesc,
+               need / 1073741824.0, freeB / 1073741824.0);
+        runlog_note("bucket", "%u regions, %s, %.2f GB", nregion_alloc,
+                    capdesc, need / 1073741824.0);
         if (need + PIPE_VRAM_MARGIN > freeB) {
             fprintf(stderr, "  pipeline: bucket array does not fit\n");
             rc = -1;
@@ -2822,17 +2854,21 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         }
     }
     /* --resieve-scan (finding 118): side 0's fill stores each record's
-     * factor-base index in an array of icap slots per region, half the
-     * bucket capacity by default (the fullest side-0 region measured 34% of
-     * it), and k_record_scan copies the pairs into a list that grows on
-     * demand. Like --q-pipeline, OFF rather than refused when it does not
-     * fit: side 0 is then walked, as it always was. */
+     * factor-base index at the record's own slot of an array laid out as the
+     * bucket array, so every record it stores has an index slot, and
+     * k_record_scan copies the pairs into a list that grows on demand. Half
+     * the bucket capacity a region, as it was, overflowed in 28 of 40 of
+     * 2,1147+'s slabs (its fullest side-0 regions hold 86% of a row's
+     * capacity); the row-class layout's saving pays for the full size
+     * (finding 132). --resieve-scan-cap N is a test knob: only a region's
+     * first N slots get an index, which drives the walk fallback as N slots
+     * a region did. Like --q-pipeline, OFF rather than refused when it does
+     * not fit: side 0 is then walked, as it always was. */
     if (cfg->resieve_scan) {
         char why[160] = "";
-        rs_icap = cfg->resieve_scan_cap ? cfg->resieve_scan_cap : cap / 2;
-        if (rs_icap > cap) rs_icap = cap;
+        rs_icap = cfg->resieve_scan_cap ? cfg->resieve_scan_cap : UINT32_MAX;
         rs_pcap = cfg->resieve_scan_pairs ? cfg->resieve_scan_pairs : PIPE_RS_PAIRS_INIT;
-        const size_t ineed = (size_t)nregion_alloc * rs_icap * 4;
+        const size_t ineed = need;
         const size_t pneed = (size_t)rs_pcap * 8 + 8;
         if (concurrent || !cfg->fill_gate) {
             snprintf(why, sizeof why, "it needs the fill gate");
@@ -2865,12 +2901,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("  --resieve-scan: side 0 is walked, because %s\n", why);
             runlog_note("resieve-scan", "off: %s", why);
         } else {
+            char capped[80] = "";
             rs_on = rs_granted = 1;
+            if (cfg->resieve_scan_cap)
+                snprintf(capped, sizeof capped, ", %u slots a region at most"
+                         " (--resieve-scan-cap)", rs_icap);
             printf("  --resieve-scan: side 0 resieved from its own records;"
-                   " index %u x %u x 4 B = %.2f GB, pair list %u\n",
-                   nregion_alloc, rs_icap, ineed / 1073741824.0, rs_pcap);
-            runlog_note("resieve-scan", "on, %u index slots per region,"
-                        " +%.2f GB", rs_icap, (ineed + pneed) / 1073741824.0);
+                   " index in the bucket array's layout%s, %.2f GB, pair"
+                   " list %u\n", capped, ineed / 1073741824.0, rs_pcap);
+            runlog_note("resieve-scan", "on, index as the buckets%s, +%.2f GB",
+                        capped, (ineed + pneed) / 1073741824.0);
             VRAM_MARK("side-0 record index");
         }
     } else {
@@ -2908,12 +2948,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * stream as before the issue/join split. Concurrent mode gives side 0 the
      * second array and each side its own stream. */
     bk1.bucket = d_bucket; bk1.cursor = d_cursor;
-    bk1.overflow = d_overflow; bk1.cap = cap;
+    bk1.overflow = d_overflow; bk1.lay = lay;
     bk1.index = bk1.index_ovf = NULL; bk1.icap = 0;
     bk1.stream = concurrent ? st_side[1] : 0;
     if (concurrent) {
         bk0.bucket = d_bucket_c; bk0.cursor = d_cursor_c;
-        bk0.overflow = d_overflow_c; bk0.cap = cap;
+        bk0.overflow = d_overflow_c; bk0.lay = lay;
         bk0.stream = st_side[0];
         bk0.index = bk0.index_ovf = NULL; bk0.icap = 0;
     } else {
@@ -4021,8 +4061,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             if (rs_on) {
                 PIPE_CK(cudaMemsetAsync(d_rsc, 0, 4, 0));
                 k_record_scan<<<xmax >> cfg->log_region, PIPE_SCAN_THREADS>>>(
-                    (const uint32_t *)bk0.bucket, bk0.cursor, bk0.cap, d_ridx,
-                    rs_icap, cfg->log_region, d_two, S0.primes, rp_x, rp_p,
+                    (const uint32_t *)bk0.bucket, bk0.cursor,
+                    bklay_at(bk0.lay, SLABBED ? j_base : 0u), d_ridx,
+                    bk0.icap, cfg->log_region,
+                    d_two, S0.primes, rp_x, rp_p,
                     rs_pcap, d_rsc);
                 PIPE_CK(cudaEventRecord(escan));
                 PIPE_CK(cudaMemcpyAsync(C.h_rb->rscan, d_rsc, 8,
@@ -4155,7 +4197,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                         rs_pcap = ncap;
                     } else {
                         /* Off for the band, and everything only the scan
-                         * used goes back too -- the index is 0.67 GB at I16,
+                         * used goes back too -- the index is 0.90 GB at I16,
                          * and the TD buffers that grow later want it more.
                          * The next sieve, issued above, still writes the
                          * index and d_rsc[1]: drain it first. Then nothing

@@ -160,17 +160,19 @@ __device__ __forceinline__ int fill_gate_drops(const uint32_t *__restrict gate,
 }
 
 /* --resieve-scan (finding 118): INDEX fills also store each record's
- * factor-base index, ibase + k, at the same (region, slot) of a second array
- * of icap slots per region, for k_record_scan. A slot at or past icap has no
- * room and is counted in index_ovf, and the host then walks that slab's
- * resieve instead. The record itself is stored exactly as without INDEX. */
+ * factor-base index, ibase + k, at the record's own slot `at` of a second
+ * array laid out as the bucket array, for k_record_scan. So every stored
+ * record has an index slot (finding 132), unless a test's --resieve-scan-cap
+ * makes icap smaller than its region: a slot at or past icap is counted in
+ * index_ovf instead, and the host then walks that slab's resieve. The record
+ * itself is stored exactly as without INDEX. */
 __device__ __forceinline__ void fill_store_index(uint32_t *__restrict index,
                                                  uint32_t icap,
                                                  uint32_t *__restrict index_ovf,
-                                                 uint32_t b, uint32_t slot,
+                                                 uint32_t at, uint32_t slot,
                                                  uint32_t fbi)
 {
-    if (slot < icap) index[(size_t)b * icap + slot] = fbi;
+    if (slot < icap) index[at] = fbi;
     else atomicAdd(index_ovf, 1u);
 }
 
@@ -184,7 +186,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                               uint32_t n, uint32_t xmax, int logI,
                               int log_region,
                               uint32_t *__restrict cursor,
-                              uint8_t *__restrict out, uint32_t cap,
+                              uint8_t *__restrict out, bklay_t lay,
                               uint32_t *__restrict overflow,
                               const uint64_t *__restrict walk_cur,
                               uint64_t *__restrict walk_next,
@@ -261,9 +263,11 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
             }
             if (fill_gate_drops(gate, gate_shift, xl)) continue;
             const uint32_t b = xl >> log_region;
+            uint32_t capb;
+            const uint32_t base = bklay_base(lay, b, &capb);
             const uint32_t slot = atomicAdd(&cursor[b], 1u);
-            if (slot >= cap) { atomicAdd(overflow, 1u); continue; }
-            const size_t at = ((size_t)b * cap + slot) * RECBYTES;
+            if (slot >= capb) { atomicAdd(overflow, 1u); continue; }
+            const size_t at = (size_t)(base + slot) * RECBYTES;
             if (RECBYTES == 2) {
                 *(uint16_t *)(out + at) = (uint16_t)(xl & offmask);
             } else if (RECBYTES == 4) {
@@ -271,7 +275,7 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
             } else {
                 *(uint64_t *)(out + at) = (uint64_t)(xl & offmask) | ((uint64_t)sl << 32);
             }
-            if constexpr (INDEX) fill_store_index(index, icap, index_ovf, b, slot, ibase + k);
+            if constexpr (INDEX) fill_store_index(index, icap, index_ovf, base + slot, slot, ibase + k);
         }
         /* x is already the exact first hit at/after the slab end. */
         if constexpr (SLABBED) walk_next[k] = x - xmax;
@@ -306,7 +310,7 @@ __global__ void k_fill_rows(const uint32_t *__restrict primes,
                             uint32_t n, uint32_t nbands, uint32_t rows,
                             int logI, int log_region,
                             uint32_t *__restrict cursor,
-                            uint8_t *__restrict out, uint32_t cap,
+                            uint8_t *__restrict out, bklay_t lay,
                             uint32_t *__restrict overflow,
                             int sieve_skip, uint32_t j_base,
                             const uint32_t *__restrict gate, int gate_shift,
@@ -364,12 +368,14 @@ __global__ void k_fill_rows(const uint32_t *__restrict primes,
             slot = __shfl_sync(peers, slot, leader) +
                    __popc(peers & ((1u << lane) - 1u));
 #endif
-            if (slot >= cap) atomicAdd(overflow, 1u);
+            uint32_t capb;
+            const uint32_t base = bklay_base(lay, b, &capb);
+            if (slot >= capb) atomicAdd(overflow, 1u);
             else {
-                *(uint32_t *)(out + ((size_t)b * cap + slot) * 4) =
+                *(uint32_t *)(out + (size_t)(base + slot) * 4) =
                     (xl & offmask) | (sl << 16);
                 /* the row tier is the factor base's first n entries */
-                if constexpr (INDEX) fill_store_index(index, icap, index_ovf, b, slot, k);
+                if constexpr (INDEX) fill_store_index(index, icap, index_ovf, base + slot, slot, k);
             }
         }
         if (active) { off += rt; if (off >= q) off -= q; }
@@ -1101,7 +1107,7 @@ template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
  * APPLY_THREADS_MAX rather than the 1024 a block could otherwise carry. */
 __global__ __launch_bounds__(512, 3)
 void k_apply(const uint32_t *__restrict buckets,
-                        const uint32_t *__restrict cnt, uint32_t cap,
+                        const uint32_t *__restrict cnt, bklay_t lay,
                         int logI, int log_region,
                         norm_t N, uint32_t CINIT, uint32_t THRESH, uint32_t tconst,
                         uint8_t *__restrict dump,
@@ -1264,10 +1270,12 @@ report spurious cell mismatches. Pricing builds only, never for relations."
                                                sieve_skip);
 
     /* ---- apply ---- */
+    uint32_t cap;
+    const uint32_t *const rec = buckets + bklay_base(lay, b, &cap);
     uint32_t n = cnt[b];
     if (n > cap) n = cap;
     for (uint32_t i = tid; i < n; i += nth) {
-        const uint32_t r = buckets[(size_t)b * cap + i];
+        const uint32_t r = rec[i];
         const uint32_t off = r & (ncell - 1);
         const uint32_t lp  = r >> 16;               /* the prime's log (finding 130) */
         const uint32_t w   = off / CPW;
@@ -3228,10 +3236,14 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
     uint32_t cap = 0;               /* records per region, set by the fill path */
     if (cfg->fill_mode == FILL_ATOMIC) {
-        cap = (uint32_t)(est / nregion) + 256;
+        cap = (uint32_t)(est / nregion) + BKLAY_MARGIN;
         size_t need = (size_t)nregion * cap * cfg->record_bytes;
         printf("  single-level: %u buckets x cap %u x %d B = %.2f GB\n",
                nregion, cap, cfg->record_bytes, need / 1073741824.0);
+        /* k_fill_atomic and k_apply address a slot in 32 bits (bklay_base) */
+        if (!bklay_fits(bklay_uniform(cap), nregion)) {
+            printf("  SKIP: 2^32 or more bucket slots\n"); return 1;
+        }
         if (need + 64u * 1024 * 1024 > freeB) {
             printf("  SKIP: does not fit in free device memory\n"); return 1;
         }
@@ -3246,15 +3258,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
         if (cfg->record_bytes == 2)                                          \
             k_fill_atomic<2, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
                 (PLAT), D.logp, fb->n, xmax, cfg->logI, log_region,          \
-                (CUR), (OUT), cap, (OVF), NULL, NULL, 0, 0u);                       \
+                (CUR), (OUT), bklay_uniform(cap), (OVF), NULL, NULL, 0, 0u);                       \
         else if (cfg->record_bytes == 4)                                     \
             k_fill_atomic<4, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
                 (PLAT), D.logp, fb->n, xmax, cfg->logI, log_region,          \
-                (CUR), (OUT), cap, (OVF), NULL, NULL, 0, 0u);                       \
+                (CUR), (OUT), bklay_uniform(cap), (OVF), NULL, NULL, 0, 0u);                       \
         else                                                                 \
             k_fill_atomic<8, false><<<(GRID), fthreads, 0, (STREAM)>>>(      \
                 (PLAT), D.logp, fb->n, xmax, cfg->logI, log_region,          \
-                (CUR), (OUT), cap, (OVF), NULL, NULL, 0, 0u);                       \
+                (CUR), (OUT), bklay_uniform(cap), (OVF), NULL, NULL, 0, 0u);                       \
     } while (0)
 
         cudaEventRecord(e2);
@@ -3620,7 +3632,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                     if (D.survbits)                                            \
                         CK(cudaMemset(D.survbits, 0, (size_t)nbitword * 4));   \
                     k_apply<CBV, AT, NM, false, ST><<<nregion, athr, smem>>>(  \
-                        (const uint32_t *)D.out, D.cursor, cap,                \
+                        (const uint32_t *)D.out, D.cursor, bklay_uniform(cap), \
                         cfg->logI, log_region,                                 \
                         N, CINIT, CINIT - BOUND, tconst, D.dumpbuf,            \
                         D.nsurv,                                               \

@@ -229,5 +229,138 @@ SLAB_HD uint32_t slab_phase_cst(uint32_t cst, uint32_t rt, uint32_t m,
     return cst >= d ? cst - d : cst + (m - d);
 }
 
+/* ---- bucket capacity by row class (--row-cap, finding 132) ----
+ *
+ * --sieve-skip keeps a fixed share of a row's positions, in sixths: under
+ * --sieve-skip 2, f = 6 for j odd and 3 !| j, 4 for j odd and 3 | j, 3 for j
+ * even and 3 !| j, and 2 for j even and 3 | j (under 1, 6 and 3). Fill stores
+ * no record on a skipped position, so a region's records follow its row's f.
+ * On 2,1147+, c183 and C194, side 1 fills 85.0, 56.7, 42.5 and 28.3% of a
+ * uniform capacity in the four classes: 1 : 2/3 : 1/2 : 1/3. A region of row
+ * j gets s*f(j) + m slots instead, with m the estimate's additive margin and
+ * s its share per sixth, so the f = 6 class keeps the uniform capacity and
+ * the others shrink with their positions. The fullest region of every class
+ * then sits at 87-89% of its capacity, as the f = 6 class always did, and the
+ * array is 67% of the uniform one.
+ *
+ * Regions are packed in order. Region b's first slot counts the slots of
+ * every region before it in its slab: s times (f summed over the rows before
+ * its row, times the regions per row, plus its column times its row's f),
+ * plus m*b. f has period 6 in j, so its sum over rows is (j/6)*fper plus a
+ * prefix; both are packed in words, f in 3 bits and the prefix in 5. s = 0 is
+ * the uniform layout, region b at b*m, which run_bench uses. s != 0 needs a
+ * region inside one row (log_region <= logI, which the pipeline requires).
+ * A launch gets the layout with its slab's first row filled in (bklay_at),
+ * so the kernel does not recompute the sum up to it. The sums are 32-bit, in
+ * both layouts: an array bklay_fits does not admit (2^32 slots or more) is
+ * refused by the pipeline and run_bench. Passed by value: a kernel
+ * parameter whose address is taken is copied to the stack, and k_apply runs
+ * at 40 registers with none. */
+typedef struct {
+    uint32_t s;        /* slots per sixth of a row's kept positions; 0 = uniform */
+    uint32_t m;        /* slots every region has (all of them when s = 0) */
+    uint32_t fpk;      /* f(j % 6), 3 bits each */
+    uint32_t ppk;      /* f summed over the rows of j's period before j, 5 bits each */
+    uint32_t fper;     /* f summed over a period, 6 rows */
+    uint32_t rshift;   /* logI - log_region: log2 of the regions per row */
+    uint32_t j0;       /* the slab's first row, global (0 unslabbed; bklay_at) */
+    uint32_t f0;       /* f summed over the rows before j0 */
+} bklay_t;
+
+#define BKLAY_MARGIN 256u   /* the estimate's margin (pipeline.cuh, `cap`) */
+
+SLAB_HD bklay_t bklay_uniform(uint32_t cap)
+{
+    bklay_t L = {0u, cap, 0u, 0u, 0u, 0u, 0u, 0u};
+    return L;
+}
+
+SLAB_HD uint32_t bklay_f(bklay_t L, uint32_t j)
+{
+    return (L.fpk >> (3u * (j % 6u))) & 7u;
+}
+
+/* f summed over rows 0 .. j-1 */
+SLAB_HD uint32_t bklay_fsum(bklay_t L, uint32_t j)
+{
+    return (j / 6u) * L.fper + ((L.ppk >> (5u * (j % 6u))) & 31u);
+}
+
+/* The layout as a slab whose first row is j0 sees it */
+SLAB_HD bklay_t bklay_at(bklay_t L, uint32_t j0)
+{
+    L.j0 = j0;
+    L.f0 = bklay_fsum(L, j0);
+    return L;
+}
+
+/* Region b of the slab L was set to: its first slot, and its capacity in
+ * *capb. One formula for both layouts, without a branch: s = 0 leaves b*m
+ * and m. 32-bit: callers refuse an array bklay_fits does not admit. */
+SLAB_HD uint32_t bklay_base(bklay_t L, uint32_t b, uint32_t *capb)
+{
+    const uint32_t j = L.j0 + (b >> L.rshift);
+    const uint32_t f = bklay_f(L, j);
+    *capb = L.s * f + L.m;
+    const uint32_t fs = ((bklay_fsum(L, j) - L.f0) << L.rshift) +
+                        (b & ((1u << L.rshift) - 1u)) * f;
+    return fs * L.s + b * L.m;
+}
+
+/* Slots of nregion regions from row j0 */
+SLAB_HD uint64_t bklay_slots(bklay_t L, uint32_t nregion, uint32_t j0)
+{
+    uint32_t c = 0;
+    if (!nregion) return 0;
+    return (uint64_t)bklay_base(bklay_at(L, j0), nregion - 1u, &c) + c;
+}
+
+/* What an array must hold for any slab of up to nregion regions, whatever
+ * row it starts at: the layout repeats every 6 rows. */
+static inline uint64_t bklay_slots_max(bklay_t L, uint32_t nregion)
+{
+    uint64_t mx = 0;
+    for (uint32_t j0 = 0; j0 < 6; j0++) {
+        const uint64_t n = bklay_slots(L, nregion, j0);
+        if (n > mx) mx = n;
+    }
+    return mx;
+}
+
+/* Whether bklay_base's 32-bit sums hold for every region of a slab of up to
+ * nregion: no region ends past nregion * (6s + m), whatever its row, and
+ * every partial sum is below that. Exact for the uniform layout (s = 0).
+ * No default plan comes near: 2,1147+'s array is 2^28.6 slots; a tiny
+ * --region with a tall --slab-j can pass it. */
+SLAB_HD int bklay_fits(bklay_t L, uint32_t nregion)
+{
+    return (uint64_t)nregion * (6u * L.s + L.m) < ((uint64_t)1 << 32);
+}
+
+/* The layout for a uniform capacity of cap. By row class when on and
+ * sieve_skip drops positions; uniform otherwise, and when cap leaves no
+ * share above the margin (a PIPE_CAP_PCT test build can cut it that far).
+ * The table is the skip predicate's (bench_kernels.cu, pos_both_even and the
+ * 3 | j rule) counted in sixths, checked against a model of it in slabtest;
+ * a level it does not know gets the uniform layout, which holds any row. */
+static inline bklay_t bklay_make(uint32_t cap, int on, int sieve_skip,
+                                 int logI, int log_region)
+{
+    static const uint8_t F[2][6] = {{3, 6, 3, 6, 3, 6},    /* --sieve-skip 1 */
+                                    {2, 6, 3, 4, 3, 6}};   /* --sieve-skip 2 */
+    if (!on || sieve_skip <= 0 || sieve_skip > 2 || log_region > logI ||
+        cap <= BKLAY_MARGIN)
+        return bklay_uniform(cap);
+    const uint8_t *f = F[sieve_skip - 1];
+    bklay_t L = {(cap - BKLAY_MARGIN + 5u) / 6u, BKLAY_MARGIN, 0u, 0u, 0u,
+                 (uint32_t)(logI - log_region), 0u, 0u};
+    for (uint32_t k = 0; k < 6; k++) {
+        L.fpk |= (uint32_t)f[k] << (3u * k);
+        L.ppk |= L.fper << (5u * k);
+        L.fper += f[k];
+    }
+    return L;
+}
+
 #undef SLAB_HD
 #endif

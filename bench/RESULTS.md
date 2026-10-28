@@ -14758,3 +14758,322 @@ The review changes no table, kernel path or engagement decision on any
 measured job, so the timing above stands. Installed as `bench/bench`;
 `b7d0608f` is kept as `work/land130/bench.b7d0608f`, and HEAD's `47f20cc2`
 as before.
+
+<a id="finding-132"></a>
+## Finding 132 — bucket regions sized by row class (`--row-cap`, default): `--sieve-skip` keeps 6, 4, 3 or 2 sixths of a row's positions by j mod 2 and j mod 3, and fill's record counts follow exactly (side 1 at 85.0 / 56.7 / 42.5 / 28.3% of the uniform capacity on three jobs), so a third of the uniform bucket array was never used. Each region now gets its class's share: the array is 67.4% of its old size, every class's fullest region at 87.4-89.4% of its capacity. Side 0's record index shares the bucket's slots, so it cannot fill before the bucket does: 2,1147+ resieves every slab from records (resieve 24.0 -> 13.3 ms/q) and runs 4.3% faster single-queued and 4.5% pipelined, with bucket + index 10% smaller (2.12 -> 1.91 GB). No measurable wall change on any other job (its stages sum to −0.5 to +0.4%); fill at or below HEAD's but C135's (+0.6-0.8%), where the form first timed paid +1.5-1.9% single-queued on C135 and C183 for placing the index a second time (+2.6% on C135 timed beside the landed form). Output identical
+
+**Date:** 2026-10-27. RTX 5070; correctness and counts with the NFS@Home
+client on the card, timing on the free card after it stopped. Builds:
+sm_120 copies of HEAD `280d9b3` (`work/rowcls/base/`), HEAD with a
+per-region count dump (`work/rsidx/`), the change as first timed
+(`work/rowcls/src/`, fat `fat/`), and as landed (`opt/`, fat `fatopt/`: the
+index at the record's own slot, below). Evidence: `work/rsidx/` (counts),
+`work/rowcls/` (gates, `timing/`, and the landed form's `timing2/`,
+`timing2c135/`).
+
+### Where this came from
+
+Finding 128's open item: 2,1147+ fills the side-0 record index (`cap / 2` a
+region) in 28 of 40 slabs, which walk instead, and a full index (`--resieve-
+scan-cap` = cap) is -2.7% wall for +0.71 GB, too much for a job in a >= 9 GB
+queue. STATUS row 9 had the other half: the uniform cap cannot shrink with
+`--sieve-skip`, because "a third of rows lose no records" -- it needs a
+per-row-class capacity.
+
+### What regions hold (`work/rsidx/regions.py`, `classes.py`)
+
+Each fill's cursors dumped per region (`RSIDX_DUMP`), 2,1147+ 10 q at 8
+slabs, c183 20 q, C194 10 q at 8 slabs. Load as a share of the uniform cap:
+
+| | j odd, 3 ∤ j (6/6) | j odd, 3 \| j (4/6) | j even, 3 ∤ j (3/6) | j even, 3 \| j (2/6) |
+|---|---:|---:|---:|---:|
+| side 1, mean, all three jobs | 84.9-85.0% | 56.6-56.7% | 42.4-42.5% | 28.3% |
+| side 1, max, against the class capacity | 88.6-89.4% | 88.4-88.8% | 88.4-89.0% | 87.4-87.6% |
+| side 0, 2,1147+, max of the uniform cap | 86.2% | 56.0% | 40.8% | 23.6% |
+| side 0, c183 / C194, max of the uniform cap | 31.1 / 32.4% | 14.9 / 16.8% | 8.4 / 9.9% | 3.7 / 4.7% |
+
+- **The classes are exact.** Side 1's means stand 1 : 2/3 : 1/2 : 1/3 to
+  three figures. The uniform cap is the f = 6 class's: its mean is 85%
+  because the estimate carries a 1.15x margin.
+- **2,1147+ is the outlier on side 0.** Its gated side 0 averages 20.2% of
+  the cap a region (c183 4.2%, C194 3.0%), because side 1's survivors are
+  dense enough to open most of the gate. 74,262 of the 74,338 regions over
+  `cap / 2` sit in the 6/6 class, at every j and in every column.
+
+### Not a spill pool
+
+A per-region index of K slots plus a shared pool for the records past K
+would cover 2,1147+ for +20-60 MB per 16,384 regions. But every spilled record
+takes an atomic on one counter: 7.7M in the worst 4,096-row slab on
+2,1147+ at K = cap / 2, so ~15M in each of a q's four 8,192-row slabs. At an
+estimated one same-address atomic per L2 clock that is ~6 ms a slab, ~24
+ms/q, against the ~10 ms/q the index saves (measured below: 24.2 -> 13.4).
+Not measured. The row-class layout needs no new atomic.
+
+### The layout (`slab.h`, `bklay_t`)
+
+A region of row j gets `s*f(j) + m` slots, m = 256 (the estimate's additive
+margin) and s = ceil((cap - 256) / 6), so the 6/6 class keeps the uniform
+capacity. Regions are packed in order; region b's first slot is s times f
+summed over the regions before it plus m*b, and f has period 6 in j, so the
+sum is `(j/6)` times f's sum over a period (24 under `--sieve-skip 2`) plus
+a 6-entry prefix, both packed in words. s = 0 is the
+uniform layout, b*m, which `run_bench`, `--no-row-cap` and `--sieve-skip 0`
+use. One function, `bklay_base`, places a region for fill (`k_fill_atomic`,
+`k_fill_rows`), apply and `k_record_scan`; the array is sized for the worst
+of the six phases a slab can start at.
+
+**The index.** Side 0's index is laid out as the bucket array, so fill
+stores a record's factor-base index at the record's own slot, and every
+record that has a bucket slot has an index slot. The first version placed
+the index with a layout of its own (`ilay`), equal to the bucket's by
+default, which cost fill a second `bklay_base` per side-0 record; the
+landed one passes the slot through (`fill_store_index(index, icap, ovf,
+base + slot, ...)`). `--resieve-scan-cap N`, the fallback's test knob, now
+gives only a region's first N slots an index: the same records walk as
+under N slots a region, but the array no longer shrinks with N. Under the
+uniform layout (`--no-row-cap`, `--sieve-skip 0`) the index is the full
+uniform array, twice HEAD's `cap / 2` (+0.71 GB on 2,1147+), and side 0
+is walked when that does not fit (review item 3).
+
+**Registers.** The first form of `bklay_base` (64-bit, a branch for the
+uniform case, the slab's prefix computed in the kernel) spilled 8 B in the
+seven Horner k_apply instances at 40 registers. Branchless and 32-bit, with
+the slab's first row and its prefix filled in by the host (`bklay_at`): no
+stack in any instance, all 66 k_apply entries and all 66 fill / scan
+entries over six archs at <= 40 registers. k_fill_atomic goes from 24-30
+to 36-40 registers on sm_120, still full occupancy; k_record_scan 32 -> 28.
+The layout is ~19 SASS instructions a record in fill, after the cursor
+atomic. The index fill's record loops (sm_120, slabbed) are 62-84
+instructions landed against 85-107 as first timed. Arrays stay
+below 2^32 slots (2,1147+ is 2^28.6): the pipeline and `run_bench` refuse
+past it (`bklay_fits`, in both layouts; review item 1).
+
+### Memory (`memtable.py`), each job's default plan
+
+| job | bucket | index | bucket + index (+ fill-ahead's array) |
+|---|---|---|---|
+| c135 (I13) | 0.09 -> 0.06 | 0.04 -> 0.06 | 0.22 -> 0.18 GB (−18%) |
+| c183 (I15) | 1.38 -> 0.93 | 0.69 -> 0.93 | 3.45 -> 2.79 GB (−19%) |
+| NFS@Home I16 | 1.33 -> 0.90 | 0.67 -> 0.90 | 2.00 -> 1.79 GB (−10%) |
+| C194 | 1.30 -> 0.88 | 0.65 -> 0.88 | 1.95 -> 1.76 GB (−10%) |
+| AS276 | 1.32 -> 0.89 | 0.66 -> 0.89 | 1.97 -> 1.78 GB (−10%) |
+| SNFS-301 | 1.30 -> 0.88 | 0.65 -> 0.88 | 1.95 -> 1.75 GB (−10%) |
+| 2,1147+ | 1.41 -> 0.95 | 0.71 -> 0.95 | 2.12 -> 1.91 GB (−10%) |
+
+Every job's bucket shrinks by more than its index grows, and the bucket is
+allocated first, so the q-pipeline, fill-ahead and the index are each
+granted wherever they were before.
+
+**Steady state on the free card** (`device memory, steady state`, which
+counts the desktop's ~1.2 GB too). Pipelined, every job's new arm reads
+0.04-0.66 GB below base (c135 1.69 -> 1.65, c183 5.91 -> 5.25, I16 5.63 ->
+5.43, 2,1147+ 8.42 -> 8.20), the same in every round. Single-queued,
+2,1147+ reads base 6.55, new 6.33 and `--no-row-cap` 7.25 GB in every
+round: exactly the allocations (`--no-row-cap`'s full uniform index is
++0.71 GB).
+
+**Open: finding 128's +1.65 GB.** Pipelined 2,1147+ sometimes takes another
+1.1-1.3 GB after setup: base in rounds 3 and 4 (9.69, 9.70 against 8.42),
+`--no-row-cap` in all four (10.20-10.37 against the 9.13 its allocations
+make), the new arm in none (8.20 every round). It is not one of the
+program's allocations: a flat and a grown base run print the same output
+but for timings (the same plan, survivors and relations, so the same
+trial-division buffers), and no kernel has more than 576 B of stack. It
+looks like something below the program (the driver under WSL) and
+pressure-dependent: free memory after setup was 3.73 GB new, 3.51 base,
+2.81 `--no-row-cap`. Finding 128's full-index arm read +1.65 GB, this
++0.94 on top of its index. On a quiet CPU (the landed form's timing,
+below) none of 12 pipelined 2,1147+ runs took it, HEAD's four included:
+the steady-state line flat in every run, and the card's peak, sampled
+every 200 ms, within 0.25 GB across each arm's rounds. HEAD's allocations
+are the same in both runs; the host is what differed (nine ECM processes,
+then msieve, in the first). Not chased further.
+
+### Gates
+
+sm_120 against HEAD's sm_120 build (`gate.sh`; identity only):
+
+| | as first timed (`src/`, client on the card) | landed (`opt/`) |
+|---|---|---|
+| `make check` | 119, with a new slabtest gate of the layout against a direct model (fails on a swapped class table and an off-by-one region start) | 119 |
+| abcheck, default | 36 of 36 | 36 of 36 |
+| abcheck, `--no-row-cap` | 18 of 18 | 18 of 18 |
+| abcheck, `--resieve-scan-cap 1536` | 17 of 17 (`--fill-concurrent` refuses the knob in both builds) | 17 of 17 |
+| fillcheck | all arms | all arms |
+| 2,1147+ 6 q, 8 slabs, single-queued | relations identical, 48 of 48 slabs from records (base 18 / 30 walked) | identical (368), 48 of 48 from records |
+| c183 `--resieve-scan-cap 3072` | identical, 8 slabs from records, 12 walked | identical (874), 8 from records, 12 walked |
+| compute-sanitizer memcheck | 0 errors: C143 4 q (region = row, fill-ahead's second array), C194 1 q at `--slab-j 4095` (9 slabs, every phase mod 6, an 8-row last slab) | 0 errors: the same two, and c183 2 q at `--resieve-scan-cap 3072` (both slabs' indexes cut, then walked) |
+
+Bucket overflow (`src/`, `PIPE_CAP_PCT` build on c183 at 5 slabs): 900 per
+mille byte-identical to base, 880 skips 27 of 50 slabs and every candidate
+left is base's, 870 and 860 skip every slab and exit 0. The timing below
+is a further identity check: 156 runs, relations identical to base's in
+every job and mode. The test builds, each an sm_120 copy of `opt/`
+(`tbgate.sh`): degradecheck at `PIPE_K=8` 16 of 16, skipcheck at
+`BN_LIMBS=4` 21 of 21, growfail (`-DPIPE_RS_TEST_GROW_FAIL=1`, the branch
+that turns the scan off and resets `icap`) 5 of 5 identical with the
+warning and "1 pair list grown, then off".
+
+**Installed** as `bench/bench` (`b247b432`, the tree's fat build of the
+landed source; `treegate.sh`): abcheck 36 of 36 against HEAD's sm_120
+build, 2,1147+ identical with 48 of 48 slabs from records, `make check`
+119, the same 14 minnctapersm warnings and no others, all 132 k_apply,
+fill and scan entries at <= 40 registers with no stack. HEAD's `3fca6f92`
+is kept as `work/rowcls/timing/bench.base`.
+After the review (below), reinstalled as `3ea5e9be`; `b247b432`, the binary
+timed below, is kept as `work/rowcls/bench.b247b432`.
+
+### Timing (`timing.sh`, `timing_summary.py`, `timing/summary.clean.txt`)
+
+Fat against fat on the free card: HEAD's installed build (`3fca6f92`)
+against `fat/` (`90d02340`, the index with its own layout), with and
+without `--no-row-cap`; four rounds in rotated order, each job single-queued
+(`--no-q-pipeline`) and pipelined. All 156 runs exit 0 with base's
+relations, and every 2,1147+ run of the new arm resieved every slab from
+records. Nine ECM processes held 9 of 16 logical CPUs throughout (load
+10-11); msieve started during round 4's pipelined C194 (load 13.6-17.8 from
+there on), and those 12 runs are left out. Medians over rounds, against
+base:
+
+| job | sq wall | sq fill | pl wall | pl fill |
+|---|---:|---:|---:|---:|
+| C135 | +0.7% | +1.9% | +0.3% | +4.8% |
+| C183 | +1.4% | +1.5% | +1.3% | +7.2% |
+| NFS@Home I16 | −0.4% | −0.9% | +0.2% | −0.1% |
+| C194 | +0.5% | −0.7% | +0.6% | −0.3% |
+| AS276 | −0.2% | −0.1% | +0.6% | +0.5% |
+| SNFS-301 | | | −1.0% | +0.3% |
+| 2,1147+ | **−4.0%** | −0.6% | **−4.0%** | −1.3% |
+
+- **2,1147+:** 242.9 -> 233.2 ms/q single-queued, 228.1 -> 218.9
+  pipelined; resieve 24.2 -> 13.4 single-queued. Better than finding 128's
+  full index (−2.7%). `--no-row-cap` (a uniform full-cap index, finding
+  128's arm, at +0.71 GB) gives −3.9% single-queued, −1.7% pipelined.
+- **I16-class jobs:** within ±1%, in no direction.
+- **C135 and C183 pay in fill, mostly for the index's second placement.**
+  C135's four rounds sit above all of base's (1.398-1.423 against
+  1.360-1.389 ms/q). `--no-row-cap` pays it too (fill +2.4%, +2.6%):
+  `bklay_base` is branchless, so the uniform layout runs the same
+  instructions, the index's own placement included. The class layout gives
+  some back: its fill is 0.6-1.9% below `--no-row-cap`'s on all six jobs.
+  The landed form drops the index's placement and most of the cost with it
+  (below). Pipelined fill overlaps other streams' kernels; wall is the
+  figure to read there.
+
+### The landed form, timed (`timing2/`, `timing2c135/`)
+
+After the gates, on the free card with a quiet CPU (load 1.5-2.6): HEAD's
+`3fca6f92`, the first form `90d02340` and the installed `b247b432`, four
+rounds rotated (`timing.sh` with `F`, a third binary), then C135 alone over
+eight. All 204 runs exit 0 with HEAD's relations, and every 2,1147+ run of
+both new builds resieved every slab from records. Medians against HEAD:
+
+| job | sq wall | sq fill | pl wall | pl fill |
+|---|---:|---:|---:|---:|
+| C135 (8 rounds) | +0.4% | +0.6% | +0.2% | +0.8% |
+| C183 | +1.0% | −0.9% | −1.2% | −2.6% |
+| NFS@Home I16 | −0.6% | −1.6% | +0.2% | −1.3% |
+| C194 | −0.4% | −2.2% | +0.2% | −1.5% |
+| AS276 | −2.5% | −1.3% | −0.4% | −1.0% |
+| SNFS-301 | | | −1.1% | −0.9% |
+| 2,1147+ | **−4.3%** | −1.0% | **−4.5%** | −1.9% |
+
+- **2,1147+:** 244.8 -> 234.4 ms/q single-queued, 232.3 -> 221.8
+  pipelined, resieve 24.0 -> 13.3 single-queued; the first form in the
+  same run −4.3% and −4.2%.
+- **Fill.** The landed form's is below the first form's in 48 of the 52
+  job, mode and round cells, and in all 16 of C135's: C135 single-queued
+  1.331-1.351 ms/q against the first form's 1.359-1.375 and HEAD's
+  1.317-1.337. So the first form's small-job cost was mostly the index's
+  second `bklay_base`. What the layout itself leaves is C135's +0.6-0.8%,
+  above HEAD in all 16 of its rounds, and nothing measurable elsewhere: on
+  the I16 class and 2,1147+ fill is 0.9-2.2% below HEAD's, for reasons not
+  measured.
+- **Wall.** Outside 2,1147+ the change moves wall by less than four rounds
+  resolve. The single-queued stage changes (fill + apply + resieve, ms/q
+  against HEAD) sum to C135 +0.4% (eight rounds), C183 −0.1%, I16 −0.4%,
+  C194 −0.5%, AS276 −0.2% and 2,1147+ −4.6% of wall, against measured
+  +0.4, +1.0, −0.6, −0.4, −2.5 and −4.3%. Fill is ~30% of single-queued
+  wall, so its 1-2% moves wall 0.2-0.5%, and apply's +0.3% on every job
+  (`bklay_base` once a region) takes ~0.1% back. The rest is noise:
+  single-queued wall drifts by round (HEAD's I16 155-181 ms/q), and the
+  first and landed forms, whose I16 stages differ by 0.3% of wall, read
+  2.1% apart. Over four rounds C135 single-queued read +2.9-3.0% for both
+  new builds, all of it in the host's "unaccounted" line; over eight it is
+  +0.4%, as its stages predict. Pipelined, fill runs beside other q's
+  kernels and is mostly hidden, so its change does not add into wall.
+
+### Review (`/code-review xhigh`, 2026-10-27)
+
+Fourteen findings on the uncommitted landing, one a memory-safety bug no
+default plan reaches. Ten fixed, three recorded, one answered:
+
+1. **The uniform fallback wrapped.** `bklay_make` gave the uniform layout
+   to an array that would reach 2^32 slots, but the uniform layout's `b * m`
+   is 32-bit too, and the pipeline had no refusal. At 2^23 regions of 550
+   records `bklay_slots_max` returned 318,767,104 slots for 4,613,734,400:
+   a 17 GB array allocated as 1.2 GB and written past (HEAD addressed in 64
+   bits). The auto plan targets at most 32,768 regions and 2,1147+ is
+   2^28.6 slots, but `--region 7 --slab-j 32768` at I16 gets there. Now one
+   64-bit bound, `bklay_fits` (nregion x (6s + m), exact for the uniform
+   layout), and the pipeline refuses before allocating, naming `--region`
+   and `--slab-j` (that case: exit 255); `run_bench` uses the same test,
+   and `bklay_make` lost the fallback and its `nregion` argument.
+2. **The gate missed it**: its fallback case checked regions below 4,096,
+   and the wrap starts near 371,000. slabtest now checks the largest array
+   `bklay_fits` admits, region by region against a 64-bit sum from three
+   starting rows, in both layouts (the uniform one to 2^32 - 1 slots), and
+   that one region more and the 2^19-region case are refused. Four negative
+   controls fail it: a bound twice too loose, one ignoring s, one admitting
+   everything, and a base whose `b * m` wraps at region 65,536.
+3. **Not changed: the uniform layout's index is the full array** (`--no-row-
+   cap`, `--sieve-skip 0`: +0.71 GB on 2,1147+ against HEAD's `cap / 2`),
+   and `--resieve-scan-cap` no longer shrinks it. Both are A/B and test
+   settings, a smaller index needs the second placement the landed form
+   removed, and side 0 is walked when it does not fit, output unchanged.
+   Written into the index paragraph above.
+4. **Answered: the `PIPE_CAP_PCT` cut.** The review read the f = 2 class as
+   barely cut. At 900 per mille the class capacities are cut 9.6% (f = 2)
+   to 10% (f = 6), since s shrinks and m stays; the small classes have a
+   little more headroom over their loads, so they overflow at slightly
+   lower settings. The overflow gate above drove skips as intended. The
+   test banner now says its figure is before the row-class layout.
+5. **The headline mixed runs for the first form's fill cost**: +1.5-1.9%
+   in its own run, +2.6% on C135 beside the landed form.
+6. **And for the resieve figure**: now the landed form's 24.0 -> 13.3
+   ms/q, also stated in its section; STATUS row 32 matches.
+7. **A stale 0.67 GB index figure** in pipeline.cuh's grow-failure
+   comment: 0.90 GB at I16 since this finding.
+8. **The same figure in STATUS row 23.**
+9. **`--no-row-cap`'s help** said "a third less memory": the default's
+   array is 2/3 of the uniform one under `--sieve-skip 2`, 3/4 under 1.
+10. **The run log** lost `--resieve-scan-cap`'s N ("index as the buckets,
+    N slots a region at most" again), and a new `bucket` note records the
+    layout: by row class with its capacity range, or uniform, marked
+    `--no-row-cap`.
+11. **The margin**: both estimates add `BKLAY_MARGIN`, not a literal 256.
+12. **Not changed: `k_fill_rows` places each hit with the full
+    `bklay_base`**, when its row terms could be hoisted per row. The kernel
+    is ~6% of c135's kernel time (`work/h2h-c135-20261027/`), so it holds a
+    fraction of C135's +0.6-0.8% fill; deferred until it can be timed.
+13. **The banners**: the bucket array's two branches, and `--resieve-
+    scan`'s two, are one each.
+14. **Guarded only: the class table is a hand copy** of the device skip
+    predicate, checked against slabtest's model of it. `--sieve-skip` is
+    range-checked to 0-2 and abcheck compares output at the levels; any
+    other level now gets the uniform layout, which holds any row, rather
+    than level 2's table. One shared host/device predicate is left.
+
+Gates of the reviewed sources, sm_120 (`work/rowcls/rev/`, `gate.sh` with
+`D=rev`, `gate.rev.run.txt`), 0 failed: abcheck 36 of 36 default, 18 of 18
+`--no-row-cap`, 17 of 17 `--resieve-scan-cap 1536`; fillcheck all arms;
+2,1147+ identical (368), 48 of 48 slabs from records; c183 at
+`--resieve-scan-cap 3072` identical (874), 8 from records and 12 walked;
+`make check` 119 (`all gates passed`); the refusal, and the banners and
+run-log notes in three arms with identical relations (`revchk/`). Installed
+`3ea5e9be`, the tree's fat build: no warnings but the 14 minnctapersm,
+132 k_apply, fill and scan entries at <= 40 registers with no stack,
+`treegate.sh` (abcheck 36 of 36, 2,1147+ identical with 48 of 48 from
+records) and `make check` 119 in the tree. No change reaches a kernel or
+the layout of a plan that fits, so the timing above stands.

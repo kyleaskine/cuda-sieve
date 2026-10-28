@@ -303,11 +303,11 @@ static void usage(void)
 "  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
 "  --resieve-scan / --no-resieve-scan  --pipeline only; side 0's resieve\n"
 "                   reads its pairs from its own gated fill records instead\n"
-"                   of walking its factor base. Costs an index array of half\n"
-"                   the bucket array; off when it does not fit, and any slab\n"
-"                   that outgrows it is walked     [on with the gate, else off]\n"
-"  --resieve-scan-cap N  index slots per region; 0 = half the bucket\n"
-"                   capacity (a test knob for the fallback)           [0]\n"
+"                   of walking its factor base. Costs an index array the size\n"
+"                   of the bucket array; off when it does not fit, and any\n"
+"                   slab that outgrows it is walked [on with the gate, else off]\n"
+"  --resieve-scan-cap N  index slots a region at most; 0 = all of the\n"
+"                   region's (a test knob for the fallback)            [0]\n"
 "  --resieve-scan-pairs N  first capacity of the scan's pair list; 0 =\n"
 "                   auto (a test knob for its growth)                  [0]\n"
 "  --q-pipeline / --no-q-pipeline  --pipeline only; sieve the next slab or\n"
@@ -354,6 +354,10 @@ static void usage(void)
 "  --sieve-skip N   pipeline: skip sieve work gcd(i,j) rules out [2]\n"
 "                   0 = off, 1 = both-even positions, 2 = also 3|i and 3|j\n"
 "                   (fill only); relations are identical at every level\n"
+"  --no-row-cap     pipeline: every bucket region gets the same capacity,\n"
+"                   instead of its row's share of the positions --sieve-skip\n"
+"                   keeps (the default's array is 2/3 of this one under\n"
+"                   --sieve-skip 2, 3/4 under 1; output identical)\n"
 "  --survbits FILE  write a survivor bitmap (1 bit/position, x order)\n"
 "  --other-bits F   the other side's bitmap -> device intersect+gcd+compact\n"
 "  --emit FILE      write the compacted survivor list (x, a, b) here\n"
@@ -1071,6 +1075,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_rows = -1; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
     cfg.resieve_scan = -1; cfg.resieve_scan_cap = 0; cfg.resieve_scan_pairs = 0;
+    cfg.row_cap = 1;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.fill_ahead = -1;   /* resolved with --q-pipeline */
     cfg.q_prep = PIPE_QPREP_AUTO;
@@ -1137,7 +1142,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.resume_rel_bytes = 0; cfg.resume_cand_bytes = 0;
     cfg.resume_nrel = 0; cfg.resume_nq = 0;
     int maxbits = 0, maxbits_set = 0;
-    int sieve_skip_set = 0, tiny_fold_set = 0, tiny_table_set = 0;
+    int sieve_skip_set = 0, tiny_fold_set = 0, tiny_table_set = 0, row_cap_set = 0;
     int fill_row_bands_set = 0, fill_gate_shift_set = 0, resieve_scan_knob = 0;
     int q_prep_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
@@ -1583,6 +1588,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             if (bench_boinc_resolve_path("--emit-cof", argv[++i], &cfg.emit_cof)) return 1;
         }
         else if (!strcmp(argv[i], "--not-both-even")) cfg.not_both_even = 1;
+        else if (!strcmp(argv[i], "--no-row-cap")) { cfg.row_cap = 0; row_cap_set = 1; }
         else if (!strcmp(argv[i], "--sieve-skip") && i + 1 < argc) {
             if (parse_int_range_arg("--sieve-skip", argv[++i], 0, 2,
                                     &cfg.sieve_skip))
@@ -1627,6 +1633,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * said otherwise. */
     if (sieve_skip_set && !cfg.pipeline) {
         fprintf(stderr, "--sieve-skip applies to --pipeline only\n");
+        return 1;
+    }
+    /* Without the skip every row keeps all of its positions, so the layout
+     * is uniform either way (bklay_make). */
+    if (row_cap_set && cfg.sieve_skip == 0) {
+        fprintf(stderr, "--no-row-cap changes nothing under --sieve-skip 0\n");
         return 1;
     }
     /* Without the small sieve there is nothing to fold, and a run logged
@@ -2337,7 +2349,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
             "--no-q-pipeline", "--q-prep", "--fill-ahead", "--no-fill-ahead",
             "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
-            "--resieve-scan-cap", "--resieve-scan-pairs", NULL
+            "--resieve-scan-cap", "--resieve-scan-pairs", "--no-row-cap", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)

@@ -378,11 +378,155 @@ static int check_ss_tail(void)
     return 0;
 }
 
+/* --row-cap's layout (bklay_t, finding 132) against a direct model: each row
+ * class's share of a row's positions counted with fill's own --sieve-skip
+ * predicate, and every region's slots laid end to end in order. A layout
+ * that overlapped two regions would mix their records silently; one that
+ * left a gap would only waste memory, so both directions are checked. */
+static uint32_t bklay_kept(uint32_t j, int logI, int skip)
+{
+    const uint32_t I = 1u << logI, ih3 = (I >> 1) % 3u;
+    uint32_t n = 0;
+    for (uint32_t x = 0; x < I; x++) {
+        if (skip && ((x | j) & 1u) == 0u) continue;
+        if (skip > 1 && j % 3u == 0u && x % 3u == ih3) continue;
+        n++;
+    }
+    return n;
+}
+
+static int check_bklay(void)
+{
+    static const uint32_t caps[] = {257, 300, 3001, 10658, 11315, 11575};
+    static const int geom[][2] = {{16, 14}, {15, 14}, {14, 14}, {13, 13},
+                                  {16, 12}, {12, 12}};
+    unsigned ncase = 0;
+    for (int skip = 1; skip <= 2; skip++) {
+        /* the table is the predicate's share, to within a position */
+        for (uint32_t j = 0; j < 12; j++) {
+            const bklay_t L = bklay_make(11575, 1, skip, 16, 14);
+            const uint64_t kept6 = (uint64_t)bklay_kept(j, 16, skip) * 6u;
+            const uint64_t want6 = (uint64_t)bklay_f(L, j) << 16;
+            if (kept6 + 12 < want6 || kept6 > want6 + 12) {
+                fprintf(stderr, "slabtest: bklay skip %d row %u keeps %llu/6 of"
+                        " 65536 positions, the table says %u sixths\n", skip, j,
+                        (unsigned long long)kept6, bklay_f(L, j));
+                return -1;
+            }
+        }
+        for (const uint32_t cap : caps)
+            for (const auto &g : geom) {
+                const int logI = g[0], lr = g[1];
+                const uint32_t per_row = 1u << (logI - lr);
+                const bklay_t L = bklay_make(cap, 1, skip, logI, lr);
+                if (!L.s || L.m != BKLAY_MARGIN || 6u * L.s + L.m < cap ||
+                    6u * L.s + L.m >= cap + 6u) {
+                    fprintf(stderr, "slabtest: bklay cap %u skip %d: s %u m %u"
+                            " does not give the f = 6 class the capacity\n",
+                            cap, skip, L.s, L.m);
+                    return -1;
+                }
+                static const uint32_t j0s[] = {0, 1, 2, 3, 4, 5, 7, 4096, 8191, 32767};
+                for (const uint32_t j0 : j0s) {
+                    const uint32_t nrow = 13;
+                    const bklay_t A = bklay_at(L, j0);
+                    uint64_t at = 0;
+                    for (uint32_t b = 0; b < nrow * per_row; b++) {
+                        const uint32_t j = j0 + b / per_row;
+                        const uint32_t f = (j & 1u) ? ((skip > 1 && j % 3u == 0u) ? 4u : 6u)
+                                                    : ((skip > 1 && j % 3u == 0u) ? 2u : 3u);
+                        uint32_t c = 0;
+                        const uint64_t base = bklay_base(A, b, &c);
+                        if (base != at || c != L.s * f + L.m) {
+                            fprintf(stderr, "slabtest: bklay cap %u skip %d logI %d"
+                                    " region %d j0 %u: region %u at %llu cap %u,"
+                                    " model %llu cap %u\n", cap, skip, logI, lr, j0,
+                                    b, (unsigned long long)base, c,
+                                    (unsigned long long)at, L.s * f + L.m);
+                            return -1;
+                        }
+                        at += c;
+                        if (bklay_slots(L, b + 1, j0) != at ||
+                            bklay_slots_max(L, b + 1) < at) {
+                            fprintf(stderr, "slabtest: bklay slots for %u regions"
+                                    " from row %u\n", b + 1, j0);
+                            return -1;
+                        }
+                        ncase++;
+                    }
+                }
+            }
+    }
+    /* uniform wherever the class layout does not apply, and b*m there */
+    const bklay_t U[] = {bklay_make(11575, 0, 2, 16, 14),
+                         bklay_make(11575, 1, 0, 16, 14),
+                         bklay_make(11575, 1, 3, 16, 14),
+                         bklay_make(256, 1, 2, 16, 14),
+                         bklay_make(11575, 1, 2, 13, 14),
+                         bklay_uniform(11575)};
+    for (const bklay_t &u : U) {
+        const bklay_t A = bklay_at(u, 12345);
+        for (uint32_t b = 0; b < 4096; b++) {
+            uint32_t c = 0;
+            if (u.s || bklay_base(A, b, &c) != (uint64_t)b * u.m || c != u.m) {
+                fprintf(stderr, "slabtest: bklay uniform layout region %u\n", b);
+                return -1;
+            }
+        }
+    }
+    /* The 32-bit sums against a 64-bit model at the largest array bklay_fits
+     * admits, every region, in both layouts (the uniform one to 2^32 - 1
+     * slots); one region more is refused, and so is the 2^19-region case that
+     * wrapped at ~371,000 regions when bklay_make fell back to uniform. */
+    const bklay_t Z[] = {bklay_make(11575, 1, 2, 16, 14), bklay_uniform(65535)};
+    for (const bklay_t &L : Z) {
+        const uint64_t per = 6u * L.s + L.m;
+        const uint32_t nmax = (uint32_t)((((uint64_t)1 << 32) - 1) / per);
+        if (!bklay_fits(L, nmax) || bklay_fits(L, nmax + 1) ||
+            bklay_fits(L, 1u << 19) || bklay_fits(bklay_uniform(11575), 1u << 19)) {
+            fprintf(stderr, "slabtest: bklay_fits admits the wrong arrays"
+                    " (s %u m %u, %u regions)\n", L.s, L.m, nmax);
+            return -1;
+        }
+        static const uint32_t j0s[] = {0, 1, 5};
+        for (const uint32_t j0 : j0s) {
+            const bklay_t A = bklay_at(L, j0);
+            uint64_t at = 0;
+            for (uint32_t b = 0; b < nmax; b++) {
+                const uint32_t j = j0 + (b >> L.rshift);
+                const uint32_t f = !L.s ? 0u
+                                 : (j & 1u) ? (j % 3u == 0u ? 4u : 6u)
+                                            : (j % 3u == 0u ? 2u : 3u);
+                uint32_t c = 0;
+                if (bklay_base(A, b, &c) != at || c != L.s * f + L.m) {
+                    fprintf(stderr, "slabtest: bklay at %u of %u regions from row"
+                            " %u: %u, model %llu\n", b, nmax, j0,
+                            bklay_base(A, b, &c), (unsigned long long)at);
+                    return -1;
+                }
+                at += c;
+                ncase++;
+            }
+            if (at >= ((uint64_t)1 << 32) || bklay_slots(L, nmax, j0) != at) {
+                fprintf(stderr, "slabtest: bklay slots for %u regions from row"
+                        " %u\n", nmax, j0);
+                return -1;
+            }
+        }
+    }
+    if (ncase < 10000) {
+        fprintf(stderr, "slabtest: bklay checked only %u regions\n", ncase);
+        return -1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     if (check_plan() || check_bkthresh_integration() || check_phase() ||
-        check_magic() || check_ss_tail() || check_walk_continuation()) return 1;
+        check_magic() || check_ss_tail() || check_walk_continuation() ||
+        check_bklay()) return 1;
     printf("slabtest: plan, bkthresh wiring, phase, reciprocal, small-sieve tail,"
-           " and continued-walk gates OK\n");
+           " continued-walk and row-class bucket layout gates OK\n");
     return 0;
 }
