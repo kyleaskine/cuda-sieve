@@ -218,26 +218,12 @@ The lambdas use CADO units. The job deliberately omits GGNFS
 The I14 experiment deliberately keeps `maxbits=13` to match the saved CADO
 factor base's prime-power convention.
 
-The small evidence files in [`c143-comparison-20261012/`](c143-comparison-20261012/)
-are tracked and pinned in `MANIFEST.sha256`:
-
-- `cuda-i13.*`, `cuda-i14.*`, `cuda-campaign.*`: verbatim output, run log,
-  and `/usr/bin/time` result, copied respectively from root-level local
-  `c143-timing.fHQfNX`, `c143-timing.FinIL9`, and `c143-timing.7GYZN2`.
-  Paths and command lines in these historical captures are unchanged.
-- `cado.parameters.txt`: the campaign's `c143.parameters_snapshot.1`.
-- `cado.campaign.txt`: original first-workunit dispatch and target-reached
-  log lines, plus the original first sieve command.
-- `cado.bands.tsv`: summary fields from the 165 accepted-range workunit
-  stderr files, with source filenames. It excludes later surplus workunits.
-- `cado.samples.txt`: non-per-q comment lines from four compressed relation
-  files, followed by explicitly labelled geometry aggregates derived from
-  their per-q headers. Relation rows are not copied.
-- `cado.dup2.slice*.txt`: verbatim duplicate-removal summaries.
-
-The multi-gigabyte relation files remain local in their original directories;
-they are not part of this capture. The temporary root `c143-timing.sh` was
-removed after preserving its effective commands here and in the run logs.
+The comparison's small evidence was in `c143-comparison-20261012/`: our I13,
+I14 and campaign outputs with their run logs and `/usr/bin/time` results, and
+the CADO campaign's parameter snapshot, dispatch log, per-workunit band
+summary, relation-file samples and duplicate-removal summaries. It left the
+tree with the other dated folders ([below](#dated-evidence-folders)). The
+multi-gigabyte relation files remain local in their original directories.
 
 To repeat the I14 first band, from the repository root, use a fresh output
 directory so an earlier run cannot resume. **Since 2026-10-13 this command
@@ -288,277 +274,45 @@ The launcher replaces `-t` with its host CPU allocation unless
 These are reproduction recipes, not new measurements. Compare fresh,
 interleaved runs and record host load and aggregate process CPU time.
 
-## C143 fill tier, fill gate and cado-gpu ablations (2026-10-13)
+## Dated evidence folders
 
-[`c143-fill-20261013/`](c143-fill-20261013/) holds the small evidence for
-[finding 107](../bench/RESULTS.md#finding-107), pinned in `MANIFEST.sha256`.
-Paths and command lines inside the captured scripts are verbatim, and the
-runs they name live in the git-ignored `../work/`.
+Findings 105-131 kept their small evidence here, one folder per finding:
+captured outputs, the gate, timing and trace scripts that produced them,
+profiles and diffs. The folders were removed from the tree on 2026-10-29
+(548 of its 665 files). `../bench/RESULTS.md` still names their files by path,
+and commit `cadcf3c` has every one of them: `git show
+cadcf3c:oracle/<folder>/<file>` prints one, and `git checkout cadcf3c --
+oracle/<folder>` restores a folder. That commit's `MANIFEST.sha256` pins
+them, and this file as it stood there describes each one. Evidence since
+finding 132 has stayed in the git-ignored `../work/`.
 
-- `fillcheck.txt`: the identity gate with the new defaults, 44 of 44
-  byte-identical.
-- `sweep-*.txt`, `confirm*.txt`: interleaved A/B lines (one per run, host load
-  on the confirmation lines), from `fillab.sh` and `confirm.sh`. `summ.py`
-  turns them into the median tables.
-- `firstband-*`: the 6,983-q first band, old fill against the new defaults at
-  I13 and I14, with `--relations` and `/usr/bin/time` (`firstband.sh`).
-- `cado-<arm>.{stderr,time,threads}.txt`: the six `las-glas` arms of
-  `cado-ablation.sh`. `threads` is a `ps -L` snapshot 15 s into the run.
-- `relcmp.py` and `cado-*_vs_cuda-i13.txt`: the first band's relation sets,
-  CADO default and CADO with `GLAS_SKIP_BOUND=0`, each against cuda-sieve I13.
+The four tools later work still runs moved to `../bench/tools/`: `analyze.py`
+and `gaps.py` (kernel concurrency and idle gaps from an `nsys` SQLite export,
+finding 113), `kernsum.py` (per-kernel ms per special-q, finding 115) and
+`relcmp.py` (two relation sets compared, finding 107).
 
-The CADO arms run the launcher with `-fb1` pointing at a copy of the
-campaign's `c143.roots1.gz` in `work/`, so glas writes its factor-base cache
-there and not into the campaign directory. The environment variables are
-the only difference between arms.
-
-## C143 two special-q in flight (2026-10-13)
-
-[`c143-qpipe-20261013/`](c143-qpipe-20261013/) holds the small evidence for
-[finding 108](../bench/RESULTS.md#finding-108), pinned in `MANIFEST.sha256`.
-Captured scripts keep their verbatim paths; the runs live in the git-ignored
-`../work/qconc/`.
-
-- `qspan-i13.txt`, `twoproc.*`, `overlap.*`: the measurements that sized the
-  prize before the build: idle time per q, two processes sharing the card,
-  and the two sides overlapped (`--fill-concurrent`).
-- `qpab.*`: the interleaved A/B, single-queued against `--q-pipeline`, on
-  C143 I13/I14 and c183.
-- `fillcheck.txt`, `fillcheck-c183-single-slab.txt`: the identity gate,
-  60 of 60 byte-identical; `identity-first-runs.txt`: the first per-job
-  checks; C194 stayed single-queued on its four-slab plan until finding 109.
-- `stop-resume.*`: a band stopped with a q in flight and resumed;
-  `stop-resume-after-review.*` and `qpab-after-review.txt` repeat the stop
-  test and the I13 A/B after the review fixes.
-- `cpu.txt`: host CPU with and without the pipeline.
-- `firstband-*`: the 6,983-q first band with the new defaults.
-- `vram-holder.cu`, `wsl-vram-holder.c183.txt`: the attempt to force the
-  VRAM fallback. Under WSL2 the driver evicted the holder's memory, so the
-  run still saw ~9 GB free.
-
-## Multi-slab --q-pipeline (2026-10-13)
-
-[`qpipe-slabs-20261013/`](qpipe-slabs-20261013/) holds the small evidence for
-[finding 109](../bench/RESULTS.md#finding-109), pinned in `MANIFEST.sha256`.
-`tests.sh` is the plan that produced `tests.txt` (identity gate, the
-NFS@Home lpba-34 job single-queued against pipelined, and the interleaved
-C194/NFS@Home timing); `fillcheck.txt` is that gate's log. **Section 3 of
-`tests.txt` is vacuous:** the stop file is read every 64 q and that 120-q
-band ended before a check saw it, so its IDENTICAL (13,487) compares two
-uninterrupted runs. The real test was run by hand with the same C194
-arguments at 400 q: `stop-resume-c194.base.txt` is the uninterrupted
-single-queued band (44,846 relations), and `stop-resume-c194.stopped.txt` /
-`.resumed.txt` are the pipelined run stopped after 192 q at q=80003687 with
-work in flight and its resume, byte-identical to the base. `tdskip.*` is
-the `PIPE_K=8` run in which slabs are dropped for truncated trial division,
-pipelined against single-queued.
-
-After the code review: `review-rerun.sh` produced `review-rerun.txt`. It
-runs `skipslab.sh` on a `BN_LIMBS=4` build (log `skipslab.txt`: norm-width
-skips on a four-slab plan, both sides, single-queued against pipelined),
-rebuilds the default, runs `fillcheck.sh` (log
-`fillcheck-after-review.txt`, now with the issued-ahead checks), and repeats
-the 400-q stop and resume against the same base, asserting that the band
-really stopped (`stop-resume-c194.after-review.*`: stopped after 128 q at
-q=80002567). `nfs-after-review.txt` is the NFS@Home job's 40-q identity run
-on the fixed build. These reruns shared the card with an NFS@Home client,
-so their timings mean nothing. The scripts' paths point into the git-ignored
-`work/slabpipe/`. The NFS@Home job's polynomial and factor base lived in the
-client's `/tmp` workdir and are not kept here.
-
-## k_apply at I16 (2026-10-14)
-
-[`apply-i16-20261014/`](apply-i16-20261014/) holds the small evidence for
-[finding 110](../bench/RESULTS.md#finding-110), pinned in `MANIFEST.sha256`.
-`prof.sh` took the source-level ncu profiles of `k_apply` (the NFS@Home
-lpba-34 I16 job and c183, q index 3, single-queued). `launches.txt` is the
-per-launch duration, instructions and issue figures for base and the
-experiment. `stages.txt` is the per-stage shares and stall mix, plus the
-64-bit-fallback share, produced by `cat.py`, `cat2.py` (line numbers
-remapped for the experiment build), `stall.py` and `catdef.py`; `agg.py`
-lists the top source lines. `exp.diff` is the experiment: the thread-tier
-load hoist, applied to a `git archive` copy of `5c1ab93` (`build.txt`).
-`ab.sh` produced `ab.txt`: relations identity on both jobs, then
-single-queued ABBA × 2 and a pipelined ABBA on the NFS@Home job. The ncu
-reports (~140 MB) and both builds stay in the git-ignored `work/applyprof/`,
-along with copies of the NFS@Home job's polynomial and factor base, which
-are not kept here. Landing it: `land-gate.sh` produced `land-gate.txt`
-(default fat build, `--verify-only`, `make check`, `fillcheck.sh` with log
-`land-fillcheck.txt`, and identity against the base copy's relation files).
-`land-recheck.txt` is the landed binary against the base copy, pipelined,
-ABBA, at host load ~15.
-
-## Two-step small-sieve tail (2026-10-14)
-
-[`ss-two-step-20261014/`](ss-two-step-20261014/) holds the evidence for
-[finding 111](../bench/RESULTS.md#finding-111), pinned in `MANIFEST.sha256`.
-`landed-run.sh` produced `landed-run.txt`: the default fat build's resources,
-`--verify-only`, apply-parity `--verify` at I16, I17 and I15 (with the new
-`ss_first` device gate), `make check`, `fillcheck.sh`, identity on the
-NFS@Home job and c183, and fat-vs-fat timing against the saved hoist
-binary. `landed-calls.txt` is the 64-bit remainder call count before and
-after. The variants that lost: `two-range-run.sh`/`.txt` (two loops back to
-back, gates passing and apply +23%) with `two-range-stalls.txt` (the barrier
-stall that explains it); `variant2-ab.sh`/`.txt` and `variant2-c183-ab.txt`
-(one loop with a per-entry select, +0.8% at c183); `variant3-ab.txt` (a
-runtime branch between two loops, stopped). `sass-structure.txt` counts each
-variant's `YIELD`/`BSSY` per `k_apply` instance. After the xhigh review:
-`review-run.sh` produced `review-run.txt` (build, per-instance SASS with the
-trap, `--verify` at four geometries, `make check` with slabtest's new tail
-gate, fillcheck, identity on all four pipeline instances against `5c1ab93`,
-ncu and timing against the hoist), and `slabtest-mutants.txt` shows two
-broken two-step proofs failing that gate. The scripts' paths point into the
-git-ignored `work/applyprof/`, where the builds and ncu reports stay.
-
-## C143 against cado-gpu, equal yield (2026-10-14)
-
-[`c143-h2h-20261014/`](c143-h2h-20261014/) holds the evidence for
-[finding 112](../bench/RESULTS.md#finding-112), pinned in `MANIFEST.sha256`.
-`run.sh` produced `run.txt`: two interleaved end-to-end rounds of CADO
-(default and `GLAS_SKIP_BOUND=0`) and cuda-sieve (I13, I14), then
-per-kernel arms (CADO one slot with and without the skip, CADO 8 slots with
-GPU stats, cuda-sieve `--no-q-pipeline` at I13 and I14). Each arm's CADO
-stderr and `/usr/bin/time`, or cuda-sieve band output and time, is kept
-here as `cado-<arm>.*` / `cuda-<arm>.*`. `build.txt` names both builds. The
-relation files stay in the git-ignored `work/h2h-20261014/`.
-
-## Nsight Systems at C143 (2026-10-14)
-
-[`nsys-c143-20261014/`](nsys-c143-20261014/) holds the evidence for
-[finding 113](../bench/RESULTS.md#finding-113), pinned in `MANIFEST.sha256`.
-`trace.sh` captured the four timelines (`trace.txt`); `analyze.py` produced
-`analysis.txt` (busy, idle, concurrency depth and per-kernel overlap for each);
-`gaps.py` produced `gaps-*.txt` (idle charged to kernel transitions, with the
-host CUDA calls inside); `gap-detail.txt` breaks down the three cuda-sieve
-gaps. The `.nsys-rep` captures and their SQLite exports (~40 MB) stay in the
-git-ignored `work/nsys-20261014/`. Recorded at host load 9.5-10.6.
-
-## Host waits removed (2026-10-14)
-
-[`hostwait-20261014/`](hostwait-20261014/) holds the evidence for
-[finding 114](../bench/RESULTS.md#finding-114), pinned in `MANIFEST.sha256`.
-`pipeline.diff` is the change. `ab.sh` produced `ab.txt` (identity on four
-jobs and interleaved timing of `3e79628`, A and B). `gates.sh` produced
-`gates.txt` (fat build, `make check`, fillcheck, stop/resume on C194 and C143,
-skipslab with its log `skipslab.txt`, the `PIPE_K=8` TD-skip identity).
-`final-fat.txt` is fat build against fat build with the SM clock logged.
-`trace-quiet.txt` is the quiet-host Nsight Systems comparison (analyze.py and
-gaps.py from `nsys-c143-20261014/`). `build.txt` names the binaries.
-After the xhigh review: `pipeline-final.diff` is the change as landed
-(`pipeline.diff` is the first version). `review-gates.sh` produced
-`review-gates.txt`: fat build, `make check`, fillcheck, identity on four
-jobs, stop/resume on C194 and C143, relative timing with the card shared
-with GPU ECM, `skipslab` and the `PIPE_K=8` TD-skip test. Its forced-overflow
-block used whole-percent capacities that either overflowed everything (85%) or
-nothing (95-99%). `ovf2.sh` produced `ovf2.txt`, the forced-overflow
-comparison at the per-mille settings where only some slabs overflow. `real-timing.txt`
-is the clean fat-vs-fat timing of the landed build, with the card free.
-
-## The NFS@Home I16 job against cado-gpu, equal yield (2026-10-16)
-
-[`i16-h2h-20261016/`](i16-h2h-20261016/) holds the evidence for
-[finding 115](../bench/RESULTS.md#finding-115), pinned in `MANIFEST.sha256`.
-`nfs.poly` is the job in CADO's format and `makefb.log` its factor-base
-build. `run.sh` produced `run.txt`: end-to-end CADO (skip off twice,
-default once) and cuda-sieve (twice), per-kernel arms (CADO one slot with GPU
-stats, cuda-sieve `--no-q-pipeline`), then `relcmp.py` (from
-`c143-fill-20261013/`) on the relation sets. `round2.sh` produced
-`round2.txt`, a second interleaved round with SM clock and power logged.
-Each arm's CADO stderr and `/usr/bin/time`, or cuda-sieve band output and
-time, is kept as `cado-<arm>.*` / `cuda-<arm>.*`. `cado-phases.txt` holds
-CADO's startup/steady split and host/device cofactor counts, read from the
-relation files. `nsys-trace.sh` captured three timelines (`nsys-trace.txt`).
-`nsys-analysis.txt` and `nsys-gaps-qp.txt` are `analyze.py` and `gaps.py`
-from `nsys-c143-20261014/`, and `kernsum.py` produced `nsys-kernsum.txt`
-(ms per q per kernel). `qpcheck.sh`, `qprel.sh` and `full.sh` (`.txt`)
-check the q-pipeline against single-queued without nsys. `build.txt` names
-both builds. The relation files, `.nsys-rep` captures and SQLite exports
-stay in the git-ignored `work/cado-nfs-i16/` and `work/nsys-i16-20261016/`.
-Recorded at host load 10-22 (nine CPU ECM processes throughout).
-
-## Resieve filter and transform fast path (2026-10-16)
-
-[`resieve-transform-20261016/`](resieve-transform-20261016/) holds the
-evidence for [finding 116](../bench/RESULTS.md#finding-116), pinned in
-`MANIFEST.sha256`. `change.diff` is the code change.
-- **Profiles:** `prof.sh` captured the ncu reports (one q of the NFS@Home
-  job: eight resieve launches, two transform launches). `metrics.py`
-  produced `*-metrics.txt`, and `agg.py` from `work/applyprof/` produced
-  `*-lines.txt`, the per-source-line split.
-- **Identity:** `ident.sh` (`ident.txt`) on four jobs and three arms.
-- **Experiments:** `ab.sh`, `ab2.sh` and `ab3.sh` (`.txt`) are the free-card
-  A/Bs at I16, on the other geometries, and at intermediate slab areas.
-- **Gates:** `gates.sh` (`gates.txt`) ran them on the final source.
-  `check-summary.txt` and `skipslab.txt` are their detail.
-- **Final timing:** `final-timing.sh` and `c143-recheck.sh` (`.txt`) ran
-  with the card time-sliced against the NFS@Home client.
-  `final-timing-clean.sh`, `c143-clean.sh` and `c143-more.sh` (`.txt`) are
-  the same on a free card.
-- **Landed binary:** `fat-check.sh` (`fat-check.txt`) checked the rebuilt fat
-  `bench/bench`.
-
-`build.txt` names the binaries. The ncu reports and snapshot builds stay in
-the git-ignored `work/resieve-i16/`.
-
-## Threshold scan and bitmap clears (2026-10-16)
-
-[`scan-clears-20261016/`](scan-clears-20261016/) holds the evidence for
-[finding 117](../bench/RESULTS.md#finding-117), pinned in
-`MANIFEST.sha256`. `change.diff` is the code change.
-- **Code shape:** `scan-sass.txt` is the threshold-scan loop of the
-  production I16 `k_apply` instance (sm_120) in the base, first and final
-  versions. `gates.txt` lists the registers of every instance.
-- **Profiles:** `prof.sh` (`prof-base.csv`, `prof-new.csv`,
-  `prof-summary.txt`) is the per-launch ncu run on one NFS@Home q. `split.csv`
-  and `split-summary.txt` are the per-kernel durations by side.
-- **Gates:** `sbgate.sh` (`sbgate.txt`) compares the harness's survivor
-  bitmaps, base against new. `ident.sh` (`ident.txt`) checks relation
-  identity on four jobs. `gates.txt` covers `--verify-only`, `make check` and
-  fillcheck.
-- **Timing:** `timing.sh` (`timing.txt`) is the three-round free-card A/B.
-  `c183-single.txt` is the single-queued intersect check.
-- **Per-side acceptance:** `sidestats.diff` is the test-only counter and
-  `sidestats.txt` its four bands. It was never landed.
-- **Review fixes (2026-10-17):** `review.diff` is the change.
-  `review-gates.sh` (`review-gates.txt`) ran the gates, and `verify-c183.txt`
-  is its `--verify` run. `timing-review.txt` is the A/B that a GPU ECM job
-  time-sliced, so only its host timers (`host-timers.txt`) are used.
-  `timing.sh` gained the `B=` override for it. `timing-retime.sh`
-  (`timing-retime.txt`) is the free-card rerun of 2026-10-18 against the
-  committed build. Its rows also record each run's exit status and the
-  card's utilization just before it.
-- **Landed binary:** `fat-check.sh` (`fat-check.txt`) checked the rebuilt fat
-  `bench/bench`, after the review fixes.
-
-`build.txt` names the binaries. The snapshot builds and SASS dumps stay in
-the git-ignored `work/scan-i16/`.
-
-## Side-0 record scan, measured (2026-10-18)
-
-[`recscan-20261018/`](recscan-20261018/) holds the evidence for
-[finding 118](../bench/RESULTS.md#finding-118), pinned in `MANIFEST.sha256`.
-`recscan.diff` is the test-only counter build on `9b9f314`. It was never
-landed. `run.sh` (`run.txt`) ran it on five jobs single-queued, and on two
-of them pipelined. Its final exit-status line was added after the run, in
-finding 119's review. `build.txt` names the binary, which stays in the
-git-ignored `work/recscan/`.
-
-## Side-0 resieve from its records (2026-10-18)
-
-[`rscan-20261018/`](rscan-20261018/) holds the evidence for
-[finding 119](../bench/RESULTS.md#finding-119), pinned in `MANIFEST.sha256`.
-`change.diff` is the code change (`bench/abcheck.sh` is in the tree).
-- **Gates:** `gates.sh` (`gates.txt`) ran `abcheck.sh` against the committed
-  `9b9f314` build: the default arm, mixed record/walk arms, every fallback,
-  the refusals, `make check` and fillcheck. `gates-first.txt` is the first
-  run, with the knob-refusal artefact described in the finding.
-- **Timing:** `timing.sh` (`timing.txt`) is the three-round free-card A/B.
-- **Landed binary:** `fat-check.sh` (`fat-check.txt`, `fat-abcheck.txt`)
-  checked the fat `bench/bench`, rebuilt after the review.
-- **Review:** `growfail.sh` (`growfail.txt`) drove the failed-growth branch
-  with the `PIPE_RS_TEST_GROW_FAIL` test build. `gates.sh` and
-  `fat-check.sh` gained exit statuses that count every check after their
-  recorded runs. Those runs' outputs are unchanged.
-
-`build.txt` names the binaries. The snapshot builds stay in the git-ignored
-`work/rscan/`.
+| folder | finding | what it held |
+|---|---|---|
+| `c143-comparison-20261012/` | [105](../bench/RESULTS.md#finding-105) | C143 against cado-gpu (above) |
+| `c143-fill-20261013/` | [107](../bench/RESULTS.md#finding-107) | fill's row tier and side-0 gate: fillcheck, interleaved sweeps, cado-gpu ablations |
+| `c143-qpipe-20261013/` | [108](../bench/RESULTS.md#finding-108) | two special-q in flight |
+| `qpipe-slabs-20261013/` | [109](../bench/RESULTS.md#finding-109) | `--q-pipeline` across slabs |
+| `apply-i16-20261014/` | [110](../bench/RESULTS.md#finding-110) | `k_apply` profiled at I16 |
+| `ss-two-step-20261014/` | [111](../bench/RESULTS.md#finding-111) | the two-step small-sieve tail, with `sass-structure.txt` (YIELD/BSSY per `k_apply` instance, cited in `bench_kernels.cu`) |
+| `c143-h2h-20261014/` | [112](../bench/RESULTS.md#finding-112) | C143 against cado-gpu at equal yield |
+| `nsys-c143-20261014/` | [113](../bench/RESULTS.md#finding-113) | Nsight Systems at C143 |
+| `hostwait-20261014/` | [114](../bench/RESULTS.md#finding-114) | two host waits removed |
+| `i16-h2h-20261016/` | [115](../bench/RESULTS.md#finding-115) | the NFS@Home I16 job against cado-gpu at equal yield |
+| `resieve-transform-20261016/` | [116](../bench/RESULTS.md#finding-116) | the resieve filter and the transform's fast path |
+| `scan-clears-20261016/` | [117](../bench/RESULTS.md#finding-117) | apply's threshold scan and the bitmap clears |
+| `recscan-20261018/` | [118](../bench/RESULTS.md#finding-118) | side 0's record scan, the counter build |
+| `rscan-20261018/` | [119](../bench/RESULTS.md#finding-119) | side 0's resieve from its records |
+| `tdwait-20261020/` | [120](../bench/RESULTS.md#finding-120) | card idle re-traced after findings 116-119 |
+| `qprep-20261020/` | [121](../bench/RESULTS.md#finding-121) | the q boundary at small jobs (`--q-prep`) |
+| `prof-c135-20261020/` | [122](../bench/RESULTS.md#finding-122) | c135 profiled against cado-gpu |
+| `fillahead-20261020/` | [123](../bench/RESULTS.md#finding-123) | fill ahead |
+| `skipoff-20261020/` | [124](../bench/RESULTS.md#finding-124) | cado-gpu at equal yield, its `p < 96` skip off |
+| `slicecut-20261021/` | [128](../bench/RESULTS.md#finding-128) | apply's slice cut on large factor bases |
+| `tinyfold-20261021/` | [129](../bench/RESULTS.md#finding-129) | `--tiny-fold` |
+| `logrec-20261022/` | [130](../bench/RESULTS.md#finding-130) | log p in the bucket records |
+| `tinytable-20261022/` | [131](../bench/RESULTS.md#finding-131) | `--tiny-table` |

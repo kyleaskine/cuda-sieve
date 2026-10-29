@@ -943,7 +943,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * at I16 for the same instructions. And testing e < nsplit in the I15
      * loop, where it is always true, cost apply +0.8% at c183 (finding 111).
      * An edit here should recount YIELD/BSSY per k_apply instance
-     * (oracle/ss-two-step-20261014/sass-structure.txt).
+     * (oracle/ss-two-step-20261014/sass-structure.txt, in commit cadcf3c).
      *
      * The one-step instance TRAPS on a table with a tail. Its entries past
      * nsplit carry magics proved only for the two-step form, and the
