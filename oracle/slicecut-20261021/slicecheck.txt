@@ -1,2 +1,0 @@
-    nslice_pow2: side 1 32, side 0 32 -> apply smem 32832 B per block
-   PASS side 1 32, side 0 32

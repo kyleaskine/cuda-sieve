@@ -1,6 +1,0 @@
-base 7.72 new 7.74 | sm=2902 load=10.42
-new 7.52 base 7.54 | sm=2910 load=10.62
-base 7.52 new 7.46 | sm=2895 load=9.83
-new 7.45 base 7.51 | sm=2887 load=10.24
-base 7.41 new 7.38 | sm=2902 load=10.28
-new 7.51 base 7.53 | sm=2895 load=10.50

@@ -1,3 +1,0 @@
-baseline: 3e79628 (fat, saved as work/hostwait/bench.3e79628)
-A/B arms: sm_120 snapshots of the working tree (A: readbacks only, B: readbacks + early prep)
-landed: bench/bench, default fat build of B

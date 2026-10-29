@@ -1,4 +1,0 @@
-i13: base  wall clock per q, COMPLETE 9.80 ms | --q-pipeline  wall clock per q, COMPLETE 7.83 ms |  --q-pipeline: two special-q in flight, a second transform set (0.05 GB) | relations identical
-i14: base  wall clock per q, COMPLETE 9.61 ms | --q-pipeline  wall clock per q, COMPLETE 8.60 ms |  --q-pipeline: two special-q in flight, a second transform set (0.05 GB) | relations identical
-c183: base  wall clock per q, COMPLETE 70.11 ms | --q-pipeline  wall clock per q, COMPLETE 63.83 ms |  --q-pipeline: two special-q in flight, a second transform set (0.26 GB) | relations identical
-c194: base  wall clock per q, COMPLETE 268.76 ms | --q-pipeline  wall clock per q, COMPLETE 270.95 ms |  --q-pipeline: staying single-queued, because the plan has 4 slabs | relations identical

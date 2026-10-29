@@ -1,7 +1,0 @@
-fat: fat build exit=2 2026-10-20 16:38:37 896 s fat build (resumed) exit=0 2026-10-20 16:39:29 34 s  | archs 6 | warnings 0 | bench/bench 5e975e96e700055e built 2026-10-20 16:39:29
-verify-only OK lines: 3 (3 expected)
-fbtest exit=0 all gates passed
-36 cases: 36 identical, 0 failed, 0 skipped, 0 with overflow warnings
-abcheck exit 0
-fat-check: 0 failed
-fat-check exit 0

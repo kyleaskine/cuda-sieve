@@ -1,4 +1,0 @@
-NFS   [sidestats] two-sided 8838899 | side 1 accept 2127352 (24.07%) | side 0 accept 928407 (10.50%) | both 223532 (2.529%) | resieve 27.125 td 66.986 classify 13.575
-C194   [sidestats] two-sided 14300807 | side 1 accept 3317564 (23.20%) | side 0 accept 1398024 (9.78%) | both 323942 (2.265%) | resieve 27.120 td 69.291 classify 16.692
-C183   [sidestats] two-sided 16198754 | side 1 accept 3732254 (23.04%) | side 0 accept 1669576 (10.31%) | both 385204 (2.378%) | resieve 13.519 td 14.800 classify 1.334
-C143   [sidestats] two-sided 10658737 | side 1 accept 1440887 (13.52%) | side 0 accept 1733097 (16.26%) | both 235141 (2.206%) | resieve 1.859 td 1.797 classify 0.393

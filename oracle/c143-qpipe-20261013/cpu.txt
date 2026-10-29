@@ -1,5 +1,0 @@
-# arm.round  elapsed_s  user_s  system_s  (C143 I13, 3000 q, /usr/bin/time; single = --no-q-pipeline)
-cpu.qpipe.0 23.79 20.29 2.00
-cpu.qpipe.1 23.68 21.86 1.91
-cpu.single.0 29.15 26.89 2.13
-cpu.single.1 28.15 25.84 2.20

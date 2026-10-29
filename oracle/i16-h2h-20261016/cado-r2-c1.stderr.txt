@@ -1,1 +1,0 @@
-# Total 23294 reports [0.002904s/r, 70.80r/sq] in 67.65 elapsed s [617.4% CPU]

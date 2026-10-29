@@ -1,6 +1,0 @@
-cado-skip0: Phases: 2.63 s startup, 65.49 s steady, 0.05 s tail, 329 special-q Cofactor candidates: 791831 host, 112379 device 
-cado-skip0b: Phases: 2.69 s startup, 65.63 s steady, 0.01 s tail, 329 special-q Cofactor candidates: 800116 host, 104094 device 
-cado-default: Phases: 2.54 s startup, 46.65 s steady, 0.01 s tail, 329 special-q Cofactor candidates: 505274 host, 298005 device 
-cado-slot1-skip0: Phases: 2.26 s startup, 64.28 s steady, 0.01 s tail, 329 special-q Cofactor candidates: 805001 host, 99209 device 
-r2-c1: Phases: 5.72 s startup, 61.89 s steady, 0.03 s tail, 329 special-q Cofactor candidates: 783363 host, 120847 device 
-r2-c2: Phases: 2.49 s startup, 61.56 s steady, 0.03 s tail, 329 special-q Cofactor candidates: 772710 host, 131500 device 

@@ -1,1 +1,0 @@
-elapsed_s=62.14 user_s=374.86 system_s=43.36

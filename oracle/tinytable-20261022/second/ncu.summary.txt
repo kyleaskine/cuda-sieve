@@ -1,5 +1,0 @@
-notable  launch 0: Duration 10.81 ms; Executed Instructions 4747269312 inst; Issue Slots Busy 89.86 %; Achieved Occupancy 99.48 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.77 Kbyte/block; Block Limit Shared Mem 3 block
-notable  launch 1: Duration 7.38 ms; Executed Instructions 3287816254 inst; Issue Slots Busy 90.63 %; Achieved Occupancy 99.32 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.77 Kbyte/block; Block Limit Shared Mem 3 block
-new      launch 0: Duration 10.34 ms; Executed Instructions 4485335776 inst; Issue Slots Busy 88.34 %; Achieved Occupancy 99.49 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.98 Kbyte/block; Block Limit Shared Mem 3 block
-new      launch 1: Duration 7.38 ms; Executed Instructions 3287825985 inst; Issue Slots Busy 90.63 %; Achieved Occupancy 99.32 %; Registers Per Thread 40 register/thread; Dynamic Shared Memory Per Block 32.98 Kbyte/block; Block Limit Shared Mem 3 block
-done: 0 failed

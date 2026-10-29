@@ -1,5 +1,0 @@
-base: fef825c, bench/bench (fat build, 2026-10-14 23:06, sha256 d6de6804577ac2f9...), copied as work/resieve-i16/bench.fef825c
-ab/ab2/ab3/ident: work/resieve-i16/exp, sm_120 snapshot with experiment switches (BENCH_TEST_RS=0 old resieve, BENCH_TEST_RS_THREADS), the same kernels as the final source
-gates/final-timing/c143-recheck: work/resieve-i16/exp rebuilt from the final source (sm_120, 0 warnings); l4 (BN_LIMBS=4) and pk8 (PIPE_K=8) snapshots of the same source
-change.diff: the code change as it stands in bench/ (uncommitted)
-landed: bench/bench, default fat build (6 archs, 0 warnings) of the final source, 2026-10-16 21:07, sha256 ffa2aaae9a09326c...; fat-check.txt

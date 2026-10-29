@@ -1,4 +1,0 @@
-fat: fat exit=0 | archs 6 | warnings 0 | bench/bench ffa2aaae9a09326c built 2026-10-16 21:07:48
-verify-only OK lines: 3
-fbtest exit=0 all gates passed
-nfs OK(2845) c183 OK(9053) c143 OK(155108) c194 OK(6730) 

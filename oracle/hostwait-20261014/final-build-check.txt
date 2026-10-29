@@ -1,9 +1,0 @@
-fat2 exit=0
--DCF_LMAX=4 -DBN_LIMBS=12 -DPIPE_K=16
-archs 6 warnings 0
-3
-nfs IDENTICAL
-c143 IDENTICAL
-c194 IDENTICAL
-
-[exited with code 0]

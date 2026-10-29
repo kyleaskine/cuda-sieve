@@ -1,3 +1,0 @@
-cuda-sieve: fef825c (findings 112-114; HEAD e31c65d changes only bench/build_windows.bat). bench/bench is the landed fat build of that source (2026-10-14 23:06, sha256 d6de6804577ac2f9...)
-cado-gpu: cado-nfs-public b5ca9c4fd3e331edc8978f93830f8de1e8dda70c with local build/launcher changes (as findings 105, 112)
-factor base: CADO makefb -poly nfs.poly -side 1 -lim 300000000 -t 16 (makefb.log); cuda-sieve work/applyprof/nfs.roots1.m16 (finding 110)

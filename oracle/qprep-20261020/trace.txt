@@ -1,6 +1,0 @@
-c143 base: exit=0  wall clock per q, COMPLETE 6.73 ms load=14.27
-c143 auto: exit=0  wall clock per q, COMPLETE 9.55 ms load=14.57
-c135 base: exit=0  wall clock per q, COMPLETE 5.29 ms load=14.67
-c135 auto: exit=0  wall clock per q, COMPLETE 6.82 ms load=15.03
-failures: 0
-exit 0

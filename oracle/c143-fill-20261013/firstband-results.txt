@@ -1,4 +1,0 @@
-i13 off elapsed_s=91.48 user_s=85.68 system_s=5.21 max_rss_kb=431212 rel=1073878  wall clock per q, COMPLETE 13.55 ms load=3.97
-i13 new elapsed_s=67.98 user_s=63.09 system_s=4.06 max_rss_kb=431676 rel=1073878  wall clock per q, COMPLETE 9.97 ms load=5.00
-i14 off elapsed_s=76.99 user_s=71.15 system_s=4.43 max_rss_kb=432176 rel=1213236  wall clock per q, COMPLETE 11.16 ms load=4.28
-i14 new elapsed_s=68.89 user_s=64.28 system_s=4.92 max_rss_kb=432476 rel=1213236  wall clock per q, COMPLETE 10.35 ms load=5.89

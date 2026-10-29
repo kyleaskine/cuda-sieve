@@ -1,7 +1,0 @@
-fat: 2026-10-18 09:50:31 | archs 6 | warnings 0 | bench/bench 77f1ababdf8a14ba built 2026-10-18 09:50:31
-verify-only OK lines: 3 (3 expected)
-fbtest exit=0 all gates passed
-34 cases: 34 identical, 0 failed, 0 skipped, 0 with overflow warnings
-abcheck exit 0
-fat-check: 0 failed
-exit 0

@@ -1,4 +1,0 @@
-base wall 68.65 isect 0.425 apply 18.170
-new wall 67.86 isect 0.412 apply 16.968
-new wall 68.92 isect 0.420 apply 17.118
-base wall 67.75 isect 0.423 apply 18.008

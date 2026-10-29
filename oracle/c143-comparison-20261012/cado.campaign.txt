@@ -1,3 +1,0 @@
-PID3186777 2026-10-12 10:26:44,487 Info:API server: Sending workunit c143_sieving_2200000-2300000 to client localhost
-PID3186777 2026-10-12 11:29:08,222 Info:Lattice Sieving: Reached target of 78000000 relations, now have 78161966
-/home/kylea/code/cado-nfs-public/gpu-siever/scripts/las-glas -poly /home/kylea/cado-gpu/c143-649044015427/c143.poly -q0 2200000 -A 26 -q1 2300000 -lim0 14000000 -lim1 18000000 -lpb0 30 -lpb1 30 -mfb0 57 -mfb1 58 -lambda0 1.905 -lambda1 1.94 -ncurves0 13 -ncurves1 14 -fb1 /home/kylea/cado-gpu/c143-649044015427/c143.roots1.gz -out /home/kylea/cado-gpu/c143-649044015427/c143.2200000-2300000.gz -t 16 -stats-stderr

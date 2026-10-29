@@ -1,4 +1,0 @@
-median of 3, ms/q; omission removes the entries outright (ceiling, wrong output)
-C135  single-queued apply: base    1.151 | pow2    1.041 (-9.6%) | t420    0.980 (-14.9%)
-C183  single-queued apply: base   16.402 | pow2   14.772 (-9.9%) | t420   13.909 (-15.2%)
-I16   single-queued apply: base   70.086 | pow2   62.890 (-10.3%) | t420   60.019 (-14.4%)

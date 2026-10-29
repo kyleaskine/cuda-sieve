@@ -1,7 +1,0 @@
-i13 base 0 fill=2.392 apply=2.564 resieve=1.258 td=2.58 wall=9.87 relq=154.97 load=10.90
-i13 qpipe 0 fill=2.566 apply=2.609 resieve=2.106 td=5.97 wall=8.11 relq=154.97 load=11.15
-i13 qpipe 1 fill=2.586 apply=2.651 resieve=2.170 td=5.89 wall=7.95 relq=154.97 load=11.14
-i13 base 1 fill=2.395 apply=2.568 resieve=1.264 td=2.56 wall=9.85 relq=154.97 load=11.23
-i13 base 2 fill=2.411 apply=2.570 resieve=1.263 td=2.66 wall=10.09 relq=154.97 load=11.11
-i13 qpipe 2 fill=2.579 apply=2.657 resieve=2.167 td=5.96 wall=8.09 relq=154.97 load=10.94
-done

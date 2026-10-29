@@ -1,4 +1,0 @@
-notable  side 1: barrier  5.8% of stall samples, long_sb 12.8%
-notable  side 0: barrier  4.9% of stall samples, long_sb  8.7%
-new      side 1: barrier  6.5% of stall samples, long_sb 13.6%
-new      side 0: barrier  4.8% of stall samples, long_sb  8.6%

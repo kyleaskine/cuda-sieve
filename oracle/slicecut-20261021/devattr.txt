@@ -1,9 +1,0 @@
-cc major                           12
-cc minor                           0
-max smem per SM (B)                102400
-max smem per block, opt-in (B)     101376
-reserved smem per block (B)        1024
-registers per SM                   65536
-max threads per SM                 1536
-max blocks per SM                  24
-SMs                                48

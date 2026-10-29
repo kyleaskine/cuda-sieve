@@ -1,9 +1,0 @@
-skipslab exit=0
--DCF_LMAX=4 -DBN_LIMBS=12 -DPIPE_K=16
-verify OK lines: 3
-fillcheck exit=0
-stop run exit=0
-STOPPED:   stopped after 128 q this session (128 total, 14445 relations). Rerun the same command to resume at q=80002567.
-resume exit=0
-stop/resume IDENTICAL (44846)
-done

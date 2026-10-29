@@ -1,6 +1,0 @@
-i13 round 0: sequential 56.358230839 s, concurrent 54.036350605 s, ratio .958, load 2.97
-i14 round 0: sequential 55.265357679 s, concurrent 51.014520224 s, ratio .923, load 3.33
-i13 round 1: sequential 57.244710104 s, concurrent 51.708825124 s, ratio .903, load 2.89
-i14 round 1: sequential 55.359388454 s, concurrent 49.583520619 s, ratio .895, load 2.59
-i13 round 2: sequential 56.200024495 s, concurrent 53.550037731 s, ratio .952, load 2.93
-i14 round 2: sequential 55.251936789 s, concurrent 50.010376115 s, ratio .905, load 3.02

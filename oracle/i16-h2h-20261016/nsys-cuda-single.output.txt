@@ -1,100 +1,0 @@
-=== cuda-sieve bucket-fill benchmark ===
-polynomial /home/kylea/code/cuda-sieve/work/applyprof/nfs.job: algebraic degree 5, skew 2.869e+08
-  job file: rlim 200000000, alim 300000000, lpbr 33, lpba 34, mfbr 64, mfba 96
-  job file: alambda 3.5 -> 98.56 bits (side 1), reported only; the allowance is derived below
-  job file: rlambda 2.4 -> 66.18 bits (side 0), reported only; the allowance is derived below
-grid: 48 SMs x 6 = 288 blocks (dev 0: NVIDIA GeForce RTX 5070, 48 MB L2)
-grid: 4608 x 32 for fill (absolute, not per SM)
-band: generating prime special-q roots on side 1 from 297000000 upward
-  norm setup: deg 5, A=1.1041e+13 B=3.2768e+04, log2(maxnorm)=213.20, scale=1.000  (sq side: log2(q) divided out)
-  normalised coeffs d[0..5] = -0.00853 -0.332 -0.145 1 0.0178 -0.184
-  norm setup: deg 1, A=1.1041e+13 B=3.2768e+04, log2(maxnorm)=144.96, scale=1.000
-  normalised coeffs d[0..1] = -1 6.85e-08
-params from q=297000071: side 1 log2(maxnorm)=213.20 scale=1.175 allowance=97.70 bound=115
-                    side 0 log2(maxnorm)=144.96 scale=1.750 allowance=65.50 bound=115
-text factor base /home/kylea/code/cuda-sieve/work/applyprof/nfs.roots1.m16: 16257542 ideals (16257330 prime, 212 prime-power) at scale 1.175
-rational factor base: 11079030 ideals up to 200000000 (93 prime-power of which 0 projective, 4 projective primes) at scale 1.750
-
-side 1 (algebraic): bucketed 65536 <= p < 300000000 : 16250718 entries, line-sieved 6824
-side 0 (rational) : bucketed 65536 <= p < 200000000 : 11072395 entries, line-sieved 6635
-  j-slabbing: 4 slabs, up to 8192 rows/slab (auto target 32768 bucket regions at --region 14; safety bounds may reduce it further)
-
-=== pipeline: both sides in one process, streaming special-q ===
-  bucket array 32768 x 10900 x 4 B = 1.33 GB, shared by both sides (10.75 GB free)
-  large-prime list 16 records per survivor (PIPE_K)
-  device memory by stage:
-    bucket array                   1.33 GB   (9.41 GB free)
-    factor bases + bitmaps         1.41 GB   (8.01 GB free)
-    trial division context         0.10 GB   (7.91 GB free)
-  cofactor width: side 0 3 limbs (96 bits), side 1 3 limbs (96 bits); this build carries 3..4
-  cofactor queue: ECM B1 = 300, 62 prime powers, B2 = 9000 (291 giant steps), 12 curves per round
-  cofactor method: side 0 rho, side 1 ECM
-    cofactor queue                 0.15 GB   (7.76 GB free)
-  --fill-gate: side 0 stores fill records only under side 1's survivors, 1 gate bit per 8 positions
-  norm setup: deg 5, A=1.1041e+13 B=3.2768e+04, log2(maxnorm)=213.20, scale=1.175  (sq side: log2(q) divided out)
-  normalised coeffs d[0..5] = -0.00853 -0.332 -0.145 1 0.0178 -0.184
-  norm setup: deg 1, A=1.1041e+13 B=3.2768e+04, log2(maxnorm)=144.96, scale=1.750
-  normalised coeffs d[0..1] = -1 6.85e-08
-
-  --- first-q validation (excluded from the band timing) ---
-    side 1: factors x cofactor == norm  9102 of 9102  PASS   (most factors 37 of 64)
-    side 0: factors x cofactor == norm  3991 of 3991  PASS   (most factors 20 of 64)
-  --- validation took 14.7 ms ---
-
-  cofactor chunk: 73728 records/launch, 2 launches per round over 130826 records (auto)
-    q=297001399  80 q  3390 rel +92706 cand  [--nq 80 reached]
-
-  device memory, steady state: 4.18 GB in use of 11.91 GB (7.74 GB free)
-
-
-  --- band of 80 special-q ---
-  (first-q reconstruction gate: 14.7 ms, excluded below)
-  wall clock per q                     220.58 ms
-    sieve, both sides                  136.85 ms
-      transform + plattice              7.399 ms
-      fill                             52.478 ms
-      apply                            76.977 ms
-    intersect + gcd                     1.596 ms
-    host per-q (sieve tables, staging)    2.125 ms
-    TD + classify, wall                 50.64 ms   <- of which, on the device:
-      rank scan (shared)                0.818 ms
-      emit (x,a,b), rank order (shared)    0.662 ms
-      survivor filter (shared)          1.120 ms
-      resieve + scatter, both sides    33.578 ms
-      norms + trial division, both sides    7.978 ms
-      classify, both sides              1.120 ms
-      joint accept + compact            0.058 ms
-      record candidate factorisations    0.933 ms
-      = device total                   46.267 ms
-      host: small-prime tables          1.738 ms
-      host: readback of candidates      0.000 ms
-      host: unaccounted                 2.635 ms
-    join and emit                        0.00 ms
-    cofactorisation, in-loop flushes    19.00 ms
-    unaccounted                         10.36 ms
-  GPU-accounted / wall (excl cofac)     0.916
-  two-sided primitive survivors/q    110486.2
-  cofactorisation candidates/q        2784.12
-  COMPLETE RELATIONS/q                 10.025
-  total relations                         802
-  total candidates                     222730
-
-  --- cofactorisation, cross-q queue ---
-  rational queue                         8.43 ms
-  algebraic queue                       23.25 ms
-  readback + emit of relations          0.018 ms
-    = device time per q                 31.70 ms
-  wall: in-loop flushes                 19.00 ms
-  wall: final flush after the band      15.13 ms
-  records enqueued                     223532  (of which 802 needed no splitting)
-    side 0: split / dead / stuck       183655 / 39877 / 0
-    side 1: split / dead / stuck         6102 / 177802 / 39628
-  ALL RELATIONS/q                       72.49
-    of which, from cofactorisation      62.46
-  total relations                        5799
-  wall clock per q, COMPLETE           235.71 ms
-Collecting data...
-Generating '/tmp/nsys-kylea/nsys-report-3417.qdstrm'
-[1/1] [0%                          ] cuda-single.nsys-rep[1/1] [0%                          ] cuda-single.nsys-rep[1/1] [1%                          ] cuda-single.nsys-rep[1/1] [2%                          ] cuda-single.nsys-rep[1/1] [5%                          ] cuda-single.nsys-rep[1/1] [6%                          ] cuda-single.nsys-rep[1/1] [10%                         ] cuda-single.nsys-rep[1/1] [13%                         ] cuda-single.nsys-rep[1/1] [=16%                        ] cuda-single.nsys-rep[1/1] [==19%                       ] cuda-single.nsys-rep[1/1] [==20%                       ] cuda-single.nsys-rep[1/1] [======================92%   ] cuda-single.nsys-rep[1/1] [=======================96%  ] cuda-single.nsys-rep[1/1] [========================98% ] cuda-single.nsys-rep[1/1] [========================100%] cuda-single.nsys-rep[1/1] [========================100%] cuda-single.nsys-rep
-Generated:
-	/home/kylea/code/cuda-sieve/work/nsys-i16-20261016/cuda-single.nsys-rep

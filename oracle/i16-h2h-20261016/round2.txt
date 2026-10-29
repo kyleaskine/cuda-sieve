@@ -1,4 +1,0 @@
-c1: Total 23294 reports [0.002904s/r, 70.80r/sq] in 67.65 elapsed s [617.4% CPU] | elapsed_s=62.14 user_s=374.86 system_s=43.36 | sm=2907 MHz power=173 W | load=20.00
-q1: rel=23497  wall clock per q, COMPLETE 220.55 ms | elapsed_s=76.37 user_s=73.46 system_s=1.52 | sm=2877 MHz power=224 W | load=13.44
-c2: Total 23293 reports [0.002751s/r, 70.80r/sq] in 64.08 elapsed s [593.6% CPU] | elapsed_s=60.53 user_s=350.02 system_s=30.87 | sm=2911 MHz power=179 W | load=22.14
-q2: rel=23497  wall clock per q, COMPLETE 219.89 ms | elapsed_s=74.37 user_s=73.60 system_s=1.54 | sm=2877 MHz power=225 W | load=14.72

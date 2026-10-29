@@ -1,5 +1,0 @@
-# CALL.REL (ss_first 64-bit remainder) executions in k_apply, NFS@Home I16 job, q index 3 slab 0,
-# ncu --section SourceCounters, thread-instructions. Hoist build (before): 66,322,432 alg /
-# 65,601,536 rat (~2.1M warp executions per launch). Landed SSTAIL build:
-landed alg 0
-landed rat 0

@@ -1,6 +1,0 @@
-base r1 rc=0 7.06 ms  td-prep  load=14.52
-auto r1 rc=0 7.26 ms  td-prep 1226 load=14.63
-base r2 rc=0 6.64 ms  td-prep  load=14.97
-auto r2 rc=0 7.30 ms  td-prep 1263 load=14.76
-base r3 rc=0 6.66 ms  td-prep  load=15.54
-auto r3 rc=0 6.42 ms  td-prep 1074 load=15.10

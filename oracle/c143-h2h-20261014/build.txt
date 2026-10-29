@@ -1,2 +1,0 @@
-3e79628 (bench/bench built 2026-10-14 12:46 from the source committed at 13:11; findings 110-111)
-cado-gpu: cado-nfs-public b5ca9c4fd3e331edc8978f93830f8de1e8dda70c with local build/launcher changes (as finding 105)

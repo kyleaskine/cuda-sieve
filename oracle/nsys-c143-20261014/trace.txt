@@ -1,9 +1,0 @@
-cuda i13 qp: exit=0  wall clock per q, COMPLETE 7.67 ms load=9.55
-cuda i13 single: exit=0  wall clock per q, COMPLETE 9.53 ms load=9.77
-cado slots8: exit=0 # Total 137087 reports [0.000044s/r, 154.73r/sq] in 6.01 elapsed s [438.0% CPU] load=10.60
-cado slot1: exit=0 # Total 137087 reports [0.000050s/r, 154.73r/sq] in 6.87 elapsed s [185.0% CPU] load=10.98
-exported cado-slot1.nsys-rep: 0
-exported cado-slots8.nsys-rep: 0
-exported cuda-i13-qp.nsys-rep: 0
-exported cuda-i13-single.nsys-rep: 0
-done

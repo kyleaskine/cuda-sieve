@@ -1,4 +1,0 @@
-base  wall clock per q, COMPLETE 246.92 ms load=15.02
-landed  wall clock per q, COMPLETE 244.10 ms load=15.22
-landed  wall clock per q, COMPLETE 242.23 ms load=15.22
-base  wall clock per q, COMPLETE 246.74 ms load=15.30
