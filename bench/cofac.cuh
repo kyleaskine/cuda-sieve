@@ -1593,7 +1593,12 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
  * resident, only the ~2% of records that become relations are ever read back.
  */
 
+/* Overridable only for tests (DEFS, a pricing build): a smaller queue fills
+ * mid-band, so qhgate.sh reaches the slabs whose k_cof_enqueue waits for the
+ * host's count because the queue lacks room for their bound. */
+#ifndef CQ_FLUSH
 #define CQ_FLUSH  131072u        /* candidates per flush, ~67 special-q */
+#endif
 
 /* ---- auto chunk sizing -------------------------------------------------- *
  *
@@ -1926,9 +1931,13 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
                               const uint32_t *__restrict f0, const uint32_t *__restrict fn0,
                               const uint32_t *__restrict f1, const uint32_t *__restrict fn1,
                               uint32_t n, uint32_t base, uint32_t lpb0, uint32_t lpb1,
-                              cofq_t Q)
+                              cofq_t Q, const uint32_t *__restrict dn)
 {
     const uint64_t stride = bench_grid_stride_x();
+    /* dn: TD's device count (k_scatter_sel's spec), when this was queued
+     * before the host read it; n is then the bound the caller checked
+     * against the queue's room */
+    if (dn) n = min(n, *dn);
     for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
         const uint32_t t = (uint32_t)tt;
         const uint32_t d = base + t;
@@ -2001,14 +2010,15 @@ static int cof_enqueue(int blocks, int threads,
                        const uint32_t *f0, const uint32_t *fn0,
                        const uint32_t *f1, const uint32_t *fn1,
                        uint32_t n, uint32_t base, uint32_t lpb0, uint32_t lpb1,
-                       const cofq_t *Q)
+                       const cofq_t *Q, const uint32_t *dn = NULL)
 {
 #define CF_ENQ(A, B) do {                                                     \
         k_cof_enqueue<A, B><<<blocks, threads>>>(cof0, bits0, cof1, bits1,    \
                                                  a, b, f0, fn0, f1, fn1,      \
-                                                 n, base, lpb0, lpb1, *Q);    \
-        /* checked here: the caller's next CUDA call is the record pass's     \
-         * owed wait, which would otherwise report this launch as its own */  \
+                                                 n, base, lpb0, lpb1, *Q, dn);\
+        /* checked here, or the caller's next CUDA call -- the record pass's  \
+         * owed wait, or TD's under --q-pipeline -- would report this launch \
+         * as its own */                                                      \
         return CUDA_CHECKED(cudaGetLastError()) ? -1 : 0;                     \
     } while (0)
     switch (Q->L0 * 8 + Q->L1) {
@@ -2357,6 +2367,78 @@ static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
     cf_emit_sorted(o, v, n);
 }
 
+/* TEST-ONLY (0 everywhere else): each flush prints one stderr line hashing
+ * what k_cof_enqueue put in the queue, so a gate can compare TD's record pass
+ * and enqueue queued ahead of the counter readback (finding 135) against the
+ * host-counted path. With speculation on, no candidate file is written, so
+ * relations were the only check of that path, and they cannot see a lost or
+ * stale candidate that splits into no relation. Hashed per slot: a, b, the
+ * status, the in-lpb residual or the limbs to split, and the factor lists
+ * sorted (cf_emit_sorted sorts them at output, so their order is not part of
+ * the result). Set through DEFS, so a build that sets it is marked a pricing
+ * build. */
+#ifndef COFQ_TEST_HASH
+#define COFQ_TEST_HASH 0
+#endif
+
+#if COFQ_TEST_HASH
+static int cofq_test_hash(const cofq_t *Q, uint32_t n)
+{
+    int64_t *a = (int64_t *)malloc((size_t)n * 8), *b = (int64_t *)malloc((size_t)n * 8);
+    uint8_t *st[2] = {(uint8_t *)malloc(n), (uint8_t *)malloc(n)};
+    uint8_t *fn[2] = {(uint8_t *)malloc(n), (uint8_t *)malloc(n)};
+    uint64_t *sm[2] = {(uint64_t *)malloc((size_t)n * 8), (uint64_t *)malloc((size_t)n * 8)};
+    uint32_t *f[2] = {(uint32_t *)malloc((size_t)n * TD_FMAX * 4),
+                      (uint32_t *)malloc((size_t)n * TD_FMAX * 4)};
+    uint32_t *c[2] = {(uint32_t *)malloc((size_t)n * Q->L0 * 4),
+                      (uint32_t *)malloc((size_t)n * Q->L1 * 4)};
+    const int L[2] = {Q->L0, Q->L1};
+    uint64_t h = 1469598103934665603ull;
+    int rc = -1;
+    auto mix = [&](const void *p, size_t len) {
+        for (size_t i = 0; i < len; i++) { h ^= ((const uint8_t *)p)[i]; h *= 1099511628211ull; }
+    };
+    if (!a || !b || !st[0] || !st[1] || !fn[0] || !fn[1] || !sm[0] || !sm[1] ||
+        !f[0] || !f[1] || !c[0] || !c[1]) { fprintf(stderr, "  tb_qh: out of memory\n"); goto out; }
+    if (CUDA_CHECKED(cudaDeviceSynchronize()) ||
+        CUDA_CHECKED(cudaMemcpy(a, Q->d_a, (size_t)n * 8, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(b, Q->d_b, (size_t)n * 8, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(st[0], Q->d_st0, n, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(st[1], Q->d_st1, n, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(fn[0], Q->d_fn0, n, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(fn[1], Q->d_fn1, n, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(sm[0], Q->d_sm0, (size_t)n * 8, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(sm[1], Q->d_sm1, (size_t)n * 8, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(f[0], Q->d_f0, (size_t)n * TD_FMAX * 4, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(f[1], Q->d_f1, (size_t)n * TD_FMAX * 4, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(c[0], Q->d_c0, (size_t)n * Q->L0 * 4, cudaMemcpyDeviceToHost)) ||
+        CUDA_CHECKED(cudaMemcpy(c[1], Q->d_c1, (size_t)n * Q->L1 * 4, cudaMemcpyDeviceToHost)))
+        goto out;
+    for (uint32_t d = 0; d < n; d++) {
+        mix(&a[d], 8); mix(&b[d], 8);
+        for (int s = 0; s < 2; s++) {
+            uint32_t v[TD_FMAX];
+            const int k = fn[s][d] < TD_FMAX ? fn[s][d] : TD_FMAX;
+            for (int i = 0; i < k; i++) {        /* insertion sort, k <= TD_FMAX */
+                uint32_t x = f[s][(size_t)d * TD_FMAX + i];
+                int j = i;
+                for (; j > 0 && v[j - 1] > x; j--) v[j] = v[j - 1];
+                v[j] = x;
+            }
+            mix(&st[s][d], 1); mix(&fn[s][d], 1); mix(v, (size_t)k * 4);
+            if (st[s][d] == CF_OK) mix(&sm[s][d], 8);
+            else mix(&c[s][(size_t)d * L[s]], (size_t)L[s] * 4);
+        }
+    }
+    fprintf(stderr, "  tb_qh: flush n=%u hash=%016llx\n", n, (unsigned long long)h);
+    rc = 0;
+out:
+    free(a); free(b);
+    for (int s = 0; s < 2; s++) { free(st[s]); free(fn[s]); free(sm[s]); free(f[s]); free(c[s]); }
+    return rc;
+}
+#endif
+
 /* Split everything queued, then write only the relations. */
 static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                       uint64_t lim1, uint32_t lpb1, int rounds, uint32_t budget,
@@ -2372,6 +2454,9 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     double h0;
     int rc = -1;
     if (!n) return 0;
+#if COFQ_TEST_HASH
+    if (cofq_test_hash(Q, n)) return -1;
+#endif
 #define COF_FLUSH_CK(x) do { if (CUDA_CHECKED(x)) goto done; } while (0)
     /* lim^2 is computed inside cf_run_rounds_dyn now, at the side's own width.
      * It used to be built here at a fixed 3 limbs, which was already the fix

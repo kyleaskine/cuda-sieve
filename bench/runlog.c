@@ -59,7 +59,7 @@ const char *runlog_build_defs(void) { return BENCH_DEFS; }
 
 /* ---- open / close ------------------------------------------------------ */
 
-/* CLOCK_MONOTONIC, not the wall clock the timestamps use: NTP steps and DST
+/* The monotonic clock, not the wall clock the timestamps use: NTP steps and DST
  * both move the wall clock, and a backwards step would stall the heartbeat for
  * the length of the step on a run that is otherwise healthy. */
 static double runlog_now_ms(void)

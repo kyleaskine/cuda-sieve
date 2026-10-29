@@ -14879,9 +14879,8 @@ round: exactly the allocations (`--no-row-cap`'s full uniform index is
 make), the new arm in none (8.20 every round). It is not one of the
 program's allocations: a flat and a grown base run print the same output
 but for timings (the same plan, survivors and relations, so the same
-trial-division buffers), and no kernel has more than 576 B of stack. It
-looks like something below the program (the driver under WSL) and
-pressure-dependent: free memory after setup was 3.73 GB new, 3.51 base,
+trial-division buffers), and no kernel has more than 576 B of stack. Its
+cause is not identified; it may depend on memory pressure: free memory after setup was 3.73 GB new, 3.51 base,
 2.81 `--no-row-cap`. Finding 128's full-index arm read +1.65 GB, this
 +0.94 on top of its index. On a quiet CPU (the landed form's timing,
 below) none of 12 pipelined 2,1147+ runs took it, HEAD's four included:
@@ -15077,3 +15076,861 @@ run-log notes in three arms with identical relations (`revchk/`). Installed
 `treegate.sh` (abcheck 36 of 36, 2,1147+ identical with 48 of 48 from
 records) and `make check` 119 in the tree. No change reaches a kernel or
 the layout of a plan that fits, so the timing above stands.
+
+## Finding 133 — the guest's monotonic clock runs 5.5% fast against both Windows time and the card's own timer, so bench's absolute ms/q and rel/s read ~5% slow, while no ratio between two runs on this host changes. At c135 cado-gpu is now 1.26x ours at equal yield (1.37x in finding 124), and our card idles 8.4% of the time (16.6% in finding 122). That idle is mostly two latencies: a kernel already queued behind another stream's event starts 43.6 µs (median) after it, against 2.7 µs on its own stream (3.1% of wall), and a kernel launched onto an idle card starts 50-61 µs after the card went idle (4.0%). A micro-test on an idle card puts the first on the platform: any cross-stream event wait costs ~51 µs here, a same-stream handoff 3.5 µs, and a host sync-then-launch ~30 µs. TD's survivor-count readback costs 0.12%. CADO's small-prime skip, worth 1.13x per relation in finding 124, read 0.99x in this session's one run
+
+**Date:** 2026-10-27. The runs were at 15:45-16:00 on a quiet host (load
+1.4-6.7, mostly cado-gpu's own host threads), with the card free and the
+client off. The traces were analysed in the evening from their saved
+exports. Ours: `b247b432` (finding 132's landed form before its review; the
+review changed no kernel). cado-gpu (`las-glas`) as in findings 122 and
+124. Runs alternated. Relations are raw, not deduplicated. Evidence in
+`work/h2h-c135-20261027/`: `run.sh`, `run.txt`, both traces with
+`*.analyze.txt` and `*.gaps.txt`, `latency.py` / `latency.txt`,
+`gapmap.py` / `gapmap.txt`, and `clk.cu`.
+
+### The clock
+
+- **CLOCK_MONOTONIC runs fast.** The guest uses `clocksource tsc`,
+  calibrated at 4691.057 MHz. Against Windows time, read through
+  PowerShell (`[DateTime]::UtcNow.Ticks`) on either side of a 45 s sleep,
+  it ran 1.0545 with the host loaded and 1.0566 quiet. Against the card's
+  event timer over 40 s (`clk.cu`) it ran 1.0548. The events' 37.92 s
+  agree with Windows time's 38.14 s once the ~0.2 s that each PowerShell
+  call takes is removed.
+- **CLOCK_REALTIME is stepped toward Windows time**
+  (`hv_utils.timesync_implicit=1`). It is right on average and wrong over
+  seconds: over 45 s it read 0.9805 and 1.0169 of Windows time. The
+  Windows time service is not running (`w32tm`: "The service has not been
+  started").
+- **`hyperv_clocksource_tsc_page` is available but not selected.**
+  Switching to it takes root; left alone (Kyle's call).
+- **What the clock touches.** Bench's wall (`host_ms`,
+  `bench_monotonic_ms`) reads the fast clock: ms/q, rel/s, ETA, and the run
+  log's `+Ns`. Stage times read the card's events.
+  - A ratio between two runs on this host is unchanged. That covers every
+    comparison of our builds, and every head-to-head that timed both
+    programs on one clock.
+  - Absolute ms/q and rel/s are ~5.2% pessimistic.
+  - `unaccounted` and GPU-accounted / wall: wall is long and the stage sums
+    are not. About 0.23 ms of C135's 0.32-0.37 ms of single-queued
+    `unaccounted` is the clock (finding 132's `timing2c135/`, wall
+    4.29-4.45 ms/q). Earlier findings that read `unaccounted` as host time
+    over-read it by ~5% of wall.
+  - It was there on 2026-10-20 too. In finding 124 the two-ahead build ran
+    6,456 q at 3.64-3.66 ms/q, which is ~24.1 s on bench's clock with ~0.6 s
+    of setup. `/usr/bin/time`, which reads the stepped realtime clock,
+    reported 23.26, 23.03 and 24.23 s for the same runs.
+
+### c135 against cado-gpu, equal yield
+
+CADO's workunit [7,000,000, 7,100,000), 6,456 special-q. cado-gpu ran with
+`GLAS_SKIP_BOUND=0`; ours with `--pipeline --cofactor` as in finding 124.
+
+| | cado-gpu, skip off (3 runs) | ours, `b247b432` (3 runs) | cado-gpu / ours |
+|---|---:|---:|---:|
+| wall, Windows time (median) | 16.28 s | 20.89 s | |
+| wall, bench's clock (median) | 17.04 s | 21.87 s | |
+| relations | 592,535 | 603,124 | |
+| relations per second, Windows time | 36.4K | 28.9K | **1.26x** |
+| | skip on (its default, 1 run): 462,878 in 12.81 s, 36.1K/s | | |
+
+- **The gap went from 1.37x to 1.26x.** Ours went from 3.64-3.66 to
+  3.27-3.30 ms/q on bench's clock (−10%), through findings 125-132.
+  cado-gpu's skip-off runs went from 16.68 to 17.04 s (+2%) on the same
+  clock.
+- **Relations: 603,124, against 603,136 on 2026-10-20.** That is −12, from
+  the ECM effort cut of findings 125-127, which allowed up to 0.5%; this
+  is 0.002%.
+- Every run exited 0.
+
+### CADO's skip at c135
+
+With the skip on, cado-gpu made 36.1K rel/s against 36.4K off: 0.99x per
+relation, while losing 21.9% of the relations per q. Finding 124 read
+40.0K/s on (11.57 s), 1.13x. Almost all of the change is the skip-on run:
+11.57 -> 13.37 s on bench's clock (+16%), against +2% skip off. That is
+one run each way, both days, so it is not settled. Finding 124 noted that
+the skip-on mode keeps ~8.6 host cores busy, and that cado-gpu slowed under
+ECM load in finding 121 (13.99 s against 12.5 quiet). This run's load
+readings (5.2-6.7 before it) are mostly cado-gpu's own threads from the
+runs before it, so they neither show contention nor rule it out. Either
+way, this moves only the comparison with CADO. It says nothing about what
+a skip would buy our apply, whose tiniest moduli findings 129 and 131 have
+already made cheaper. Next: three interleaved on/off pairs on a quiet
+host.
+
+### The C148 (`work/AS3373380-2684/`)
+
+Kyle's C148 aliquot job: I14, lpb 30/29, run on 2026-10-25 from commit
+`3ca7fc7-dirty`. It found 65,040,215 relations in `+4418s` on bench's
+clock (11.52 ms/q, 14.7K rel/s). Its realtime stamps run from 15:12:23 to
+16:22:56, 4,233 s (15.4K rel/s). Each of its 300 s log windows is 287 s
+apart by the stamps, a rate of 1.045 against today's 1.055; the stamps are
+stepped, ±1 s each. So the run took 4,190-4,233 s, at 15.4-15.5K rel/s.
+
+Replay of the log's first window with `b247b432`, q from 10,000,000 for
+26,275 q: 11.53 ms/q against the log's 11.42, both on bench's clock.
+4,795,728 relations in 288.6 s of Windows time, 16.6K rel/s. That is one
+run each, on different days and builds: no change that one run can show.
+
+### The traces
+
+nsys, CUDA only, q in [7,000,000, 7,020,000), ~1,290 q. Finding 113's
+`analyze.py` and `gaps.py` read the middle 80% of launches (3.16 s, 1,016
+q for ours).
+
+| | ours, 2026-10-20 (finding 122) | ours, now | cado-gpu, now |
+|---|---:|---:|---:|
+| card idle | 16.6% | 8.4% | 0% |
+| summed kernel time / busy time | 1.19x | 1.38x | 2.25x |
+| fill overlapped with other kernels | 32% | 51% (`k_fill_atomic`) | 95% (`fill_ahead_kernel`) |
+| apply / region overlapped | 8% | 16% | 37% |
+
+Fill ahead (finding 123) took most of the idle: 16.6-20.8% -> 9.5% then.
+
+### Where the 8.4% goes (`latency.py`, `gapmap.py`)
+
+Each idle gap is classed by how its next kernel got there. It was either
+queued (its launch call had returned before the card went idle) or
+launched late (after the card went idle). Separately, the kernel that
+ended last was either on the same stream or on another one.
+
+| next kernel | gaps | median gap | share of wall |
+|---|---:|---:|---:|
+| queued, same stream | 8,551 | 2.7 µs | 1.2% |
+| queued behind another stream's event | 2,206 | 43.6 µs | 3.1% |
+| launched late, same stream | 1,472 | 60.9 µs | 3.4% |
+| launched late, other stream | 266 | 50.4 µs | 0.6% |
+
+- **A cross-stream wait costs ~44 µs, 16 times a same-stream handoff**,
+  even with the work queued long before. `k_gate_fold` was launched a
+  median 698 µs before it ran. The events are already
+  `cudaEventDisableTiming`. The micro-test below shows it is the platform,
+  not how we wait.
+- **A late launch costs more than its calls.** In one sampled q,
+  `k_group_counts` started 75 µs after its launch call. It and the three
+  launches after it had all returned before the card idled for 15.6 µs
+  between two other kernels. It started 25 µs after the host's next
+  `cudaStreamSynchronize`. That looked like launches being held until a
+  flush, as under WDDM. The micro-test rules that out, so this sample is
+  unexplained.
+
+The four largest pairs:
+
+1. **`k_cof_enqueue -> k_intersect_compact`** (1.9% of wall, 909 gaps,
+   mean 67.5 µs). Every one is a late launch. The host first pays the TD
+   record join, an event wait while the card is busy, then a legacy-stream
+   sync. Then it makes two synchronous `cudaMemset` calls (`d_n`, `d_pre`,
+   `pipeline.cuh:4015`), records `ea`, and launches. Of the mean gap,
+   ~14 µs is the memsets, ~4 µs the event, ~3 µs host code, and ~45 µs runs
+   from the launch call to the kernel's start.
+2. **`k_record_scan -> k_gate_fold`** (1.6%, 959 gaps, 54.2 µs). Every one
+   is queued. `st_sv` waits on `eisect`, which is recorded after the record
+   scan (`issue_behind_isect`), and the next sieve starts ~54 µs after the
+   scan ends.
+3. **`k_intersect_compact -> k_apply`** (1.6%, 953 gaps, 52.9 µs). 85%
+   are queued: the next q's side-1 apply, issued early under
+   `--fill-ahead`, waits on `eb`, which is recorded after the
+   intersection.
+4. **`k_scatter_sel -> k_gather_ab`** (1.2%, 507 gaps, 72.2 µs). Every one
+   is a late launch. The host waits (`cudaStreamSynchronize`) for TD's
+   accepted count, then records an event and launches `k_gather_ab`. Of
+   the mean gap, ~10 µs is the wait's return, ~14 µs the event, ~6 µs host
+   code, and ~42 µs the launch call to the kernel's start.
+
+So 3.1% of wall is cross-stream waits and 4.0% is late launches. The other
+1.2% is 2.7 µs same-stream handoffs, which is the floor.
+
+**TD's survivor-count readback is not a gap.** An outside review proposed
+passing the intersection's count into `pipe_td_perq` instead of reading
+the rank scan's back (`pipeline.cuh:1784`). Across 1,016 slabs, the time
+from the rank scan's last kernel to `k_emit_ranked` has a median of
+171 µs, but the card idles for only 3.6 µs of it on average: 3.68 ms in
+all, 0.12% of wall, because other streams' work runs through it. The
+change is worth making only if the wait makes the host late for one of
+the gaps above. If it is made, moving the consistency check (`:4280`)
+later must cover every kernel that indexes by rank, not only the emit,
+which already bounds its writes. `k_resieve_scatter` indexes `pcnt`,
+sized n, by `td_rank` (`td.cuh:693`).
+
+### The latency micro-test (`work/launchlat/`)
+
+`lat.cu` runs on an idle card, with `run.sh` refusing to start while
+anything else holds the card or the client runs. It ran 2026-10-27
+21:35, with the card idle and the host CPU loaded (~16, Kyle's ECM
+workers). Each kernel stamps its start and end with `%globaltimer`, the
+card's own clock. A gap is B's start minus A's end, taken as the median of
+400 repetitions; A spins 50 µs (10 µs before a sync) and B 1 µs, as one
+warp. Output: `run.load16.txt`. 0 failed.
+
+| B after A | median | p10-p90 |
+|---|---:|---:|
+| queued, same stream (non-blocking, or legacy) | 3.4-3.6 µs | 2.3-6.5 |
+| queued, another stream waiting on an event after A (non-blocking, legacy -> non-blocking, blocking) | 50.6-51.5 µs | 39.8-57.8 |
+| host syncs on A, then launches B (legacy or non-blocking) | 30.0-30.8 µs | 21.8-56.6 |
+| the same, with 300 µs of host work after B's launch | 31.3-38.0 µs | 24.7-59.5 |
+| the same, with `cudaStreamQuery` after B's launch | 30.9-31.7 µs | 24.1-60.1 |
+
+- **The cross-stream cost is the platform.** It is the same for every
+  stream kind, and matches the trace's 43.6 µs on a quiet host. Windows'
+  hardware-accelerated GPU scheduling is already on (`HwSchMode` = 2).
+- **Launches are not held for a flush.** B starts ~30 µs after A ends
+  whatever the host does next, and `cudaStreamQuery` changes nothing.
+- **So on this host only same-stream order is cheap.** A host round trip
+  (~30 µs) costs less than a GPU-side cross-stream wait (~51 µs). Turning
+  a readback into an event wait makes a gap longer, not shorter.
+
+### Next
+
+1. **Pairs 2 and 3** (3.2% of wall). In both, the next sieve on `st_sv`
+   waits on the legacy stream's intersection and record scan. Running
+   those two on `st_sv` ahead of the sieve makes both handoffs
+   same-stream. TD's inputs must then stay safe from the next slab's
+   intersection and record scan, which would overwrite `d_two` and the
+   pair list: either a second buffer, or a wait on TD's end that is
+   normally satisfied long before it is needed. The host already waits on
+   the intersection's count, so TD's launch needs no new GPU-side wait.
+2. **Pairs 1 and 4** (3.1%). Each is a host round trip with a ~30 µs
+   floor, plus 20-30 µs of calls between the wake-up and the launch. Make
+   the two memsets before the intersection async or fold them into a
+   kernel, cut the event records on that path, and keep `k_gather_ab`'s
+   count on the device.
+3. Closing every late launch and cross-stream gap (7.1% of wall) is worth
+   at most ~1.08x.
+4. **cado-gpu's skip:** three interleaved on/off pairs on a quiet host.
+
+## Finding 134 — fill ahead's early side-1 apply now has the record scan beside it, on a stream of its own at the device's greatest priority, and otherwise the intersection and record scan run on `st_sv` ahead of the next sieve: C135 −1.9% (18 rounds), C143, C148 and C183 −0.7 to −1.5%, plans of several slabs per q unchanged, relations identical; idle at c135 8.2% -> 6.5%. On this host a cross-stream wait costs only when its event is still pending as its stream reaches it. The first form, everything on `st_sv`, gained nothing: the scan lost the overlap it had in the apply's tail. And bench's wall clock was off by a different amount in every run: the WSL guest's CLOCK_MONOTONIC is steered between nominal and 6.6-8.3% fast every few seconds. Bench now reads CLOCK_MONOTONIC_RAW, which matches the card's timer to 1 part in 10,000
+
+**Date:** 2026-10-28, card free, client off, one single-threaded P+1 `ecm`
+on 1 of 16 cores (load 1.9-2.8). sm_120 builds against HEAD's (`b0c486d`)
+sm_120 build `be4b1115`: the first form `414ef993`, the landed form
+`0ab7d2d5`, and with the clock change base `0b2b7de9` and landed
+`189e97c8`. Installed: the tree's fat build `26cca731`. Evidence in
+`work/isect/`: `trace.v1/` and `trace/` (c135, `trace.sh`), `trace143/`,
+`seq.py`, `trans.py`, `stall.py`, `timing.v1.txt`, `timing.v2.txt`,
+`timing.raw.txt`, `timing.raw2.txt` (+ `timing.raw2/clocks.csv`),
+`paired.py`, `clk/` (`clk2.cu`, `ticks.py`), the gate logs; the micro-test
+in `work/launchlat/` (`run.full.txt`).
+
+### The first form: everything on `st_sv`
+
+Finding 133's next step 1 as written. Under `--q-pipeline` the
+intersection (its two memsets now async), the record scan, both copies and
+`eisect` run on `st_sv` behind this slab's sieve and ahead of the next, so
+pairs 2 and 3 hand off in stream order. TD's inputs (`d_two`, the pair
+list) are kept from the next slab's intersection by `etd`, recorded on the
+legacy stream once `pipe_td_perq` has queued TD. Every TD kernel is on that
+stream, and `k_cof_enqueue` after it reads only TD's compacted output.
+`st_sv` waits on `etd` only if the host has not already seen it complete,
+which it almost always has. Single-queued and `--fill-concurrent` are
+unchanged.
+
+It passed every gate and gained nothing. The c135 trace read 3.27 ms/q in
+both arms, and idle went 9.5% -> 9.0%. Timed 6 rounds on the old clock, the
+paired medians were 0.987-1.003 on all seven jobs.
+
+- **The scan lost its overlap.** On HEAD the scan is on the legacy stream,
+  but it does not run beside the early apply: its memset ran a median
+  61 µs after the intersection and the scan itself at 690 µs, as the
+  apply's last blocks drained (the apply's 4,096 blocks are queued
+  first). It filled the apply's tail, 79% overlapped. Queued behind the
+  apply on `st_sv` it had the card to itself: 0% overlapped, 19.9 µs per
+  slab exposed against ~6.5 µs.
+- **The stall moved.** HEAD's pair 2 (~47 µs before the next sieve's
+  16 KiB cursor memset) became a stall after that memset, before the next
+  4 B one. 834 of 1,268 slabs stalled, by a median 42 µs, with no host
+  call between the two memsets, both queued ~660 µs ahead, and the card
+  idle.
+  In exactly those slabs the host's own wait on `eisect` returned late:
+  62 µs after the memset, against 4.7 µs in the others. Neither the copies
+  nor the fill's wait on its transform (complete ~2 ms earlier) nor the
+  timing record reproduces it in isolation (below). Its cause is not
+  identified.
+
+### Pending and completed waits (the micro-test, extended)
+
+`work/launchlat/lat.cu`, an idle card, medians of 400. A spins 50 µs on
+one stream, then B (1 µs) runs on the same stream with the listed work
+between them.
+
+| between A and B | median |
+|---|---:|
+| nothing | 3.1-3.4 µs |
+| a wait on an event another stream completed long before (host-synced or not), or skipped after `cudaEventQuery` | 3.0-3.6 µs |
+| the fill's prologue: that wait, a timing record, a 16 KiB and two 4 B memsets | 7.2-8.7 µs |
+| the trace's whole sequence after the scan: two small D2H copies, two records, the prologue; the host spinning on one record, then submitting to the legacy stream | 15.0 µs |
+| (B on another stream, waiting on an event recorded after A: still pending as it is reached) | 31.6-48.7 µs |
+
+**So a cross-stream wait costs only while its event is pending.** A wait
+on a completed event costs what stream order does. On a busy card that is
+a design rule: a consumer on another stream is free if its producer
+finishes well before the consumer's stream reaches the wait. Same-stream
+order is free always, but it serialises.
+
+### The landed form: the scan beside the early apply
+
+When fill ahead's early side-1 apply is queued on `st_sv` behind the
+intersection (every q but the last of a one-slab plan), the record scan,
+both copies, `ws_free` and `eisect` go on `st_rs` behind `eb`. `st_rs` is
+a non-blocking stream at the device's greatest priority, created with fill
+ahead's other resources. The scan's blocks are dispatched ahead of the
+apply's undispatched ones, so the scan runs at the apply's start, not in
+its tail. `eisect` is then complete long before `st_sv` reaches its wait
+on it at the issue point, so the next sieve does not stall. The host's
+wait returns earlier too. TD's first launch call comes a median 115 µs
+after the intersection ends, against 732 µs, so TD is queued behind the
+apply instead of after it, and its first kernel starts at 668 µs against
+815. Without the early apply (plans of several slabs, or a q not prepared
+ahead), the first form's single-stream order stands.
+
+c135, same session, q in [7,000,000, 7,020,000), the middle 80% of
+launches:
+
+| | HEAD | landed |
+|---|---:|---:|
+| window (1,016 q) | 3.171 s | 3.114 s (−1.8%) |
+| wall per q (bench's old clock) | 3.15 ms | 3.11 ms |
+| card idle | 8.2% | 6.5% |
+| `k_record_scan` overlapped | 79.5% | 99.7% |
+| `k_record_scan -> k_gate_fold` | 1.64% | — |
+| `k_intersect_compact -> k_apply` | 1.55% | 0.82% |
+| `k_scan_pass3 -> k_gate_fold` | — | 0.42% |
+| `k_cof_enqueue -> k_intersect_compact` (late) | 1.82% | 1.97% |
+| `k_scatter_sel -> k_gather_ab` (late) | 1.20% | 1.50% |
+| TD's survivor-count round trip, card idle | 3.6 µs/slab (0.11%) | 18.6 µs/slab (0.61%) |
+
+TD's two round trips cost more now. TD runs where less of the next sieve
+is left to cover them.
+
+C143 (1,000 q from 2,200,000, `trace143/`): idle 5.6% -> 3.8%. Its windows
+(4.719 against 4.212 s) are not comparable: `k_apply` averaged 1,305 µs in
+HEAD's run and 1,194 µs in the landed one, for the same work, so the card
+itself ran faster in the second.
+
+### Bench's clock
+
+Finding 133 measured CLOCK_MONOTONIC 5.5% fast and called ratios between
+runs safe. They are not.
+
+- **The kernel's clock steering toggles.** Sampled once a second
+  (`clk/ticks.py`), adjtimex's `tick` switched every 1-8 s between 10000
+  (nominal at 100 Hz) and 10655, 10807 or 10833 (+6.6 to +8.3%); `freq`
+  between −0.3 and +47 ppm. Over the uptime, CLOCK_MONOTONIC gained
+  13,161 s on CLOCK_MONOTONIC_RAW in 263,714 s (+5.0%).
+- **Against the card, interval by interval** (`clk/clk2.cu`, 6 x 10 s):
+  CLOCK_MONOTONIC ran 1.0525, 1.0562, 1.0713, 1.0534, 1.0525 and 1.0766
+  of the card's event timer. CLOCK_MONOTONIC_RAW ran 1.0000 in every one.
+- **Two time sources are active.** `systemd-timesyncd` syncs to
+  `ntp.ubuntu.com` (offset −1.85 s, jitter 99 ms, poll 32 s), while
+  `hv_utils` steps realtime toward Windows time (finding 133). Which of
+  them writes `tick` was not identified. Choosing one source, or none, is
+  Kyle's call.
+- **What it did to timings.** A run's wall reads 0-8% long depending on
+  where its seconds fall. In the landed form's first timing, on the old
+  clock, C1147 base r4 read 208.3 s against 223-231 s for the other
+  rounds, with its fill and apply at their usual 85.0 and 64.8 ms/q; C135
+  base r5 read 2.89 ms/q against 3.20-3.40. Paired medians of a few rounds
+  absorb much of it, single runs do not, and nothing absorbs it at the 1%
+  level.
+- **The fix.** `bench_monotonic_ms` (`platform.c`) reads
+  CLOCK_MONOTONIC_RAW on Linux and falls back to CLOCK_MONOTONIC. Wall,
+  ms/q, rel/s, ETA, the run log's heartbeat and the watchdog read it. On a
+  host whose clock is not steered this changes nothing measurable (NTP
+  slews at most 500 ppm). Here, C135's base reads 3.115 ms/q against
+  3.29 on the old clock that day (−5.3%).
+
+### Timing
+
+Base `0b2b7de9` against landed `189e97c8`, both on the RAW clock,
+interleaved in rotated order, relations identical in every run, 0 failed:
+
+| job | plan | rounds | landed / base, paired median | landed faster |
+|---|---|---:|---:|---:|
+| C135 | one slab, fill ahead | 18 | 0.981 | 14 of 18 |
+| C143 | one slab, fill ahead | 18 | 0.993 | 12 of 18 |
+| C148 | one slab, fill ahead | 6 | 0.985 | 5 of 6 |
+| C183 | one slab, fill ahead | 6 | 0.986 | 5 of 6 |
+| NFS@Home I16 | 4 slabs | 6 | 1.011 | 2 of 6 |
+| C194 | 4 slabs | 6 | 1.002 | 2 of 6 |
+| 2,1147+ | 4 slabs | 6 | 1.001 | 3 of 6 |
+
+- **The noise is ~±1% per session.** Plans of several slabs run identical
+  code in the first and landed forms (no fill ahead, so neither `st_rs`
+  nor the early path). I16 read 0.989 in the first form's session and
+  1.007 and 1.011 in the landed form's two. C135 read 0.976, 0.979 and
+  0.986 in three sessions.
+- **The card's own speed varies.** In some runs the event-timed fill and
+  apply ran 6-8% slower in proportion: I16 landed r3-r5 and C194 r5 in
+  both arms. In the session logged once a second (`timing.raw2/clocks.csv`)
+  the SM clock held at 2,872-2,940 MHz under load, with one
+  clock-event-reason bit (0x400) set throughout, idle or loaded, and
+  48-71 °C. So it is not SM clock throttling. Its cause is not identified.
+
+### Gates and install
+
+The landed sources, sm_120, 0 failed:
+- `abcheck` 36 of 36;
+- fillcheck, all arms;
+- memcheck, 0 errors and identical relations: C143 fill ahead (633), C194
+  9 slabs (112), c183 5 slabs (93);
+- `make check` 119;
+- 2,1147+ 8 slabs, pipelined and single-queued, identical (368), 48 of 48
+  slabs from records;
+- degradecheck (`PIPE_K=8`) and skipcheck (`BN_LIMBS=4`);
+- grow-fail 5 of 5 identical, with the pair list failing and the scan off
+  from then on, which covers the early path with the scan off.
+
+The first form passed the same set. Installed as `bench/bench`: the tree's
+fat build `26cca731` (no warnings but the 14 minnctapersm). `treegate.sh`:
+abcheck 36 of 36 against HEAD's sm_120 build; 2,1147+ pipelined and
+single-queued identical (368); `make check` in the tree, binary unchanged.
+The binary it replaced, `3ea5e9be`, is kept as
+`work/isect/bench.installed.prev`.
+
+### Next
+
+1. **Pair 1** (`k_cof_enqueue -> k_intersect_compact`, 1.97% at c135), a
+   late launch. The host issues the next slab's intersection only after
+   issuing TD and joining the next sieve. To queue it on `st_sv` behind
+   that sieve, `d_two` needs either a second buffer (4 MiB at c135,
+   256 MiB at I16, so only where memory allows) or the `etd` wait while TD
+   is still pending (~35-50 µs, still less than the ~65 µs paid now). The
+   join's skip decisions come after it, but an intersection of a slab
+   that is then skipped is never read.
+2. **TD's two round trips**: the accepted count (pair 4, 1.50%), and the
+   survivor count, now 0.61% against 0.11%. Finding 133's outside review
+   proposed passing the intersection's count to `pipe_td_perq` instead of
+   reading the rank scan's. That is now worth doing, with the check moved
+   past every kernel that indexes by rank (`td.cuh:693`).
+3. **The slow-card runs**: a 6-8% kernel slowdown that lasts a run or
+   several, with the SM clock steady. Log the memory clock and the Windows
+   side's GPU load next to a timing.
+4. **cado-gpu's skip:** three interleaved on/off pairs (finding 133).
+
+## Finding 135 — TD's tail no longer holds the card: the record pass's wait and the enqueue's drain are left owed to the next slab, so its intersection runs beside them, and the record pass and enqueue are queued ahead of TD's counter readback on a count the device gates exactly as the host would. C135 −2.9% (18 of 18 rounds faster), C143 −1.1%, C148 and 2,1147+ −0.9%, C183, C194 and I16 within ±0.3%; relations identical; idle at c135 6.7% -> 3.6% under trace. A ~35 µs hold before the first record kernel is left; no isolated shape reproduces it
+
+**Date:** 2026-10-28, card free, client off, one single-threaded P+1 `ecm`
+on 1 of 16 cores (load 1.3-2.7). sm_120 builds against finding 134's
+sm_120 build `189e97c8` (`bench.v2raw`, the installed sources): fix A alone
+`a00ac36c`, A and B `6355f7b3`, and the final form `a9399a83` (adds an
+exact `d_sm_next` guard and a test hook, neither on the path the first two
+timings ran). Installed: the tree's fat build `0789a8cb`. Evidence in `work/tdtail/`: `NOTES.md`, `trace.A/`,
+`trace.B/` (c135, `trace.sh`), `trace143.C/` (`trace143.sh`), `hostseq.py`,
+`cycle.py`, `qdelay.py`, `flush.py`, `trigger.py`, `after_call.py`,
+`timing.txt` (A), `timing.AB.txt`, `timing.all.txt`, `timing.183.txt`,
+`trace183/`, the gate logs; the
+micro-tests in `work/launchlat/` (`lat2.cu`-`lat7.cu`, `run2.txt`-`run7.txt`).
+
+### What finding 134 left
+
+Its c135 trace (6.5% idle) had two late launches at the top, both in TD's
+tail: `k_cof_enqueue -> k_intersect_compact` 1.97% and `k_scatter_sel ->
+k_gather_ab` 1.50%. C143's had the same two at 1.2% and 1.1%.
+
+- **Pair 1 is the host, not a cross-stream wait.** `hostseq.py`: after
+  queueing the record pass, `k_cand_stats` and `k_cof_enqueue`, the host
+  waited ~57 µs in `cudaEventSynchronize(ev[13])` for the record pass and
+  ~11 µs in `cudaStreamSynchronize(0)` for the enqueue. Only then did it
+  run the loop top, the next slab's join (four event syncs, its sieve long
+  done), the `etd` query (done: no wait queued), two memsets, a record and
+  the launch, and the kernel took ~20 µs more to start. The card idled
+  from the enqueue's end through all of it.
+- **Pair 2 is TD's counter readback.** The host waits for the counter
+  block (flags, accepted count, overflow), then queues the record pass.
+  ~44 µs of the ~72 µs gap is from the launch call to the kernel's start:
+  a kernel launched onto an idle card on this host (finding 133: ~30 µs).
+
+### Fix A: the record pass's wait and the enqueue's drain left owed
+
+Under `--q-pipeline` the caller no longer pays `pipe_td_record_join` or
+drains the legacy stream after `k_cof_enqueue`. The next slab's
+`pipe_td_perq` pays the record wait first, before `ev[12]`/`ev[13]` are
+recorded again; its phase 1 wait drains the enqueue, before
+`pipe_td_grow` could free anything either reads. A flush, in the slab or
+at the loop top, runs behind both on the legacy stream. The band's end
+pays the last one before the summary. A fault in either now surfaces in a
+later call and still ends the band. Single-queued is unchanged.
+
+Two things the drain used to cover, and now don't:
+- **`etd`** was recorded after TD returned, so it also covered the record
+  pass, which reads neither `d_two` nor the pair list. `pipe_td_perq` now
+  records it (`two_free`) behind the last kernel that does read them:
+  behind phase 1, and again behind side 0's resieve or pair append. It has
+  completed by the time TD returns, so the next intersection's wait is
+  still never queued.
+- **The TD small-prime tables.** With one slab per q, the next q's tables
+  are uploaded into the spare set (`pipe_td_prepare_next`), and since the
+  loop top's swap that set is the one an owed record pass may still be
+  reading. On the legacy stream the uploads queue behind it. On `st_sv`
+  they now wait on `ev[13]`, but only when that swap happened while a
+  record pass was owed (`rec_swapped`).
+
+c135, same session (`trace.A/`): idle 7.7% -> 6.6%, wall under trace 3.02 ->
+2.99 ms/q; pair 1 1.8% (775 gaps) -> 0.5% (228). In most of the 228 left,
+the intersection was launched before the card went idle, but it waited for
+room behind `st_fa`'s `k_fill_atomic`, or for its own memsets (below).
+Timed alone (`timing.txt`, 12 rounds): C135 0.983 (new faster 12 of 12),
+C143 0.989 (10 of 12).
+
+### Fix B: the record pass and enqueue queued ahead of the readback
+
+Under `--q-pipeline`, unless the host reads the records (a candidate
+file), the first q's validation runs, or `--td-record-scalar` is set:
+- **The device makes the host's decision.** `k_scatter_sel` also writes
+  `spec`: the accepted count, or 0 if the flags carry
+  `TDF_NORM_OVERFLOW` or `TDF_LIST_TRUNCATED` or the count exceeds the
+  candidate list. Those are exactly the host's three refusals, and every
+  kernel that raises a flag has already run.
+- **What goes ahead, behind the counter copy.** A new event (`ev[14]`),
+  then the record pass (`k_gather_ab`, both `k_td_record_warp`,
+  `k_cand_stats`) on that count, with a grid sized for the bound
+  `min(survivors, list)`; `k_td_record_warp`'s blocks past the count
+  return before its tile loop. Then the caller's `k_cof_enqueue`, but only
+  if the queue has room for that bound. No flush can then be due, so the
+  flush points, and with them the relation order, are the host count's.
+- **The host waits for the copy alone** (`ev[14]`), not the stream.
+- **A skipped slab** returns with its no-op pass owed. **A list the
+  candidates outgrew:** drain the stream, join the no-op pass, grow,
+  scatter, record and enqueue as before.
+
+The kernels take the count as an optional device pointer, taken as a
+minimum with `n`. `PIPE_TD_TEST_CCAP` starts the list small so tests reach
+the growth branch.
+
+c135, same session (`trace.B/`):
+
+| | base (finding 134) | A and B |
+|---|---:|---:|
+| window (1,016 q) | 3.130 s | 3.034 s (−3.1%) |
+| wall per q, under trace | 2.86 ms | 2.78 ms |
+| card idle | 6.7% | 3.6% |
+| `k_cof_enqueue -> k_intersect_compact` | 2.1% | 0.3% |
+| `k_scatter_sel -> k_gather_ab` | 1.5% | 0.1% (6.9 µs) |
+| `k_intersect_compact -> k_apply` | 0.7% | 0.2% |
+| `k_gather_ab -> k_td_record_warp` | 0.3% (10.3 µs) | 0.7% (36.1 µs) |
+| first record kernel's start, after the counter copy ends | 77.8 µs | 36.5 µs |
+| TD's survivor-count round trip, card idle | 19.1 µs/slab (0.62%) | 12.5 µs/slab (0.42%) |
+
+0.9% of the new trace's idle is in gaps over 1 ms, against 0.3% in base's.
+Those are host stalls inside single CUDA calls (below).
+
+C143, 1,000 q (`trace143.C/`): idle 3.1% -> 2.8%. Pair 1 0.9% -> 0.2%,
+pair 2 0.9% -> 0.1%, the record hold 0.1% -> 0.6%. The new run also had
+~40 ms of host stalls (seven gaps over 0.5 ms, against base's two of 1.2
+and 1.6 ms): one `cudaEventRecord` took 12.1 ms, and two
+`cudaEventSynchronize` calls took 10.6 and 13.4 ms with the card idle.
+Without them, idle is ~1.9% against ~3.0%.
+
+### The hold before the first record kernel
+
+Queued ~1 ms ahead behind `k_gather_ab` on the legacy stream, the first
+`k_td_record_warp` starts a median 33 µs after it, against 4.5 µs when the
+host launched it after the readback. Work the host queues on `st_sv` as it
+wakes (the next intersection's memsets) is held as long. `after_call.py`:
+of 760 queued operations held over 20 µs with no kernel on the card, 531
+are that kernel. No host call kind consistently just precedes their start.
+They start ~41 µs after the host's last event sync returned. None of
+these reproduce it on an idle card (`work/launchlat/`, medians of 300):
+
+| shape | gap |
+|---|---:|
+| a grid of 19 to 4,096 blocks of 256 threads with 16 KiB shared, most returning at once, behind a 0-smem kernel (`lat4`) | 3.0-3.6 µs |
+| copy, event, small kernel, the record-like kernel; the host waits on the event, then queues a memset and kernel on another stream (`lat5`) | 2.0-3.0 µs |
+| the same with the host's real burst on waking: ~20 calls over two other streams, records, a cross-stream wait, 4 B copies (`lat7`) | 3.0 µs |
+| another stream blocked in a cross-stream wait, default or greatest priority (`lat6`) | 2.2-2.3 µs |
+
+Its cause is not identified. It costs 0.6-0.7% of the window, and B still
+starts the record pass 41 µs sooner than before.
+
+### Transitions and host calls (micro-tests)
+
+- **Memsets and small copies between kernels** (`lat2`, A -> X -> B on one
+  stream): a 4 B memset +1 µs, the fill's three-memset prologue +4, a
+  one-block zeroing kernel +3.5, a 4 B D2H copy +4, two of them +6, a
+  4 KiB H2D copy +4. The same with a long kernel on another stream, or on
+  the legacy one. With queues of short kernels and 4 B D2H copies on two
+  other streams, the prologue's p90 is 40 µs (the zeroing kernel's 13). In
+  the pipeline (`qdelay.py`), kernel -> 4 B D2H on `st_sv` has a p90 of
+  383 µs and kernel -> memset 36 µs, both only while other streams run.
+- **The host's cost per call** (`lat3`): 3.5-4.5 µs median with the card
+  idle, 5-9 µs with another stream busy, 4.7-7.5 µs just after a sync. So
+  the 15-80 µs calls seen in the trace's prep gaps are not batching: the
+  host thread was stalled.
+
+### Timing
+
+Against `bench.v2raw`, RAW clock, rotated order, relations identical in
+every run, 0 failed. A and B `6355f7b3` on C135 and C143 (12 rounds), then
+the final form on all seven jobs (6 rounds) and C183 again (12):
+
+| job | plan | rounds | new / base, paired median | new faster |
+|---|---|---:|---:|---:|
+| C135 | one slab, fill ahead | 18 | 0.971 | 18 of 18 |
+| C143 | one slab, fill ahead | 18 | 0.989 | 15 of 18 |
+| C148 | one slab, fill ahead | 6 | 0.991 | 5 of 6 |
+| C183 | one slab, fill ahead | 18 | 1.002 | 7 of 18 |
+| NFS@Home I16 | 4 slabs | 6 | 1.000 | 3 of 6 |
+| C194 | 4 slabs | 6 | 0.997 | 5 of 6 |
+| 2,1147+ | 4 slabs | 6 | 0.991 | 4 of 6 |
+
+A alone (`a00ac36c`, `timing.txt`, 12 rounds): C135 0.983, C143 0.989.
+
+- **C183 is flat.** Its first 6 rounds read 1.005 (1 of 6 faster), and 12
+  more 1.000 (6 of 12). A 60 q trace (`trace183/`) read −1.9% under trace,
+  idle 1.0% -> 0.1%. Its record pass is the largest of these (~1,915
+  candidates and 0.33 ms a q) and now shares the card (72% overlapped,
+  against 0%): its event time doubled, to 0.70-0.93 ms a q. Its grid is
+  sized for the bound (1,664 blocks) where ~240 are live, and at 2 blocks
+  per SM the empty ones queue behind the live ones. Whether that costs
+  anything was not measured separately.
+- **Plans of several slabs** gain at most ~1%. There the TD tail is a
+  smaller share of a much longer slab.
+
+### Gates and install
+
+The final form `a9399a83`, sm_120, against `bench.v2raw` (`allgates.sh`,
+`ccgate.run.txt`):
+- `abcheck` 36 of 36 identical;
+- fillcheck, all arms;
+- memcheck, 0 errors and identical relations: C143 fill ahead (633), C194 9
+  slabs (112), c183 5 slabs (93);
+- `make check`, all gates passed, binary unchanged. Its cofcheck A/B
+  against `--td-record-scalar` sets the record pass queued ahead against
+  the host-counted scalar one;
+- 2,1147+ 8 slabs, pipelined and single-queued, identical (368), 48 of 48
+  slabs from records;
+- degradecheck (`PIPE_K=8`), skipcheck (`BN_LIMBS=4`);
+- grow-fail 5 of 5 identical. These write candidates, so the pass ahead is
+  off there, and they cover A alone;
+- the growth branch (`ccgate.sh` on `tb_cc`, both arms `--no-td-verify`):
+  c135 300 q and C143 100 q identical (28,189 and 15,605), and C143 4 q
+  under memcheck (0 errors, 633). Each run took the branch.
+
+The clean run (`allgates.run.txt`) had 0 failures, with Kyle's GPU ECM
+sharing the card for part of it. It came after three harness slips, all
+fixed. The work copy first lacked its `oracle` link. The runner passed a
+step named "1". And the growth gate's first form never reached the branch:
+the first q's validation turns the pass ahead off, so its slab grew the
+list non-speculatively, and no later slab outgrew it.
+
+Installed as `bench/bench`: the tree's fat build `0789a8cb` (no warnings
+but the 14 minnctapersm). `treegate.sh`: abcheck 36 of 36 against
+`bench.v2raw`; 2,1147+ pipelined and single-queued identical (368);
+c135 300 q (`--no-td-verify`) identical to base and to `tb_cc`; `make
+check` in the tree, binary unchanged. The binary it replaced, `26cca731`,
+is kept as `work/tdtail/bench.installed.prev`.
+
+### Next
+
+1. **The hold before the first record kernel** (0.6-0.7%). Next to try:
+   record `ev[14]` behind `k_gather_ab` or the first record kernel instead
+   of right after the copy, and a pinned, device-written counter block
+   instead of the copy.
+2. **The fill prologue** (`k_scan_pass3 -> k_gate_fold` 0.3%: two 4 B
+   copies and three memsets on `st_sv` between the side-0 apply and the
+   next fill) and the memset before the early apply
+   (`k_intersect_compact -> k_apply` 0.2%). One zeroing kernel replaces
+   the three memsets, ~same median and a far shorter tail (`lat2`).
+3. **TD's survivor count from the intersection** (finding 134's next 2):
+   its round trip still idles the card 12.5 µs a slab at c135 (0.42%) and
+   9.7 µs at C143 (0.18%).
+4. **The record grid's bound.** Sizing it from recent slabs' counts (the
+   kernel loops if a slab exceeds it) would drop the empty blocks C183
+   carries; worth a C183 A/B.
+5. **Host stalls.** Single CUDA calls of 1-13 ms, ~1% of C143's window in
+   one run. Not the code. The Windows side holds ~2 GB and 6-12% of the
+   card at idle, which is worth a look.
+6. Finding 134's next 3 and 4 stand.
+
+## Finding 136 — The record pass and enqueue queued ahead (finding 135) now have a candidate-level gate: the cofactor queue's contents hash identically with and without them on five jobs, a mid-band-filling queue and a mutant that loses one candidate a slab. Capping that record pass's grid at the resident grid, an outside review's suggestion, gave no measurable wall-time gain and is not kept
+
+**Date:** 2026-10-29. The gate ran with Kyle's GPU ECM on the card (identity
+only); the timing and traces ran on a free card and quiet host (load 1.3-2.4),
+client off. sm_120 builds: finding 135's `a9399a83` (`bench.135`), the grid cap
+`33a65094` (`bench.136`); after the code review, `b53bde6a`. Installed: the
+tree's fat build `7cb58341` (the review's fixes, `--no-td-ahead`, the test
+hooks compiled out). The binary it replaced, `0789a8cb`, is kept as
+`work/tdtail/bench.installed.135`. The gate is
+`bench/qhcheck.sh`. Evidence in `work/tdtail/`: `NOTES.md`, `qhgate.sh` (its
+first form), `qhgate.135.txt`, `qhgate.final.txt`, `qhcheck.run.txt`,
+`timing136.sh`, `timing.136.txt`, `trace136/`.
+
+### The gap
+
+An outside review of findings 133-135 pointed out that the record pass and
+`k_cof_enqueue` queued ahead of the counter readback run only when no
+candidate file is written (`want_host` off). So none of the candidate-file
+identity checks ran them; only relation identity did. A candidate lost or
+left stale there that splits into no relation leaves the relations
+unchanged.
+
+### The gate
+
+`COFQ_TEST_HASH` (`cofac.cuh`, test builds only, set through DEFS) makes
+every `cofq_flush` print one stderr line. It holds the slot count and a
+hash over every queued slot: a and b, each side's status, its in-lpb
+residual or the limbs to split, and its factor list sorted
+(`cf_emit_sorted` sorts at output, so the order is not part of the
+result). At band end it also prints how many slabs were enqueued in TD and
+how many after. `CQ_FLUSH` became `#ifndef` so a test build can shrink the
+queue. A DEFS build refuses `--relations`, so no stop, checkpoint or
+limb-widening flush can fire. That leaves the queue's capacity and band
+end as the only flush points, the same in both arms.
+
+`qhgate.sh` runs each case pipelined (enqueue in TD wherever the queue has
+room for the slab's bound) and `--no-q-pipeline` (host count, every slab).
+Flush lines must match in order, and the pipelined arm must have enqueued
+in TD:
+
+| case | flushes | candidates | slabs in TD / after |
+|---|---:|---:|---:|
+| c135 300 q | 1 | 43,698 | 299 / 1 |
+| C143 100 q | 1 | 23,633 | 99 / 1 |
+| c183 20 q | 1 | 38,443 | 19 / 1 |
+| C194 3 q, `--slab-j 4095` | 1 | 15,823 | 25 / 1 |
+| I16 10 q | 1 | 27,862 | 39 / 1 |
+| c135, 16,384-slot queue (`tb_qf`) | 3 | 43,698 | 208 / 92 |
+| C143, `tb_qf` | 2 | 23,633 | 46 / 54 |
+| c183, `tb_qf` | 3 | 38,443 | 3 / 17 |
+
+All identical, on finding 135's code (`qhgate.135.txt`, the first five)
+and on the final source (`qhgate.final.txt`, all eight). The "after" slab
+in full-queue runs is the first q's, whose validation turns the pass ahead
+off. In `tb_qf` the queue fills mid-band. Slabs whose bound does not fit
+then have their record pass queued ahead and their enqueue made after the
+host's count and any flush, a combination no full-size run reaches. A
+mutant (`tb_qm`, `k_scatter_sel`'s device count one short) changes c135's
+hash (`eac274ad...` against `39cf8859...`), so the gate sees one lost
+candidate a slab.
+
+The gate's first form (`work/tdtail/qhgate.sh`) lived only in the
+git-ignored `work/`. The review asked for it in the repository:
+`bench/qhcheck.sh` builds its own five test copies and runs the same cases.
+c135 and I16 are skipped and counted when their `work/` inputs are absent;
+the small-queue and mutant cases use C143, which is in the tree. It also
+takes over finding 135's growth gate (`ccgate.sh`, `work/`). A build with
+`PIPE_TD_TEST_CCAP=16` must print the line the growth branch now prints
+from source under that macro, and match `--no-q-pipeline`'s queue
+contents. C143 4 q under memcheck must show 0 errors. After the code
+review below, the mutants are two. `qe` drops the last candidate inside
+`k_cof_enqueue`, so the hash must differ. `qm`, the one-short device
+count, must now make the run fail on the host's new check. One more case
+runs `--no-td-ahead`. Not in `check`; it needs a card.
+
+### The record grid's bound
+
+With the pass ahead, `k_td_record_warp`'s grid is sized for the bound
+min(survivors, list capacity), and blocks past the device count return
+before the tile loop. On C183 that is 1,664 blocks for ~240 live. The
+kernel strides over its candidates and stages the tile once per iteration
+per block, so a grid capped at the resident grid does the same work. The
+cap (`bench.136`): under the device count, at most the resident grid
+(occupancy x SMs, computed at init). Here that is 96 blocks, 2 per SM.
+
+Timed on the RAW clock against `bench.135`, 12 rounds rotated, relations
+identical in every run (`timing.136.txt`):
+
+| job | new / base (median) | range | new faster |
+|---|---:|---|---:|
+| C183 | 1.0004 | 0.9959-1.0029 | 5 of 12 |
+| C135 | 1.0000 | 0.9767-1.0135 | 3 of 12 |
+| C143 | 1.0000 | 0.9815-1.0208 | 5 of 12 |
+| I16 | 0.9998 | 0.9959-1.0051 | 8 of 12 |
+| C194 | 0.9990 | 0.9947-1.0027 | 8 of 12 |
+
+C183 trace, 60 q (`trace136/`): the cap took effect (1,664 -> 96 blocks on
+all 118 speculative launches). Each record kernel ran longer, 199.4 ->
+215.9 µs (mean). The runs read 38.12 and 38.04 ms/q. The cap gave no
+measurable wall-time gain. That does not price the empty blocks alone,
+though. A slab's ~1,920 candidates (~240 blocks' worth) through 96
+blocks is three passes of the tile loop each, 288 block-passes against
+240. The extra tile staging and lockstep could hide a small saving. A cap
+of 256-384 blocks would separate the two; it is not worth a run now.
+C183's longer record pass since finding 135 (154 -> 209.5 µs) fits the
+pass overlapping other streams' work, as the review suspected. The cap is
+reverted. `queue_record`'s comment records the measurement.
+
+### Code review
+
+`/code-review xhigh` over the uncommitted tree (findings 134-136) found no
+bug that changes a healthy run's output. Of its 11 items, 9 are fixed:
+- **The device's copy of the host's refusals.** `k_scatter_sel` named the
+  two flags by hand. One mask, `TDF_REFUSE` (`td.cuh`), now names them for
+  the device. `pipe_td_perq` also checks the device's count, from the same
+  24-byte copy, against its own decision on each way out of a slab with the
+  pass ahead (skipped, outgrown, recorded), and fails the band if they
+  differ. Were a flag refused on one side and not the other, the queue
+  could count slots nothing wrote. `qhcheck`'s `qm` mutant must now trip
+  this check (exit 255); `qe` is the one the hash must see.
+- **`qhcheck.sh` ran `make` after a failed `cd`** (`;`, not `&&`), which
+  would have rebuilt this directory's `bench/bench` as a pricing build.
+  `work/tdtail/tbbuild.sh` had the same pattern. Both now leave the
+  subshell instead.
+- **An error path drained `st_rs` only if `st_sv` drained cleanly**
+  (`issue_behind_isect`, finding 134's code). It now drains both, and
+  teardown drains `st_rs` before freeing the record scan's buffers.
+- **A lost q's rollback** (`PIPE_Q_ROLLBACK`, every slab skipped) also
+  rolled back the previous q's last record pass, which fix A pays in the
+  next q, so the band's `record` stage came out low. That pass is now paid
+  explicitly at the q's first trial division and kept through a rollback
+  (`carry_rec`, `carry_td`).
+- **`*spec_out`** is now 0 on the truncated-list skip, as its contract
+  says. The caller skipped the slab before reading it, so no output
+  changed.
+- **`--td-ahead` / `--no-td-ahead`**, on by default wherever `--q-pipeline`
+  is. It is a field fallback to the host's count that keeps the rest of the
+  pipeline. Refused without `--q-pipeline`, like the other pipeline-only
+  options; the run says so when it is off.
+- **One enqueue call for both paths** (an `enqueue(n, dn)` lambda), and
+  `spec_enqueue`'s `!cfg->cofactor` test, which could never fire, is gone.
+- `queue_record`'s `nb` is now `ncand`: it shadowed the rank scan's block
+  count.
+- Comments: the record join's names `pipe_td_grow_cand`, which frees what
+  the enqueue reads, not `pipe_td_grow`; `td_ctr_t`'s no longer says three
+  counters.
+
+Not changed: the intersection on `st_sv` waiting behind the next q's
+uploads and `k_transform` when fill ahead is off. That is finding 134's
+design, and the jobs it affects, C194 and I16, measured within ±0.3%.
+Nor the pass ahead's launches on slabs that accept nothing: the host
+cannot know that before the copy it is queued ahead of, and the kernels
+leave at once.
+
+Gates on the fixes (`work/tdtail/allgates.run.txt`, sm_120 `b53bde6a`), 0
+failed:
+- abcheck 36 of 36 against `bench.v2raw`;
+- fillcheck;
+- memcheck: C143 633, C194 112, c183 93;
+- `make check`;
+- 2,1147+ pipelined and single-queued (368, 48 of 48 slabs from records);
+- degradecheck, skipcheck, grow-fail;
+- the growth gate (c135 28,189, C143 15,605, C143 under memcheck 633);
+- `qhcheck.sh` 14 of 14 (`qhcheck.rerun.txt`: run from the work copy, its
+  c135 and I16 paths needed passing in). That covers the five full-size
+  cases, `--no-td-ahead`, three small-queue cases, two growth cases, the
+  growth case under memcheck (0 errors), and both mutants.
+
+C143 40 q gave identical relations from finding 135's build and from this
+one, with and without `--no-td-ahead`.
+
+Installed `7cb58341` (`treegate.sh`, `treegate.run.txt`), 0 failed:
+abcheck 36 of 36 against `bench.v2raw`; 2,1147+ pipelined and
+single-queued identical (368); c135 300 q identical to base and to
+`tb_cc`, and with `--no-td-ahead`; `make check` in the tree, binary
+unchanged. Not timed: the fixes add one comparison per slab on the host,
+and move a wait finding 135 already paid in the same place.
+
+### Next
+
+Finding 135's list, with item 4 closed here. On item 3, removing TD's
+survivor-count round trip: its phase-1 wait is also what drains the
+previous slab's enqueue before `pipe_td_grow_cand` can free what it reads. A
+change there needs that drain to move first. The review's other
+suggestions are for larger jobs:
+- side-0 norms gated by side-1 survivors, priced after counting empty
+  64-position groups and active lanes in the 16-bit scan's actual layout,
+  with finding 104's lazy-norm losses (C194, AS276) in mind;
+- the capacity high-water on I16 and SNFS301 (row 32);
+- no tiny-prime skip (row 26's `p < 96`) without an interleaved comparison
+  on one reliable clock.

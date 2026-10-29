@@ -30,7 +30,16 @@ double bench_monotonic_ms(void)
         return (double)time(NULL) * 1000.0;
     return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
 #else
+    /* CLOCK_MONOTONIC_RAW where there is one. CLOCK_MONOTONIC is slewed by
+     * adjtimex: under WSL2, with systemd-timesyncd and Hyper-V time sync both
+     * steering, it ran 5.3-7.7% fast against the card's event timer, by a
+     * different amount in each 10 s, while RAW matched it to 1e-4
+     * (finding 134). */
     struct timespec t;
+#ifdef CLOCK_MONOTONIC_RAW
+    if (!clock_gettime(CLOCK_MONOTONIC_RAW, &t))
+        return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+#endif
     if (clock_gettime(CLOCK_MONOTONIC, &t))
         return (double)time(NULL) * 1000.0;
     return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;

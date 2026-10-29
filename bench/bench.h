@@ -670,6 +670,12 @@ typedef struct {
      * Output-identical; finding 123. Default on wherever --q-pipeline is
      * (bench_main resolves -1). */
     int      fill_ahead;
+    /* --td-ahead: under --q-pipeline, TD's record pass and k_cof_enqueue are
+     * queued ahead of its counter readback, on a count the device gates as
+     * the host would. Output-identical; finding 135. Default on wherever
+     * --q-pipeline is (bench_main resolves -1); --no-td-ahead falls back to
+     * the host's count without giving up the rest of the pipeline. */
+    int      td_ahead;
     /* --qspan: bracket each special-q's GPU work with two events and report
      * the span, splitting `unaccounted` into host-with-no-GPU-work versus
      * idle-between-stages. Diagnostic; STATUS item 19 step 2. */

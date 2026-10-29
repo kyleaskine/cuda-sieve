@@ -408,9 +408,11 @@ __global__ void k_cand_stats(uint32_t n,
                              const uint32_t *__restrict fn0,
                              const uint32_t *__restrict fn1,
                              uint32_t lpb0, uint32_t lpb1, uint32_t fmax,
-                             uint32_t *__restrict out)
+                             uint32_t *__restrict out,
+                             const uint32_t *__restrict dn = nullptr)
 {
     const uint64_t stride = bench_grid_stride_x();
+    if (dn) n = min(n, *dn);
     for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
         const uint32_t t = (uint32_t)tt;
         if (fn0[t] > fmax || fn1[t] > fmax) { atomicAdd(&out[2], 1u); continue; }
@@ -862,6 +864,11 @@ __global__ void k_pair_scatter(const uint32_t *__restrict px,
 
 #define TDF_NORM_OVERFLOW  1u
 #define TDF_LIST_TRUNCATED 2u
+/* The flags pipe_td_perq refuses a slab on (fails the band, or skips the
+ * slab). k_scatter_sel zeroes its device count on these, so a flag added to
+ * the host's refusals belongs here too; pipe_td_perq checks the device's
+ * count against its own decision on every slab and fails on a mismatch. */
+#define TDF_REFUSE (TDF_NORM_OVERFLOW | TDF_LIST_TRUNCATED)
 
 /* One thread per survivor. The norm is built in registers, divided down in
  * place, and only the residual cofactor is written out -- a 224-bit norm never
@@ -1126,7 +1133,8 @@ __global__ void k_td_record_warp(const int64_t *__restrict A,
                                  uint32_t *__restrict flags,
                                  uint32_t *__restrict fac,
                                  uint32_t *__restrict faccnt,
-                                 uint32_t fmax, uint32_t j_base)
+                                 uint32_t fmax, uint32_t j_base,
+                                 const uint32_t *__restrict dn = nullptr)
 {
     __shared__ tdsmall_t tile[TD_TILE];
 
@@ -1134,6 +1142,11 @@ __global__ void k_td_record_warp(const int64_t *__restrict A,
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
     const uint32_t lane  = threadIdx.x & 31u;
     const uint32_t wpb   = blockDim.x >> 5;            /* warps per block */
+    /* A grid sized for a bound (dn) has blocks with no candidate in any
+     * iteration: they leave before the tile loop, whole blocks at once, so
+     * its __syncthreads never see a partial block. */
+    if (dn) n = min(n, *dn);
+    if ((uint64_t)blockIdx.x * wpb >= n) return;
     const uint64_t nwarp = (uint64_t)gridDim.x * wpb;
     const uint64_t w0    = (uint64_t)blockIdx.x * wpb + (threadIdx.x >> 5);
     const uint64_t iters = ((uint64_t)n + nwarp - 1) / nwarp;
@@ -1305,25 +1318,43 @@ __global__ void k_accept_flags(const uint8_t *__restrict st0,
     }
 }
 
+/* spec, if not NULL: the count the record pass queued ahead of the host's
+ * read of the counter block takes (--q-pipeline, finding 135) -- the accepted
+ * count, or 0 wherever the host will not record this slab from this scatter:
+ * a flag it skips the slab or fails the band on, or more candidates than sel
+ * holds (it grows sel and scatters and records again). tdflags are final
+ * here: every kernel that raises them ran before this one. */
 __global__ void k_scatter_sel(const uint32_t *__restrict flag,
                               const uint32_t *__restrict off,
                               uint32_t n, uint32_t *__restrict sel,
-                              uint32_t cap, uint32_t *__restrict nacc)
+                              uint32_t cap, uint32_t *__restrict nacc,
+                              const uint32_t *__restrict tdflags = nullptr,
+                              uint32_t *__restrict spec = nullptr)
 {
     const uint64_t stride = bench_grid_stride_x();
     for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
         const uint32_t t = (uint32_t)tt;
         if (flag[t] && off[t] < cap) sel[off[t]] = t;
-        if (t == n - 1) *nacc = off[t] + flag[t];
+        if (t == n - 1) {
+            const uint32_t na = off[t] + flag[t];
+            *nacc = na;
+            if (spec)
+                *spec = ((*tdflags & TDF_REFUSE) || na > cap) ? 0u : na;
+        }
     }
 }
 
+/* dn, here and in the record pass's other kernels: a device count (k_scatter_sel's
+ * spec) that replaces n when it is smaller; n is then only the bound the grid
+ * was sized for. */
 __global__ void k_gather_ab(const int64_t *__restrict A,
                             const int64_t *__restrict B,
                             const uint32_t *__restrict sel, uint32_t n,
-                            int64_t *__restrict oa, int64_t *__restrict ob)
+                            int64_t *__restrict oa, int64_t *__restrict ob,
+                            const uint32_t *__restrict dn = nullptr)
 {
     const uint64_t stride = bench_grid_stride_x();
+    if (dn) n = min(n, *dn);
     for (uint64_t tt = bench_grid_thread_x(); tt < n; tt += stride) {
         const uint32_t t = (uint32_t)tt;
         oa[t] = A[sel[t]]; ob[t] = B[sel[t]];
