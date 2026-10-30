@@ -1128,8 +1128,8 @@ int check_relations(const char *path, const poly_t *poly, uint32_t lpb0,
  * polynomial and nothing else -- the checkpoint fingerprint covers the sieve
  * parameters, which a valid-looking line cannot. Returns bad lines, or -1. */
 /* `limit` bounds the sample to the checkpointed prefix, since a torn final line
- * past it is normal after a crash and is about to be truncated away; 0 means
- * the whole file. */
+ * past it is normal after a crash and is about to be truncated away; 0 checks
+ * nothing, as none of the file is kept. */
 int check_relations_sample(const char *path, const poly_t *poly, uint32_t lpb0,
                            uint32_t lpb1, uint32_t n, unsigned long long limit,
                            uint32_t *checked);

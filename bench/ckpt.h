@@ -103,7 +103,7 @@ static inline int ckpt_path_usable(const char *relations, const char *what)
 }
 
 /* Silent: a caller that skipped ckpt_path_usable() gets a return code, not a
- * message. ckpt_write() runs this on every flush of a multi-day band, so a
+ * message. ckpt_write() runs this at every checkpoint of a multi-day band, so a
  * diagnostic here would repeat until it buried the log. Argument order matches
  * the wrappers below so a misremembered call cannot silently swap the two
  * const char * parameters. */

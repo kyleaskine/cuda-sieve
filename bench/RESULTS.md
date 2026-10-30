@@ -15934,3 +15934,397 @@ suggestions are for larger jobs:
 - the capacity high-water on I16 and SNFS301 (row 32);
 - no tiny-prime skip (row 26's `p < 96`) without an interleaved comparison
   on one reliable clock.
+
+## Finding 137 — the cofactor queue's relations are formatted by hand instead of by `fprintf`: at every mid-band flush the card sat idle while the host printed them, ~2 µs a relation (5% of c135's wall). Now C135 −5.1%, C143 −4.5%, C148 −2.7% (12 of 12 rounds each), C183 and I16 flat, relations byte-identical. Also measured on the free card: finding 136's fixes cost nothing; cado-gpu is now 1.19x ours at c135 (1.26x in finding 133) and ours is 1.066x cado-gpu at I16; and finding 135's 35 µs hold follows the host waiting on a TIMED event (`E[14]`, never timed), which an untimed one removes, with no wall-time gain
+
+**Date:** 2026-10-29, afternoon and evening. Card free and client off
+throughout. One CPU `ecm -pp1` ran (host load 1.5-3.3). Firefox held a steady
+4.0-4.4% of the 5070's 3D engine (below). sm_120 builds of HEAD `29252cd`:
+`base` `03bfefe7`, the emitter `fast` `4d1666f6` (gated; the timing ran its
+fat rebuild `f968c644`, which finding 138 shows makes no difference).
+Installed: the tree's fat build `a1081c4d` (`29252cd8-dirty`, this change). The binary it replaced,
+`7cb58341`, is kept as `work/tdtail/bench.installed.136`. Evidence:
+`work/emit/` (`gate.sh`, `gate.txt`, `gate.fat.txt`, `gate.tree.txt`,
+`timing.sh`, `timing.txt`, `trace/`), `work/hold/` (`NOTES.md`, `trace.sh`,
+`trace*.txt`, `timing.n.txt`), `work/h2h-20261029/` (`run.sh`, `run.txt`),
+`work/tdtail/` (`timinginst.sh`, `timing.inst*.txt`, `NOTES.md`),
+`work/launchlat/lat8.cu` (`run8.txt`).
+
+### Where the flush's time went
+
+Traces of c135 (q in [7000000, 7020000)) written with `--relations` showed one
+card-idle gap per mid-band cofactor flush. In the base build it was 245 ms,
+after `k_cofac` and the readback. The readback's synchronous copies end 1.5 ms
+into it. The host then makes no CUDA call for 181 ms while `cofq_flush`
+formats relations. Each relation was a `qsort` with a comparator call per
+compare and ~30 `fprintf` calls. bench's own "readback + emit of relations"
+reads 0.195 ms/q at C135 (93 relations/q): 2.1 µs a relation, with the card
+idle. The trace without `--relations` (finding 133's `run.sh` form) shows
+none of it, because the loop only runs when a file is written.
+
+### The change
+
+`cofac.cuh`. `cf_fmt_sorted` formats one side into a buffer: an insertion
+sort (at most `TD_FMAX + CF_MAXFAC + 2` values), then hex by digit table.
+These are the bytes `%llx` wrote. `cofq_flush` builds whole lines, `a,b` in
+decimal by hand as `%lld` wrote them, into a 64 KiB stack buffer, with one
+`fwrite` per buffer. The `--cofac` path's emitter keeps its `FILE *`
+signature on the same formatter, so the two outputs still share one format,
+as `cf_emit_sorted`'s comment requires. `cf_u64cmp`, which only the `qsort`
+used, is gone.
+
+### Gates
+
+| gate | base `03bfefe7` vs `fast` | `7cb58341` vs fat `1b0c31bf` | `7cb58341` vs tree `a1081c4d` |
+|---|---|---|---|
+| abcheck, all four sets | 36 of 36 identical | 36 of 36 | 36 of 36 |
+| `--cofac` on base's candidate batch, C143 / c183 | identical, 23,850 / 728 | identical | identical |
+| `--check-relations`, c135 300 q | 28,189 of 28,189 | same | same |
+| `make check` | passed | passed | passed, binary unchanged |
+
+abcheck's `cof` and `stop` sets go through `cofq_flush`'s emitter, including
+C143's stop at 172,906 relations across mid-band flushes.
+
+### Timing
+
+`timing.sh` (`work/isect/timing.sh`): RAW clock, 12 rounds rotated,
+relations written and identical to base r1 in every run, 0 failed:
+
+| job | fast / base, paired median | range | fast faster | ms/q, base -> fast |
+|---|---:|---|---:|---|
+| C135 | **0.9494** | 0.9365-0.9559 | 12 of 12 | 2.96 -> 2.81 |
+| C143 | **0.9545** | 0.9406-0.9715 | 12 of 12 | 5.28 -> 5.04 |
+| C148 | **0.9727** | 0.9682-0.9859 | 12 of 12 | 10.63 -> 10.36 |
+| C183 | 0.9986 | 0.9961-1.0013 | 8 of 12 | 38.52 -> 38.50 |
+| NFS@Home I16 | 0.9989 | 0.9962-1.0030 | 10 of 12 | 143.83 -> 143.66 |
+
+On the c135 trace, readback + emit fell from 0.195 to 0.053 ms/q (0.57 µs a
+relation, the writes included). The host's silent stretch in the flush fell
+from 181.0 to 53.4 ms, and the whole gap from 245 to 121.5 ms.
+
+The rest of the gap: 62-66 ms in both builds after `cofq_flush` returns,
+before the next launch. The in-loop flush checkpoints there every time.
+Without `--cofactor`, checkpoints are throttled to one per 30 s
+(`pipeline.cuh`). An OS-runtime trace of the fast build (`trace/osrt.*`, its
+gap 88 ms) put the checkpoint's two `fsync` calls at 5.9 + 1.6 ms. A probe on
+this filesystem gave 7.7-15.1 ms to `fsync` an 11 MB append, but 7-105 ms for
+the `write` before it. So on this WSL disk the rest is write and sync latency
+that varies run to run; it was not pinned down further. At c135 a flush comes
+about every 3 s of sieving.
+
+### Also on the free card
+
+**Finding 136's fixes, timed** (`timinginst.sh`). The fat `7cb58341`
+against the fat `0789a8cb` it replaced, RAW clock, rotated, relations
+identical: C135 1.0000 over 36 rounds (17 slower, 12 faster, 7 tied; the
+first 12 read 1.0048 at 7/1/4, and the next 24 took that back), C143 0.9991
+(6 of 12 faster), C148 0.9978 (7 of 12), C183 1.0000 (5 of 12). No cost.
+
+**Against cado-gpu** (`h2h-20261029/run.sh`). Finding 127's commands and
+q ranges, cado-gpu's skip off (equal yield), `7cb58341` (before this
+change), three ABBA rounds each, Windows clock, medians:
+
+| job | cado-gpu | ours | |
+|---|---:|---:|---|
+| c135 | 592,535 rel in 17.15 s: 34,550/s | 603,124 rel in 20.73 s: 29,094/s | cado-gpu 1.19x (1.26x in finding 133) |
+| NFS@Home I16 | 23,292 rel in 60.10 s: 387.6/s | 23,465 rel in 56.78 s: 413.3/s | ours 1.066x (1.015x in finding 127) |
+
+With this change's −5.1% at C135 the c135 ratio should be about 1.13x; not
+measured. The c135 trace of `7cb58341` (no relation file): idle 3.2%, `k_gather_ab ->
+k_td_record_warp` 31.4 µs median.
+
+**Firefox shares the card.** All of this session's runs read 6-8% slower
+than finding 136's of the same binaries that morning (C183 40.6 against
+38.3 ms/q, C135 3.12 against 2.93). That included stage times on the card's
+own timer, at the same SM clock (2,894 MHz mean), memory clock, power and
+temperature. RAW clock against Windows time over 27.8 s: 0.991 (uptime
+1.082). The Windows GPU Engine counters on the 5070's adapter showed
+`firefox.exe` at 4.0-4.4% of the 3D engine, card idle or not. That probably
+accounts for STATUS row 33's "kernels 6-8% slower with the SM clock steady";
+not confirmed (it needs the tab closed and a run before and after). Every
+comparison in this finding is paired within the session, so its ratios
+stand. A volunteer's browser costs the siever about that much.
+
+### The hold before the first record kernel (finding 135's next 1)
+
+One sm_120 build of HEAD with switches read from the environment (`PIPE_HOLD`,
+`work/hold/src/`), one c135 trace per arm, relations identical to arm 0 in
+every arm. Gap `k_gather_ab -> k_td_record_warp`, median:
+
+| arm | gap |
+|---|---:|
+| HEAD: 24 B copy, `E[14]`, gather, record | 32.9-37.2 µs |
+| `cudaStreamQuery(0)` once the pass ahead is queued (to submit a batch) | 33.2 |
+| `E[14]` after gather | 34.4 |
+| an empty kernel after gather | 33.4 before it, 2.7 after |
+| counters written by a kernel to mapped host memory, no copy | 33.2 |
+| `--blocking-sync` | 33.8 |
+| no `cudaEventElapsedTime` reads after the wait | 35.9 |
+| a 60 µs spin with no CUDA call after the wait | 33.4 |
+| `E[14]` polled with `cudaEventQuery` | 33.7 |
+| `E[14]` after the first record kernel | 2.6 |
+| **`E[14]` created `cudaEventDisableTiming`** | **2.6** |
+| no `E[14]`: the host spins on a sequence word in mapped memory | 2.6 |
+
+The next launch after the host's wait on `E[14]` is held ~33 µs only when
+`E[14]` is a timing event; nothing times it. It is not the copy, the wait
+mode, submission batching or the host's calls after waking. With the spin,
+the record kernel starts at +37 µs from the copy while the host is silent
+until +68. Placed after the record kernel, the event's hold hides behind it,
+but the host wakes ~35 µs later each slab, and the gap before the next q's
+`k_group_counts` grows from 67 to 763 µs.
+
+On an idle card the shape does not reproduce (`lat8.cu`). The same-stream
+copy, event, gather and record, with the host waiting, gives 2.5-3.0 µs
+timed or untimed, on the legacy or a non-blocking stream. A cross-stream
+wait is 35-44 µs either way, which is finding 133's latency. Finding 135's
+`lat5`-`lat7` used untimed events throughout, which is why they never
+reproduced it. So the timed event interacts with something the pipeline
+has and the idle card does not; that was not identified.
+
+An untimed `E[14]` cut held queued ops from 657 to 377. But idle in gaps
+under 1 ms went 3.3% -> 3.5%, and the timing (`timing.n.txt`, one binary
+with and without the switch, 12 rounds) read C135 1.0016 (4 faster, 6
+slower), C143 0.9954 (8/4), C148 0.9982 (7/5), C183 0.9991 (7/4). At c135
+the sieve stream sets the pace, and the hold was not on that path. Not
+changed in the tree. It is a free one-line change, worth making only
+alongside something else.
+
+### Next
+
+1. **Done in finding 138** (a 30 s floor, 0.5-1% at c135-class jobs).
+   **The checkpoint at every in-loop flush.** At c135 that is one `fsync` of
+   the relation file and one sidecar write every ~3 s. A 30 s floor like
+   the non-cofactor path's would cost a crash at most 30 s more re-sieving.
+   That is Kyle's call (BOINC volunteers' disks included); the gain on this
+   host is up to the 62-66 ms a flush seen above, ~2% at c135, and not
+   isolated yet.
+2. **The emit's remaining 53 ms a flush** (`write` latency included). A
+   writer thread would hide it. A checkpoint must then wait for the writer to
+   go idle, which the flush-site checkpoint's precondition (whole q in the
+   file) already implies.
+3. **`k_cofac` runs alone**: 155 ms of kernels over the c135 trace's two
+   flushes, 0% overlapped, because the host blocks in the flush. Running the
+   next q's sieve beside it means an asynchronous flush, a larger design
+   (finding 108's territory).
+4. `PIPE_ZERO` (fill's three memsets as one kernel, finding 135's next 2) is
+   built in `work/hold/src/` and not yet measured.
+5. Finding 136's list stands: side-0 norm gating after a side-1 survivor
+   census, the I16/SNFS301 capacity high-water (row 32), no tiny-prime skip
+   without an interleaved comparison.
+
+## Finding 138 — the `--cofactor` band's in-loop checkpoint now waits at least 30 s (`PIPE_CKPT_MS`), as the non-cofactor path's already did. It had fsynced the relation file at every queue flush, every 2.6-6.7 s. Each skipped checkpoint is ~15-30 ms of flush on this disk: c135 −0.7% over a 20,000-q band, C143 −0.4% and C148 −1.3% on short bands, C183 and I16 flat, relations identical. The crash gate found that a crash before a band's first in-loop checkpoint could not be resumed: the resume check sampled the torn tail it was about to truncate. Before this change that state lasted milliseconds; with the floor it is the first 30 s of every band. Fixed. Finding 137's timing compared an sm_120 base against a fat build; fat against sm_120 of the same source is 1.0000-1.0015, so its gains stand
+
+**Date:** 2026-10-29, 21:20-22:46. Kyle's msieve-s queue held the card until
+21:20 and the runs waited for it. Then card free and client off throughout,
+Firefox at 1.4-1.7% of the 3D engine when checked. Builds of HEAD `29252cd` with finding
+137's emitter: `base` `5e2a889f` (sm_120, the installed source rebuilt), `new`
+`886b1e59` (sm_120, + the floor), `new` `4d53d6d4` (+ the resume fix, only
+`bench_main.o` rebuilt), `new` `126ca3ed` (+ a comment, rebuilt by `make
+check`). Installed: the tree's fat build `dab15da1` (`29252cd8-dirty`). The
+binary it replaced, `a1081c4d`, is kept as `work/emit/bench.installed.137`.
+Evidence: `work/ckpt30/` (`gate.sh`, `gate.txt`, `gate/`, `resume.sh`,
+`resume.txt`, `idgate.sh`, `idgate.fat.txt`, `timing.sh`, `timing.txt`,
+`timing2.sh`, `timing2.txt`, `tree.check.txt`, `stats.awk`).
+
+### The change
+
+Kyle, on finding 137's next 1: "I think every thirty seconds is more than
+often enough. Every 3 seconds is excessive IMO".
+
+`pipeline.cuh` defines `PIPE_CKPT_MS` (30000.0; not a `-D` knob, see the
+review below). The checkpoint after a mid-band `cofq_flush` at slab 0 now
+also needs `host_ms() - t_ckpt > PIPE_CKPT_MS`. That is the clock the non-cofactor
+q-boundary checkpoint already used; its literal 30000.0 is now the macro.
+`host_ms` is `CLOCK_MONOTONIC_RAW` (finding 134), so WSL's wall-clock steps
+(below) do not move it. Unchanged: the seed checkpoint at q0, and the
+unconditional checkpoints at a stop (stop file, signal, degraded, skip cap)
+and at the band's end.
+
+A flush that skips its checkpoint leaves whole q in the file past the
+sidecar's offset. Resume truncates them and re-sieves, as it always has for a
+later slab's flush. A crash now loses up to 30 s of sieving plus the wait for
+the next slab-0 flush, instead of ~3 s. `RUNBOOK.md` (the `.part` note and
+"Stopping and resuming") and a comment in `ckpt.h` updated.
+
+How often each job flushed, from records per q against the queue's ~131k
+cap (finding 137's timing outputs):
+
+| job | s between flushes |
+|---|---:|
+| C135 | 2.7 (905 q) |
+| C143 | 2.9 |
+| C148 | 6.4 |
+| C183 | 2.6 (68 q) |
+| NFS@Home I16 | 6.7 (47 q; 4 slabs a q, and only a flush at slab 0 checkpoints) |
+
+### The resume the gate refused
+
+`gate.sh` killed `new` 20 s into a c135 band of 20,000 q, before its first
+in-loop checkpoint. The sidecar was the band's seed (`rel_bytes 0`, `next_q`
+= q0), and the `.part` was 60,698,624 bytes, ending mid-line on a 4 KiB
+stdio boundary. The rerun exited 1: "1 of 16 sampled relations in ... do not
+reconstruct. Refusing to append to it."
+
+`check_relations_sample` reads `limit` 0 as the whole file. So on a seed
+checkpoint it sampled the torn final line that resume was about to truncate,
+along with everything else. Under BOINC management the refusal goes through
+`boinc_discard_bad_resume`; from the command line the band stays stopped
+until someone passes `--restart`. Before the floor, the state existed only
+between a flush's write and its checkpoint (milliseconds), and at I16 between
+a later slab's flush and the next slab-0 one. With the floor it is the first
+30 s of every band.
+
+The fix, in `bench_main.cu`: on a seed checkpoint, skip the sample, since
+nothing in the `.part` is kept, and say so. Past a checkpoint the sampler was
+already right: it stops at `rel_bytes`, and the 45 s case passed before the
+fix. The review below moved the fix into the sampler and changed the message
+to "the checkpoint records no relations; none of ... is kept".
+
+### Gates
+
+| gate | base `5e2a889f` vs `new` | fat `dab15da1` (installed) |
+|---|---|---|
+| abcheck, all four sets | 36 of 36 identical | 36 of 36 against base |
+| c135, 20,000 q | relations identical to base, 1,855,599 | identical to `new`'s |
+| checkpoint census, same band | base 23 sidecar writes: the seed + 22 in-loop, 2.77-2.90 s apart. `new` 2: the seed + one at 31.2 s | — |
+| kill -9, rerun the same command | at 5 and 20 s (seed only, torn tail) and 45 s (`rel_bytes` 121,388,257 of a 151,747,809-byte `.part`): all identical to the uninterrupted run (`4d53d6d4`) | at 10 s (seed only): identical |
+| `--check-relations` | 1,855,599 of 1,855,599 | same |
+| `make check` | passed (`886b1e59`, `126ca3ed`) | passed in the tree, binary unchanged |
+
+The census polls the sidecar's mtime every 0.25 s. Base's intervals
+include one of −0.82 s: WSL stepped the wall clock back. journald logged
+"Time jumped backwards" five times between 21:44 and 21:53. The mtimes
+are wall clock; the floor is not.
+
+### Timing
+
+`timing.sh` and `timing2.sh` (`work/isect/timing.sh`): RAW clock, rotated,
+relations identical to base r1 in every run, 0 failed. These bands are short:
+C135 3000 q is ~8.5 s, C143 ~10 s, C148 ~21 s. Base takes about three in-loop
+checkpoints in each, `new` none.
+
+| job | rounds | new / base, paired median | new faster | ms/q, base -> new | in-loop flush ms/q |
+|---|---:|---:|---:|---|---|
+| C135 | 12 | 1.0000 | 5 | 2.82 -> 2.81 | 0.147 -> 0.133 |
+| C143 | 12 | **0.9960** | 10 | 5.07 -> 5.03 | 0.252 -> 0.218 |
+| C148 | 12 | **0.9871** | 9 | 10.46 -> 10.33 | 0.206 -> 0.184 |
+| C183 | 12 | 0.9963 | 9 | 38.84 -> 38.69 | 4.16 -> 4.08 |
+| NFS@Home I16 | 12 | 0.9999 | 6 | 144.00 -> 143.67 | 6.43 -> 6.40 |
+
+C183 and I16 are the second pass (`126ca3ed`). The first pass's 6 rounds
+read 1.0048 and 1.0112 (2 of 6 each), with I16's rounds spread 4% against
+finding 137's 0.7%; `new` does strictly less work, so that pass is taken as
+noise. Their flush wall is mostly `k_cofac`, and they write few relations
+(6,847 and 4,341 a band), so each fsync has little to sync.
+
+The long band says more than the short ones. On the census's c135 20,000 q
+(~58 s, one pair, not rotated), wall went 2.88 -> 2.86 ms/q and in-loop flush
+0.21 -> 0.18 ms/q: ~0.6 s over 21 fewer checkpoints, ~29 ms each. The short
+bands' flush columns give 14-22 ms each. That puts the steady-state gain at
+c135-class jobs at 0.5-1% on this disk. Finding 137 estimated up to ~2% from
+the 62-66 ms gap after each flush; the checkpoint is less than half of that
+gap. The rest of the gap was not looked at here.
+
+### Finding 137's builds
+
+Finding 137's gate ran on `fast` `4d1666f6` (sm_120). The gate's closing
+`make check` then ran without `GPU_ARCH=120` and rebuilt `fast/` fat
+(`f968c644`, 17:39), and `timing.sh` timed that: its header reads
+`base 03bfefe7 new f968c644`. So finding 137's timing table compares an
+sm_120 base against a fat build of the change. Measured here, fat
+`f968c644` against `base` `5e2a889f` (the same source, sm_120), 12 rounds:
+
+| job | sm_120 / fat, paired median | range | sm_120 faster, tied, slower |
+|---|---:|---|---|
+| C135 | 1.0000 | 0.9894-1.0139 | 3, 7, 2 |
+| C143 | 1.0000 | 0.9829-1.0059 | 3, 4, 5 |
+| C148 | 1.0015 | 0.9828-1.0165 | 6, 0, 6 |
+
+(A first pass of 6 rounds read C135 1.0035, C143 1.0147 and C183 1.0005, 2-3
+of 6 each.) The fat binary runs the same sm_120 SASS, and no difference
+shows, so finding 137's −5.1/−4.5/−2.7% stand. This finding's gate passes
+`GPU_ARCH=120` to every `make check` in a work copy.
+
+### Review (2026-10-30)
+
+Kyle ran `/code-review xhigh` on the uncommitted diff (findings 137 and 138):
+12 findings. Each was checked against the code; one went to Kyle, eight were
+fixed, three were left.
+
+| # | finding | verdict |
+|---:|---|---|
+| 1 | The floor costs more under BOINC than a manual `kill -9` shows | Confirmed (below). Kyle's call: keep 30 s everywhere |
+| 2 | `--help` still said the `.part` is checkpointed after every cofactor flush | Fixed: "at most every 30 s ... up to ~30 s at c135, a minute or more where a q has several slabs", and a sentence on a BOINC suspend |
+| 3 | The torn-tail fix patched the caller; `check_relations_sample` still read `limit` 0 as the whole file | Fixed in the sampler: `limit` 0 checks nothing (`bench.h` comment updated) |
+| 4 | RUNBOOK's "typically 30 seconds to a minute" is no bound where a q has several slabs: a checkpoint also needs a flush that lands on slab 0 | Fixed: ~30 s at c135, ~a minute at I16 (a mean gap of ~57 s), more where flushes are rarer |
+| 5 | The seed checkpoint is written only under `--cofactor` | Left: predates this change; non-cofactor bands are not production |
+| 6 | A failed seed was not retried for 30 s; a band failure in that window deletes the `.part` | Fixed: until one checkpoint succeeds, every slab-0 flush tries again |
+| 7 | Finding 137's `cf_emit_sorted` capped `n` silently, so a longer factor list would write a wrong relation | Fixed: the `--cofac` emitter is now `cf_emit_side(o, r, side)`, which takes the record and sizes its buffer from the record's own arrays. No cap is left. Unreachable before (`cf_fill_side` caps at 68) |
+| 8 | The resume message said "band's seed" for any checkpoint with `rel_bytes` 0, and tested it twice | Fixed: "records no relations", one if/else |
+| 9 | `#ifndef PIPE_CKPT_MS` could never take effect: `-D` goes through `DEFS`, which marks a pricing build, and a pricing build refuses `--relations` | Fixed: a plain `#define`, with the reason in its comment; this finding's text corrected |
+| 10 | The non-cofactor host join still writes relations with `fprintf` | Left: a speed item on a path production does not use |
+| 11 | Stale comments from finding 137 (a comparator that is gone, `cf_emit_sorted` as the shared formatter) | Fixed in `cofac.cuh` and `td.cuh` |
+| 12 | `ckpt.h`'s fingerprint comment says dropping `--cofactor` swaps flush-anchored checkpoints for a timer | Left: still true. Both now wait on the timer, but the cofactor path checkpoints only where a slab-0 flush lands, the other at any q boundary |
+
+**BOINC.** In BOINC's source (master, read 2026-10-30), `client/app.cpp`
+`ACTIVE_TASK::preempt` handles a user or scheduler suspend with "GPU jobs:
+always remove from mem, since it's tying up GPU RAM", which sends the task a
+quit. In `api/boinc_api.cpp`, a quit with `direct_process_action` set
+(`boinc_options_defaults` in `api/boinc_api.h` sets it to 1, "true for regular
+apps, false for wrappers") and no critical section exits through
+`exit_from_timer_thread`. `boinc_support.cpp` takes the defaults and never
+reads `quit_request`. So under BOINC every suspend of this GPU task is a
+crash: the band restarts from its last checkpoint. At c135 a suspend now
+loses up to ~30 s plus the wait for a slab-0 flush, against ~3 s before; at
+I16 the mean gap between checkpoints goes from ~27 s to ~57 s. A host whose
+GPU sessions keep ending sooner than that never gets past its last
+checkpoint. Options put to Kyle: (A) under BOINC, keep a checkpoint at every
+slab-0 flush and pay its ~1%; (B) treat BOINC's quit as a clean stop, so a
+suspend loses nothing; (C) keep 30 s everywhere. Kyle: "Let's go with C".
+BOINC's own default checkpoint preference is 60 s. The cost is written down
+in `RUNBOOK.md` ("Under BOINC a suspend is a crash"), `bench --help` and the
+comment at `PIPE_CKPT_MS`.
+
+**Gates** (`work/ckpt30/run3.sh`, 11:14-12:03; it waited for Kyle's GPU-ECM
+stage 1 to exit and the card to stay empty for a minute, with the CUDA client
+off throughout). Kyle's msieve linear algebra (`-nc2 -nc3`) came onto the
+card at 11:17 and shared it with the gates to the end; they check identity
+only, so nothing here depends on that. `new2` is HEAD `29252cd` with both
+findings and the fixes, sm_120 `f7d536bb`; the fat build is `3d312d7d`
+(`29252cd8-dirty`), 6 SASS targets.
+
+| gate | base `5e2a889f` vs `new2` (`gate3.sh`) | fat `3d312d7d` (`idgate.sh`) |
+|---|---|---|
+| abcheck, all four sets | 36 of 36 identical | 36 of 36 against base |
+| `--cofac` emitter: base's candidate batches, cofactorised by both | C143 23,850 and C183 728 relations, identical | — |
+| c135, 20,000 q | identical to `new`'s, 1,855,599 | same |
+| kill -9 at 10 s (`rel_bytes` 0, `.part` 10,125,312 bytes), rerun | "records no relations; none of ... is kept"; identical | same |
+| kill -9 at 45 s (`rel_bytes` 50,586,805 of 60,699,829), rerun | "spot-checked 16 relations ... 16 rebuild both norms exactly PASS"; identical | — |
+| `--check-relations` | 1,855,599 of 1,855,599 | same |
+| `make check` | passed (`GPU_ARCH=120`) | passed in the tree after the install, binary unchanged |
+
+No timing: the fixes are off the hot path (the sampler and message run once
+at resume, the retry only while no checkpoint has succeeded, and the emitter
+change is on `--cofac`).
+
+Installed: `3d312d7d` as `bench/bench`, swapped by `mv` with the tree's
+objects, then `make all` (nothing to relink) and `make -q all` clean. The
+binary it replaced, `dab15da1`, is kept as `work/ckpt30/bench.installed.138`;
+the new one is also `work/ckpt30/bench.installed.138b`. Evidence:
+`work/ckpt30/` (`run3.sh`, `run3.txt`, `gate3.sh`, `gate3.txt`, `gate3/`,
+`idgate.fat2.txt`, `idgate.fat2/`, `build2.log`, `tree.relink2.log`,
+`tree.check2.txt`).
+
+### Next
+
+1. **The rest of the gap after a flush** (~35 ms of finding 137's 62-66 at
+   c135, not the checkpoint). Not yet traced.
+2. Finding 137's next 2-5 stand: the emit's remaining 53 ms a flush (a
+   writer thread), `k_cofac` running alone during a flush (an asynchronous
+   flush), `PIPE_ZERO` (built in `work/hold/src/`, not measured), and
+   finding 136's list.
+3. **Option B from the review:** handle BOINC's quit as a clean stop
+   (`direct_process_action` off, poll `quit_request`, drain and checkpoint),
+   so a BOINC suspend loses nothing. Needs a BOINC client to test; one to do
+   with Greg.

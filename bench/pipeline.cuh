@@ -132,7 +132,22 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
     return ckpt_write(cfg->relations, P, cfg, ck);
 }
 
-/* A missed checkpoint costs at most one flush of re-sieving on the next
+/* The least time between periodic checkpoints, on both paths: without
+ * --cofactor at a q boundary, under it at a flush that lands on one. Each pays
+ * an fsync of the relation file, and a c135 flushes about every 3 s -- one
+ * fsync per flush was ~1% of its wall (finding 138) to bound a crash's loss at
+ * 3 s of sieving where 30 s is plenty. The stops still checkpoint
+ * unconditionally; this only spaces out the ones a running band takes.
+ *
+ * Under BOINC a suspend is a crash: the client quits a GPU task whenever it
+ * suspends it, and the runtime exits without letting this checkpoint. So a
+ * volunteer's suspend costs up to this much sieving too (at I16, where only a
+ * slab-0 flush may checkpoint, about a minute). Kyle's call, finding 138.
+ * Not a -D knob: a -D goes through DEFS, which marks a pricing build, and a
+ * pricing build refuses --relations, so no checkpoint could see it. */
+#define PIPE_CKPT_MS 30000.0
+
+/* A missed checkpoint costs one more PIPE_CKPT_MS of re-sieving on the next
  * resume. Aborting the band costs everything produced since the last
  * successful one, so a full disk, a read-only remount or an fsync EIO warns
  * and the sieve keeps going. Only the FIRST failure is reported: a persistent
@@ -3607,9 +3622,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* Without --cofactor the host join loop writes each q's relations as it
          * finishes, so every q boundary is a valid resume point and the only
          * question is how often to pay the fsync. Under --cofactor this is
-         * handled at the flush instead, and doing it here as well would record
-         * a point the queue's contents are not in the file for. */
-        if (fr && !cfg->cofactor && qi && host_ms() - t_ckpt > 30000.0) {
+         * handled at the flush instead, on the same PIPE_CKPT_MS clock, and
+         * doing it here as well would record a point the queue's contents are
+         * not in the file for. */
+        if (fr && !cfg->cofactor && qi && host_ms() - t_ckpt > PIPE_CKPT_MS) {
             t_ckpt = host_ms();
             pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
                                 base_rel + (unsigned long long)acc_rel,
@@ -4552,11 +4568,19 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                    blocks, cfg->threads, fr)) {
                         rc = -1; break;
                     }
-                    if (fr && slab == 0)
+                    /* A flush skipped here leaves whole q past the sidecar's
+                     * offset, which resume truncates and replays exactly as
+                     * it does a later slab's flush. Until a checkpoint has
+                     * landed (the seed failed), every slab-0 flush retries:
+                     * a band that fails with none written deletes its .part. */
+                    if (fr && slab == 0 &&
+                        (!ckpt_written || host_ms() - t_ckpt > PIPE_CKPT_MS)) {
+                        t_ckpt = host_ms();
                         pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
                                             base_rel + Q.nrel,
                                             base_nq + nqdone,
                                             &ckpt_written, &ckpt_warned);
+                    }
                 }
                 if (nacc_s > Q.cap) {
                     runlog_warn("  q=%llu slab %u: %u candidates exceeds the"

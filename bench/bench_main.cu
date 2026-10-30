@@ -164,9 +164,11 @@ static void usage(void)
 "\n"
 "STOPPING AND RESUMING  (--relations runs only)\n"
 "  Relations stage to NAME.part and are renamed to NAME when the band finishes.\n"
-"  After every cofactor flush -- the one instant the file holds a whole number\n"
-"  of special-q -- the .part is fsynced and NAME.part.ckpt records the next\n"
-"  (q, rho), the byte offset and the derived scale. Rerunning the SAME command\n"
+"  At most every 30 s, at a point where the file holds a whole number of\n"
+"  special-q (under --cofactor, a flush landing on one), the .part is fsynced\n"
+"  and NAME.part.ckpt records the next (q, rho), the byte offset and the\n"
+"  derived scale. A crash loses the sieving since then: up to ~30 s at c135,\n"
+"  a minute or more where a q has several slabs. Rerunning the SAME command\n"
 "  resumes there: the .part is truncated to that offset, discarding any torn\n"
 "  final line, and sieving continues. An empty .part with no checkpoint is\n"
 "  discarded automatically. Under a BOINC client, unusable staging/checkpoint\n"
@@ -174,7 +176,9 @@ static void usage(void)
 "  standalone runs still refuse nonempty or mismatched/corrupt artifacts.\n"
 "  SIGINT or SIGTERM stops cleanly at the next special-q, draining the queue\n"
 "  first, so a planned stop loses no work; a second signal exits at once and\n"
-"  falls back to the previous checkpoint.\n"
+"  falls back to the previous checkpoint. A BOINC client quits a GPU task\n"
+"  whenever it suspends it, and this build does not intercept that quit, so\n"
+"  under BOINC every suspend falls back to the previous checkpoint too.\n"
 "  --restart        discard an existing .part and its checkpoint, start over\n"
 "  --stop-file P    stop cleanly once path P exists (for unattended runs)\n"
 "  --watchdog S     report to stderr when the sieve makes no progress for S\n"
@@ -2745,12 +2749,23 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 {   /* Cheap, host-only, and it catches the case the
                      * fingerprint cannot: a .part that was hand-edited, or
                      * concatenated from another job, under a checkpoint that
-                     * still matches. Proves the polynomial only. */
+                     * still matches. Proves the polynomial only.
+                     *
+                     * Skipped when the checkpoint records no relations
+                     * (rel_bytes 0, the band's seed among others): resume
+                     * truncates the whole .part, so nothing in it is kept.
+                     * Sampling it read the torn final line of a kill -9 and
+                     * refused a sound resume of any crash before the first
+                     * in-loop checkpoint, 30 s into the band (finding 138). */
                     uint32_t nchecked = 0;
-                    const int bad = check_relations_sample(part, &POLY,
-                                                           cfg.lpb0, cfg.lpb,
-                                                           8, ck.rel_bytes,
-                                                           &nchecked);
+                    int bad = 0;
+                    if (!ck.rel_bytes)
+                        printf("  resume: the checkpoint records no relations;"
+                               " none of %s is kept\n", part);
+                    else
+                        bad = check_relations_sample(part, &POLY, cfg.lpb0,
+                                                     cfg.lpb, 8, ck.rel_bytes,
+                                                     &nchecked);
                     if (bad < 0) return 1;
                     if (bad > 0) {
                         BOINC_RECOVER_OR_RETURN(

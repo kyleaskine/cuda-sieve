@@ -1086,8 +1086,8 @@ __global__ void k_td(const int64_t *__restrict A, const int64_t *__restrict B,
  *     until p no longer divides, so an entry consumes the whole power of its
  *     prime whichever entry reaches it first, and distinct primes commute:
  *     the recorded multiset is order-invariant. Both emitters sort before
- *     writing anyway (`cf_emit_sorted`, cofac.cuh:1613; `std::sort`,
- *     pipeline.cuh:1002), so relation TEXT cannot see the order either.
+ *     writing anyway (`cf_fmt_sorted`, cofac.cuh; `std::sort`,
+ *     pipeline.cuh), so relation TEXT cannot see the order either.
  *     Order is load-bearing in exactly one place -- when `nf` exceeds `fmax`
  *     the tail is dropped, so which factors survive depends on it -- and that
  *     path is a hard error the host reports as "raise TD_FMAX". A

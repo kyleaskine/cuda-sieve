@@ -76,7 +76,7 @@ Two practical notes:
   relation file — ~8 GB on a c151 at 65M relations (~128 bytes each). Budget
   ~15 GB per job including msieve's `.mat` / `.cyc` / `.chk` / `.dep`.
 - **`bench` writes `NAME.part` and renames on success.** The `.part` is the
-  durable artifact, not scratch: after every cofactor flush it is fsynced and
+  durable artifact, not scratch: at most every 30 seconds it is fsynced and
   `NAME.part.ckpt` records the resume point. **Rerunning the same command
   resumes there** — it does not overwrite, and it does not need the several
   files and a `cat` this note used to prescribe. See "Stopping and resuming"
@@ -1082,10 +1082,27 @@ something on a terminal. That cadence is fixed and independent of
 ### Stopping and resuming
 
 Relations stage to `NAME.part`; the rename to `NAME` is the "band completed"
-marker. After every cofactor flush — the one instant the file holds a whole
-number of special-q — the `.part` is fsynced and `NAME.part.ckpt` records the
-next `(q, rho)`, the byte offset, the relation count, the derived scale and
-allowance, and a job fingerprint.
+marker. At most every 30 seconds (`PIPE_CKPT_MS`), at a point where the file
+holds a whole number of special-q — under `--cofactor`, a queue flush made
+before any slab of the current q was emitted — the `.part` is fsynced and
+`NAME.part.ckpt` records the next `(q, rho)`, the byte offset, the relation
+count, the derived scale and allowance, and a job fingerprint. A crash loses
+the sieving since that point. Checkpoints come about every 30 seconds at
+c135, whose queue flushes every ~3 s. Where a special-q has several slabs,
+only a flush at slab 0 can checkpoint, so they come about a minute apart at
+I16 (4 slabs, a flush every ~7 s) and further apart on jobs that flush more
+rarely. A clean stop loses nothing.
+
+**Under BOINC a suspend is a crash.** The client quits a GPU task whenever it
+suspends it ("GPU jobs: always remove from mem", BOINC's
+`ACTIVE_TASK::preempt`), and this build leaves the quit to the BOINC runtime,
+which exits without letting `bench` checkpoint. So every suspend, including
+each "suspend GPU while the computer is in use", costs the sieving since the
+last checkpoint, and a task never left running for longer than the
+checkpoint interval makes no progress. That is the price of the 30 s
+interval, Kyle's call in finding 138; BOINC's own default checkpoint
+preference is 60 s. Handling the quit request as a clean stop would make a
+suspend free.
 
 - **Rerunning the same command resumes**, truncating the `.part` to the
   recorded offset, which also discards any torn final line from a `kill -9`.

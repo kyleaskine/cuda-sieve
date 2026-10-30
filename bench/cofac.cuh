@@ -2159,12 +2159,6 @@ __global__ void k_rel_pack(uint32_t nr, const uint32_t *__restrict idx, cofq_t Q
 
 /* ---- the queue, host side ---------------------------------------------- */
 
-static int cf_u64cmp(const void *x, const void *y)
-{
-    uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
-    return a < b ? -1 : (a > b);
-}
-
 
 typedef struct {
     int64_t  *a, *b;
@@ -2345,26 +2339,59 @@ done:
  * primes are bounded by lpb, and mixing widths in one sorted array is how a
  * 33-bit split prime would get truncated on its way to the file.
  *
- * Shared by both emitters. They differ only in how the trial-division half
- * arrives (an array from the inline queue, a hex string from a --candidates
- * file), and keeping the sort and the format in one place is what stops the
- * two output paths drifting: the 64-bit widening had to touch the array type,
- * the comparator and the format string, and would have had to do it twice. */
-static void cf_emit_sorted(FILE *o, uint64_t *v, int n)
+ * cf_fmt_sorted is shared by both emitters (the inline queue through
+ * cq_fmt_side, a --candidates file through cf_emit_side). They differ only in
+ * how the trial-division half arrives (an array, a hex string), and keeping
+ * the sort and the format in one place is what stops the two output paths
+ * drifting: the 64-bit widening had to touch the array type, the sort and the
+ * format, and would have had to do it twice.
+ *
+ * Formatted by hand into a buffer rather than one fprintf per factor: the
+ * inline queue's flush wrote ~2 us of fprintf and qsort per relation, the
+ * card idle throughout (176 ms a flush at c135, ~5% of the wall). The bytes
+ * are printf's: %llx (lowercase, no leading zeros) and %lld. The sort is an
+ * insertion sort: at most TD_FMAX + CF_MAXFAC + 2 values. */
+#define CF_FMT_MAX(n) ((size_t)(n) * 17u)    /* n hex values and separators */
+static inline char *cf_put_hex(char *p, uint64_t v)
 {
-    qsort(v, n, sizeof v[0], cf_u64cmp);
-    for (int i = 0; i < n; i++)
-        fprintf(o, "%s%llx", i ? "," : "", (unsigned long long)v[i]);
+    char t[16];
+    int n = 0;
+    do { t[n++] = "0123456789abcdef"[v & 15u]; v >>= 4; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
 }
-
-static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
+static inline char *cf_put_dec(char *p, int64_t x)
+{
+    uint64_t v = x < 0 ? 0u - (uint64_t)x : (uint64_t)x;
+    char t[20];
+    int n = 0;
+    if (x < 0) *p++ = '-';
+    do { t[n++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
+static char *cf_fmt_sorted(char *p, uint64_t *v, int n)
+{
+    for (int i = 1; i < n; i++) {
+        const uint64_t x = v[i];
+        int j = i;
+        for (; j > 0 && v[j - 1] > x; j--) v[j] = v[j - 1];
+        v[j] = x;
+    }
+    for (int i = 0; i < n; i++) {
+        if (i) *p++ = ',';
+        p = cf_put_hex(p, v[i]);
+    }
+    return p;
+}
+static char *cq_fmt_side(char *p, const uint32_t *f, int nf,
                          const uint64_t *sp, int nsp)
 {
     uint64_t v[TD_FMAX + CF_MAXFAC];
     int n = 0;
     for (int i = 0; i < nf && n < TD_FMAX + CF_MAXFAC; i++) v[n++] = f[i];
     for (int i = 0; i < nsp && n < TD_FMAX + CF_MAXFAC; i++) v[n++] = sp[i];
-    cf_emit_sorted(o, v, n);
+    return cf_fmt_sorted(p, v, n);
 }
 
 /* TEST-ONLY (0 everywhere else): each flush prints one stderr line hashing
@@ -2374,7 +2401,7 @@ static void cq_emit_side(FILE *o, const uint32_t *f, int nf,
  * relations were the only check of that path, and they cannot see a lost or
  * stale candidate that splits into no relation. Hashed per slot: a, b, the
  * status, the in-lpb residual or the limbs to split, and the factor lists
- * sorted (cf_emit_sorted sorts them at output, so their order is not part of
+ * sorted (cf_fmt_sorted sorts them at output, so their order is not part of
  * the result). Set through DEFS, so a build that sets it is marked a pricing
  * build. */
 #ifndef COFQ_TEST_HASH
@@ -2820,18 +2847,31 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->nsp0, O->d_nsp0, nr, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->nsp1, O->d_nsp1, nr, cudaMemcpyDeviceToHost));
-    if (fo)
+    if (fo) {
+        /* a line is at most two 20-character integers, two sides of
+         * TD_FMAX + CF_MAXFAC factors and four separators */
+        enum { CQ_LINE_MAX = 2 * 20 + 2 * (int)CF_FMT_MAX(TD_FMAX + CF_MAXFAC) + 4,
+               CQ_OUTBUF = 1 << 16 };
+        char ob[CQ_OUTBUF];
+        char *p = ob;
         for (uint32_t k = 0; k < nr; k++) {
+            if ((size_t)(ob + CQ_OUTBUF - p) < (size_t)CQ_LINE_MAX) {
+                fwrite(ob, 1, (size_t)(p - ob), fo);
+                p = ob;
+            }
             int64_t a = O->a[k], b = O->b[k];
             if (b < 0) { a = -a; b = -b; }
-            fprintf(fo, "%lld,%lld:", (long long)a, (long long)b);
-            cq_emit_side(fo, O->f0 + (size_t)k * TD_FMAX, O->fn0[k],
-                         O->sp0 + (size_t)k * CF_MAXFAC, O->nsp0[k]);
-            fputc(':', fo);
-            cq_emit_side(fo, O->f1 + (size_t)k * TD_FMAX, O->fn1[k],
-                         O->sp1 + (size_t)k * CF_MAXFAC, O->nsp1[k]);
-            fputc('\n', fo);
+            p = cf_put_dec(p, a); *p++ = ',';
+            p = cf_put_dec(p, b); *p++ = ':';
+            p = cq_fmt_side(p, O->f0 + (size_t)k * TD_FMAX, O->fn0[k],
+                            O->sp0 + (size_t)k * CF_MAXFAC, O->nsp0[k]);
+            *p++ = ':';
+            p = cq_fmt_side(p, O->f1 + (size_t)k * TD_FMAX, O->fn1[k],
+                            O->sp1 + (size_t)k * CF_MAXFAC, O->nsp1[k]);
+            *p++ = '\n';
         }
+        fwrite(ob, 1, (size_t)(p - ob), fo);
+    }
     Q->ms_host += host_ms() - h0;
     Q->n = 0;
     rc = 0;
@@ -3383,8 +3423,11 @@ extern "C" int check_relations_sample(const char *path, const poly_t *poly,
     /* `limit` is the checkpointed prefix, and everything past it is about to be
      * truncated away. Stopping here is not an optimisation: a kill -9 leaves a
      * torn final line beyond the checkpoint, and sampling it would report a
-     * corrupt file and refuse a resume that is in fact perfectly sound. */
-    end = (limit && (int64_t)limit < size) ? (int64_t)limit : size;
+     * corrupt file and refuse a resume that is in fact perfectly sound. That
+     * holds at 0 too -- nothing is kept, so nothing is checked. Reading 0 as
+     * "the whole file" refused every crash before a band's first in-loop
+     * checkpoint (finding 138). */
+    end = (int64_t)limit < size ? (int64_t)limit : size;
     rewind(f);
     while (seen < n && bench_getline(&line, &cap, f) > 0) {
         int r;
@@ -3510,6 +3553,18 @@ static int cf_rec_build(cf_rec_t *r, const char *f0, const uint64_t *e0, int n0,
     r->n0 = cf_fill_side(r->f0, f0, e0, n0);
     r->n1 = cf_fill_side(r->f1, f1, e1, n1);
     return r->n0 >= 0 && r->n1 >= 0;
+}
+
+/* One side of a relation cf_rec_build accepted. It takes the record, not a
+ * bare array, so the count is bounded by the array it indexes, and the buffer
+ * is sized from that array: there is no clamp, because a clamp here writes a
+ * relation short of a factor, which fails reconstruction far downstream. */
+static void cf_emit_side(FILE *o, cf_rec_t *r, int side)
+{
+    char buf[CF_FMT_MAX(sizeof r->f0 / sizeof r->f0[0])];
+    uint64_t *v = side ? r->f1 : r->f0;
+    const int n = side ? r->n1 : r->n0;
+    fwrite(buf, 1, (size_t)(cf_fmt_sorted(buf, v, n) - buf), o);
 }
 
 /* Cofactorise a `--candidates` batch and write the relations it yields.
@@ -3739,9 +3794,9 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
             nrel++;
             if (fo) {
                 fprintf(fo, "%s:", rest[r].ab);
-                cf_emit_sorted(fo, rb.f0, rb.n0);
+                cf_emit_side(fo, &rb, 0);
                 fputc(':', fo);
-                cf_emit_sorted(fo, rb.f1, rb.n1);
+                cf_emit_side(fo, &rb, 1);
                 fputc('\n', fo);
             }
         }
@@ -3763,9 +3818,9 @@ extern "C" int run_cofac(const char *path, const char *out, uint32_t lim0,
             nrel2++;
             if (fo) {
                 fprintf(fo, "%s:", rest[r].ab);
-                cf_emit_sorted(fo, rb.f0, rb.n0);
+                cf_emit_side(fo, &rb, 0);
                 fputc(':', fo);
-                cf_emit_sorted(fo, rb.f1, rb.n1);
+                cf_emit_side(fo, &rb, 1);
                 fputc('\n', fo);
             }
         }
