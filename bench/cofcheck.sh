@@ -550,6 +550,44 @@ for sj in 0 4095; do
                "sieve-skip output identity" "$shape" "$got"; fail=1
     fi
 done
+# --norm-gate is output-identical by construction (RESULTS finding 141): side
+# 0 skips its norm only where side 1 has no survivor, which k_intersect_compact
+# drops anyway. The default runs it, so this pins --no-norm-gate, the kernel
+# that predates it, to the same 37 byte for byte, and checks each run's banner
+# says which it got. Both slab shapes, as for --sieve-skip: the gate's bit
+# index is slab-relative.
+for sj in 0 4095; do
+    case $sj in
+        0) sjarg=""            ; shape="unslabbed"       ;;
+        *) sjarg="--slab-j $sj"; shape="odd slab starts" ;;
+    esac
+    run --cofactor $sjarg --relations $TMP/ng1.txt > $TMP/ng1.out || true
+    run --cofactor $sjarg --no-norm-gate --relations $TMP/ng0.txt > $TMP/ng0.out || true
+    n1=$(grep 'total relations' $TMP/ng1.out | tail -1 | awk '{print $NF}') || true
+    n0=$(grep 'total relations' $TMP/ng0.out | tail -1 | awk '{print $NF}') || true
+    if [ "$n1" = "37" ] && [ "$n0" = "37" ] && cmp -s $TMP/ng1.txt $TMP/ng0.txt &&
+       grep -q -- '--norm-gate: side 0' $TMP/ng1.out &&
+       ! grep -q -- '--norm-gate: side 0' $TMP/ng0.out; then
+        printf 'PASS   %-34s %s, 37 on and off, byte-identical\n' "norm-gate output identity" "$shape"
+    else
+        printf 'FAIL   %-34s %s, expected 37/37 identical with the gate on/off, got %s/%s\n' \
+               "norm-gate output identity" "$shape" "${n1:-none}" "${n0:-none}"; fail=1
+    fi
+done
+# The refusals keep side 0's apply from reading side 1's bitmap when the fill
+# gate is off: under --fill-concurrent the two sides of a q overlap, so it
+# would be read while side 1 writes it. The message is checked too, so a run
+# refused for some other reason does not pass for this one.
+for off in --no-fill-gate --fill-concurrent; do
+    if ./bench --pipeline --cadofb $FB --poly $POLY $Q --cofactor --norm-gate $off \
+               --relations $TMP/r.txt >$TMP/o 2>&1; then
+        printf 'FAIL   %-34s %s accepted, should have been refused\n' "norm-gate without the fill gate" "$off"; fail=1
+    elif grep -q 'norm-gate reads side 1' $TMP/o; then
+        printf 'PASS   %-34s %s refused\n' "norm-gate without the fill gate" "$off"
+    else
+        printf 'FAIL   %-34s %s refused, but not for the gate\n' "norm-gate without the fill gate" "$off"; fail=1
+    fi
+done
 expect_refused "sieve-skip not an integer"      --sieve-skip two
 expect_refused "bkthresh below I"               --bkthresh 16384
 expect_refused "bkthresh above 2^30"            --bkthresh 2147483648

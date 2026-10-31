@@ -16328,3 +16328,416 @@ the new one is also `work/ckpt30/bench.installed.138b`. Evidence:
    (`direct_process_action` off, poll `quit_request`, drain and checkpoint),
    so a BOINC suspend loses nothing. Needs a BOINC client to test; one to do
    with Greg.
+
+## Finding 139 — a laptop RTX 5070 Ti at its 115 W cap against this desktop RTX 5070 on the same job, build and q: 16.35 against 13.94 ms/q, so the laptop runs at 85% of the desktop's speed (80-83% once the desktop's busy host is allowed for) on 38% less board energy per q. The desktop never reached its 250 W cap (217 W mean). Finding 94's undervolt, 30% less power for 5% less speed, does not carry over to a laptop's power cap
+
+**Date:** 2026-10-30. The laptop is Kyle's (WSL2, driver 13.5, runtime 13.3),
+sieving AS2982 (C152, index 1539) for real through `sievelocal.sh`, 12:03
+onward. Its `sieve.runlog` up to +1800 s is the data. The desktop band ran
+12:43-12:51 (`work/laptop/band.sh`) with the card free and the CUDA client
+off, but the host busy: msieve's square root (`-t 8`) and the CPU sieving
+client's 12 workers, load 21 on 16 logical CPUs. Both ran HEAD `29252cd8`,
+clean: the laptop its own build, the desktop `work/emit/base` `03bfefe7`
+(sm_120). Evidence: `work/laptop/` (`laptop.runlog`, `desktop.runlog`,
+`band.out`, `smi.csv`, `job.job`).
+
+The job: I14, rlim/alim 150M/200M, lpb 29/30, mfb 56/59, q from 10M, 72M
+relations wanted. The same settings as Kyle's C148 (`work/AS3373380-2684/`)
+except the limits, 80M/120M there.
+
+| AS2982, q 10,000,000-10,592,041 (36,685 q) | laptop 5070 Ti | desktop 5070 |
+|---|---:|---:|
+| SMs (`blocks` / 6) | 46 | 48 |
+| ms per q | **16.35** (its +600 s line) | **13.94** (band end; 13.56 at +300 s) |
+| relations per q | ~135 | 135.6 |
+| board power | 115.0 W in every busy sample: the cap | 217 W mean, 246 W max, 250 W cap; 2,894 MHz |
+| host load | 1.00 (bench's own spinning core, finding 105) | 21 |
+| board energy per q | **1.88 J** | **3.02 J** |
+
+- **Speed.** The laptop takes 1.17x the desktop's time per q, 85% of its
+  speed. The desktop's load of 21 is 1.3 busy threads per logical CPU, which
+  finding 96 prices at 3-6% at c183. Allowing for that (13.94 / 1.03-1.06
+  against 16.35), the laptop is at 80-83%. Its 46 SMs against 48 account for ~4% of the gap; the 115 W cap
+  for the rest.
+- **The forecast was optimistic.** I first gave the laptop 80-90% of the
+  desktop, then 85-90% from finding 94: the desktop's undervolt cut board
+  power 30% for 5% of speed. The undervolt kept the clock (~2,900 MHz at
+  950 mV against stock's 1,080 mV). A laptop's cap lowers the clock, and the
+  sieve is bound by L2 throughput, which runs at the core clock. The laptop's
+  log records no clock, so how far it drops is not measured.
+- **Yield is the same.** The desktop band wrote 135.63 relations a q. At the
+  same q count the laptop had written 4,938,741 with 39,890 candidates still
+  queued, about the 36,727 relations between the two.
+- **Energy.** Board energy per q is 38% lower on the laptop: 13.9 against
+  22.3 mJ a relation. Board only; neither machine's whole draw was measured.
+- **The desktop's card idled** at every flush on this build (utilization
+  samples of 0-35%, with 80-99% between): `29252cd8` predates finding 137's
+  emitter, and the busy host lengthens the flush. The laptop logged 99-100%
+  at five of its six 300 s samples. Both paid the same emitter.
+- **The job.** At its rate (8.0-8.4K relations/s a window, ms/q 16.32 ->
+  16.39 over the first 30 min), the laptop's 72M take ~2h28m. Kyle's
+  scheduler said 2h20m. On this build the desktop would take ~2h06m at its
+  band-end rate (2h28m x 13.94 / 16.35; 2h03m at its +300 s rate), and
+  ~2h00m only with the 3-6% host allowance as well.
+
+### Also: msieve's GPU linear algebra is power-bound on this card
+
+Before the band, msieve's `-nc2` held the desktop card at 249.6-250.5 W
+against the 250 W limit, at 2,715-2,737 MHz, with memory-controller use at
+42-43% (ten samples, 2 s apart). That is a power-capped workload, not a
+bandwidth-bound one, so a laptop's cap would slow msieve's LA too. One 20 s
+look, not a measurement of msieve.
+
+### Next
+
+1. The laptop's SM clock under the cap (`nvidia-smi --query-gpu=clocks.sm`
+   beside a run) would split the gap between clock and power.
+2. NFS@Home volunteers include laptops. This is one card on one job: the
+   ratio is for the jobs where L2 throughput sets the pace, as it does here.
+
+## Finding 140 — probes of the open items. Row-class capacity holds on the NFS@Home I16 job and SNFS301: side 1's fullest region is 88-90% of its class's capacity everywhere, side 0's at most 85% (SNFS301's lowest q). Side 1's survivors leave 60-86% of side 0's 64-position groups empty on the GNFS jobs, and side 0's per-position norm is 32-41% of its apply launch, so a gate on it is worth building. At c135 the gap after a flush is gone (it was the checkpoint): what is left is a 49 ms emit with the card idle and cofactor rounds that run on one SM
+
+**Date:** 2026-10-30, 13:05-13:40. Card free and the CUDA client off
+throughout. The capacity census and survivor census ran while the CPU
+sieving client drained (they count, they do not time); the traces and ncu
+ran after it stopped, with one CPU ECM P+1 process (load ~2.2). Source: HEAD
+`3b22151` (findings 137-138 committed) in three measurement copies, none of
+which touches `bench/`: `work/hw/` (bucket-region and survivor counters after
+every fill, `BKHW`), `work/flush/` (every watchdog phase as an NVTX range, and
+marks inside `cofq_flush`), `work/norm0/` (`NORM0CONST=1` gives side 0's
+apply `NORM_CONST`). Evidence: those directories (`hw.sh`, `hw.txt`,
+`census.sh`, `census.txt`, `trace.sh`, `trace.txt`, `flushgap.py`, `ncu.sh`,
+`ncuparse.py`, the CSVs and traces).
+
+### 1. Row-class capacity on the large jobs (STATUS row 32)
+
+Every fill's per-region record count (cursors, overflowed records included)
+against the region's own capacity, `bklay_base`. Fullest region by row class
+(f = sixths of a row `--sieve-skip 2` keeps), percent of that class's
+capacity:
+
+| job, q | fills a side | side 1: f = 6 / 4 / 3 / 2 | side 0: f = 6 / 4 / 3 / 2 | side 0's fullest rows |
+|---|---:|---|---|---|
+| NFS@Home I16, 297M, 200 q | 800 | 89.75 / 89.30 / 89.17 / 89.22 | 21.5 / 14.3 / 11.4 / 8.2 | 285-5320 |
+| SNFS301, 60M, 100 q | 400 | 89.47 / 88.86 / 89.58 / 88.34 | **85.3** / 81.0 / 74.9 / 63.3 | 2-11 |
+| SNFS301, 200M, 200 q | 800 | 89.44 / 89.15 / 89.38 / 88.48 | 80.7 / 77.3 / 66.9 / 61.0 | 2-11 |
+| SNFS301, 450M, 100 q | 400 | 89.46 / 89.22 / 89.09 / 87.94 | 77.2 / 70.2 / 57.7 / 47.0 | 3-10 |
+| C194, 60 q | 240 | 89.31 / 89.28 / 88.79 / 87.92 | 34.0 / 24.9 / 19.3 / 14.7 | |
+| 2,1147+, 60 q | 240 | 89.35 / 89.89 / 89.10 / 88.51 | **86.2** / 83.8 / 79.7 / 72.2 | 4-49 |
+| c183, 150 q | 150 | 89.04 / 89.24 / 89.03 / 88.72 | 33.9 / 22.7 / 16.7 / 11.4 | |
+
+- **No class is undersized.** In 3,030 fills a side, no region overflowed,
+  no index overflowed, and no region on either side passed 90% of its
+  capacity. Side 1's means are 81-85% in every class on every job, its
+  maxima 88-90%: finding 132's 1.15x margin holds the same way at I16 and on
+  the SNFS.
+- **Side 0 is closest on SNFS301 at its lowest q,** 85.3% in row 11 at
+  q = 60M (36 regions over 80%), falling to 77% at 450M. Its fullest regions
+  sit in the first dozen rows, where side 1 survives densely and the fill
+  gate opens. The job runs q = 60-450M, so ~15% is its least headroom.
+  2,1147+ is as close (86.2%), as finding 132 found.
+
+### 2. Side 1's survivors where side 0 is sieved (item 10's census)
+
+At each side-0 fill, side 1's survivor bitmap (the fill gate's input),
+counted in 64-position groups: one warp step of both the 16-bit threshold
+scan (positions k and k + 32 in lane k) and the norm init (positions 2k and
+2k + 1). Groups are aligned to 64 in every region.
+
+| job | side-1 survivors / position | groups holding one | lanes active in those, of 32 | two-sided survivors / q |
+|---|---:|---:|---:|---:|
+| c135 | 0.28% | **15.8%** | 1.15 | 6,144 |
+| C143 | 0.24% | **13.6%** | 1.13 | 10,728 |
+| C148 | 0.42% | **22.4%** | 1.20 | 41,527 |
+| c183 | 0.88% | 39.6% | 1.42 | 80,993 |
+| C194 | 0.63% | 31.2% | 1.29 | 236,997 |
+| AS276 (I16) | 0.61% | 30.1% | 1.29 | 122,824 |
+| NFS@Home I16 | 0.42% | **22.8%** | 1.19 | 110,475 |
+| SNFS301 | 1.94% | 64.0% | 1.91 | 106,680 |
+| 2,1147+ | 5.27% | 90.2% | 3.57 | 88,216 |
+
+In a group that holds a survivor, 70-88% hold exactly one on the GNFS jobs
+(50% on SNFS301, 20% on 2,1147+).
+
+**What side 0's norm costs** (`ncu --clock-control none`, 24 `k_apply`
+launches a run after 8 skipped, alternating side 1 then side 0 as the
+pipeline issues them; medians):
+
+| job | side 0, real norm | side 0, flat norm | side 0's norm | side 1 (unchanged, the noise) |
+|---|---:|---:|---:|---:|
+| c135 | 0.442 ms | 0.299 | **−32.3%** | +0.1% |
+| C148 | 1.390 | 0.814 | **−41.4%** | −0.1% |
+| c183 | 5.908 | 3.638 | **−38.4%** | −3.3% |
+| C194 | 6.586 | 4.295 | **−34.8%** | +2.4% |
+| NFS@Home I16 | 7.164 | 4.310 | **−39.8%** | −5.7% |
+| SNFS301 | 7.084 | 4.326 | **−38.9%** | −0.3% |
+
+Side 0's apply is light everywhere else: the fill gate keeps its buckets
+small, so the norm, computed at every position, is a third of the launch.
+(The comment in `k_apply` that prices the norm at 1.76 ms of a 27 ms apply
+dates from before the gate.)
+
+**A gate on it.** Side 0's survivors count only where side 1 survived, at the
+intersection. A warp whose 64 positions hold no side-1 survivor can skip its
+norm and start its cells at 0, as the both-even positions already do: a
+warp-uniform branch on one 64-bit read of side 1's bitmap, which is complete
+before side 0's fill. Kernel time it would remove per q, if the groups the
+census counts as empty cost nothing (the flat-norm arm is the limit where
+every group is skipped):
+
+| job | side-0 slabs a q | norm a slab | groups skipped | kernel ms saved a q | against wall (finding 138) |
+|---|---:|---:|---:|---:|---:|
+| c135 | 1 | 0.143 ms | 84% | 0.12 | 4.2% of 2.81 ms/q |
+| C148 | 1 | 0.576 | 78% | 0.45 | 4.4% of 10.33 |
+| c183 | 1 | 2.270 | 60% | 1.37 | 3.5% of 38.69 |
+| C194 | 4 | 2.291 | 69% | 6.3 | |
+| NFS@Home I16 | 4 | 2.854 | 77% | 8.8 | 6.1% of 143.67 |
+| SNFS301 | 4 | 2.758 | 36% | 4.0 | |
+
+Upper bounds: the pipeline overlaps kernels (1.38x summed kernel time over
+busy time at c135, finding 133), so the wall moves less than the kernel time.
+It is not finding 104's lever. Those designs deferred the norm until after
+the scan and paid for it with extra passes and barrier stall that grew with
+job size (C194 +3%, AS276 +16%). A gate adds no pass. The flat-norm arm, the
+gate's limit, showed no such loss: C194 −34.8%, the I16 jobs −39 to −40%.
+Relations should not change; the build's identity gates decide that.
+
+### 3. The c135 flush on this build
+
+Two nsys traces of c135, q in [7000000, 7020000) with `--relations`:
+CUDA + NVTX, and CUDA + NVTX + OS runtime. Both runs give 118,655 relations,
+identical. The band (1,290 q, ~4 s) has one in-loop flush. Per trace:
+
+| the in-loop flush | NVTX | NVTX + osrt |
+|---|---:|---:|
+| flush, host side | 150.6 ms | 149.3 |
+| its kernels, card busy | 97.8 | 98.1 |
+| card idle after them | **51.4** | **50.4** |
+| of which: readback | 2.1 | 1.6 |
+| format + write | **49.1** | **48.7** |
+| from `cofq_flush`'s return to the next kernel (`k_cof_enqueue`) | 0.05 | 0.1 |
+
+- **Finding 137's "rest of the gap" is gone.** Its 62-66 ms after the
+  return were the checkpoint: with finding 138 this flush skipped its
+  checkpoint, and the card resumed 0.05-0.1 ms after the return. The ~35 ms
+  finding 138 left unexplained was write and sync latency inside it.
+- **The emit is 49 ms with the card idle,** ~83k relations at 0.59 µs each.
+  No system call in it took over 0.5 ms (the osrt trace's 100 ms `poll`s
+  are runtime threads), so it is formatting, not the disk. At a flush every
+  ~2.6 s that is ~1.9% of c135's wall; ~1% at C148 (170 relations a q);
+  nothing at I16.
+
+**The flush's kernels** (`ncu`, the first two flushes of a c135 band of 2,000
+q, 40 `k_cofac` launches; each round is one full launch and one ~2 µs
+launch for the chunk's remainder):
+
+| round | side 0 | SM cycles active | side 1 | SM cycles active |
+|---|---:|---:|---:|---:|
+| 1 | 21.3-21.8 ms | 89-90% | 32.8-33.8 ms | 93-94% |
+| 2 | 5.0-5.4 | 19-20% | 8.1-8.3 | 78-79% |
+| 3 | 4.3-4.6 | **2.1%** | 7.3 | 20% |
+| 4 | 2.3-2.7 | **2.1%** | 4.9-5.2 | **2.1%** |
+| 5 | | | 2.8-3.0 | **2.1%** |
+
+- **Round 1 fills the card**: every SM active, 27% of warps, because 128
+  registers a thread allow two 256-thread blocks an SM. Nothing else could
+  run beside it.
+- **The later rounds are tails.** The records still open after round 1 are
+  few, and in four of a flush's nine launches they all sit on one SM (2.1% =
+  1 of 48) for 2.3-5 ms. Over a flush, ~27 ms of `k_cofac` runs with the card
+  at most 20% busy, ~30 ms of idle SM time: ~1.2% of c135's wall. This is
+  what an asynchronous flush would fill (finding 137's next 3), and it is
+  measured now.
+
+### Next
+
+1. **Gate side 0's norm by side 1's survivors, per warp** (section 2). It is
+   a branch in `k_apply`'s init loop, and side 1's bitmap passed to side 0's
+   apply (fill already takes it). Gates: abcheck and relations byte-identical,
+   then timing on c135, C148, c183, I16, C194 and SNFS301. Bound: 3.5-6% of
+   wall by kernel time.
+2. **A writer thread for the emit**: ~1.9% at c135, ~1% at C148 (finding
+   137's next 2). A checkpoint waits for it to go idle.
+3. **The cofactor tail**: rounds 2+ leave the card ≤20% busy for ~27 ms a
+   flush (~1.2% at c135). Either an asynchronous flush, or records still
+   open after a round carried into the next flush's first round.
+4. Unchanged: `PIPE_ZERO` (`work/hold/src/`), TD's survivor-count round trip,
+   and no tiny-prime skip without an interleaved comparison.
+
+## Finding 141 — side 0's norm gated by side 1's survivors (`--norm-gate`, finding 140's next 1): relations byte-identical, wall −2.4 to −3.2% on every GNFS job (c135 to I16) and −1.4% on SNFS301, apply −5.7 to −6.8% (−3.2%). The gate has to be a template parameter: a runtime test of the pointer cost both sides' apply 2.5-4.0% with the gate off, which ate half the win. Gathering the bitmap loads ahead, to hide their latency, was slower than one load per word
+
+**Date:** 2026-10-30, 21:25-23:20. Card free, both NFS@Home clients off,
+one CPU ECM P+1 process (load 1.6-2.7). Source: HEAD `3b22151` plus this
+change, built sm_120 in `work/ngate/new/`; base is HEAD's own sm_120 build
+(`work/ckpt30/new2`, `f7d536bb`). Evidence: `work/ngate/` (`gate.sh`,
+`gate.txt`, `gate2.txt`, `gate.fix.txt`, `gate.fat.txt`, `timing.sh`, `timing/`, `timing2/`,
+`timing.txt`, `timing2.txt`, the build logs and SASS dumps).
+
+### The change
+
+`--norm-gate`, on by default wherever `--fill-gate` is (so everywhere the
+pipeline runs the sides serially), refused without it. Side 0's `k_apply`
+takes side 1's unfolded survivor bitmap (one bit a position, the fill gate's
+input before `k_gate_fold`), and in its init loop a cell whose bit is clear
+gets no norm and starts at 0, as a both-even cell does. Such a cell can
+never be a two-sided survivor, and `k_intersect_compact` ANDs the two
+bitmaps, so nothing downstream sees it; side 0's own survivor count, already
+"[gated by side 1]" in `--verbose-q`, shrinks. Side 1's apply has finished
+by then in stream order whenever the fill gate is on (one legacy stream, or
+`st_sv` under `--q-pipeline`, with `--fill-ahead` included), which is what
+the fill gate already relies on.
+
+The branch is per lane, not per warp: a warp runs the norm when any lane's
+cell has a bit and branches over it when none does. In SASS the both-even
+test and the gate bit form one predicate that jumps the whole norm block.
+
+### Three builds
+
+| build | gate | bitmap load | `k_apply` registers |
+|---|---|---|---|
+| simple (`d0e71794`) | runtime test of `ngate` | one word per word, used two instructions later | 40, no spill |
+| gathered (`9bdcf4c4`) | runtime test | the next 16 words' bits in one batch of 16 loads | 40, no spill |
+| **NGATE (`cf53e396`)** | template parameter, side 0's instance only | one word per word | 40, no spill |
+
+The gathered build came from reading the simple one's SASS: a warp whose
+norm is skipped does almost nothing per iteration but wait out its load, so
+batching the loads looked free. The NGATE build came from the first timing.
+Its four new instances (`SLABBED` x `SSTAIL`, `NGATE = true`) bring `k_apply`
+to 15 instances; the ungated ones are instruction for instruction HEAD's
+(3,992, 4,016 and 4,096 instructions, 0 differ with immediates masked), so
+side 1, `--no-norm-gate` and the standalone harness run the old kernel.
+
+### Identity
+
+On both the gathered and the NGATE build, against base:
+
+| gate | result |
+|---|---|
+| `abcheck.sh`, all four sets | 36 of 36 identical, no overflow warnings |
+| `abcheck.sh`, `NEWARGS=--no-norm-gate`, pipeline sets | 18 of 18 identical |
+| c135, 20,000 q | 1,855,599 relations, byte-identical to finding 138's reference |
+| `--check-relations` on it | 1,855,599 of 1,855,599 rebuild both norms |
+| SNFS301 (special-q on side 0, I16), 10 q | 669 relations, identical |
+| refusals: `--no-fill-gate`, `--fill-concurrent`, no `--pipeline`; banner on, silent under `--no-norm-gate` | all as specified |
+
+Every timing run below also had to match base r1's relations for its job:
+all 336 did. (`gate.sh`'s first no-pipeline check passed `--logI 13` with
+the default `--region 14`, so the region refusal fired first; that was the
+script, fixed and rerun, `gate.fix.txt`.)
+
+### Timing 1: simple and gathered, gate on and off
+
+`timing.sh`, four arms rotated each round, 8 rounds, the job sizes as
+listed in it. Rounds 6 and 7 ran ~12% slow on every arm (host contention),
+so these are medians of per-round ratios against base's run in the same
+round:
+
+| job | off (gathered, `--no-norm-gate`): wall / apply | gathered: wall / apply | simple: wall / apply |
+|---|---|---|---|
+| c135 | +1.7% / +2.5% | −1.7% / −4.3% | −0.5% / −4.9% |
+| C148 | +1.5% / +4.0% | −2.0% / −4.7% | −2.4% / −4.8% |
+| c183 | +1.6% / +3.7% | −1.4% / −3.5% | −1.6% / −3.9% |
+| C194 | +1.5% / +3.8% | −1.5% / −3.2% | −1.7% / −3.9% |
+| NFS@Home I16 | +1.6% / +3.2% | −2.2% / −4.9% | −2.4% / −5.6% |
+| SNFS301 | +1.3% / +3.6% | −0.2% / −0.5% | −0.6% / −0.9% |
+
+- **The runtime test costs 2.5-4.0% of apply with the gate off,** on both
+  sides, since side 1 runs the same instance with a NULL pointer. Not root-
+  caused; it is the reconvergence lesson of `SSTAIL` (`td.cuh`: two loops in
+  one kernel cost apply +24% at I16) at a smaller scale, and a template
+  parameter removes it rather than explaining it.
+- **Gathering was slower,** apply 0.4-0.7% of base behind the simple load
+  on five jobs of six (C148 a tie). Not profiled; presumably three blocks of
+  16 warps an SM already hide one load an iteration, and the batch only adds
+  its 16 predicated loads and the refill bookkeeping.
+
+### Timing 2: the NGATE build
+
+`ARMS="base off on" timing.sh`, 8 rounds. Base wall and gate-on wall are
+means in ms/q; the percentages are medians of per-round pairs against base.
+Rounds 7-8 had slow runs again, single arms this time: I16 gate on r7,
+SNFS301 gate on r7, C194 base and off r7, C148 and c135 base r8, c183 off
+r8, all three I16 arms r8. Each is slow in fill as well (I16 gate on: fill
+54.79 and 55.14 ms against 53.39-53.55 in r1-6), which the gate does not
+touch, so it is the host, not the gate. The medians shrug them off and the
+means do not: I16's means give −2.6% and C148's −3.0% against the medians'
+−3.2% and −2.4%. Rounds 1-6 alone give the same wall medians within 0.1%,
+and apply within 0.3% except c135 (−5.4%):
+
+| job | base wall | gate on wall | wall | apply | off: wall / apply |
+|---|---:|---:|---:|---:|---|
+| c135 | 2.819 | 2.741 | **−2.5%** | −6.1% | 0.0% / −0.3% |
+| C148 | 10.400 | 10.089 | **−2.4%** | −6.8% | +0.1% / +0.1% |
+| c183 | 38.001 | 37.104 | **−2.5%** | −5.9% | +0.1% / −0.1% |
+| C194 | 153.27 | 148.85 | **−2.7%** | −5.7% | −0.1% / +0.3% |
+| NFS@Home I16 | 143.05 | 139.32 | **−3.2%** | −5.7% | 0.0% / −0.1% |
+| SNFS301 | 156.25 | 154.35 | **−1.4%** | −3.2% | +0.2% / +0.5% |
+
+- `--no-norm-gate` is now base within noise on every job, wall and apply.
+- Against finding 140's kernel-time bound (c135 4.2%, C148 4.4%, c183 3.5%,
+  I16 6.1%) the wall gain is 52-71% of it, as overlap predicted.
+- SNFS301 gains least because its side 1 survives densely: 64% of side 0's
+  groups hold a survivor (finding 140), against 16-40% on the GNFS jobs.
+  2,1147+ (90%) was not timed and would gain little.
+
+### Install and next
+
+1. **Installed 23:40, Kyle's call**: `work/ngate/fat/bench/bench`
+   (`6c7c2a84`), the fat build of exactly the tree's source (six SASS targets
+   plus compute_80 PTX, 2 min 19 s to build), after `gate.sh` on it passed
+   every gate above (`gate.fat.txt`). `work/ngate/install.sh` did it the way
+   finding 138's was, with the CUDA client off: objects copied, the binary
+   swapped by `mv`, `make -q all` clean in the tree before and after
+   `make check` (all gates passed). Copy: `work/ngate/bench.installed.141`;
+   the previous `3d312d7d` is `work/ckpt30/bench.installed.138b`.
+2. Finding 140's next 2-4 stand: the emit's writer thread (~1.9% at c135),
+   the cofactor tail (~1.2% at c135), and the rest unchanged.
+
+### The review's follow-ups (2026-10-31)
+
+An xhigh code review found no defect in the gate: it re-derived the identity
+(a gated cell starts at 0, as at the norm's ceiling, and side 1's clear bit
+drops it at the intersect), the stream order on all three paths, and 0 stack
+and local memory for all 90 `k_apply` entries of the fat build. It found doc
+errors, fixed in place: Timing 2's "no slow rounds" (above), the runtime
+test's 2.4% (a mean; the medians give 2.5%), finding 139's ~2h00m and 81-83%,
+and STATUS rows 29 and 32. The code and test items, all done:
+
+- **`pipe_apply_kern<SLABBED>(ngate, tail)`** (`pipeline.cuh`) is the one
+  place a pipeline `k_apply` instance is picked. The launch, the
+  shared-memory opt-in (now all four instances, unconditionally) and the
+  occupancy banner all read it, so they cannot drift apart.
+- **The occupancy banner covers every instance a run can launch,** both
+  SSTAIL ones and the NGATE pair under `--norm-gate`, and prints the fewest
+  blocks per SM, adding "another runs N" when they differ. Before, it
+  queried only the ungated one-step instance, so a third block lost by side
+  0's instance alone would have been silent (finding 128's failure).
+- **`--help`** lists `--norm-gate` after `--fill-gate-shift`, not inside
+  `--resieve-scan`'s sub-options, and says it is refused without the gate.
+- **`bench_kernels.cu` comments:** 15 instantiations, not nine (30-40
+  registers, no stack or local memory, on all six targets); the 1.76 of 27 ms
+  norm figure is marked stale against finding 140's 32-41%.
+- **`fillcheck.sh`** gains `gate3-nonorm` (the fill gate alone; every other
+  gated arm now runs the norm gate too) and names `--norm-gate`.
+- **`cofcheck.sh`** (`make check`) pins `--no-norm-gate` to the default's 37
+  relations byte for byte, unslabbed and on odd slab starts, checking each
+  banner says which ran, and refuses `--norm-gate` with `--no-fill-gate` and
+  with `--fill-concurrent`, checking the message.
+
+Build `work/ngate2/fat/bench/bench` (`aff3bc31`, `3b221517-dirty`), the fat
+build of exactly the tree's source. Its device SASS matches the installed
+`6c7c2a84`'s in all 642 arch x function bodies (`work/ngate2/sass/`; only
+the order of the four pipeline instances in the cubin moved), so the change
+is host code. `work/ngate2/gate.sh` passed every check: finding 141's gate on
+it (refusals, abcheck 36/36 and 18/18, c135 20,000 q identical to the
+reference with `--check-relations` 1,855,599/1,855,599, SNFS301 669
+identical); the apply banner line the installed binary's, gate on and off, at
+c135 and SNFS301 (3 blocks); `make check` all gates passed, the four new
+cases among them; `fillcheck.sh` 65 of 65 arms byte-identical. Not timed: the
+kernels are the installed ones. **Installed 13:07, Kyle's call**, by
+`work/ngate2/install.sh`, the way `work/ngate/install.sh` did it, with the
+CUDA client off: `make -q all` clean in the tree before and after `make
+check` (all gates passed, the four new cases among them; run beside Kyle's
+GPU ECM, which an identity gate does not mind). Copy:
+`work/ngate2/bench.installed.141b`; `6c7c2a84` is
+`work/ngate/bench.installed.141`.

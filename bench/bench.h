@@ -646,6 +646,12 @@ typedef struct {
      * fallback and the growth in tests. */
     int      resieve_scan;
     uint32_t resieve_scan_cap, resieve_scan_pairs;
+    /* --norm-gate (findings 140-141): side 0's apply computes the log norm only
+     * where side 1 has a survivor; elsewhere the cell starts at 0, as a
+     * both-even one does, and the intersection discards it. Reads the gate's
+     * bitmap, so it needs the gate: default on with it, off without, and
+     * refused explicitly without it. Output-identical by construction. */
+    int      norm_gate;
     /* --row-cap (default; --no-row-cap): each bucket region holds its row
      * class's share of the capacity, by the positions --sieve-skip keeps in
      * its row (slab.h, bklay_t; finding 132). Output-identical. */

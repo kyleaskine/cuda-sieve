@@ -163,7 +163,8 @@ TD_MOD_HD uint32_t td_mod_magic(uint32_t w, uint32_t m,
  * finding 111). The bloat argument above did land, in a different form: the
  * tail is a k_apply template parameter (SSTAIL), so each pipeline
  * specialisation ships twice -- 11 k_apply instances instead of 9 in every
- * arch of a fat build -- and the source writes the magic path twice
+ * arch of a fat build (15 since --norm-gate's NGATE doubled the four
+ * pipeline ones, finding 141) -- and the source writes the magic path twice
  * (ss_first's one- and two-step forms). That was the price of keeping one
  * thread-tier loop per instance: two loops in one kernel lost reconvergence
  * and cost apply +24% at I16. */

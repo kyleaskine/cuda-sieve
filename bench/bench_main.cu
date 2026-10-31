@@ -305,6 +305,9 @@ static void usage(void)
 "                   records only under side 1's survivors\n"
 "                   [on, off under --fill-concurrent, which refuses it]\n"
 "  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
+"  --norm-gate / --no-norm-gate  --pipeline only; side 0's apply computes\n"
+"                   the log norm only where side 1 has a survivor\n"
+"                   [on with the gate, else off; refused without it]\n"
 "  --resieve-scan / --no-resieve-scan  --pipeline only; side 0's resieve\n"
 "                   reads its pairs from its own gated fill records instead\n"
 "                   of walking its factor base. Costs an index array the size\n"
@@ -1084,6 +1087,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_rows = -1; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
     cfg.resieve_scan = -1; cfg.resieve_scan_cap = 0; cfg.resieve_scan_pairs = 0;
+    cfg.norm_gate = -1;
     cfg.row_cap = 1;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.fill_ahead = -1;   /* resolved with --q-pipeline */
@@ -1276,6 +1280,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         }
         else if (!strcmp(argv[i], "--resieve-scan")) { cfg.resieve_scan = 1; }
         else if (!strcmp(argv[i], "--no-resieve-scan")) { cfg.resieve_scan = 0; }
+        else if (!strcmp(argv[i], "--norm-gate")) { cfg.norm_gate = 1; }
+        else if (!strcmp(argv[i], "--no-norm-gate")) { cfg.norm_gate = 0; }
         else if (!strcmp(argv[i], "--resieve-scan-cap") && i + 1 < argc) {
             if (parse_u32_range_arg("--resieve-scan-cap", argv[++i], 0u,
                                     UINT32_MAX, &cfg.resieve_scan_cap)) return 1;
@@ -1685,6 +1691,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
      * are sparse enough to scan (finding 118). */
     if (cfg.resieve_scan < 0)
         cfg.resieve_scan = (cfg.pipeline && cfg.fill_gate) ? 1 : 0;
+    /* --norm-gate: likewise, since it reads the gate's bitmap (finding 140) */
+    if (cfg.norm_gate < 0)
+        cfg.norm_gate = (cfg.pipeline && cfg.fill_gate) ? 1 : 0;
     /* --q-pipeline (findings 108-109): on wherever it can run. Its VRAM check
      * happens in run_pipeline_impl and falls back to one q at a time;
      * --fill-concurrent and --qspan exclude it, so there the default is off
@@ -1720,6 +1729,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         fprintf(stderr, "--resieve-scan reads side 0's gated fill records; it"
                 " needs the gate, which is off (--no-fill-gate, or"
                 " --fill-concurrent)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.norm_gate && !cfg.fill_gate) {
+        fprintf(stderr, "--norm-gate reads side 1's survivors through the fill"
+                " gate, which is off (--no-fill-gate, or --fill-concurrent)\n");
         return 1;
     }
     if (cfg.pipeline && resieve_scan_knob && !cfg.resieve_scan) {
@@ -2373,7 +2387,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--no-q-pipeline", "--q-prep", "--fill-ahead", "--no-fill-ahead",
             "--td-ahead", "--no-td-ahead",
             "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
-            "--resieve-scan-cap", "--resieve-scan-pairs", "--no-row-cap", NULL
+            "--resieve-scan-cap", "--resieve-scan-pairs", "--no-row-cap",
+            "--norm-gate", "--no-norm-gate", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -3401,10 +3416,10 @@ resume_artifacts_ready:
              * free VRAM after setup, so run_pipeline_impl writes its own
              * `q-pipeline` line with what was granted. */
             runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
-                        " gate=%d shift=%d resieve-scan=%d", cfg.fill_rows,
-                        cfg.fill_row_bands, cfg.resieve_rows, cfg.fill_gate,
-                        cfg.fill_gate ? cfg.fill_gate_shift : 0,
-                        cfg.resieve_scan);
+                        " gate=%d shift=%d resieve-scan=%d norm-gate=%d",
+                        cfg.fill_rows, cfg.fill_row_bands, cfg.resieve_rows,
+                        cfg.fill_gate, cfg.fill_gate ? cfg.fill_gate_shift : 0,
+                        cfg.resieve_scan, cfg.norm_gate);
             if (cfg.resume)
                 runlog_note("resume", "at q=%llu rho=%llu after %llu q,"
                             " %llu relations",

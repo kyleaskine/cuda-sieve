@@ -1059,8 +1059,14 @@ __host__ __device__ __forceinline__ bool apply_scan_stores(int logI, int log_reg
  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
  */
 template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
-          bool SSTAIL = true>
-/* __launch_bounds__(512, 3): ptxas otherwise settles on 45-46 registers, which
+          bool SSTAIL = true, bool NGATE = false>
+/* NGATE: --norm-gate's instance, which reads ngate (the init comment). A
+ * template parameter, not a test of ngate, because the test alone cost both
+ * sides' apply 2.5-4.0% with the gate off (finding 141) -- SSTAIL's lesson
+ * (td.cuh) again. Without it ngate is ignored and the kernel is the one
+ * that predates the option.
+ *
+ * __launch_bounds__(512, 3): ptxas otherwise settles on 45-46 registers, which
  * fits only TWO 512-thread blocks per SM and pins theoretical occupancy at
  * 66.67%. ncu on a 5070 (sm_120) reports the limiter explicitly -- Block Limit
  * Registers 2 against Block Limit Shared Mem 3 and Block Limit Warps 3 -- so
@@ -1075,8 +1081,10 @@ template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
  * lands. Anyone reusing this recipe on another kernel must round DOWN to a
  * multiple of 8 before believing the arithmetic.
  *
- * ptxas lands on 40 with NO spill for all nine instantiations, on sm_120 and
- * sm_80 alike; total spill bytes across the whole TU stay at 0, as at HEAD.
+ * ptxas lands on 40 with NO spill for all 15 instantiations (nine before
+ * --norm-gate's NGATE doubled the pipeline's four; finding 141's fat build
+ * shows 30-40 registers and no stack or local memory for every one on all six
+ * targets, sm_75 to sm_120); total spill bytes across the whole TU stay at 0.
  * This is the mirror image of k_fill_l1, where the same annotation had to be
  * REVERTED because a widened walk pushed it past the cap into 12 spill stores:
  * check `-Xptxas -v` before assuming a cap is free, in both directions.
@@ -1121,7 +1129,8 @@ void k_apply(const uint32_t *__restrict buckets,
                         uint32_t nsplit, uint32_t nfold, uint32_t ntab,
                         uint32_t probe_x, uint32_t *__restrict probe_out,
                         uint32_t *__restrict survbits, int not_both_even,
-                        int sieve_skip, uint32_t j_base)
+                        int sieve_skip, uint32_t j_base,
+                        const uint32_t *__restrict ngate)
 {
     extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
@@ -1163,6 +1172,18 @@ void k_apply(const uint32_t *__restrict buckets,
     /* ---- init: log-norm bound, computed in shared memory ---- */
     for (uint32_t w = tid; w < nword; w += nth) {
         uint32_t word = 0;
+        /* --norm-gate (NGATE): ngate is the OTHER side's survivor bitmap for
+         * this slab. A cell whose bit is clear can never be a two-sided
+         * survivor, so it gets no norm and starts at 0, like a both-even one;
+         * the intersection drops whatever it scans to. The word's CPW cells
+         * share one bitmap word, since CPW divides 32 and x is CPW-aligned.
+         * Not warp-uniform, and need not be: a warp runs the norm below when
+         * any lane's cell has a bit, and skips it when none does -- 84% of
+         * side 0's 64-position groups at c135, 77% at I16 (finding 140).
+         * One load per word, used at once: gathering 16 words' bits ahead in
+         * one batch of loads was slower (finding 141). */
+        const uint32_t xw = xbase + w * CPW;
+        const uint32_t gw = NGATE ? ngate[xw >> 5] >> (xw & 31u) : ~0u;
         #pragma unroll
         for (uint32_t c = 0; c < CPW; c++) {
             uint32_t t;
@@ -1171,6 +1192,8 @@ void k_apply(const uint32_t *__restrict buckets,
              * xbase and CPW are even. */
             if (sieve_skip && pos_both_even(x, jblk)) {
                 t = CINIT;                       /* cell starts at 0 */
+            } else if (NGATE && !((gw >> c) & 1u)) {
+                t = CINIT;                       /* --norm-gate: likewise */
             } else if (NORMMODE == NORM_CONST) {
                 t = tconst;
             } else {
@@ -1226,8 +1249,11 @@ void k_apply(const uint32_t *__restrict buckets,
                  * host equivalent, so the CPU replay could not mirror this
                  * expression exactly and "0 cells differ" was measuring two
                  * slightly different functions. Accurate log2f is reproducible
-                 * on both sides; norm init was 1.76 ms of a 27 ms apply, so the
-                 * difference is affordable and correctness is not. */
+                 * on both sides. It was priced when norm init was 1.76 ms of a
+                 * 27 ms apply; the norm is far more of apply now (32-41% of side
+                 * 0's launch before --norm-gate, finding 140), so re-price it
+                 * with NORM_FAST_LOG2 below -- parity keeps the accurate one
+                 * either way. */
 #ifdef NORM_FAST_LOG2
 #warning "NORM_FAST_LOG2: __log2f breaks CPU parity; --verify and dumpcmp will \
 report spurious cell mismatches. Pricing builds only, never for relations."
@@ -3640,7 +3666,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         D.smag,                                               \
                         nsmall, nblk, nwrp, nsplit, nfold, ntab, probe_x,      \
                         D.probe,                                               \
-                        D.survbits, cfg->not_both_even, 0, 0u);                   \
+                        D.survbits, cfg->not_both_even, 0, 0u, NULL);             \
                 }                                                              \
                 cudaEventRecord(e4);                                           \
                 CK(cudaEventSynchronize(e4));                                  \

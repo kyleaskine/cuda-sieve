@@ -939,6 +939,21 @@ typedef struct {
     cudaEvent_t after, t0, t1;
 } pipe_part_t;
 
+/* The pipeline's four k_apply instances, by --norm-gate (NGATE, side 0's
+ * launches) and the two-step tail (SSTAIL, ss_needs_tail). The launch, the
+ * shared-memory opt-in and the occupancy banner all pick from here, so an
+ * instance cannot launch without its MaxDynamicSharedMemorySize or escape the
+ * banner's check, and a fifth template flag changes one place. */
+template <bool SLABBED>
+static auto pipe_apply_kern(int ngate, int tail)
+{
+    return ngate
+        ? (tail ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true, true>
+                : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false, true>)
+        : (tail ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true, false>
+                : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false, false>);
+}
+
 template <bool SLABBED>
 static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                  int side, uint32_t xmax, uint32_t j_base,
@@ -1059,10 +1074,14 @@ apply:
          * one-step loop alone (sieve_small, SSTAIL; finding 111). The choice
          * is ss_needs_tail, never a geometry test: the one-step instance on a
          * table with a tail would give silently wrong residues, and traps.
-         * Its own scope, so the SLAB_CK gotos above do not jump past it. */
-        auto *const apply_kern = ss_needs_tail(S->nsplit, S->nsmall)
-            ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>
-            : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>;
+         * Its own scope, so the SLAB_CK gotos above do not jump past it.
+         * --norm-gate: side 0's instance reads the unfolded bitmap, one bit
+         * a position, complete by the same stream order as the fill's gate;
+         * every other launch is the ungated instance (NGATE, finding 141).
+         * Both choices go through pipe_apply_kern. */
+        const uint32_t *const ngate = cfg->norm_gate ? gate_bits : NULL;
+        auto *const apply_kern = pipe_apply_kern<SLABBED>(
+            ngate != NULL, ss_needs_tail(S->nsplit, S->nsmall));
         apply_kern<<<nregion, athr, S->apply_smem, st>>>(
             (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
             S->N, S->CINIT, S->CINIT - S->BOUND,
@@ -1070,7 +1089,7 @@ apply:
             S->sp, S->srt, S->sg, S->slp, S->smag,
             S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold, S->ntab,
             0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
-            j_base);
+            j_base, ngate);
     }
     SLAB_CK(cudaEventRecord(S->ev[3], st));
     /* The join's two counts, queued behind apply on the same stream: the
@@ -2713,30 +2732,42 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             S1.apply_smem > S0.apply_smem ? S1.apply_smem : S0.apply_smem;
         /* MaxDynamicSharedMemorySize belongs to each k_apply specialization.
          * Setting it independently while initializing the two sides is wrong:
-         * the second side can lower the limit required by the first. Both
-         * SSTAIL instances, because the launch picks one per q. */
-        PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
-        PIPE_CK(cudaFuncSetAttribute(k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+         * the second side can lower the limit required by the first. All four
+         * of pipe_apply_kern's instances: the launch picks SSTAIL per q and
+         * NGATE per side, and setting one this run never launches is harmless. */
+        for (int g = 0; g < 2; g++)
+            for (int t = 0; t < 2; t++)
+                PIPE_CK(cudaFuncSetAttribute(pipe_apply_kern<SLABBED>(g, t),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
         /* Apply's blocks per SM, and whether shared memory is what limits
          * them. Losing the third block used to be silent: finding 128's
          * 2,1147+ ran apply 16-18% slower with clean output, and the k_apply
          * comment's budget leaves 48 B with --tiny-table's tables (256 B
          * without). The count is the device's own
-         * occupancy calculation, so it holds on every architecture. */
+         * occupancy calculation, so it holds on every architecture. It covers
+         * every instance this run can launch -- both SSTAIL ones, and the
+         * NGATE pair under --norm-gate -- and prints the fewest, naming the
+         * most when they differ. */
         {
             const int apply_thr = cfg->apply_threads ? cfg->apply_threads : 512;
-            int nb = 0, nb_nosmem = 0;
-            PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb,
-                k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
-                apply_thr, apply_smem));
-            PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb_nosmem,
-                k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false>,
-                apply_thr, 0));
+            int nb = -1, nb_hi = 0, smem_limits = 0;
+            for (int g = 0; g <= (cfg->norm_gate ? 1 : 0); g++)
+                for (int t = 0; t < 2; t++) {
+                    int n = 0, n_nosmem = 0;
+                    PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,
+                        pipe_apply_kern<SLABBED>(g, t), apply_thr, apply_smem));
+                    PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n_nosmem,
+                        pipe_apply_kern<SLABBED>(g, t), apply_thr, 0));
+                    if (nb < 0 || n < nb) nb = n;
+                    if (n > nb_hi) nb_hi = n;
+                    smem_limits |= n < n_nosmem;
+                }
             printf("  apply: %d block%s of %d threads per SM, %zu B shared memory"
-                   " each%s\n", nb, nb == 1 ? "" : "s", apply_thr, apply_smem,
-                   nb < nb_nosmem ? " -- shared memory is the limit" : "");
+                   " each%s", nb, nb == 1 ? "" : "s", apply_thr, apply_smem,
+                   smem_limits ? " -- shared memory is the limit" : "");
+            if (nb < nb_hi)
+                printf(" -- the fewest of its instances; another runs %d", nb_hi);
+            printf("\n");
         }
     }
     VRAM_MARK("factor bases + bitmaps");
@@ -3090,6 +3121,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  --fill-gate: side 0 stores fill records only under side 1's"
                " survivors, 1 gate bit per %u positions\n",
                1u << cfg->fill_gate_shift);
+    if (cfg->norm_gate)
+        printf("  --norm-gate: side 0's apply computes the log norm only under"
+               " side 1's survivors\n");
     if (cfg->small_sieve) {
         printf("  --tiny-fold: %s\n", cfg->tiny_fold
                ? "small-sieve moduli that are powers of two <= 32 are added at"

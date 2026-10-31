@@ -1,17 +1,19 @@
 #!/bin/sh
 # fillcheck.sh -- identity gate for --fill-rows, --resieve-rows, --fill-gate
-# and --q-pipeline.
+# (with --norm-gate) and --q-pipeline.
 #
-# None of the four changes which records the sieve needs. --fill-rows moves
+# None of these changes which records the sieve needs. --fill-rows moves
 # the smallest bucketed moduli to a row-banded kernel (same lattice points,
 # another order inside each bucket); --fill-gate drops side-0 records only at
 # positions side 1 already rejected, which k_intersect_compact discards
-# anyway; --resieve-rows finds the same (survivor, prime) pairs in another
-# order; --q-pipeline only moves the next slab's or q's sieve under this one's
-# trial division. So every arm must reproduce the old configuration's
-# relation file (all four off) byte for byte. The explicit arms run with the
-# pipeline at its default (on, where VRAM allows), `single` turns it off, and
-# `concurrent` excludes it.
+# anyway, and --norm-gate, on wherever the fill gate is, skips side 0's norm
+# at those positions, so every arm with the gate runs both and `gate3-nonorm`
+# is the fill gate alone; --resieve-rows finds the same (survivor, prime)
+# pairs in another order; --q-pipeline only moves the next slab's or q's sieve
+# under this one's trial division. So every arm must reproduce the old
+# configuration's relation file (all of them off) byte for byte. The explicit
+# arms run with the pipeline at its default (on, where VRAM allows), `single`
+# turns it off, and `concurrent` excludes it.
 #
 # The jobs cover the shapes the kernels branch on: C143 at I13 (the row tier
 # starts at q = I, one region per row) and I14 (two regions per row), c183 I15
@@ -58,6 +60,7 @@ ARMS='rows4|--fill-rows 4 --no-resieve-rows --no-fill-gate
 rows16|--fill-rows 16 --no-resieve-rows --no-fill-gate
 rows16-bands7|--fill-rows 16 --fill-row-bands 7 --no-resieve-rows --no-fill-gate
 gate3|--fill-rows 0 --fill-gate
+gate3-nonorm|--fill-rows 0 --fill-gate --no-norm-gate
 gate0|--fill-rows 0 --fill-gate --fill-gate-shift 0
 rows16-gate3|--fill-rows 16 --no-resieve-rows --fill-gate
 rows4-rs|--fill-rows 4 --resieve-rows --no-fill-gate
