@@ -702,6 +702,8 @@ typedef struct {
     int      small_sieve;   /* 1 = line-sieve p < bkthresh into the region      */
     int      tiny_fold;     /* 1 = moduli 2^k <= 32 folded into apply's init     */
     int      tiny_table;    /* 1 = moduli 3, 5, 7, 9 from per-region tables      */
+    uint32_t ss_block_cut;  /* small-sieve tier cuts (ss_block_cut()); 0 = the  */
+    uint32_t ss_warp_cut;   /* defaults                                         */
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
     double   scale;         /* las byte scale for this side; 1.0 = raw bits    */
@@ -824,6 +826,30 @@ typedef struct {
      * cfg.qmin is already the original. */
     uint64_t resume_qmin;
 } bench_cfg_t;
+
+/* The small sieve's tier cuts on the modulus m (bench_kernels.cu, "Three
+ * tiers"; RESULTS finding 145): the whole block walks m < the block cut, a
+ * warp per entry m < the warp cut, a thread per entry the rest. Set by
+ * --ss-block-cut / --ss-warp-cut. They change which tier walks an entry and
+ * no output, so they are not in the resume fingerprint. The device code never
+ * sees a cut, only the tier counts ss_tiers derives from it, so the limits
+ * are the packing's: the block tier packs c0 and the step (< 2m) in 8 bits,
+ * the warp tier in 16, and --tiny-fold's moduli (<= SS_FOLD_MAX, 32) and
+ * --tiny-table's (<= 9) must sit in the block tier. The defaults were measured
+ * on an RTX 5070 only, which is why they are flags. */
+#define SS_BLOCK_CUT_DEFAULT  36u
+#define SS_WARP_CUT_DEFAULT  256u
+#define SS_BLOCK_CUT_MIN      33u
+#define SS_BLOCK_CUT_MAX     128u
+#define SS_WARP_CUT_MAX    32768u
+static inline uint32_t ss_block_cut(const bench_cfg_t *cfg)
+{
+    return cfg->ss_block_cut ? cfg->ss_block_cut : SS_BLOCK_CUT_DEFAULT;
+}
+static inline uint32_t ss_warp_cut(const bench_cfg_t *cfg)
+{
+    return cfg->ss_warp_cut ? cfg->ss_warp_cut : SS_WARP_CUT_DEFAULT;
+}
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
 #define FILL_TWOLEVEL 1     /* (c) smem-staged, flush full cache lines  */

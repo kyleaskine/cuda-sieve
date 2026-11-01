@@ -17083,14 +17083,501 @@ of wall at best. Parked. `ss_setup`, which the fold shares with the table and
 the small-sieve tiers, is 5-10% across all its callers. The fold's part of it
 is one call per lane per 32 entries.
 
+### The production form (2026-11-01, in the tree; installed 00:19)
+
+`bench_kernels.cu` carries `proto2`'s dispatch (`work/deg2/port.py`): the
+loop body indented inside the lambda, a comment, and a
+`static_assert(BENCH_MAX_DEGREE == 8)` tying the eight cases to the bound.
+`git diff -w` is about 40 lines. The re-indent pushes 31 comment lines just
+past 80 columns; they were left as they are.
+
+- **The same device code as the timed build:** an sm_120 build of the tree
+  (`work/deg2/sm120/`, `fcae3f3c`) matches `proto2`'s SASS in all 107
+  functions, so the timing above is this code's.
+- **Fat build** `6148a21b` (`work/deg2/fat/`): 2:44 elapsed and 424 s of CPU,
+  against 2:40 and 390 s for `d7defb03`. Its sm_120 SASS matches the sm_120
+  build in all 107 bodies (with cub's arch-list namespace normalised: the fat
+  build's is `_V_300403_SM_750_..._120`).
+- **Other archs:** `k_apply`'s registers rose in 30 of its 90 arch x instance
+  bodies. On sm_80/86/89 they went from 36-38 to 40, the `__launch_bounds__`
+  cap; on sm_75 from 37-38 to 40-42. sm_90 and sm_120 were already at the
+  cap. No body has a stack or local memory, and blocks per SM are unchanged
+  on every arch. sm_75 is held to 2 by its 1,024 threads either way, the rest
+  run 3. The speed on those cards is unmeasured.
+- **Gates** (`work/deg2/gate.sh`, installed `d7defb03` against `6148a21b`),
+  all passed: abcheck 36/36; c135 20,000 q byte-identical to finding 138's
+  reference, with `--check-relations` 1,855,599/1,855,599; kill -9 resumes
+  and SIGINT/SIGTERM/stop-file stops all resumed to the reference; SNFS301
+  669 identical; `make check`; C1147 (degree 7) and short c135/SNFS301 runs
+  identical, with the apply line unchanged (3 blocks of 512 threads per SM);
+  fillcheck 65 of 65 arms byte-identical. The first run failed both new
+  device checks on the checks' own design: cub's names, and requiring equal
+  registers instead of equal blocks per SM. Both checks were fixed and
+  rerun.
+
 ### Next
 
-1. **The production form in the tree** (Kyle's call): `proto2`'s dispatch,
-   commented. Then the fat build, gates (abcheck, `make check`, c135 against
-   finding 138's reference, SNFS301, C1147) and an install, as for finding 142.
+1. **Install: done 2026-11-01 00:19**, Kyle's call. `work/deg2/install.sh`
+   copied the fat objects into `bench/` and swapped the binary; `make all` in
+   the tree left it in place and `make check` in the tree passed.
+   `bench/bench` is `6148a21b` (copy at `work/deg2/bench.installed.144`);
+   `d7defb03` is kept as `work/emitw2/bench.installed.142b`.
 2. **The tier and fill sweep** (the review's third lead). `SS_BLOCK_CUT` (64)
    and `SS_WARP_CUT` (1024) were set in findings 101-102, before
    `--tiny-fold` and `--tiny-table` took the moduli up to 32, and 3, 5, 7
    and 9, out of the walk. `--fill-blocks 4608` was last confirmed in finding
    85, before the row-banded fill and the fill gate. The bounds:
    `SS_FOLD_MAX < SS_BLOCK_CUT <= 128`, and `SS_WARP_CUT <= 32768`.
+
+## Finding 145 — the small-sieve tier cutoffs and the fill grid re-swept (finding 144's next 2, the outside review's third lead): with the smallest moduli folded and tabled, both cutoffs belong far lower. `SS_BLOCK_CUT` 36 (from 64, the lowest the fold allows) with `SS_WARP_CUT` 256 (from 1024) is −1.1% (C1147) to −5.3% (C143) on wall across six jobs, 8 of 8 rounds each, with relations byte-identical. The fill grid has no consistent winner and stays at 4608. Installed 2026-11-01 as fat `c07d3c75`, after every gate passed (`work/tier/`)
+
+`SS_BLOCK_CUT` (64) and `SS_WARP_CUT` (1024) were set in findings 101-102,
+before `--tiny-fold` (finding 129) and `--tiny-table` (finding 131) took the
+moduli up to 32, and 3, 5, 7 and 9, out of the walk. `--fill-blocks` 4608 was
+last confirmed in finding 85, before the row-banded fill and the fill gate
+(finding 107). The tiers and the fill grid change no output: every run below
+matched base r1's relations byte for byte.
+
+### Stage 1 (`work/sweep/`, 2026-11-01 00:29-01:19, 5 rotated rounds)
+
+Base is `work/deg2/sm120` (sm_120, the installed `6148a21b`'s source). The
+tier arms are copies of it with one `#define` changed (`build.sh`;
+registers 38-40, no stack, like base). The fill arms are base with
+`--fill-blocks N`. Medians over rounds of arm/base wall, and the rounds the
+arm was faster:
+
+| arm | C135 | C148 | I16 | SNFS301 |
+|---|---:|---:|---:|---:|
+| `SS_BLOCK_CUT` 48 | −1.12% (3/5) | −0.31% (3/5) | −0.77% (5/5) | −0.42% (4/5) |
+| `SS_BLOCK_CUT` 96 | +1.94% (0/5) | +2.77% (0/5) | +1.98% (0/5) | +0.61% (1/5) |
+| `SS_BLOCK_CUT` 128 | +4.49% (0/5) | +3.38% (0/5) | +3.70% (0/5) | +1.40% (0/5) |
+| `SS_WARP_CUT` 512 | **−2.26% (5/5)** | +1.12% (2/5) | **−0.51% (5/5)** | **−1.30% (5/5)** |
+| `SS_WARP_CUT` 2048 | +1.62% (0/5) | +2.40% (0/5) | +1.81% (0/5) | +0.92% (0/5) |
+| `SS_WARP_CUT` 4096 | +8.09% (0/5) | +4.66% (0/5) | +5.36% (0/5) | +3.57% (0/5) |
+| `--fill-blocks` 2304 | −0.32% (3/5) | +0.10% (2/5) | +0.87% (1/5) | +0.20% (1/5) |
+| `--fill-blocks` 3456 | −0.97% (3/5) | +0.00% (2/5) | −0.17% (5/5) | −0.44% (4/5) |
+| `--fill-blocks` 6912 | −1.29% (3/5) | +0.00% (2/5) | +0.14% (1/5) | −0.07% (3/5) |
+| `--fill-blocks` 9216 | −0.65% (3/5) | +1.21% (0/5) | +0.82% (0/5) | −0.10% (3/5) |
+
+Base walls: C135 2.824, C148 10.092, I16 139.93, SNFS301 155.93 ms/q.
+
+- **The tiers move monotonically:** every raised cutoff is slower on every
+  job, by up to 8%, and both lowered ones are faster on most. With the
+  smallest moduli folded and tabled, a block-tier or warp-tier entry now
+  costs more than the thread tier would.
+- **`SS_WARP_CUT` 512 at C148 is +1.1% on wall with its apply stage −2.6%.**
+  C148's fill arms read apply −2.6 to −4.3% with flat walls, so this job's
+  apply stage was noisy in this run. Stage 2 repeats it.
+- **The fill grid stays at 4608:** no arm is consistently ahead. The largest
+  readings are C135's 3/5 rounds, inside that job's round-to-round spread.
+
+### Stage 2 (`work/sweep/run2.sh`, 2026-11-01 01:38-02:19, 6 rotated rounds)
+
+`build2.sh`: `SS_WARP_CUT` 256 and 384, `SS_BLOCK_CUT` 40, and `SS_BLOCK_CUT`
+48 with `SS_WARP_CUT` 384 or 512, all with base's registers (38-40) and no
+stack. B48 and W512 ran again. The run waited for msieve's linear algebra
+to start and finish, so it never held VRAM when msieve started. Medians over
+rounds of arm/base wall, and the rounds the arm was faster:
+
+| arm (block, warp cutoff) | C135 | C148 | I16 | SNFS301 |
+|---|---:|---:|---:|---:|
+| B48 (48, 1024) | −0.57% (4/6) | −0.81% (4/6) | −0.87% (6/6) | −0.28% (6/6) |
+| B40 (40, 1024) | −0.57% (5/6) | −1.43% (6/6) | −1.09% (6/6) | −0.59% (6/6) |
+| W512 (64, 512) | −1.14% (6/6) | +0.15% (2/6) | −0.77% (6/6) | −0.51% (5/6) |
+| W384 (64, 384) | −1.14% (5/6) | −0.87% (4/6) | −0.97% (6/6) | −0.87% (6/6) |
+| W256 (64, 256) | −1.71% (6/6) | −1.28% (6/6) | −1.04% (6/6) | −0.99% (6/6) |
+| B48W512 (48, 512) | −1.71% (6/6) | −1.53% (6/6) | −1.65% (6/6) | −0.98% (6/6) |
+| **B48W384 (48, 384)** | **−1.89% (6/6)** | **−1.94% (6/6)** | **−1.89% (6/6)** | **−1.00% (6/6)** |
+
+Base walls: C135 2.635, C148 9.802, I16 136.18, SNFS301 151.33 ms/q. All
+four are 2.7-6.7% below stage 1's base. Stage 1 ran 50 minutes earlier
+with Kyle's machine in use, and the arms are compared within a round, so
+the ratios stand. The run prints C135's wall to 0.01 ms, which is 0.38% of
+2.6 ms, so C135's column moves in steps of about 0.38%.
+
+- **B48W384 is the fastest arm on every job, 6 of 6 rounds each.** The two
+  cutoffs add up: on every job, B48's gain plus W384's is within 0.05-0.26
+  points of the pair's.
+- **The warp cutoff still falls monotonically, W256 > W384 > W512,** and B40
+  beats B48 on three of four jobs. The bottom is not found yet: stage 3
+  goes lower.
+- **W512 alone at C148 is flat again** (+0.15%, 2/6), with apply −2.0%. So
+  stage 1's +1.1% was not only noise. Every arm that lowers the block cutoff
+  too is faster at C148, on all 6 rounds. Pipelined stage times overlap
+  other q, so they cannot say where W512's apply gain goes.
+
+### Stage 3 (`work/sweep/run3.sh`, 2026-11-01 02:23-03:04, 6 rotated rounds)
+
+`build3.sh`: block cutoffs 48, 40 and 36 with warp cutoffs 384, 256 and 128.
+All have registers 38-40 and no stack. Stage 2's B48W384 ran again.
+
+| arm (block, warp cutoff) | C135 | C148 | I16 | SNFS301 |
+|---|---:|---:|---:|---:|
+| B48W384 (48, 384) | −1.71% (6/6) | −1.18% (5/6) | −1.78% (6/6) | −1.21% (6/6) |
+| B48W256 (48, 256) | −2.29% (6/6) | −1.03% (6/6) | −1.83% (6/6) | −1.22% (6/6) |
+| B48W128 (48, 128) | −1.34% (6/6) | −1.38% (6/6) | −1.51% (6/6) | −0.74% (6/6) |
+| B40W384 (40, 384) | −2.66% (6/6) | −1.69% (6/6) | −1.99% (6/6) | −1.42% (6/6) |
+| B40W256 (40, 256) | −2.67% (6/6) | −2.15% (6/6) | −1.92% (6/6) | **−1.57% (6/6)** |
+| B40W128 (40, 128) | −2.65% (6/6) | −1.74% (6/6) | −1.77% (6/6) | −1.20% (6/6) |
+| **B36W256 (36, 256)** | **−2.66% (6/6)** | **−2.61% (6/6)** | **−2.55% (6/6)** | −1.40% (6/6) |
+
+Base walls: C135 2.628, C148 9.773, I16 136.10, SNFS301 151.20 ms/q. Every
+arm beat base in every round but one.
+
+- **The warp cutoff bottoms out at 256-384.** 128 is slower than 256 in
+  seven of the eight job and block-cutoff pairs, by 0.02-0.95 points. The
+  exception is B48 at C148, where 128 is 0.35 points faster.
+- **The block cutoff still falls as low as it can go.** B40 beats B48 at
+  every warp cutoff, and B36 beats B40 by 0.5-0.6 points on C148 and I16,
+  ties on C135, and trails by 0.2 on SNFS301. Small-sieve moduli are prime
+  powers, so 37 is the only modulus that B36 moves out of the block tier
+  that B40 kept. None lies in 33-35, so 36 is the same split as 33,
+  the lowest the static_assert allows: `SS_FOLD_MAX` (32) must stay below
+  `SS_BLOCK_CUT`. At B36 the block tier walks only 11, 13, 17, 19, 23, 29
+  and 31, plus 25 and 27 when the factor base holds prime powers. The fold
+  takes the powers of two and the tables take 3, 5, 7 and 9.
+  Moving those to the warp tier as well would need the fold's and tables'
+  leading-run rule reworked, not just a cutoff changed.
+- **B48W384's repeat runs 0.2-0.8 points from stage 2's** (C148 −1.18%
+  against −1.94%), which is this sweep's round-to-round spread. Gaps
+  smaller than that between neighbouring arms do not rank them.
+
+### Stage 4, the confirmation (`work/sweep/run4.sh`, 2026-11-01 03:05-03:38, 8 rotated rounds)
+
+Stage 3's two leaders against base, on the four sweep jobs plus C143 and
+C1147 (degree 7), which `timing.sh` gained for this run:
+
+| job | base ms/q | B36W256 (36, 256) | B40W256 (40, 256) | B36 faster than B40 |
+|---|---:|---:|---:|---:|
+| C135 | 2.645 | **−3.21% (8/8)** | −2.84% (8/8) | 3/8, 3 ties |
+| C143 | 4.694 | **−5.33% (8/8)** | −5.01% (8/8) | 5/8, 3 ties, none slower |
+| C148 | 9.810 | −1.95% (8/8) | −1.98% (8/8) | 5/8 |
+| I16 | 136.27 | **−2.71% (8/8)** | −2.07% (8/8) | **8/8** (−0.30 to −0.75%) |
+| SNFS301 | 151.07 | −1.36% (8/8) | −1.31% (8/8) | 4/8, 1 tie |
+| C1147 | 207.18 | −1.13% (8/8) | −1.21% (8/8) | 4/8 |
+
+Every run matched base r1's relations.
+
+- **B36W256 is the pick: −1.1% (C1147) to −5.3% (C143) on wall, 8 of 8
+  rounds on all six jobs.** C143 gains the most, with its apply stage
+  −11%.
+- **B36 against B40 is a clear win only on I16** (8 of 8). On C143 it is
+  ahead or level in every round. On C135, C148, SNFS301 and C1147 it is
+  inside the spread, either way. It is never measurably behind, and it is
+  the floor (stage 3), so it is taken.
+- **Measured on sm_120 only** (the RTX 5070). The cutoffs trade a block's
+  or a warp's shared setup against per-thread walks, so the best values
+  could differ on other architectures. NFS@Home's queue runs whatever cards
+  volunteers have. S2 of the install gate checks only that `k_apply` keeps
+  its blocks per SM everywhere.
+
+### The change, gated (`work/tier/`, 2026-11-01 03:45-04:03)
+
+`edit.py` sets the two `#define`s and rewrites the tier comment above them:
+the old entry counts were for the old cuts. It also records why 36 is the
+floor. `build.sh` applied it to a copy of the tree (HEAD 05e8f83 plus finding
+144's uncommitted change), not the tree, and built it fat: `c07d3c75`.
+`gate.sh` against the installed `6148a21b`, all passed:
+
+- **S1:** fat's sm_120 SASS is identical to the sweep's B36W256 (107 of 107
+  function bodies), so the build that was timed is the build gated.
+- **S2:** `k_apply`'s registers are unchanged on every arch (0 of 90
+  instances moved), with no stack and no local memory.
+- **G:** `work/emitw/gate.sh` passed. abcheck was 36 of 36 identical. The
+  c135 20,000-q band matched finding 138's reference, with all 1,855,599
+  relations rebuilding both norms. Both kill -9 resumes and the SIGINT,
+  SIGTERM and stop-file stops resumed to the reference. SNFS301 was
+  identical, and `make check` passed.
+- **X1:** C135, SNFS301 and C1147 were identical, with the apply occupancy
+  line unchanged (3 blocks of 512 per SM).
+- **X2:** with `--no-tiny-fold --no-tiny-table`, so the block tier holds
+  the powers of two and 3, 5, 7 and 9 again, c135 (300 q) and C148 (200 q)
+  were identical.
+- **X3:** `fillcheck.sh` was byte-identical on all 65 arms.
+
+**Installed 2026-11-01 06:28, Kyle's call.** `edit.py` was applied to the
+tree's `bench_kernels.cu`, which `cmp` showed to be fat's. Then
+`work/tier/install.sh` copied fat's objects in, swapped the binary by `mv`,
+and ran `make all`, `make -q all` and `make check` in the tree, all
+passing. `bench/bench` is `c07d3c75`; `6148a21b` is kept at
+`work/deg2/bench.installed.144`. The first attempt stopped at
+`make -q all`. The tree's source had been edited after fat was built, so
+`make all` rebuilt `bench_kernels.o` and relinked an ungated binary. No
+client was running. `install.sh` now gives the tree's byte-identical
+sources fat's timestamps first; `6148a21b` was restored and the install
+rerun.
+
+## Finding 146 — the small-sieve tier cutoffs as runtime flags, and `bench/tune.sh` to time the speed-only knobs on one card (Kyle's question after finding 145: are cutoffs tuned on sm_120 right for other cards?). `--ss-block-cut` and `--ss-warp-cut` move only host code: every arch's 642 function bodies are identical to the installed `c07d3c75`. At the defaults the build times the same as the installed one (−0.5% to +0.3% median over four jobs). Set to 64/1024, it times the same as the old compiled 64/1024 build (−0.3% to +0.6%). Relations stay byte-identical at the extremes (33/34, 128/32768). `tune.sh` keeps the defaults on the 5070 at C135 and C148; C148's lean toward `--fill-blocks` 2304 confirmed at −1.0% over 8 rounds, below the bar. Built and gated as fat `9e67c7e4` (`work/tunecut/`); installed 2026-11-01 10:00, Kyle's call. After Kyle's code review, `tune.sh` was fixed, `cofcheck.sh` gained the tier-cut cases, and `0c7dda1f` was installed at 18:46. It carries three `bench_kernels.cu` fixes that leave the code unchanged
+
+### Why runtime, and why the fill grid stays absolute
+
+Finding 145 swept the cutoffs on one card, the 5070. The best block cutoff
+differed little between nearby settings (B36 led B40 measurably only on
+I16), and other archs
+divide shared memory, registers and SMs differently, so the sm_120 optimum
+need not hold elsewhere. Making the cutoffs flags costs nothing in device
+code. Every cutoff build in finding 145's sweep already had identical
+device SASS, because the kernels see only the entry counts `nblk` and
+`nwrp`, which the host computes from the cutoffs. So a flag lets any card
+be tuned without a rebuild, and a report from one names a setting that
+others can try.
+
+`--fill-blocks` stays an absolute count, not a per-SM one. Its old optimum
+(1152) was the same total count on a 48-SM 5070, a 128-SM 4090 and a 170-SM
+5090 (finding 52), and its optimum moves with geometry, not card: c194
+prefers 4608, c183/I15e 9216, c147 slabbed 1152 (STATUS item 2, `bench.h`).
+It joins the cutoffs as a tune lever with finding 76's five-rung grid. The
+startup fill autotuner in STATUS item 2 was built and deleted on 2026-09-01
+because it timed repeat fills, the wrong regime. `tune.sh` is offline and
+times whole runs of real q, so it does not repeat that mistake, but it is
+not the in-band autotuner item 2 describes either.
+
+### The change (the tree, uncommitted)
+
+- **`bench.h`:** `bench_cfg_t` gains `ss_block_cut` and `ss_warp_cut`
+  (0 = the default). `SS_BLOCK_CUT_DEFAULT` 36 and `SS_WARP_CUT_DEFAULT` 256
+  replace `bench_kernels.cu`'s `#define`s, with the limits
+  `SS_BLOCK_CUT_MIN` 33, `SS_BLOCK_CUT_MAX` 128 and `SS_WARP_CUT_MAX` 32768,
+  and the resolvers `ss_block_cut(cfg)` and `ss_warp_cut(cfg)`.
+- **`bench_kernels.cu`:** `ss_tiers` takes `cfg` and resolves the cutoffs.
+  The static_asserts that guarded the old constants now guard the limits:
+  folded moduli stay below the minimum block cutoff, block-tier fields pack
+  in 8 bits up to 128, and warp-tier fields pack in 16 bits up to 32768.
+  `ss_tab_set_ok`'s check runs to `SS_WARP_CUT_MAX`.
+- **`bench_main.cu`:** the flags `--ss-block-cut N` (33-128) and
+  `--ss-warp-cut N` (above the block cutoff, at most 32768). Both are refused
+  under `--no-smallsieve`. A warp cutoff at or below the resolved block
+  cutoff is refused. The banner gains `small sieve tiers: block m < B, warp
+  m < W`, tagged `[--ss-block-cut]` / `[--ss-warp-cut]` when set.
+- **`pipeline.cuh`:** `ss_tiers` is passed `cfg`.
+
+Output is identical at every setting, so the resume fingerprint does not
+include the cutoffs; a run may resume under different ones.
+
+### `bench/tune.sh` (new)
+
+As first written and run below; the code review at the end changed its
+ordering, busy checks and tie rule.
+
+`sh tune.sh [-b BENCH] [-r ROUNDS] [-o DIR] [-a ARMS] -- BENCH-ARGS` times
+one job's short band (BENCH-ARGS, without `--relations`) on this card. By
+default it tries 11 settings, one knob at a time away from the defaults:
+block cutoff 40, 48, 64; warp cutoff 128, 384, 512, 1024; fill-blocks 1152,
+2304, 9216, 18432. Method, from STATUS item 2 and findings 85 and 145:
+
+- Every arm sieves the same q, interleaved within a round, with the order
+  rotated each round (6 rounds by default, at least 3).
+- Every run's relations are compared byte for byte with the defaults' first
+  run. A difference fails the run (exit 1).
+- It refuses to start with anything on the card or a local client running
+  (exit 2), and stops if either appears between runs (exit 3). Under WSL it
+  warns that `nvidia-smi` cannot see Windows programs (finding 137).
+- An arm is ADOPTED only if it beat the defaults in every round and its
+  median gain is above 1% and above the defaults' own spread between rounds.
+  Each knob's largest adopted gain wins. When two or more knobs have
+  winners, stage 2 times the combination against the defaults under the
+  same rule.
+- It writes `DIR/report.txt` (card, driver, binary hash, job, the table and
+  the verdict), `walls.txt` and `differs.txt`.
+
+Dry-run with a fake `bench` and a fake `nvidia-smi`, it adopted a true 2.5%
+gain and rejected a 1.6% one under ±1% noise.
+
+### Gates (`work/tunecut/`, 2026-11-01)
+
+`build.sh` built copies of the tree, never the tree: sm_120-only `5fd39260`
+and fat `9e67c7e4`. The sm_120 build's SASS is the installed binary's
+(107 of 107 function bodies). `gate.sh`, fat against the installed
+`c07d3c75`, 08:17-08:32, all passed:
+
+- **S1:** 642 of 642 function bodies identical on sm_120, 75, 80, 86, 89
+  and 90.
+- **S2:** every function's resource usage identical.
+- **G:** `work/emitw/gate.sh` passed. abcheck was 36 of 36 identical. The
+  c135 20,000-q band matched finding 138's reference, with all 1,855,599
+  relations rebuilding both norms. Both kill -9 resumes and the SIGINT,
+  SIGTERM and stop-file stops resumed to the reference. SNFS301 was
+  identical, and `make check` passed.
+- **X1:** 7 of 7 bad settings refused.
+- **X2:** the default banner reads `block m < 36, warp m < 256`, untagged,
+  and C135's relations are identical.
+- **X3:** c135 (300 q, 28,189 relations) and C148 (200 q, 36,476) are
+  identical to the installed binary at 33/34, 128/32768 and 64/1024 (c135
+  only), with the banner naming and tagging the settings.
+
+### Timing: the flags cost nothing (`equiv.sh`, 08:03-08:17, 4 rotated rounds)
+
+Four arms: the installed `c07d3c75`, the new sm_120 build at its defaults,
+the old sm_120 build compiled at 64/1024 (`work/deg2/sm120`, `fcae3f3c`),
+and the new build with `--ss-block-cut 64 --ss-warp-cut 1024`. Median wall
+per q (ms), and the change within each pair:
+
+| job | installed | new | change | old 64/1024 | new at 64/1024 | change |
+|---|---:|---:|---:|---:|---:|---:|
+| C135 | 2.555 | 2.545 | −0.39% | 2.650 | 2.665 | +0.57% |
+| C148 | 9.580 | 9.605 | +0.26% | 9.895 | 9.865 | −0.30% |
+| I16 | 133.100 | 133.100 | 0.00% | 136.840 | 136.545 | −0.22% |
+| SNFS301 | 150.735 | 149.995 | −0.49% | 151.005 | 151.635 | +0.42% |
+
+Both pairs sit within ±0.6%, below the C135 wall's resolution steps
+(0.38%) and the rounds' spread. The defaults' lead over 64/1024 matches
+finding 145's: C135 −4.5%, C148 −2.6%, I16 −2.5%, SNFS301 −1.1%.
+
+### `tune.sh` on the 5070
+
+`run.sh` ran `tune.sh`'s default grid with fat's binary on two jobs, 6
+rounds each, with every run's relations identical to the defaults':
+C135 (3000 q, about 9 s a run, 08:32-08:42) and C148 (2000 q, about 23 s,
+08:54-09:20). Median wall against the defaults, and the rounds faster:
+
+| arm | C135 | C148 |
+|---|---:|---:|
+| `--ss-block-cut` 40 | +1.76% (0/6) | +0.27% (3/6) |
+| `--ss-block-cut` 48 | +3.11% (0/6) | +0.41% (2/6) |
+| `--ss-block-cut` 64 | +1.95% (0/6) | +1.14% (1/6) |
+| `--ss-warp-cut` 128 | +1.36% (2/6) | −1.19% (5/6) |
+| `--ss-warp-cut` 384 | 0.00% (3/6) | −0.72% (4/6) |
+| `--ss-warp-cut` 512 | +1.76% (1/6) | −0.26% (4/6) |
+| `--ss-warp-cut` 1024 | +2.54% (0/6) | −0.26% (3/6) |
+| `--fill-blocks` 1152 | +0.59% (3/6) | −1.40% (4/6) |
+| `--fill-blocks` 2304 | +1.36% (1/6) | −1.64% (6/6) |
+| `--fill-blocks` 9216 | 0.00% (2/6) | +0.77% (2/6) |
+| `--fill-blocks` 18432 | +0.78% (1/6) | +1.32% (0/6) |
+
+Defaults 2.565 ms/q at C135 (spread between rounds 2.73%) and 9.680 at C148
+(5.17%). Both reports: keep the defaults.
+
+- **C135:** every raised block cutoff lost every round, as in finding 145.
+  Nothing else beat the defaults in more than half the rounds.
+- **C148's `--fill-blocks` 2304 beat the defaults in 6 of 6 rounds** but was
+  not adopted: its 1.64% is below the defaults' 5.17% spread, most of which
+  is round 6 running slow for every arm. An 8-round confirmation
+  (`tune.sh -a`, 09:21-09:33, defaults' spread 2.08%) gave `--fill-blocks`
+  2304 −1.04% (7/8, the eighth a tie), 1152 −0.58% (7/8), and
+  `--ss-warp-cut` 128 +0.21% (2/8). W128's lead was noise, and F2304's shrank
+  by a third. So the rule did its job: rankings reproduce, margins do not.
+- **C148 leans about 1% toward fewer fill blocks**, the same direction as c147
+  slabbed (STATUS item 2). 4608 stays. Under finding 145's old cutoffs F2304
+  was flat on C148 (+0.10%, 2/5) and +0.87% on I16, and 1% is below
+  `tune.sh`'s bar.
+- **Is the spread rule too strict?** Drift that hits every arm in a round
+  inflates the defaults' raw spread, and interleaving already cancels it.
+  Taking it out (dividing each run by its round's median over arms) gives
+  1.69% at C148, still above F2304's 1.64%, and 4.97% at C135 (one fast
+  defaults run). On this data the rule would adopt nothing different, so it
+  is unchanged.
+
+### The guard's false alarm
+
+`run.sh` queued all of this behind Kyle's msieve GPU polynomial selection,
+which held the card until 08:03. A guard checked every 15 s for a process on
+the card whose binary was not under `work/`, and stopped the C148 tune at
+08:52:20 with nothing else on the card. A bench run had exited at
+08:52:20.008: `nvidia-smi` still listed its PID, but `/proc/PID/exe` was
+already gone, and the empty link read as foreign. The guard now checks a hit
+again 3 s later, and the C148 tune was rerun from the start.
+
+### Installed (2026-11-01 10:00, Kyle's call)
+
+Its device code is `c07d3c75`'s, so the install changes no speed. What it
+adds is the two flags and the banner line. `work/tunecut/install.sh` is
+`work/tier/install.sh` with the new precondition (`bench/bench` is
+`c07d3c75`). It checked that the tree's sources are fat's, gave them fat's
+timestamps, copied fat's objects in, swapped the binary by `mv`, and ran
+`make all`, `make -q all` and `make check` in the tree, all passing.
+`bench/bench` is `9e67c7e4`; `c07d3c75` is kept at
+`work/tier/bench.installed.145`.
+
+### Next
+
+1. Volunteers or Greg run `tune.sh` on other archs. The defaults, the grid
+   and finding 145 were all measured on sm_120.
+2. Defaults per arch should come from several reports that agree, not from
+   one machine and not from tuning at startup.
+
+### The code review (2026-11-01, after the install)
+
+Kyle ran `/code-review xhigh` on the uncommitted tree: 15 findings, 11 in
+`tune.sh`. All 15 were checked against the code; all hold.
+
+**`tune.sh`, fixed** and dry-run with a fake `bench` and `nvidia-smi`
+(`work/review/tunefake/`; every path below exercised):
+
+- **The CPU client blocked it.** The busy pattern matched
+  `ggnfs-sieve-client`, which the CPU client shares. It is now
+  `run-cuda-client|ggnfs-sieve-client.*(engine=cuda|cuda-bench)`: a dummy
+  CPU-client process let it run, a CUDA one refused it.
+- **Rotation alone did not balance drift within a round.** Shifting the
+  order by one each round keeps every arm's offset from the defaults, so an
+  arm just before them stayed there in 5 of 6 rounds. The order now rotates
+  every two rounds and reverses in the second of each pair, so a linear
+  drift favours an arm in one round and the defaults in the other.
+- **A combination that failed stage 2 discarded the single winners** and
+  reported "keep the defaults". The single winner with the largest gain now
+  stands.
+- **Busy was checked only between runs.** It is now also checked every 3 s
+  while bench runs, leaving out bench's own PID, with a hit checked again
+  3 s later (the exit race that stopped `run.sh`). Every card counts, since
+  which one bench will pick is not known before it starts.
+- **The report named `nvidia-smi`'s first card and a commit guessed from
+  `strings`.** Every run now takes `--log`, and the report quotes the
+  defaults' first run log's `# commit` and `# device` lines (name and PCI
+  bus).
+- **Ties at bench's 0.01 ms resolution counted as losses.** At C135 one step
+  is 0.38%. The rule is now "slower in no round"; ties are reported.
+- **A failed or empty first defaults run** made every later run read
+  "RELATIONS DIFFER". It now stops with the cause (exit 1).
+- **A reused `-o DIR`** let bench resume an interrupted run's `.rel.part`.
+  Each run's files are removed first, and the stage pick files at the start.
+- **Arm names:** `combined` (stage 2's) and duplicates are refused.
+- **The default DIR lands in the checkout** and would mark the next build
+  `-dirty`: `.gitignore` gains `tune.*/`.
+
+**In-tree gate for the flags:** `cofcheck.sh` (in `make check`) gains
+byte-identity at 33/34 and 128/32768 against the defaults on its c183 q,
+and six refusals: block cut 32 and 129, warp cut 32769, warp at the block
+cut, `--ss-warp-cut 36` against the default block cut, and the flags under
+`--no-smallsieve`. It passed with both binaries (below).
+
+**`bench_kernels.cu`, built in `work/review/`, then installed:**
+
+- **`ss_tab_set_ok`'s compile-time loop** had grown from 2048 to 32,767
+  iterations. MSVC stops constexpr evaluation at 100,000 steps by default,
+  and `build_windows.bat` compiles this file with cl.exe as nvcc's host
+  compiler, so the Windows build likely no longer compiles. The bound is now
+  `2 * SS_BLOCK_CUT_MAX`. A host-only g++ test still rejects a tabled 25, 45
+  or 200 and accepts 15, which divides table A's period.
+- **The default cuts are static_asserted** against the flags' limits; a 0 in
+  `cfg` resolves to them unchecked. The suggested runtime check in `ss_tiers`
+  was not added: only `bench_main` fills `cfg`, and it range-checks.
+- **The tier comment** said the block tier walks only 11-31 by default. It
+  also walks 3, 5, 7 and 9 on a side whose tables do not pay (a rational
+  side, or x^7 + 2).
+
+None of the three should change generated code. Built fat as `0c7dda1f`
+and gated against the installed `9e67c7e4` (`work/review/gate.sh`,
+11:58-12:03):
+
+- **S1:** 642 of 642 function bodies identical on sm_120, 75, 80, 86, 89
+  and 90.
+- **S2:** every function's resource usage identical.
+- **H:** host `.text` is not byte-identical: 282 of 274,308 lines differ.
+  `work/review/hostcheck.py` explains all 282, with none left over. One is
+  nvcc's per-build anonymous-namespace hash in a symbol name. The other 281
+  are `__LINE__` immediates from `CK(...)` and `CUDA_CHECKED` on 213 source
+  lines. Each moves by exactly 11, the lines the edits add above them, and
+  each pair maps old line to new line through a diff of the two sources,
+  with the same text and a macro call on that line.
+- **C:** `cofcheck.sh` with the tier-cut cases, once Kyle's GPU-ECM left the
+  card (`work/review/run.sh`, 17:48-17:54): 80 PASS, 0 FAIL with `0c7dda1f`
+  and again with the installed `9e67c7e4`. Relations are byte-identical at
+  33/34 and 128/32768, and all six bad settings are refused.
+
+**Installed** with Kyle's OK, 18:46 (`work/review/install.sh`, output
+in `install.txt`). `edit.py`'s result is now the tree's `bench_kernels.cu`,
+and `bench/bench` is `0c7dda1f`. `make all` left the binary alone,
+`make -q all` is clean, and the tree's `make check` printed "all gates
+passed", tier-cut cases included. `9e67c7e4` is kept at
+`work/tunecut/bench.installed.146`, the new one copied to
+`work/review/bench.installed.146r`. Speed is unchanged. The Windows build
+should compile again, but that has not been tried here.

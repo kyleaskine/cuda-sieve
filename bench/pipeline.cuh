@@ -671,7 +671,7 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
                                cfg->sieve_skip);
         S->tab_q += S->ntab > 0;
         S->prep_q++;
-        ss_tiers(hsp, k, &S->nblk, &S->nwrp);
+        ss_tiers(hsp, k, cfg, &S->nblk, &S->nwrp);
         S->nsplit = ss_two_step_from(hsp, k, S->nwrp, cfg->J, cfg->logI);
         for (uint32_t i = 0; i < k; i++)
             ss_magic_build(hsp[i], hsg[i] > 1 ? cfg->J / hsg[i] : cfg->J,

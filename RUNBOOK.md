@@ -1526,6 +1526,32 @@ Note `--blocks` and `--threads` do **not** move fill — the grids are fully
 separate, and the startup lines print both. See RESULTS.md finding 52 (and 51,
 which it supersedes on the geometry).
 
+**`bench/tune.sh` times the speed-only knobs on your card, for one job.** It
+tries the small-sieve tier cutoffs (`--ss-block-cut`, `--ss-warp-cut`) and
+`--fill-blocks`, one at a time away from the defaults, on a short band of the
+job. The arms are interleaved on the same q over 6 rounds, the order
+rotated and reversed in alternate rounds, and every run's relations are
+compared byte for byte with the defaults'. A setting is adopted only if it
+was slower than the defaults in no round, and faster by more than 1% and by
+more than the defaults' own spread between rounds; if two knobs win, it
+times the combination too. Pick `--nq` so one run takes 10-60 s; the default
+grid of 12 arms is then 15-75 minutes. It refuses to start with anything on
+any card or an NFS@Home CUDA client running (the CPU client is fine), and
+stops if either appears. On a host with several cards, all must be idle.
+Under WSL, `nvidia-smi` cannot see Windows programs, so close them first
+(finding 137). Its output directory, `tune.HOST.DATE` in the working
+directory unless `-o` says otherwise, is gitignored.
+
+```sh
+sh bench/tune.sh -b bench/bench -- --pipeline --cofactor --poly JOB.job \
+    --logI 14 --qrange Q0: --nq 2000
+```
+
+Every default and the whole grid were measured on a 5070 (sm_120), so a
+report from another card is useful even when it keeps the defaults:
+`DIR/report.txt` names the card, driver, binary and job (RESULTS.md
+finding 146).
+
 Three rules for comparing cards, all learned the hard way (RESULTS.md
 findings 48–53):
 

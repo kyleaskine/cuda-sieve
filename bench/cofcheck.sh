@@ -188,6 +188,30 @@ fi
 
 expect_refused "sq-side out of range"         --cofactor --sq-side 2
 
+# ---- small-sieve tier cuts ------------------------------------------------
+# --ss-block-cut and --ss-warp-cut only move entries between the small sieve's
+# tiers (RESULTS finding 146), so the extremes must give the defaults'
+# relations byte for byte. The refusals guard the packing -- block-tier fields
+# hold m <= 128 in 8 bits, warp-tier ones m <= 32768 in 16 -- and the resolved
+# pair: a warp cut at or below the block cut, default or not, is refused.
+TC="--cofactor --cof-rho --cof-rounds 2 --cof-budget 65536"
+run $TC --relations $TMP/t0.txt >/dev/null || true
+for cuts in "33 34" "128 32768"; do
+    set -- $cuts
+    run $TC --ss-block-cut $1 --ss-warp-cut $2 --relations $TMP/t1.txt >/dev/null || true
+    if [ -s $TMP/t0.txt ] && cmp -s $TMP/t0.txt $TMP/t1.txt; then
+        printf 'PASS   %-34s byte-identical\n' "tier cuts $1/$2"
+    else
+        printf 'FAIL   %-34s relations differ from the defaults\n' "tier cuts $1/$2"; fail=1
+    fi
+done
+expect_refused "block cut below 33"           --ss-block-cut 32
+expect_refused "block cut above 128"          --ss-block-cut 129
+expect_refused "warp cut above 32768"         --ss-warp-cut 32769
+expect_refused "warp cut at the block cut"    --ss-block-cut 64 --ss-warp-cut 64
+expect_refused "warp cut at the default block" --ss-warp-cut 36
+expect_refused "tier cuts with no small sieve" --no-smallsieve --ss-block-cut 40
+
 # ---- survivor allowance policy -------------------------------------------
 # The DERIVED default (mfb + ~1.5 bits, from our own quantisation) is tighter
 # than the old CADO-rule value, and on this single q that costs one relation:

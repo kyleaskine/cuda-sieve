@@ -94,3 +94,7 @@ __pycache__/
 # bench.<tag>-<date> and kept on disk until the finding is superseded -- but a
 # 53 MB fat binary does not belong in the history.
 bench/bench.*-[0-9]*
+
+# bench/tune.sh's default output directory, made in the working directory.
+# Untracked, it would set the build stamp's -dirty flag on the next make.
+tune.*/

@@ -362,6 +362,10 @@ static void usage(void)
 "                   rest instead of adding them as apply's init writes\n"
 "  --no-tiny-table  walk the small sieve's moduli 3, 5, 7 and 9 instead of\n"
 "                   adding them at apply's init from per-region tables\n"
+"  --ss-block-cut N small-sieve moduli m < N are walked by the whole block\n"
+"                   [36], 33..128; changes no output, only the speed\n"
+"  --ss-warp-cut N  the rest below N by one warp each, above them by one\n"
+"                   thread each [256], above the block cut, <= 32768\n"
 "  --not-both-even  apply las's filter: i,j both even can never survive\n"
 "  --sieve-skip N   pipeline: skip sieve work gcd(i,j) rules out [2]\n"
 "                   0 = off, 1 = both-even positions, 2 = also 3|i and 3|j\n"
@@ -1353,6 +1357,18 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-smallsieve")) cfg.small_sieve = 0;
         else if (!strcmp(argv[i], "--no-tiny-fold")) { cfg.tiny_fold = 0; tiny_fold_set = 1; }
         else if (!strcmp(argv[i], "--no-tiny-table")) { cfg.tiny_table = 0; tiny_table_set = 1; }
+        else if (!strcmp(argv[i], "--ss-block-cut") && i + 1 < argc) {
+            int v;
+            if (parse_int_range_arg("--ss-block-cut", argv[++i], SS_BLOCK_CUT_MIN,
+                                    SS_BLOCK_CUT_MAX, &v)) return 1;
+            cfg.ss_block_cut = (uint32_t)v;
+        }
+        else if (!strcmp(argv[i], "--ss-warp-cut") && i + 1 < argc) {
+            int v;
+            if (parse_int_range_arg("--ss-warp-cut", argv[++i], SS_BLOCK_CUT_MIN + 1,
+                                    SS_WARP_CUT_MAX, &v)) return 1;
+            cfg.ss_warp_cut = (uint32_t)v;
+        }
         else if (!strcmp(argv[i], "--side") && i + 1 < argc) {
             if (parse_int_range_arg("--side", argv[++i], 0, 1, &cfg.side))
                 return 1;
@@ -1667,6 +1683,18 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     }
     if (tiny_table_set && !cfg.small_sieve) {
         fprintf(stderr, "--no-tiny-table changes nothing under --no-smallsieve\n");
+        return 1;
+    }
+    if ((cfg.ss_block_cut || cfg.ss_warp_cut) && !cfg.small_sieve) {
+        fprintf(stderr, "--ss-block-cut and --ss-warp-cut change nothing under"
+                " --no-smallsieve\n");
+        return 1;
+    }
+    /* Checked on the resolved pair: --ss-warp-cut 35 passes its own range
+     * check but sits below the default block cut. */
+    if (ss_warp_cut(&cfg) <= ss_block_cut(&cfg)) {
+        fprintf(stderr, "the warp cut (%u) must be above the block cut (%u)\n",
+                ss_warp_cut(&cfg), ss_block_cut(&cfg));
         return 1;
     }
     /* Defaults of record (RESULTS finding 107), resolved only under --pipeline
@@ -2339,6 +2367,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                cfg.fill_threads ? cfg.fill_threads : FILL_THREADS_DEFAULT,
                cfg.fill_blocks  ? "  [--fill-blocks]"  : "",
                cfg.fill_threads ? "  [--fill-threads]" : "");
+        if (cfg.small_sieve)
+            printf("small sieve tiers: block m < %u, warp m < %u%s%s\n",
+                   ss_block_cut(&cfg), ss_warp_cut(&cfg),
+                   cfg.ss_block_cut ? "  [--ss-block-cut]" : "",
+                   cfg.ss_warp_cut  ? "  [--ss-warp-cut]"  : "");
         /* A knob the banner does not name is a knob a log cannot prove was
          * live -- the --fill-blocks lesson (bench_kernels.cu, twolevel note).
          * --fill-streams reaches k_fill_atomic only, so say so HERE rather

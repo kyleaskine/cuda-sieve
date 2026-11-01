@@ -452,16 +452,22 @@ __global__ void k_gate_fold(const uint32_t *__restrict bits,
  * Three tiers, sized so each entry's hit count matches the number of threads
  * assigned to it. The cut is on the entry's effective MODULUS m = q/g, not on
  * the prime: row-divisor and projective entries have a large q and a small m.
- * (Entry counts below are from an early job; c183's algebraic side has 95
- * block-tier entries.)
- *   m <   64  (52 entries, 84% of updates): the whole block
- *   m < 1024  (165 entries):                one warp per entry
- *   m >= 1024 (1752 entries, <=16 hits):    one thread per entry
+ *   m <  36:  the whole block
+ *   m < 256:  one warp per entry
+ *   m >= 256: one thread per entry
  * The two lower tiers share each entry's setup across a warp by shuffle
- * (RESULTS findings 101-102); see sieve_small.
+ * (RESULTS findings 101-102); see sieve_small. The cuts were 64 and 1024
+ * until --tiny-fold and --tiny-table took the powers of two up to 32, and 3,
+ * 5, 7 and 9, out of the walk; re-swept then, 36 and 256 are 1.1-5.3% faster
+ * on six jobs (finding 145). 36 is as low as the block cut goes: the folded
+ * moduli must stay below it (SS_FOLD_MAX), and no modulus, a prime power,
+ * lies in 33-35. So by default the block tier walks only the moduli 11-31,
+ * plus 3, 5, 7 and 9 on a side whose tables do not pay (ss_tab_count: a
+ * rational side, or x^7 + 2); --no-tiny-fold and --no-tiny-table put the
+ * rest back.
+ * Those are the defaults, measured on a 5070 only; --ss-block-cut and
+ * --ss-warp-cut set others (bench.h: SS_BLOCK_CUT_DEFAULT and the limits).
  */
-#define SS_BLOCK_CUT   64u
-#define SS_WARP_CUT  1024u
 
 template <int CELLBITS, int ATOMIC>
 __device__ __forceinline__ void ss_add(uint32_t *S, uint32_t c, uint32_t lp)
@@ -584,18 +590,26 @@ __device__ __forceinline__ uint32_t ss_setup(uint32_t e,
 
 /* The tier split, for BOTH callers (the pipeline and run_bench). hsp must be
  * sorted by modulus; the counts are the leading runs below each cut, which is
- * what sieve_small's packing relies on: every e < nblk has m < SS_BLOCK_CUT
- * and every e < nwrp has m < SS_WARP_CUT. One copy, so the two callers cannot
- * drift apart and hand the block tier a modulus its 8-bit fields cannot hold. */
+ * what sieve_small's packing relies on: every e < nblk has m < the block cut
+ * <= SS_BLOCK_CUT_MAX and every e < nwrp has m < the warp cut <=
+ * SS_WARP_CUT_MAX (bench_main checks the flags against those limits). One
+ * copy, so the two callers cannot drift apart and hand the block tier a
+ * modulus its 8-bit fields cannot hold. */
 static inline void ss_tiers(const uint32_t *hsp, uint32_t n,
+                            const bench_cfg_t *cfg,
                             uint32_t *nblk, uint32_t *nwrp)
 {
+    const uint32_t bcut = ss_block_cut(cfg), wcut = ss_warp_cut(cfg);
     uint32_t b = 0, w = 0;
-    while (b < n && hsp[b] < SS_BLOCK_CUT) b++;
+    while (b < n && hsp[b] < bcut) b++;
     w = b;
-    while (w < n && hsp[w] < SS_WARP_CUT) w++;
+    while (w < n && hsp[w] < wcut) w++;
     *nblk = b; *nwrp = w;
 }
+static_assert(SS_BLOCK_CUT_MIN <= SS_BLOCK_CUT_DEFAULT && SS_BLOCK_CUT_DEFAULT <= SS_BLOCK_CUT_MAX
+              && SS_BLOCK_CUT_DEFAULT < SS_WARP_CUT_DEFAULT && SS_WARP_CUT_DEFAULT <= SS_WARP_CUT_MAX,
+              "the default cuts must pass bench_main's checks on the flags: a 0 in cfg"
+              " resolves to them unchecked, and ss_tiers trusts what it gets");
 
 /* --tiny-fold (STATUS 8b stage A, finding 129): the moduli whose hits are one constant
  * word per thread. In k_apply's init loop thread tid writes the cells
@@ -605,7 +619,7 @@ static inline void ss_tiers(const uint32_t *hsp, uint32_t n,
  * --sieve-skip), and m == 1 has step 1, or 2 in a skipped even row; nth is a
  * multiple of 32 and CPW >= 2, so 64 divides CPW*nth and every such step does. */
 #define SS_FOLD_MAX 32u
-static_assert(SS_FOLD_MAX < SS_BLOCK_CUT,
+static_assert(SS_FOLD_MAX < SS_BLOCK_CUT_MIN,
               "every folded modulus must sit in the block tier's leading run, or"
               " the warp tier walks entries k_apply already added (nfold > nblk)");
 static inline int ss_folds(uint32_t m)
@@ -634,14 +648,18 @@ __host__ __device__ constexpr int ss_tab_of(uint32_t m)
 /* Every tabled m must sit in the block tier's leading run, and its table's
  * period must cover every step it can take -- m, or 2m in a --sieve-skip even
  * row. CPW >= 2, so 2 * words cells is the smallest period; larger CPW are
- * multiples. Checked over every modulus, so adding one to ss_tab_of that its
- * table cannot hold (25, 27, 49: finding 131's review) fails to compile. */
+ * multiples. Checked over every m below 2 * SS_BLOCK_CUT_MAX, far past any
+ * modulus a table could hold, so adding one to ss_tab_of that its table
+ * cannot hold (25, 27, 49: finding 131's review) fails to compile. The bound
+ * stays small on purpose: build_windows.bat compiles this file with cl.exe
+ * as nvcc's host compiler, and MSVC stops constexpr evaluation at 100,000
+ * steps by default, which a loop to SS_WARP_CUT_MAX would pass. */
 __host__ __device__ constexpr bool ss_tab_set_ok()
 {
-    for (uint32_t m = 1; m < 2u * SS_WARP_CUT; m++) {
+    for (uint32_t m = 1; m < 2u * SS_BLOCK_CUT_MAX; m++) {
         const int t = ss_tab_of(m);
         if (t < 0) continue;
-        if (m >= SS_BLOCK_CUT) return false;
+        if (m >= SS_BLOCK_CUT_MIN) return false;
         if ((2u * (t ? SS_TAB_B_WORDS : SS_TAB_A_WORDS)) % (2u * m) != 0u) return false;
     }
     return true;
@@ -667,7 +685,7 @@ static inline size_t k_apply_smem(int log_region, int cellbits, int tables)
  * next, so k_apply can skip both as leading runs [0, nfold) and
  * [nfold, nfold + ntab). The rest stay sorted, so ss_tiers' leading runs and
  * ss_two_step_from see what they saw before (every folded or tabled m is
- * below SS_BLOCK_CUT), and the reciprocals are built afterwards by index as
+ * below SS_BLOCK_CUT_MIN), and the reciprocals are built afterwards by index as
  * always. Without either it is the plain modulus order. One definition, so
  * the two callers cannot drift. */
 static inline int ss_group(uint32_t m, int fold, int tab)
@@ -845,7 +863,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * sets. */
     #define SS_SETUP(e, MM) ss_setup((e), sp, srt, sg, smag, j, ilo, kshift, evenrow, &(MM))
 
-    /* WHOLE-BLOCK TIER (m < SS_BLOCK_CUT), setup shared by shuffle. An entry's
+    /* WHOLE-BLOCK TIER (m < the block cut), setup shared by shuffle. An entry's
      * setup is the same for every thread in the block, and the per-warp form
      * computed it in all nth/32 warps for every entry: ncu on the c183
      * algebraic side (95 entries) put that replicated setup at ~19% of
@@ -853,11 +871,11 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * each warp now sets up entry base+k and the warp walks those 32 entries
      * with ONE __shfl_sync each: ceil(nblk/32) setups per warp, not nblk.
      *
-     * One register carries it all: m < SS_BLOCK_CUT <= 128 bounds c0 (< 2m
-     * after the even-row shift) and the step mm (<= 2m) to 8 bits each, and the
-     * log is 16. mm == 0 means "no hits in this row". The host guarantees
-     * m < SS_BLOCK_CUT for every e < nblk (ss_tiers); the static_assert keeps
-     * the constant inside the packing. Cell sums are integer adds, so the
+     * One register carries it all: m < the block cut <= SS_BLOCK_CUT_MAX <=
+     * 128 bounds c0 (< 2m after the even-row shift) and the step mm (<= 2m)
+     * to 8 bits each, and the log is 16. mm == 0 means "no hits in this row".
+     * The host guarantees m < the block cut for every e < nblk (ss_tiers);
+     * the static_assert keeps the limit inside the packing. Cell sums are integer adds, so the
      * reordering is output-identical.
      *
      * Leftover hits always land on the lowest tids, so warp 0 runs the most
@@ -867,8 +885,8 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
      * Entries [0, nlead) are not walked: k_apply added them at init
      * (--tiny-fold's ss_fold_word, then --tiny-table's tables). nlead <= nblk:
      * all are leading runs of the same table, and SS_FOLD_MAX and 9 below
-     * SS_BLOCK_CUT are static_asserts. */
-    static_assert(SS_BLOCK_CUT <= 128u, "block-tier fields are packed in 8 bits");
+     * SS_BLOCK_CUT_MIN are static_asserts. */
+    static_assert(SS_BLOCK_CUT_MAX <= 128u, "block-tier fields are packed in 8 bits");
     for (uint32_t base = nlead; base < nblk; base += 32u) {
         const uint32_t e = base + lane;
         uint32_t pk = 0;
@@ -888,13 +906,13 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
         }
     }
 
-    /* WARP TIER (SS_BLOCK_CUT <= m < SS_WARP_CUT), setup shared by shuffle
+    /* WARP TIER (the block cut <= m < the warp cut), setup shared by shuffle
      * too. Warp w still owns entries nblk + w + i*nwarps, but instead of
      * running each entry's setup as a whole-warp sequence for its 0.5-8 hits
      * per lane, lane k sets up the warp's k-th next entry and the warp walks
      * them: apply −7.0% on c183 (finding 102). c0 and mm are < 2m < 2^16. */
     {
-        static_assert(SS_WARP_CUT <= 32768u, "warp-tier c0/mm are packed in 16 bits");
+        static_assert(SS_WARP_CUT_MAX <= 32768u, "warp-tier c0/mm are packed in 16 bits");
         for (uint32_t base = 0; ; base += 32u) {
             const uint32_t e0 = nblk + warp + base * nwarps;
             if (e0 >= nwrp) break;
@@ -918,7 +936,7 @@ __device__ void sieve_small(uint32_t *S, uint32_t region, int logI, int log_regi
         }
     }
 
-    /* THREAD TIER (m >= SS_WARP_CUT): one thread per entry, so the setup is
+    /* THREAD TIER (m >= the warp cut): one thread per entry, so the setup is
      * already lane-parallel. The log is loaded with the setup's four words,
      * not after c0 is known: three dependent L2 round trips per entry became
      * one. At I16 this tier has ~6,500 entries per side, each paid in every
@@ -1058,6 +1076,9 @@ __host__ __device__ __forceinline__ bool apply_scan_stores(int logI, int log_reg
  * price what correctness costs, since a byte cell overflows into its
  * neighbour (accumulated logs do exceed 255) and cannot be used for real.
  */
+/* A polynomial degree as a type, for k_apply's init (finding 144). */
+template <int D> struct deg_c { static constexpr int value = D; };
+
 template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
           bool SSTAIL = true, bool NGATE = false>
 /* NGATE: --norm-gate's instance, which reads ngate (the init comment). A
@@ -1170,120 +1191,150 @@ void k_apply(const uint32_t *__restrict buckets,
     }
 
     /* ---- init: log-norm bound, computed in shared memory ---- */
-    for (uint32_t w = tid; w < nword; w += nth) {
-        uint32_t word = 0;
-        /* --norm-gate (NGATE): ngate is the OTHER side's survivor bitmap for
-         * this slab. A cell whose bit is clear can never be a two-sided
-         * survivor, so it gets no norm and starts at 0, like a both-even one;
-         * the intersection drops whatever it scans to. The word's CPW cells
-         * share one bitmap word, since CPW divides 32 and x is CPW-aligned.
-         * Not warp-uniform, and need not be: a warp runs the norm below when
-         * any lane's cell has a bit, and skips it when none does -- 84% of
-         * side 0's 64-position groups at c135, 77% at I16 (finding 140).
-         * One load per word, used at once: gathering 16 words' bits ahead in
-         * one batch of loads was slower (finding 141). */
-        const uint32_t xw = xbase + w * CPW;
-        const uint32_t gw = NGATE ? ngate[xw >> 5] >> (xw & 31u) : ~0u;
-        #pragma unroll
-        for (uint32_t c = 0; c < CPW; c++) {
-            uint32_t t;
-            const uint32_t x = xbase + w * CPW + c;
-            /* Warp-uniform: cell c has the same parity in every word, because
-             * xbase and CPW are even. */
-            if (sieve_skip && pos_both_even(x, jblk)) {
-                t = CINIT;                       /* cell starts at 0 */
-            } else if (NGATE && !((gw >> c) & 1u)) {
-                t = CINIT;                       /* --norm-gate: likewise */
-            } else if (NORMMODE == NORM_CONST) {
-                t = tconst;
-            } else {
-                const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
-                const uint32_t jlocal = x >> logI;
-                uint32_t jj = jlocal;
-                if constexpr (SLABBED) jj += j_base;
-                const float fi = (float)ii;
-                const float fj = (float)jj;
-                const float u = fmaf(N.ua, fi, N.ub * fj);
-                const float v = fmaf(N.va, fi, N.vb * fj);
-                float acc = N.d[N.deg], vp = 1.0f;
-                /* The same Horner on |.|, which bounds the cancellation. The
-                 * normalisation gives fp32 ample dynamic RANGE, but near a root
-                 * line of F the terms are O(1) and cancel to something tiny, so
-                 * what is left is mostly rounding noise. Measured before this
-                 * guard: 144 of 63,497 positions in a band along the three real
-                 * root lines rounded to the wrong sieve-log value, -3.31 to
-                 * +2.57 units and BOTH SIGNS -- false survivors and lost
-                 * relations alike. */
-                float aabs = fabsf(N.d[N.deg]), vpa = 1.0f;
-                const float au = fabsf(u), av = fabsf(v);
-                #pragma unroll
-                for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
-                    if (k < N.deg) {
-                        vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
-                        vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
-                    }
-                float s = fabsf(acc);
-                if (s < NORM_CANCEL_TOL * aabs) {
-                    /* redo in fp64: (a,b) exactly in int64, sum at 2^-53.
-                     * Doubles are 1/64 rate on this part, but this fires on
-                     * well under one cell in a thousand. */
-                    const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
-                    const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
-                    const double ud = a / N.A, vd = b / N.B;
-                    double accd = N.dd[N.deg], vpd = 1.0;
+    /* The degree as a compile-time constant (finding 144): the loop below is
+     * written once over DEG and the switch after it picks the copy for this
+     * side's N.deg, once per block. With DEG fixed the `k < deg` guards fold
+     * away, the first Horner step's vp and vpa start from 1.0 so its two
+     * multiplies fold (exactly: x * 1.0f == x), and N.d[deg] is a constant
+     * index. The arithmetic and its order are unchanged, so the cells are
+     * bit-identical. k_apply 5-11% faster under ncu, wall 1.5-3.0% on six
+     * jobs, for 17% more compile time. EVERY legal degree has its copy: a
+     * runtime-degree loop compiled beside them ran 4.5% slower than base's
+     * (C1147, degree 7, when only 1, 5 and 6 were specialised), so DEG 0 --
+     * the loop over N.deg -- is left only for a degree outside 1..8, which
+     * poly.c refuses. NORM_CONST evaluates no norm and keeps one copy. */
+    auto init_words = [&](auto degc) {
+        constexpr int DEG = decltype(degc)::value;
+        const int deg = DEG > 0 ? DEG : N.deg;
+        for (uint32_t w = tid; w < nword; w += nth) {
+            uint32_t word = 0;
+            /* --norm-gate (NGATE): ngate is the OTHER side's survivor bitmap for
+             * this slab. A cell whose bit is clear can never be a two-sided
+             * survivor, so it gets no norm and starts at 0, like a both-even one;
+             * the intersection drops whatever it scans to. The word's CPW cells
+             * share one bitmap word, since CPW divides 32 and x is CPW-aligned.
+             * Not warp-uniform, and need not be: a warp runs the norm below when
+             * any lane's cell has a bit, and skips it when none does -- 84% of
+             * side 0's 64-position groups at c135, 77% at I16 (finding 140).
+             * One load per word, used at once: gathering 16 words' bits ahead in
+             * one batch of loads was slower (finding 141). */
+            const uint32_t xw = xbase + w * CPW;
+            const uint32_t gw = NGATE ? ngate[xw >> 5] >> (xw & 31u) : ~0u;
+            #pragma unroll
+            for (uint32_t c = 0; c < CPW; c++) {
+                uint32_t t;
+                const uint32_t x = xbase + w * CPW + c;
+                /* Warp-uniform: cell c has the same parity in every word, because
+                 * xbase and CPW are even. */
+                if (sieve_skip && pos_both_even(x, jblk)) {
+                    t = CINIT;                       /* cell starts at 0 */
+                } else if (NGATE && !((gw >> c) & 1u)) {
+                    t = CINIT;                       /* --norm-gate: likewise */
+                } else if (NORMMODE == NORM_CONST) {
+                    t = tconst;
+                } else {
+                    const int32_t  ii = (int32_t)(x & Imask) - Ihalf;
+                    const uint32_t jlocal = x >> logI;
+                    uint32_t jj = jlocal;
+                    if constexpr (SLABBED) jj += j_base;
+                    const float fi = (float)ii;
+                    const float fj = (float)jj;
+                    const float u = fmaf(N.ua, fi, N.ub * fj);
+                    const float v = fmaf(N.va, fi, N.vb * fj);
+                    float acc = N.d[deg], vp = 1.0f;
+                    /* The same Horner on |.|, which bounds the cancellation. The
+                     * normalisation gives fp32 ample dynamic RANGE, but near a root
+                     * line of F the terms are O(1) and cancel to something tiny, so
+                     * what is left is mostly rounding noise. Measured before this
+                     * guard: 144 of 63,497 positions in a band along the three real
+                     * root lines rounded to the wrong sieve-log value, -3.31 to
+                     * +2.57 units and BOTH SIGNS -- false survivors and lost
+                     * relations alike. */
+                    float aabs = fabsf(N.d[deg]), vpa = 1.0f;
+                    const float au = fabsf(u), av = fabsf(v);
                     #pragma unroll
                     for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
-                        if (k < N.deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
-                    s = (float)fabs(accd);
-                }
-                /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5).
-                 * las clamps here at 255 because its cell IS a byte, and that
-                 * is the whole reason `scale` exists (1.28 * 196.61 = 251.7).
-                 * Our cell is 16 bits, so the ceiling is CINIT, not 255, and
-                 * scale becomes a free parameter rather than a constraint --
-                 * at scale 1.28 las discards 0.39 bits of resolution per
-                 * position that we can keep. Clamping at 255 threw that away
-                 * and, worse, would have silently flattened every norm above
-                 * 255/scale into one bucket the moment anyone raised scale. */
-                /* log2f, NOT __log2f. The fast intrinsic is ~2 ulp and has no
-                 * host equivalent, so the CPU replay could not mirror this
-                 * expression exactly and "0 cells differ" was measuring two
-                 * slightly different functions. Accurate log2f is reproducible
-                 * on both sides. It was priced when norm init was 1.76 ms of a
-                 * 27 ms apply; the norm is far more of apply now (32-41% of side
-                 * 0's launch before --norm-gate, finding 140), so re-price it
-                 * with NORM_FAST_LOG2 below -- parity keeps the accurate one
-                 * either way. */
+                        if (k < deg) {
+                            vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
+                            vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
+                        }
+                    float s = fabsf(acc);
+                    if (s < NORM_CANCEL_TOL * aabs) {
+                        /* redo in fp64: (a,b) exactly in int64, sum at 2^-53.
+                         * Doubles are 1/64 rate on this part, but this fires on
+                         * well under one cell in a thousand. */
+                        const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
+                        const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
+                        const double ud = a / N.A, vd = b / N.B;
+                        double accd = N.dd[deg], vpd = 1.0;
+                        #pragma unroll
+                        for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+                            if (k < deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
+                        s = (float)fabs(accd);
+                    }
+                    /* las: S = fb_log(|F|) = floor(log2|F| * scale + 0.5).
+                     * las clamps here at 255 because its cell IS a byte, and that
+                     * is the whole reason `scale` exists (1.28 * 196.61 = 251.7).
+                     * Our cell is 16 bits, so the ceiling is CINIT, not 255, and
+                     * scale becomes a free parameter rather than a constraint --
+                     * at scale 1.28 las discards 0.39 bits of resolution per
+                     * position that we can keep. Clamping at 255 threw that away
+                     * and, worse, would have silently flattened every norm above
+                     * 255/scale into one bucket the moment anyone raised scale. */
+                    /* log2f, NOT __log2f. The fast intrinsic is ~2 ulp and has no
+                     * host equivalent, so the CPU replay could not mirror this
+                     * expression exactly and "0 cells differ" was measuring two
+                     * slightly different functions. Accurate log2f is reproducible
+                     * on both sides. It was priced when norm init was 1.76 ms of a
+                     * 27 ms apply; the norm is far more of apply now (32-41% of side
+                     * 0's launch before --norm-gate, finding 140), so re-price it
+                     * with NORM_FAST_LOG2 below -- parity keeps the accurate one
+                     * either way. */
 #ifdef NORM_FAST_LOG2
 #warning "NORM_FAST_LOG2: __log2f breaks CPU parity; --verify and dumpcmp will \
-report spurious cell mismatches. Pricing builds only, never for relations."
-                /* PRICING SWITCH, not a shipping option: __log2f is one MUFU
-                 * instruction against log2f's software sequence, and the point
-                 * of building with it is to measure what the accurate version
-                 * costs -- see the paragraph above for why the accurate one is
-                 * the default.
-                 *
-                 * This SILENTLY INVALIDATES THE PARITY GATE, which is why the
-                 * #warning above exists. poly.c's norm_target_host mirrors the
-                 * device expression deliberately -- same float type, same
-                 * clamp, same log2f -- so that "0 cells differ" means
-                 * something. Building with this breaks the mirror on the
-                 * device side only, and the ~2 ulp difference shows up as
-                 * scattered mismatches at threshold boundaries that read
-                 * exactly like a kernel regression. */
-                float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
+    report spurious cell mismatches. Pricing builds only, never for relations."
+                    /* PRICING SWITCH, not a shipping option: __log2f is one MUFU
+                     * instruction against log2f's software sequence, and the point
+                     * of building with it is to measure what the accurate version
+                     * costs -- see the paragraph above for why the accurate one is
+                     * the default.
+                     *
+                     * This SILENTLY INVALIDATES THE PARITY GATE, which is why the
+                     * #warning above exists. poly.c's norm_target_host mirrors the
+                     * device expression deliberately -- same float type, same
+                     * clamp, same log2f -- so that "0 cells differ" means
+                     * something. Building with this breaks the mirror on the
+                     * device side only, and the ~2 ulp difference shows up as
+                     * scattered mismatches at threshold boundaries that read
+                     * exactly like a kernel regression. */
+                    float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
 #else
-                float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
+                    float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
 #endif
-                int ti = (int)floorf(lg + 0.5f);
-                const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
-                t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
+                    int ti = (int)floorf(lg + 0.5f);
+                    const uint32_t TMAX = (CELLBITS == 8) ? 255u : CINIT;
+                    t = (ti < 0) ? 0u : ((uint32_t)ti > TMAX ? TMAX : (uint32_t)ti);
+                }
+                if (probe_out && x == probe_x) probe_out[0] = t;
+                word |= (CINIT - t) << (c * CELLBITS);
             }
-            if (probe_out && x == probe_x) probe_out[0] = t;
-            word |= (CINIT - t) << (c * CELLBITS);
+            S[w] = word + fw +
+                   (ntab ? T[w % SS_TAB_A_WORDS] + T[SS_TAB_A_WORDS + w % SS_TAB_B_WORDS] : 0u);
         }
-        S[w] = word + fw +
-               (ntab ? T[w % SS_TAB_A_WORDS] + T[SS_TAB_A_WORDS + w % SS_TAB_B_WORDS] : 0u);
+    };
+    static_assert(BENCH_MAX_DEGREE == 8,
+                  "one init_words copy per degree 1..BENCH_MAX_DEGREE");
+    if constexpr (NORMMODE == NORM_CONST) init_words(deg_c<0>{});
+    else switch (N.deg) {
+        case 1: init_words(deg_c<1>{}); break;
+        case 2: init_words(deg_c<2>{}); break;
+        case 3: init_words(deg_c<3>{}); break;
+        case 4: init_words(deg_c<4>{}); break;
+        case 5: init_words(deg_c<5>{}); break;
+        case 6: init_words(deg_c<6>{}); break;
+        case 7: init_words(deg_c<7>{}); break;
+        case 8: init_words(deg_c<8>{}); break;
+        default: init_words(deg_c<0>{}); break;
     }
     __syncthreads();
 
@@ -3150,7 +3201,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
          * rule therefore leaves out the 3/4 even-row factor here. */
         nfold = ss_fold_count(hsp, nsmall, cfg->tiny_fold);
         ntab = ss_tab_count(hsp, hsg, nsmall, nfold, cfg->tiny_table, 0);
-        ss_tiers(hsp, nsmall, &nblk, &nwrp);
+        ss_tiers(hsp, nsmall, cfg, &nblk, &nwrp);
         nsplit = ss_two_step_from(hsp, nsmall, nwrp, cfg->J, cfg->logI);
         for (i = 0; i < nsmall; i++)
             ss_magic_build(hsp[i],
@@ -3180,7 +3231,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             printf("  small sieve: %u entries (%u block-tier m<%u, %u warp-tier m<%u,"
                    " %u thread-tier), %u with a row divisor, %u projective,"
                    " %.3e updates\n",
-                   nsmall, nblk, SS_BLOCK_CUT, nwrp - nblk, SS_WARP_CUT,
+                   nsmall, nblk, ss_block_cut(cfg), nwrp - nblk, ss_warp_cut(cfg),
                    nsmall - nwrp, nrow, nprj, upd);
             if (nfold)
                 printf("  --tiny-fold: %u block-tier entries (power-of-two m <= 32)"
