@@ -81,6 +81,14 @@
 #include "watchdog.h"
 #include <stdint.h>
 #include <errno.h>          /* strtoull ERANGE in the relation gate */
+#include <new>              /* the relation writer: std::nothrow */
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#ifndef _WIN32
+#include <signal.h>         /* the writer starts with every signal blocked */
+#include <pthread.h>
+#endif
 /* Directly, not by luck of translation-unit ordering: this header calls
  * bench_mul_u64_wide, bench_u128_take32, bench_seek_end and friends, and it
  * compiled only because bench_kernels.cu happens to include platform.h first.
@@ -2169,10 +2177,17 @@ typedef struct {
     uint32_t *d_f0, *d_f1;
     uint64_t *d_sp0, *d_sp1;
     uint8_t  *d_fn0, *d_fn1, *d_nsp0, *d_nsp1;
+    struct cofq_writer *w;            /* the relation writer; NULL until used */
+    int w_failed;                     /* it could not be started: write inline */
+    double ms_fmt, ms_wait;           /* its formatting; the band's waits on it */
 } cofq_out_t;
+
+/* Before the relation file is closed; with the writer, below. */
+static void cofq_writer_stop(cofq_out_t *O);
 
 static void cofq_free(cofq_t *Q, cofq_out_t *O)
 {
+    cofq_writer_stop(O);   /* it reads O's host arrays, freed below */
     cudaFree(Q->d_c0); cudaFree(Q->d_c1); cudaFree(Q->d_st0); cudaFree(Q->d_st1);
     cudaFree(Q->d_sm0); cudaFree(Q->d_sm1); cudaFree(Q->d_a); cudaFree(Q->d_b);
     cudaFree(Q->d_f0); cudaFree(Q->d_f1); cudaFree(Q->d_fn0); cudaFree(Q->d_fn1);
@@ -2392,6 +2407,160 @@ static char *cq_fmt_side(char *p, const uint32_t *f, int nf,
     for (int i = 0; i < nf && n < TD_FMAX + CF_MAXFAC; i++) v[n++] = f[i];
     for (int i = 0; i < nsp && n < TD_FMAX + CF_MAXFAC; i++) v[n++] = sp[i];
     return cf_fmt_sorted(p, v, n);
+}
+
+/* ---- the relation writer ----------------------------------------------- *
+ *
+ * A flush's relations used to be formatted and written on the band loop's own
+ * thread, with the card idle until the last line was out: 49 ms a flush at
+ * c135 (~83k relations at 0.59 us each, after finding 137's hand formatting),
+ * ~1.9% of its wall and ~1% of C148's (finding 140). The writer thread does it
+ * instead, and the loop goes straight back to launching the next q.
+ *
+ * ONE BATCH IN FLIGHT, IN O's PINNED HOST ARRAYS. Everything else that touches
+ * them or the relation file waits for the writer first: the next flush before
+ * its readback overwrites them, every checkpoint before its fflush, fsync and
+ * tell (pipe_try_checkpoint: the offset it records must cover every relation
+ * its count does), the final flush inside its timer, and the band's end
+ * before the file is closed (cofq_writer_stop, from pipe_finalize_outputs,
+ * which closes it). The lines go out in queue order, the inline writer's
+ * bytes exactly, so the relation file is byte-identical to it. A thread that
+ * cannot be started leaves the flush writing inline, as before. */
+struct cofq_writer {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    cofq_out_t *O = NULL;
+    FILE *fo = NULL;
+    uint32_t nr = 0;                  /* the batch in flight; 0 when idle */
+    bool quit = false;
+};
+
+/* One batch of relations, in the queue's order. */
+static void cofq_write_lines(const cofq_out_t *O, uint32_t nr, FILE *fo)
+{
+    /* a line is at most two 20-character integers, two sides of
+     * TD_FMAX + CF_MAXFAC factors and four separators */
+    enum { CQ_LINE_MAX = 2 * 20 + 2 * (int)CF_FMT_MAX(TD_FMAX + CF_MAXFAC) + 4,
+           CQ_OUTBUF = 1 << 16 };
+    char ob[CQ_OUTBUF];
+    char *p = ob;
+    for (uint32_t k = 0; k < nr; k++) {
+        if ((size_t)(ob + CQ_OUTBUF - p) < (size_t)CQ_LINE_MAX) {
+            fwrite(ob, 1, (size_t)(p - ob), fo);
+            p = ob;
+        }
+        int64_t a = O->a[k], b = O->b[k];
+        if (b < 0) { a = -a; b = -b; }
+        p = cf_put_dec(p, a); *p++ = ',';
+        p = cf_put_dec(p, b); *p++ = ':';
+        p = cq_fmt_side(p, O->f0 + (size_t)k * TD_FMAX, O->fn0[k],
+                        O->sp0 + (size_t)k * CF_MAXFAC, O->nsp0[k]);
+        *p++ = ':';
+        p = cq_fmt_side(p, O->f1 + (size_t)k * TD_FMAX, O->fn1[k],
+                        O->sp1 + (size_t)k * CF_MAXFAC, O->nsp1[k]);
+        *p++ = '\n';
+    }
+    fwrite(ob, 1, (size_t)(p - ob), fo);
+}
+
+/* A batch is taken whole and quit is honoured only when idle, so a stop
+ * writes what was posted before it. ms_fmt is written here under the lock
+ * and read by the band only after a wait or the join. */
+static void cofq_writer_main(cofq_writer *w)
+{
+    std::unique_lock<std::mutex> lk(w->m);
+    for (;;) {
+        w->cv.wait(lk, [w] { return w->nr || w->quit; });
+        if (!w->nr) return;
+        const uint32_t nr = w->nr;
+        lk.unlock();
+        const double t0 = host_ms();
+        cofq_write_lines(w->O, nr, w->fo);
+        const double dt = host_ms() - t0;
+        lk.lock();
+        w->O->ms_fmt += dt;
+        w->nr = 0;
+        w->cv.notify_all();
+    }
+}
+
+/* Until the batch in flight is written. A no-op without a writer. The wait
+ * is its own watchdog phase, so a write hung on the disk reports as that and
+ * not as the caller's phase; the caller's is put back after it. */
+static void cofq_writer_wait(cofq_out_t *O)
+{
+    cofq_writer *const w = O ? O->w : NULL;
+    if (!w) return;
+    std::unique_lock<std::mutex> lk(w->m);
+    if (!w->nr) return;
+    const char *const ph = wd_phase_now();
+    wd_phase("cofq.writer_wait");
+    const double t0 = host_ms();
+    w->cv.wait(lk, [w] { return !w->nr; });
+    O->ms_wait += host_ms() - t0;
+    if (ph) wd_phase(ph);
+}
+
+/* Hand the writer a batch already read back into O. The caller has waited,
+ * so the writer is idle. -1 when no writer thread could be started: the
+ * caller then writes the batch itself, as it does for the rest of the band.
+ * -2 when the writer was NOT idle: the readback has overwritten the batch it
+ * is writing, so the caller fails the flush, and the band is not committed.
+ *
+ * The thread starts with every signal blocked, so asynchronous ones stay
+ * with the band's thread: BOINC's runtime suspends and quits from its
+ * SIGALRM handler, which must run there, and a process-directed signal goes
+ * to any thread not blocking it. */
+static int cofq_writer_post(cofq_out_t *O, uint32_t nr, FILE *fo)
+{
+    if (!O->w) {
+        if (O->w_failed) return -1;
+        cofq_writer *w = new (std::nothrow) cofq_writer;
+        if (w) {
+#ifndef _WIN32
+            sigset_t all, old;
+            sigfillset(&all);
+            pthread_sigmask(SIG_BLOCK, &all, &old);
+#endif
+            try { w->th = std::thread(cofq_writer_main, w); }
+            catch (...) { delete w; w = NULL; }
+#ifndef _WIN32
+            pthread_sigmask(SIG_SETMASK, &old, NULL);
+#endif
+        }
+        if (!w) {
+            O->w_failed = 1;
+            fprintf(stderr, "  warning: no relation writer thread; the"
+                    " cofactor flush writes its relations inline\n");
+            return -1;
+        }
+        O->w = w;
+    }
+    {
+        std::lock_guard<std::mutex> lk(O->w->m);
+        if (O->w->nr) return -2;
+        O->w->O = O; O->w->fo = fo; O->w->nr = nr;
+    }
+    O->w->cv.notify_all();
+    return 0;
+}
+
+/* Write what is in flight, then end the thread. Before the relation file is
+ * closed, on every path. */
+static void cofq_writer_stop(cofq_out_t *O)
+{
+    cofq_writer *const w = O ? O->w : NULL;
+    if (!w) return;
+    cofq_writer_wait(O);
+    {
+        std::lock_guard<std::mutex> lk(w->m);
+        w->quit = true;
+    }
+    w->cv.notify_all();
+    w->th.join();
+    delete w;
+    O->w = NULL;
 }
 
 /* TEST-ONLY (0 everywhere else): each flush prints one stderr line hashing
@@ -2836,6 +3005,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
                                     O->d_f0, O->d_fn0, O->d_f1, O->d_fn1,
                                     O->d_sp0, O->d_nsp0, O->d_sp1, O->d_nsp1);
     COF_FLUSH_CK(cudaStreamSynchronize(0)); COF_FLUSH_CK(cudaGetLastError());
+    cofq_writer_wait(O);   /* the last batch is still in the arrays below */
     h0 = host_ms();
     COF_FLUSH_CK(cudaMemcpy(O->a, O->d_a, (size_t)nr * 8, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->b, O->d_b, (size_t)nr * 8, cudaMemcpyDeviceToHost));
@@ -2847,30 +3017,15 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaMemcpy(O->sp1, O->d_sp1, (size_t)nr * CF_MAXFAC * 8, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->nsp0, O->d_nsp0, nr, cudaMemcpyDeviceToHost));
     COF_FLUSH_CK(cudaMemcpy(O->nsp1, O->d_nsp1, nr, cudaMemcpyDeviceToHost));
+    /* On the writer thread; here only when it could not be started. */
     if (fo) {
-        /* a line is at most two 20-character integers, two sides of
-         * TD_FMAX + CF_MAXFAC factors and four separators */
-        enum { CQ_LINE_MAX = 2 * 20 + 2 * (int)CF_FMT_MAX(TD_FMAX + CF_MAXFAC) + 4,
-               CQ_OUTBUF = 1 << 16 };
-        char ob[CQ_OUTBUF];
-        char *p = ob;
-        for (uint32_t k = 0; k < nr; k++) {
-            if ((size_t)(ob + CQ_OUTBUF - p) < (size_t)CQ_LINE_MAX) {
-                fwrite(ob, 1, (size_t)(p - ob), fo);
-                p = ob;
-            }
-            int64_t a = O->a[k], b = O->b[k];
-            if (b < 0) { a = -a; b = -b; }
-            p = cf_put_dec(p, a); *p++ = ',';
-            p = cf_put_dec(p, b); *p++ = ':';
-            p = cq_fmt_side(p, O->f0 + (size_t)k * TD_FMAX, O->fn0[k],
-                            O->sp0 + (size_t)k * CF_MAXFAC, O->nsp0[k]);
-            *p++ = ':';
-            p = cq_fmt_side(p, O->f1 + (size_t)k * TD_FMAX, O->fn1[k],
-                            O->sp1 + (size_t)k * CF_MAXFAC, O->nsp1[k]);
-            *p++ = '\n';
+        const int wp = cofq_writer_post(O, nr, fo);
+        if (wp == -2) {
+            fprintf(stderr, "  internal error: a relation batch was read back"
+                    " while the writer was still writing the last one\n");
+            goto done;
         }
-        fwrite(ob, 1, (size_t)(p - ob), fo);
+        if (wp) cofq_write_lines(O, nr, fo);
     }
     Q->ms_host += host_ms() - h0;
     Q->n = 0;

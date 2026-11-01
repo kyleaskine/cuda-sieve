@@ -153,7 +153,7 @@ static int pipe_checkpoint(const poly_t *P, const bench_cfg_t *cfg, ckpt_t *ck,
  * and the sieve keeps going. Only the FIRST failure is reported: a persistent
  * one would otherwise print on every flush for days. */
 static void pipe_try_checkpoint(const poly_t *P, const bench_cfg_t *cfg,
-                                ckpt_t *ck, FILE *fr, FILE *fc,
+                                ckpt_t *ck, cofq_out_t *O, FILE *fr, FILE *fc,
                                 const qsel_t *next, unsigned long long nrel,
                                 unsigned long long nqdone,
                                 int *written, int *warned)
@@ -162,6 +162,9 @@ static void pipe_try_checkpoint(const poly_t *P, const bench_cfg_t *cfg,
      * phase that can legitimately block for seconds on a busy disk -- name it
      * so a stall report can say so. */
     wd_phase("q.checkpoint");
+    /* nrel counts the relation writer's batch in flight: its lines must be in
+     * the file before the fflush, fsync and tell (cofac.cuh, the writer) */
+    cofq_writer_wait(O);
     if (pipe_checkpoint(P, cfg, ck, fr, fc, next, nrel, nqdone) == 0) {
         *written = 1;
         return;
@@ -2252,18 +2255,21 @@ static int pipe_mem_info_optional(const char *where,
  * whole band and final cofactor flush succeed. Any close or rename failure
  * converts the operation to discard mode and removes whatever temporary files
  * remain. */
-/* commit:       claim the final names. A clean stop is NOT a completed band,
+/* QO:           the relation writer, stopped (its last batch written) before
+ *               the relation file is closed; NULL without one.
+ * commit:       claim the final names. A clean stop is NOT a completed band,
  *               so the caller passes 0 and the .part keeps its staging name.
  * keep_partial: a checkpoint sidecar was actually written, so what is on disk
  *               is resumable work rather than debris. Only ever consulted on
  *               the discard path. */
-static int pipe_finalize_outputs(FILE **frp, FILE **fcp,
+static int pipe_finalize_outputs(cofq_out_t *QO, FILE **frp, FILE **fcp,
                                  const bench_cfg_t *cfg,
                                  const char *rtmp, const char *ctmp,
                                  int commit, int keep_partial)
 {
     int bad = 0;
 
+    cofq_writer_stop(QO);
     if (frp && *frp) {
         const int io_bad = ferror(*frp);
         if (fclose(*frp) || io_bad) bad = 1;
@@ -3554,7 +3560,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * empty/prefix checkpoint before any work so a crash can always keep
          * the .part and replay this q from a whole-q boundary. */
         if (fr && cfg->cofactor && !ckpt_written && !nqdone && Q.n == 0)
-            pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+            pipe_try_checkpoint(POLY, cfg, &ck, &QO, fr, fc, cur,
                                 base_rel + Q.nrel, base_nq + nqdone,
                                 &ckpt_written, &ckpt_warned);
 
@@ -3610,7 +3616,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * checkpoint, and letting ckpt_written be set anyway would print a
              * "resume at q=" line naming a .part that does not exist. */
             if (fr)
-                pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                pipe_try_checkpoint(POLY, cfg, &ck, &QO, fr, fc, cur,
                                     base_rel + (cfg->cofactor ? Q.nrel
                                         : (unsigned long long)acc_rel),
                                     base_nq + nqdone, &ckpt_written,
@@ -3646,7 +3652,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                            cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks,
                            cfg->threads, fr)) { rc = -1; break; }
-            pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+            pipe_try_checkpoint(POLY, cfg, &ck, &QO, fr, fc, cur,
                                 base_rel + (cfg->cofactor ? Q.nrel
                                                           : (unsigned long long)acc_rel),
                                 base_nq + nqdone, &ckpt_written, &ckpt_warned);
@@ -3661,7 +3667,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * not in the file for. */
         if (fr && !cfg->cofactor && qi && host_ms() - t_ckpt > PIPE_CKPT_MS) {
             t_ckpt = host_ms();
-            pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+            pipe_try_checkpoint(POLY, cfg, &ck, &QO, fr, fc, cur,
                                 base_rel + (unsigned long long)acc_rel,
                                 base_nq + nqdone, &ckpt_written, &ckpt_warned);
         }
@@ -3735,7 +3741,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                      * outcome -- but the two policy stops must not disagree
                      * about the same hazard. */
                     if (fr)
-                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                        pipe_try_checkpoint(POLY, cfg, &ck, &QO, fr, fc, cur,
                                             base_rel + (cfg->cofactor ? Q.nrel
                                                 : (unsigned long long)acc_rel),
                                             base_nq + nqdone, &ckpt_written,
@@ -4610,7 +4616,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     if (fr && slab == 0 &&
                         (!ckpt_written || host_ms() - t_ckpt > PIPE_CKPT_MS)) {
                         t_ckpt = host_ms();
-                        pipe_try_checkpoint(POLY, cfg, &ck, fr, fc, cur,
+                        pipe_try_checkpoint(POLY, cfg, &ck, &QO, fr, fc, cur,
                                             base_rel + Q.nrel,
                                             base_nq + nqdone,
                                             &ckpt_written, &ckpt_warned);
@@ -5207,6 +5213,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (cofq_flush(&Q, &QO, cfg->lim0, cfg->lpb0, cfg->lim, cfg->lpb,
                        cfg->cof_rounds, cfg->cof_budget, cfg->cof_chunk, blocks, cfg->threads, fr))
             rc = -1;
+        /* Its batch, inside the timer: the file must hold it before it is
+         * closed, so the band pays for it here as the inline emit did, and
+         * COMPLETE must count it. A band shorter than one flush emits all of
+         * its relations here (testsieve.sh's samples). */
+        cofq_writer_wait(&QO);
         cofac_tail = host_ms() - cf0;
     }
     if (rc == 0 && !stopped && cfg->target_rels && !target_reached) {
@@ -5236,7 +5247,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * and the final name is not claimed. Renaming here would present a
          * partial band as a finished one and strand the rest of the q range. */
         const int commit = (rc == 0 && !stopped);
-        if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, commit,
+        if (pipe_finalize_outputs(&QO, &fr, &fc, cfg, rtmp, ctmp, commit,
                                   ckpt_written))
             rc = -1;
         outputs_finalized = 1;
@@ -5619,9 +5630,16 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             printf("\n  --- cofactorisation, cross-q queue ---\n");
             printf("  %-34s %8.2f ms\n", "rational queue", Q.ms_rat / N);
             printf("  %-34s %8.2f ms\n", "algebraic queue", Q.ms_alg / N);
-            printf("  %-34s %8.3f ms\n", "readback + emit of relations", Q.ms_host / N);
+            /* The emit is the writer thread's, beside the card, unless it
+             * could not be started (then it is inside the readback line).
+             * The sum is the band thread's cost, as it was with the emit
+             * inline: the writer's own time is not in it, the band's waits
+             * for the writer are. lpbsweep/sweep.sh and bands.sh read it. */
+            printf("  %-34s %8.3f ms\n", "readback of relations", Q.ms_host / N);
+            printf("  %-34s %8.3f ms\n", "waits for the writer", QO.ms_wait / N);
             printf("  %-34s %8.2f ms\n", "  = device time per q",
-                   (Q.ms_rat + Q.ms_alg + Q.ms_host) / N);
+                   (Q.ms_rat + Q.ms_alg + Q.ms_host + QO.ms_wait) / N);
+            printf("  %-34s %8.3f ms\n", "emit, on the writer thread", QO.ms_fmt / N);
             printf("  %-34s %8.2f ms\n", "wall: in-loop flushes", tm.cofac / N);
             printf("  %-34s %8.2f ms\n", "wall: final flush after the band",
                    cofac_tail / N);
@@ -5773,7 +5791,7 @@ done:
      * but still honours a written checkpoint, since a .part that a sidecar
      * describes is resumable work whatever killed this session. */
     if (!outputs_finalized) {
-        if (pipe_finalize_outputs(&fr, &fc, cfg, rtmp, ctmp, 0, ckpt_written))
+        if (pipe_finalize_outputs(&QO, &fr, &fc, cfg, rtmp, ctmp, 0, ckpt_written))
             rc = -1;
     }
     /* A special-q issued ahead and never consumed may still be sieving, and

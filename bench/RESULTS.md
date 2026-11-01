@@ -16741,3 +16741,356 @@ check` (all gates passed, the four new cases among them; run beside Kyle's
 GPU ECM, which an identity gate does not mind). Copy:
 `work/ngate2/bench.installed.141b`; `6c7c2a84` is
 `work/ngate/bench.installed.141`.
+
+## Finding 142 — the cofactor flush's relations formatted and written on a writer thread (finding 140's next 2): relations byte-identical, wall c135 −1.8%, C143 −1.5%, C148 −0.9% (8 of 8 rounds each), I16 flat. c135's card-idle gap after a flush goes from 42.0 ms to 1.8 ms, the readback
+
+**Date:** 2026-10-31, 17:29-17:59. Card free, both NFS@Home clients off,
+one CPU ECM P+1 process (load 2-4). Source: HEAD `8d0c1a7` plus this change
+(`cofac.cuh`, `pipeline.cuh`), built sm_120 in `work/emitw/new/`
+(`bed719e8`); base is HEAD's own source (`git archive`), sm_120
+(`work/emitw/base/`, `2dc0490d`). Their device SASS is identical in all 107
+functions (`work/emitw/sass.*.txt`), so the change is host code.
+
+### The change
+
+`cofq_flush` reads a batch's relations back and hands them to a writer
+thread (`std::thread`; Linux, the BOINC link's static libstdc++ and MSVC
+all have it), which formats and writes them while the band loop goes back
+to the card. One batch is in flight, in the queue's pinned host arrays, and
+whatever touches those arrays or the relation file waits for the writer
+first:
+
+- the next flush, before its readback overwrites the arrays;
+- every checkpoint (`pipe_try_checkpoint`), before its fflush, fsync and
+  tell, so the offset it records covers every relation its count does;
+- both `pipe_finalize_outputs` calls (`cofq_writer_stop`), so the file is
+  never closed under the writer, error exits included; and `cofq_free`.
+
+The lines go out in queue order, the inline writer's bytes exactly. A thread
+that cannot be started leaves the flush writing inline, with one warning.
+The band report's "readback + emit of relations" line becomes three: the
+readback, the emit on the writer thread, and the band's waits for it.
+
+### Gates (`work/emitw/gate.sh`, all passed)
+
+- abcheck base new: 36 of 36 identical.
+- c135 20,000 q byte-identical to finding 138's reference (1,855,599
+  relations), and `--check-relations` 1,855,599 of 1,855,599.
+- Crash and resume: kill -9 at 20 s (only the seed checkpoint) and at 45 s
+  (past an in-loop one), rerun to completion: both byte-identical to the
+  reference.
+- Clean stops with the writer up, at 30 s, by SIGINT, SIGTERM and the stop
+  file: each exits 0 with a sidecar covering the whole `.part` (106.9-109.7
+  MB), so the drain waited out the writer, and each resumes to the
+  reference byte for byte.
+- SNFS301 10 q, base against new: 669 relations, identical.
+- `make check` in `new/`: all gates passed.
+
+### Timing (`work/emitw/timing.sh`, 8 rounds, rotated)
+
+| job | base wall | new wall | wall (median of pairs) | rounds faster |
+|---|---:|---:|---:|---:|
+| c135 | 2.758 | 2.704 | **−1.8%** | 8 of 8 |
+| C143 | 4.887 | 4.807 | **−1.5%** | 8 of 8 |
+| C148 | 10.067 | 9.979 | **−0.9%** | 8 of 8 |
+| NFS@Home I16 | 139.54 | 139.58 | +0.05% | flat |
+
+Walls are means in ms/q. All 64 runs matched base r1's relations.
+
+**Corrected 2026-10-31 (the review of the change, `/code-review xhigh`):
+these walls leave out the last batch's emit.** `cofq_writer_stop` waits it
+out after `cofac_tail` is taken, so 'wall clock per q, COMPLETE' omits it,
+where base paid it inside the final flush. With each new run's 'waits for the
+writer' added back (an upper bound: these runs are under 30 s, so the waits
+are almost all that band-end wait), the medians of pairs are **c135 −1.63%,
+C143 −1.31%, C148 −0.82%**, still 8 of 8 rounds each, and I16 +0.05%. The
+waits were 0.005, 0.014 and 0.009 ms/q (0.20%, 0.29% and 0.09% of new's
+wall). The same omission makes `testsieve.sh`'s short samples, which never
+reach an in-loop flush, drop their whole emit from COMPLETE. Finding 144's
+timing is not affected: both of its arms have the writer.
+
+- **c135 gets ~85% of finding 140's 1.9% bound** (corrected above; ~95% as first read), and C148 ~80% of its ~1%.
+- **The trace** (nsys, c135 q in [7000000, 7020000), one in-loop flush):
+  base idles the card 42.0 ms after the flush, new 1.8 ms (the readback's
+  copies). Gaps over 1 ms: 46.4 ms of a 3,092 ms window, against 1.8 ms of
+  3,043.
+- **The writer takes longer than the inline emit did** (c135 0.064 ms/q
+  over 20,000 q, against finding 137's 0.053), beside the band's spinning
+  host thread. It is off the critical path and done long before the next
+  flush.
+- **The waits are the band's end and checkpoints.** The last batch must be
+  in the file before it closes, which base paid inline too. A checkpoint
+  that follows its flush waits out that batch: ~50 ms at c135, at most once
+  per 30 s (≤0.17%). A checkpoint deferred until the writer goes idle would
+  save that (the file holds nothing past the batch until the next one). Not
+  done.
+
+### Next
+
+1. Install: **done 2026-10-31 21:49**, Kyle's call (see "The install"
+   below).
+2. The cofactor tail (finding 140's next 3, ~1.2% at c135). Facts from the
+   code: `cf_run_rounds` issues every round with no host sync (the live count
+   stays on the device), each round launches the full grid, and the live
+   records are packed from the first block, so a late round's few hundred
+   records run on one SM. The host blocks at the flush's end for all ~100 ms
+   of its kernels. Three ways at it:
+   - **(a) Spread a round's live records over the SMs**, a permuted record
+     index in `k_cofac`. Byte-identical by construction (records are
+     independent). It gains only if one SM's 8 warps are issue-bound rather
+     than each record's ECM chain latency-bound, which is the likelier case.
+     One `ncu` of the tail rounds would tell.
+   - **(b) An asynchronous flush**: the flush's kernels on their own
+     non-blocking stream, completed when its event has fired (polled at each
+     q top), with a second queue's input arrays (~86 MB at 131,072 records,
+     scratch shared) so the band enqueues while the last batch flushes, and
+     a fits-check falling back to today's flush, as `--q-pipeline` does.
+     Checkpoints move to the completion, with the q boundary and counts
+     captured at issue. Same batches in the same order, so byte-identical.
+     Bound: the tail's ~1.2% at c135, plus whatever of round 1 fills
+     sieving's own gaps.
+   - **(c) A tail record's curves in parallel**: no. `mz_split` restarts its
+     factor stack from the cofactor on every call and sigma is `c0*1000 +
+     cv + 6`, so splitting curves changes results unless done as speculate
+     and commit, a large change to the ECM kernel.
+
+### The install (2026-10-31)
+
+- **Build:** `work/emitw/build.sh`, every tracked file of the tree copied
+  into `work/emitw/fat/` and built at the default (fat) `GPU_ARCH`:
+  `73901347`, stamped `8d0c1a71-dirty`. Its device SASS matches the
+  installed `aff3bc31`'s in all 642 arch x function bodies, so only the
+  host side changed.
+- **A first build left `make -q all` stale:** `bench_main.o` was stamped
+  1 s before its own source was unpacked, and the build stamps after it.
+  The likely cause is a backward step of WSL2's clock; nothing in `dmesg`
+  confirms it. A second `make all` rebuilt that object and relinked, and
+  `make -q all` was clean.
+- **Gates (`work/emitw/fatgate.sh`, the installed binary against the fat
+  build), run once msieve's linear algebra left the card:** abcheck 36
+  of 36; c135 20,000 q byte-identical to finding 138's reference and
+  `--check-relations` 1,855,599 of 1,855,599; kill -9 resumes at 20 and
+  45 s and SIGINT/SIGTERM/stop-file stops all resumed to the reference;
+  SNFS301 669 identical. `make check` failed at first because the copy
+  held only tracked files and cofcheck reads the untracked
+  `oracle/c183.fb1`. With `oracle/` linked to the tree's, as earlier
+  build copies had it (now in `build.sh`), it passed: 120 PASS lines,
+  and `make -q all` clean.
+- **Installed 21:49** by `work/emitw/install.sh`: the fat objects copied
+  into `bench/` and the binary swapped. `make all` in the tree left it in
+  place, and `make check` in the tree passed. A copy is at
+  `work/emitw/bench.installed.142`; `aff3bc31` stays at
+  `work/ngate2/bench.installed.141b`.
+
+### The review's fixes (2026-10-31, `/code-review xhigh`, installed 23:32)
+
+The review found nothing that breaks correctness. Seven of its eight items
+are fixed. Device SASS is unchanged, so all seven are host side.
+
+1. **The final flush waits for the writer inside its timer**
+   (`pipeline.cuh`). The band-end wait had been in `cofq_writer_stop`,
+   after `cofac_tail` was taken, so COMPLETE left out the last batch's
+   emit. Base paid that emit inside the final flush. The corrected
+   timing is in the section above. A band shorter than one flush emits
+   everything there (`testsieve.sh`'s samples), so their COMPLETE had
+   dropped the whole emit.
+2. **'= device time per q' is the band thread's cost again**: rational +
+   algebraic + readback + the waits for the writer. That is what it summed
+   with the emit inline, and `lpbsweep/*.sh` read it. The writer's own emit
+   is printed after the sum, not indented under the readback.
+3. **The writer and watchdog threads start with every signal blocked**
+   (`pthread_sigmask` around their creation, POSIX only). BOINC's runtime
+   suspends and quits from its SIGALRM handler, which must run on the worker
+   thread. A process-directed signal goes to any thread that does not block
+   it. The watchdog thread had the same exposure before the writer existed.
+   Its backtrace request is thread-directed at the stalled thread, so it is
+   unaffected.
+4. **The wait is its own watchdog phase** (`cofq.writer_wait`, with the
+   caller's phase put back after it; `wd_phase_now` is new). A write hung on
+   the disk now reports as that phase, not as the caller's.
+5. **`pipe_finalize_outputs` stops the writer itself**, before it closes the
+   relation file, instead of each of its two callers doing it by hand.
+6. **A post to a writer that is not idle fails the flush** (-2). The
+   readback has already overwritten the batch the writer is still writing,
+   so the band must not be committed. The code avoids `abort()` (a core of
+   a 12 GB address space).
+7. **A writer that could not be started is remembered** (`w_failed`), so
+   the band writes inline from then on without retrying the thread at every
+   flush.
+
+Not done: item 8, the checkpoint that follows a flush and waits out its
+batch. It was already noted above (≤0.17%).
+
+**Build and gates** (`work/emitw2/`): fat build `d7defb03`, device SASS
+identical to the installed `73901347` in all 642 bodies.
+`work/emitw/gate.sh`, installed against new, all passed: abcheck 36/36,
+c135 20,000 q against finding 138's reference with `--check-relations`
+1,855,599/1,855,599, kill -9 resumes at 20 and 45 s, SIGINT/SIGTERM/
+stop-file stops and resumes, SNFS301 669 identical, `make check`. Three
+checks were added for the fixes:
+- The printed sum equals its parts (0.04 + 0.06 + 0.002 + 0.002 against
+  0.11, at the print's rounding).
+- A 200-q c135 band, with no in-loop flush, waits out its one batch (waits
+  0.055 against the emit's 0.054 ms/q).
+- At 12 s into a c135 band, the new binary has one thread blocking SIGALRM
+  (the writer; the watchdog is not armed by default) where the installed one
+  had none. The main thread blocks nothing.
+
+Installed by `work/emitw2/install.sh`, and `make check` in the tree passed.
+`73901347` is kept as `work/emitw/bench.installed.142`, and the new binary
+as `work/emitw2/bench.installed.142b`.
+
+## Finding 143 — finding 142's option (a) measured: dealing a late round's live records over the blocks puts them on 6-85% of SMs instead of one, but the tail launches get only 3.5% shorter and the fuller rounds up to 69% longer, so `k_cofac` is +5.4% over a flush. The tail is each record's ECM chain, not one SM's throughput. Not adopted
+
+**Date:** 2026-10-31, 18:16-18:25. Card free, both NFS@Home clients off,
+one CPU ECM P+1 process. Base `work/emitw/new/` (finding 142's build);
+new `work/spread/new/`, the same source with `k_cofac`'s first index
+transposed (`threadIdx.x * gridDim.x + blockIdx.x`) whenever the slice is
+smaller than the grid, a bijection of the grid, so each record still runs
+once on its own thread. Registers ≤128 on every instance (two blocks an SM
+kept). `work/spread/ncu.sh`: ncu `--clock-control none`, the first 40
+`k_cofac` launches of a c135 band of 2,000 q (two flushes), then the band's
+relations, identical (185,982).
+
+| launch (first flush) | base ms | SM active | spread ms | SM active | spread/base |
+|---|---:|---:|---:|---:|---:|
+| side 0 round 1 | 23.44 | 87.5% | 24.13 | 93.5% | 1.03 |
+| side 0 round 2 | 5.97 | 20.1% | 6.25 | 85.8% | 1.05 |
+| side 0 round 3 | 4.55 | 2.1% | 3.25 | 64.5% | **0.71** |
+| side 0 round 4 | 2.34 | 2.1% | 2.31 | 25.3% | 0.99 |
+| side 1 round 1 | 33.16 | 92.8% | 33.74 | 93.7% | 1.02 |
+| side 1 round 1, remainder slice | 7.65 | 78.8% | 12.88 | 83.6% | **1.69** |
+| side 1 round 2 | 7.73 | 19.8% | 8.38 | 85.3% | 1.08 |
+| side 1 round 3 | 4.90 | 2.1% | 3.96 | 57.1% | 0.81 |
+| side 1 round 4 | 2.80 | 2.1% | 2.79 | 15.2% | 1.00 |
+
+Over all 40 launches: base 226.5 ms, spread 238.8 ms (+5.4%). The launches
+base runs below 50% of SMs: 78.5 ms against 75.8 ms (−3.5%). The second
+flush repeats the pattern (`work/spread/ncu.cmp.txt`).
+
+- **The last round of each side does not move** (2.3-3.0 ms either way):
+  one record's chain of curves sets it, wherever it runs. Round 3 gains
+  20-29% (~1 ms), where a few hundred records shared one SM's schedulers.
+- **A slice just under the grid gets slower,** up to +69%. Dealt lane-major,
+  a warp's lanes read records a grid apart, so the loads of `sel`, the
+  cofactor and the status, and the factor stores, stop coalescing.
+- **Restricted to the true tail** (a slice under a sixteenth of the grid,
+  say) it would keep round 3's ~1 ms on each side and lose nothing: ~2 ms a
+  flush, ~0.08% of c135's wall. Not worth the code.
+
+So the tail's ~27 ms a flush is latency: only work run beside it can use the
+idle SMs. That is option (b), the asynchronous flush (finding 142's next 2).
+**(b) is not pursued (Kyle's call, 2026-10-31):** at most ~1.2% at c135,
+less at C148 and nothing at I16, for a second queue, a stream of its own
+and checkpoints moved to each batch's completion. STATUS row 38 is closed.
+`work/spread/` is kept for reference; the tree does not carry the change.
+
+## Finding 144 — the norm's polynomial degree made a compile-time constant in `k_apply`'s init: a prototype that picks one of eight specialised copies per block cuts `k_apply` 5-11% under ncu and wall 1.5-3.0% on six jobs (8 of 8 rounds each), relations byte-identical. The tiny fold is priced at the same time: 1.9-4.1% of a side's instructions, parked. The tree does not carry the change yet
+
+The lead came from an outside, read-only review (ChatGPT, 2026-10-31) of
+what was left to speed up. The norm loop (`bench_kernels.cu:1220`) always
+runs `BENCH_MAX_DEGREE` (8) unrolled steps, each guarded by `k < N.deg`, and
+starts from `N.d[N.deg]`, a dynamic index. Every GNFS job here has degree 5 on
+the algebraic side, SNFS301 6, C1147 7, and the rational side is degree 1.
+
+### The prototype (`work/deg/`, sm_120, measurement only)
+
+- **`proto2/`** (`aba4dcba`): the init loop becomes a generic lambda over a
+  compile-time degree (`deg_c<D>`), called once per block from a switch on
+  `N.deg` over 1..8, with the runtime-degree loop as the default. With `D`
+  fixed, the guards and `N.d[deg]` fold at compile time. The arithmetic and
+  its order are unchanged. `NORM_CONST` instances keep a single copy.
+  `k_apply` gets no new template instances. Registers stay at 38-40, with no
+  stack and no local memory, and every instance still runs 3 blocks per SM.
+- **Compile cost:** sm_120 `bench_kernels.o` takes 21.7 s in base, 23.4 s in
+  `proto/` and 25.4 s in `proto2/` (+17%). The object grows from 3.01 MB to
+  3.46 MB (+15%).
+- **A first version (`proto/`, `95e1a4cc`) specialised only 1, 5 and 6.**
+  C1147 (degree 7) then ran the generic copy, and its dense side got 4.5%
+  slower under ncu (instructions −1.5%), so the runtime loop costs more in
+  the new layout than in base's. Specialising every degree 1..8 means no legal
+  polynomial reaches it.
+
+### Where the instructions go
+
+From per-line instruction counts (ncu SourceCounters, base against `proto/`),
+on I16's dense side, which lost 8.5% of its instructions:
+
+- **The `|.|` chain lost 3.6% of the side's instructions** and the main
+  Horner chain 1.1%. With the degree known, the first step's `vp *= v` and
+  `vpa *= av` start from 1.0, which folds exactly, and its coefficients
+  become constant-bank operands.
+- **The `k < N.deg` guards were 1.0%.**
+- **The rest** is the `N.d[N.deg]` start (0.3%) and setup lines the
+  compiler scheduled differently.
+
+So the review's guess (guard overhead) was about an eighth of what the
+prototype saved. The rest is the constant folding that a known degree allows.
+
+### Identity
+
+- abcheck base against `proto/` and against `proto2/`: 36 of 36 identical
+  each.
+- c135 3,000 q (279,675 relations), SNFS301 10 q (669) and C1147 4 q (253):
+  identical, for both prototypes. The apply occupancy line is unchanged.
+- The timing's 96 runs all matched base r1's relations.
+
+### ncu (`proto2/` against base, `--clock-control none`, 12 launches a side)
+
+| job (degree) | dense side | gated side | `k_apply` | dense-side instructions |
+|---|---:|---:|---:|---:|
+| C135 (5) | −8.2% | −1.5% | −5.7% | −9.8% |
+| C148 (5) | −12.5% | −9.6% | −11.4% | −10.9% |
+| I16 (5) | −8.0% | −2.2% | −5.8% | −10.1% |
+| SNFS301 (6) | −4.1% | −5.4% | −4.7% | −12.4% |
+| C1147 (7) | −7.4% | −10.3% | −8.8% | −12.4% |
+
+The same runs of `proto/` read −8.3 to −10.3% on the dense side, except
+C1147's +4.5%. Single ncu passes without clock control vary by a few
+points (SNFS301's dense side: −8.5% for `proto/`, −4.1% for `proto2/`,
+though both run a degree-6 copy of the same source). The instruction counts are
+steadier.
+
+### Timing (`work/isect/timing.sh`, unprofiled, 8 rotated rounds, sm_120 against sm_120)
+
+| job | base ms/q | `proto2` ms/q | wall (median of pairs) | apply stage | rounds faster |
+|---|---:|---:|---:|---:|---:|
+| C135 | 2.738 | 2.692 | **−1.5%** | −5.6% | 8 of 8 |
+| C143 | 4.856 | 4.771 | **−1.7%** | −3.7% | 8 of 8 |
+| C148 | 10.190 | 9.969 | **−2.2%** | −5.3% | 8 of 8 |
+| NFS@Home I16 | 142.13 | 137.93 | **−3.0%** | −5.9% | 8 of 8 |
+| SNFS301 | 158.35 | 153.20 | **−2.7%** | −7.3% | 8 of 8 |
+| C1147 | 214.16 | 209.76 | **−2.2%** | −8.2% | 8 of 8 |
+
+Base is `work/emitw/new` (sm_120, the installed `73901347`'s source).
+`work/isect/timing.sh` gained an SNFS301 job (30 q) for this.
+
+### The tiny fold, priced (the review's second lead)
+
+`ss_fold_word`'s own lines, as a share of the side's `k_apply` instructions
+(base, one launch a side):
+
+| job | dense side | gated side |
+|---|---:|---:|
+| I16 | 2.8% | 1.9% |
+| C135 | 3.8% | 4.1% |
+
+Its result is already computed once per thread and reused for every word
+that thread initialises (8 at c135, 16 at I16). A per-row pattern prepared
+once would remove the repetition between warps and regions, but at most
+these shares, before the cost of the preparation step and its loads: about 1%
+of wall at best. Parked. `ss_setup`, which the fold shares with the table and
+the small-sieve tiers, is 5-10% across all its callers. The fold's part of it
+is one call per lane per 32 entries.
+
+### Next
+
+1. **The production form in the tree** (Kyle's call): `proto2`'s dispatch,
+   commented. Then the fat build, gates (abcheck, `make check`, c135 against
+   finding 138's reference, SNFS301, C1147) and an install, as for finding 142.
+2. **The tier and fill sweep** (the review's third lead). `SS_BLOCK_CUT` (64)
+   and `SS_WARP_CUT` (1024) were set in findings 101-102, before
+   `--tiny-fold` and `--tiny-table` took the moduli up to 32, and 3, 5, 7
+   and 9, out of the walk. `--fill-blocks 4608` was last confirmed in finding
+   85, before the row-banded fill and the fill gate. The bounds:
+   `SS_FOLD_MAX < SS_BLOCK_CUT <= 128`, and `SS_WARP_CUT <= 32768`.

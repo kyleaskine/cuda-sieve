@@ -103,6 +103,10 @@ void wd_stop(void);
  * so a loop that revisits the same phase still shows the counter moving. */
 void wd_phase(const char *name);
 
+/* The phase last set, or NULL when disarmed: for a wait that labels itself
+ * and then puts the caller's phase back (cofq_writer_wait). */
+const char *wd_phase_now(void);
+
 /* Context that makes a phase name actionable. Neither counts as progress on
  * its own -- they are labels for the next report, not a heartbeat -- but both
  * are cheap enough to call per q and per slab. */

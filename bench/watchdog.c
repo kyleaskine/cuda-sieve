@@ -81,6 +81,11 @@ void wd_phase(const char *name)
     W.seq++;
 }
 
+const char *wd_phase_now(void)
+{
+    return W.armed ? W.phase : NULL;
+}
+
 void wd_arm_kill(void)
 {
     W.kill_armed = 1;
@@ -373,8 +378,20 @@ int wd_start(double stall_s, double kill_s, const char *logpath)
     if (!W.th) { W.armed = W.run = 0; }
 #else
     W.stalled = pthread_self();
-    if (pthread_create(&W.th, NULL, wd_thread, NULL) == 0) W.have_th = 1;
-    else { W.armed = W.run = 0; }
+    {
+        /* Started with every signal blocked, so asynchronous ones stay with
+         * the threads that handle them: BOINC's runtime suspends and quits
+         * from its SIGALRM handler, which must run on the worker thread, and
+         * a process-directed signal goes to any thread not blocking it. The
+         * backtrace request is thread-directed at W.stalled, so it is
+         * unaffected. */
+        sigset_t all, old;
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        if (pthread_create(&W.th, NULL, wd_thread, NULL) == 0) W.have_th = 1;
+        else { W.armed = W.run = 0; }
+        pthread_sigmask(SIG_SETMASK, &old, NULL);
+    }
 #endif
     if (!W.armed) {
         fprintf(stderr, "bench: could not start the watchdog thread;"
