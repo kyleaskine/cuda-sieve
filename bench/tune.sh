@@ -23,9 +23,12 @@
 #   --ss-block-cut 40 48 64              default 36; 33 is the floor, and
 #                                        33-35 split as 36 does
 #   --ss-warp-cut 128 384 512 1024       default 256
-#   --fill-blocks 1152 2304 9216 18432   default 4608
+#   --fill-blocks 1152 2304 9216 18432 36864   default 4608
+#   --fill-gate-shift 1 2 4              default 3
+#   --no-fill-merge                      default on with the row tier, at
+#                                        one slab per q; not timed elsewhere
 #
-# Method (STATUS item 2, RESULTS findings 85, 145 and 146). Every arm sieves the
+# Method (STATUS item 2, RESULTS findings 85, 145, 146 and 149). Every arm sieves the
 # same q, and the arms are interleaved within a round. The order is rotated
 # every two rounds and reversed in the second of each pair, so a drift within
 # a round favours an arm in one round of the pair and the defaults in the
@@ -63,10 +66,26 @@ done
 [ -x "$BIN" ] || { echo "tune: $BIN is not an executable"; exit 2; }
 case $ROUNDS in ''|*[!0-9]*) echo "tune: -r needs a number"; exit 2 ;; esac
 [ "$ROUNDS" -ge 3 ] || { echo "tune: -r must be at least 3"; exit 2; }
+ARMS_GIVEN=$ARMS
 [ -n "$ARMS" ] || ARMS="B40=--ss-block-cut,40 B48=--ss-block-cut,48 B64=--ss-block-cut,64
   W128=--ss-warp-cut,128 W384=--ss-warp-cut,384 W512=--ss-warp-cut,512 W1024=--ss-warp-cut,1024
-  F1152=--fill-blocks,1152 F2304=--fill-blocks,2304 F9216=--fill-blocks,9216 F18432=--fill-blocks,18432"
+  F1152=--fill-blocks,1152 F2304=--fill-blocks,2304 F9216=--fill-blocks,9216 F18432=--fill-blocks,18432
+  F36864=--fill-blocks,36864 G1=--fill-gate-shift,1 G2=--fill-gate-shift,2 G4=--fill-gate-shift,4 M0=--no-fill-merge"
 ARMS=$(echo $ARMS)
+# Leave out of the grid whatever bench would refuse on this job line: one
+# refused arm fails in every round and voids the whole result.
+if [ -z "$ARMS_GIVEN" ]; then
+  keep=
+  for a in $ARMS; do
+    case "$a $* " in
+      *=--ss-*" --no-smallsieve "*) ;;
+      *=--fill-gate-shift*" --no-fill-gate "*|*=--fill-gate-shift*" --fill-concurrent "*) ;;
+      *=--no-fill-merge*" --fill-merge "*|*=--no-fill-merge*" --fill-merge-cut "*) ;;
+      *) keep="$keep $a" ;;
+    esac
+  done
+  ARMS=$(echo $keep)
+fi
 seen=" "
 for a in $ARMS; do
   case $a in *=--*) ;; *) echo "tune: arm '$a' is not NAME=FLAGS"; exit 2 ;; esac
@@ -111,6 +130,7 @@ flags_of() {  # the flags of arm $1 (empty for default), commas to spaces
   for a in $ARMS; do [ "${a%%=*}" = "$1" ] && echo "${a#*=}" | tr , ' '; done
 }
 fails=0
+NOOP=
 # run_stage STAGE "NAMES": every arm in NAMES (default first) for ROUNDS
 # rounds, rotated every two rounds and reversed in the second; appends
 # "stage arm round wall" lines to DIR/walls.txt.
@@ -121,6 +141,7 @@ run_stage() {
     order="$(echo $names | tr ' ' '\n' | tail -n +$((k + 1)) | tr '\n' ' ')$(echo $names | tr ' ' '\n' | head -n $k | tr '\n' ' ')"
     [ $((rd % 2)) -eq 0 ] && order=$(echo $order | awk '{ for (i = NF; i > 0; i--) printf "%s ", $i }')
     for arm in $order; do
+      case " $NOOP " in *" $arm "*) continue ;; esac
       if busy_now; then say "tune: another process came onto the card before stage $st $arm round $rd; stopping"; exit 3; fi
       o=$DIR/s$st.$arm.$rd
       # A reused DIR: an interrupted run's .rel.part and checkpoint would
@@ -147,6 +168,12 @@ run_stage() {
         say "   commit $(sed -n 's/^# commit *//p' "$o.log" | head -1)"
         say "   card $(sed -n 's/^# device *//p' "$o.log" | head -1)"
         say "   one run takes about $((t1 - t0)) s; stage 1 is $(( (t1 - t0) * n * ROUNDS / 60 + 1 )) min"
+        # --no-fill-merge on a plan with no merge would time the defaults
+        # against themselves, and noise could adopt a flag that does nothing.
+        if ! grep -q -- '--fill-merge: .*one launch' "$o.out"; then
+          for a in $ARMS; do [ "${a#*=}" = --no-fill-merge ] && NOOP="$NOOP ${a%%=*}"; done
+          [ -n "$NOOP" ] && say "   not timing$NOOP: this plan has no merge to turn off"
+        fi
       else
         if [ $rc -ne 0 ] || [ -z "$w" ]; then
           say "   stage $st $arm round $rd: bench exited $rc (see $o.out)"; fails=$((fails+1)); continue

@@ -17581,3 +17581,601 @@ passed", tier-cut cases included. `9e67c7e4` is kept at
 `work/tunecut/bench.installed.146`, the new one copied to
 `work/review/bench.installed.146r`. Speed is unchanged. The Windows build
 should compile again, but that has not been tried here.
+
+## Finding 147 — where findings 137-146 leave us (STATUS rows 27 and 10): cado-gpu's lead at c135 is down to 1.03x (1.19x in finding 137), and ours leads at I16 by 1.14x (1.066x). In the same session, the installed `0c7dda1f` is 1.153x finding 137's binary at c135 and 1.076x at I16. Fill is now the largest kernel at C135 and C148 and a close second at I16, still memory-latency-bound; the four installs since finding 137 came out of apply and TD. Wider fill blocks still do not pay (finding 76), at C135 or C148
+
+**Date:** 2026-11-01, 20:18-21:04. Card free and no client throughout. One
+CPU `ecm -pp1` ran; host load 1.6-7.6. Windows GPU users (finding 137):
+Firefox held 1.2-3.5% of the 3D engine at 20:15. When the run started at
+20:18 only one unidentified 0.5% user remained, and from the end of the
+head-to-head (20:40) there was none. Binaries:
+- **new:** the installed `0c7dda1f`.
+- **old:** `7cb58341`, the binary finding 137 timed, run in the same session
+  to anchor it to that one.
+
+Evidence: `work/stand-20261101/`:
+- `run.sh`, `run.txt`
+- `h2h.txt` and `h2hsum.py`; the runs are in `h2h/`
+- `trace/` (nsys, `analyze.py`, `gaps.py`)
+- `ncu/`, `ncusum.py`, `ncusum.txt`
+- `fill.sh`, `fill.c135/`, `fill.c148/`
+
+### Against cado-gpu
+
+The method is finding 137's (`work/h2h-20261029/run.sh`): finding 127's
+commands and q ranges, cado-gpu's small-prime skip off (equal yield),
+Windows clock. There are three arms, and six rounds in which each arm takes
+each position twice. Medians:
+
+| job | cado-gpu | new `0c7dda1f` | old `7cb58341` |
+|---|---:|---:|---:|
+| c135 | 592,535 rel in 16.41 s: 36,108/s | 603,124 rel in 17.16 s: 35,148/s | 603,124 in 19.91 s: 30,286/s |
+| NFS@Home I16 | 23,292 rel in 57.05 s: 408.3/s | 23,465 rel in 50.48 s: 464.9/s | 23,465 in 54.28 s: 432.3/s |
+
+Relations per second, paired by round:
+
+| job | cado-gpu / new | cado-gpu / old | new / old |
+|---|---|---|---|
+| c135 | **1.031** (0.964-1.065, cado-gpu faster in 4 of 6) | 1.181 (6 of 6) | **1.153** (6 of 6) |
+| I16 | **0.878**: ours 1.139x (cado-gpu faster in 0 of 6) | 0.945: ours 1.058x | **1.076** (6 of 6) |
+
+- **The session matches finding 137's.** cado-gpu against the old binary
+  reads 1.181 at c135 (1.19 then) and 0.945 at I16 (ours 1.058x against
+  1.066x then).
+- **At c135 the two sievers are now within the rounds' noise.** cado-gpu's
+  own six runs spanned 16.22-17.31 s, and ours was faster in two rounds.
+- **new / old against the product of the installs' measured gains:**
+  - c135: 1.153 measured. The emitter (5.1%), the norm gate (2.5%), the
+    degree (1.5%) and the tier cuts (3.2%) multiply to 1.134.
+  - I16: 1.076 measured, against 1.095 from the norm gate (3.2%), the degree
+    (3.0%) and the tier cuts (2.7%). Finding 137 measured the emitter flat at
+    I16.
+- **Relations:** new's are byte-identical to old's on both jobs, and every
+  round's to its arm's first.
+- **bench's own wall per q:** c135 new 2.52-2.62 ms against old 2.91-3.00 ms.
+  I16 new 131.3-131.7 ms against old 143.1-143.4 ms.
+
+### Where the time goes now
+
+nsys CUDA traces of new (`analyze.py`, middle 80% of launches). c135 is
+q [7000000, 7020000) with relations written. C148 is 400 q and I16 60 q,
+both with relations. Share of summed kernel time:
+
+| kernel | c135 | C148 | I16 |
+|---|---:|---:|---:|
+| `k_fill_atomic` | **32.8%** | **29.3%** | 34.8% |
+| `k_apply` | 25.6% | 22.3% | **37.0%** |
+| `k_resieve_scatter` | 9.9% | 16.7% | 8.1% |
+| `k_td` | 8.7% | 7.8% | 6.1% |
+| `k_transform` | 4.8% | 12.1% | 2.4% |
+| `k_fill_rows` | 5.9% | 4.9% | — |
+| `k_classify` | 3.3% | 2.6% | 1.2% |
+| `k_cofac` | 2.6% | (no flush in the window) | 5.2% |
+| card idle | 5.0% | 1.4% | 0.5% |
+
+Against finding 137's c135 trace of the old binary (no relation file, same
+q, so the new run without one is the one to compare), mean time per launch:
+- `k_apply` 594.0 → 482.8 µs (−18.7%)
+- `k_td` 188.9 → 168.4 µs (−10.9%)
+- `k_fill_atomic` 621.5 → 618.7 µs (flat)
+- `k_resieve_scatter` 368.5 → 391.4 µs (+6.2%; it runs 97% overlapped)
+
+The card's idle time rose from 3.2% to 5.4% as the kernels shrank. It is
+spread thin: no kernel-to-kernel gap is above 0.8% of the window.
+
+### What each kernel waits on (ncu)
+
+`ncu --set full --clock-control none`, one kernel per run, 4 launches after
+16 (`k_cofac`: its first 2), at C135, C148 and I16 (`ncusum.txt`). Issue
+active is the share of cycles that issue an instruction. Stalls are the
+share of stalled warps per issued instruction.
+
+- **`k_fill_atomic`: latency-bound.**
+  - Issue active 22-25%, and the SMs run at 12-24% of peak.
+  - long_scoreboard is 78-80% of its stalls on all three jobs: each record's
+    store needs its cursor `atomicAdd`'s result.
+  - Warps active 42-49% of peak, at the 50% cap that 24 one-warp blocks per
+    SM set (finding 76).
+  - About 16 of 32 lanes are active per instruction.
+  - L2 throughput 35% (C135), 61% (C148), 80% (I16). Finding 76 measured
+    69% at c194, where it called the kernel L2-bound.
+- **`k_apply`: issue-bound.**
+  - Issue active 80-82%, warps active 98-99%.
+  - not_selected, wait and long_scoreboard lead its stalls.
+  - long_scoreboard grows with job size: 2.43, 2.96, 3.40 stalled warps per
+    issue, as its L2 traffic rises from 5.6% to 9.2% to 19.6%.
+  - Barrier stall: 1.73, 1.42, 1.23 per issue (13%, 11%, 9%). This falls
+    with job size, so row 10's growth question, which concerned the parked
+    lazy designs (finding 104), does not arise here. The tier cuts raised it
+    (below).
+- **`k_resieve_scatter` at C148:**
+  - long_scoreboard is 67% of its stalls (31% at C135, 29% at I16).
+  - Issue active 38% (57%, 66%).
+  - It is 16.7% of C148's kernel time, against 8-10% elsewhere.
+- **`k_transform`: balanced.** Issue 61%, DRAM up to 52% at I16, with wait,
+  math-pipe throttle and not_selected about equal.
+- **`k_td`:**
+  - wait is 38-47% of its stalls.
+  - 94 registers per thread hold warps active to 21-30% of peak.
+- **`k_cofac` at I16:**
+  - long_scoreboard is 39% of its stalls, with warps active 27%.
+  - It runs with nothing beside it: 16 flushes of 25.6 ms in the trace.
+  - Row 38 closed its tail rounds.
+
+### Wider fill blocks, retimed (finding 76's lever where L2 is not saturated)
+
+Finding 76 found 64- to 256-thread fill blocks slower at c194, the kernel
+being L2-bound there. At C135 the L2 is at 35%, so the question was open.
+`tune.sh` (6 rounds, relations identical, against the installed binary) with
+three arms:
+- **T64x2304:** 64-thread blocks, the same 147,456 threads.
+- **T64x4608:** 64-thread blocks, twice the threads.
+- **T128x1152:** 128-thread blocks, the same threads.
+
+| arm | C135 (2.585 ms/q, spread 4.64%) | C148 (9.670 ms/q, spread 1.86%) |
+|---|---|---|
+| T64x2304 | +2.52%, faster in 2 of 6 | −0.88%, faster in 5 of 6 |
+| T64x4608 | +0.77%, faster in 0 of 6 | −0.31%, faster in 3 of 6 |
+| T128x1152 | +1.75%, faster in 1 of 6 | −1.29%, faster in 5 of 6 |
+
+Both jobs keep the defaults. C135 loses with more resident warps although
+its L2 is far from saturated. C148 leans about 1% toward them, the same size
+as finding 146's C148 lean toward fewer blocks, and below the bar. The fill's
+occupancy is worth about 1% at most on this card.
+
+### `k_apply`'s barrier stall: the tier cuts' side effect, under 1% of wall (2026-11-01, 21:52-21:56)
+
+The first version of this finding compared today's stall with finding 104's
+0.5-0.7 per issue as "2-3x", and guessed at the norm gate and the degree.
+Both were wrong. Finding 104's readings were c183, C194 and AS276, not these
+jobs, and the kept binaries below show the tier cuts did it.
+
+**Where it sits** (`ncusrc/`, `srcb.py`, `srcb2.py`: SourceCounters, 4
+launches, 2026-11-01 21:52). Samples are attributed by address to the
+`BAR.SYNC` before them, as share of each side's not-issued samples:
+
+| barrier (`bench_kernels.cu`) | C135 side 1 | C135 side 0 | I16 side 1 | I16 side 0 |
+|---|---:|---:|---:|---:|
+| 1363, after the small sieve and the bucket add | **12.1%** | **18.3%** | **11.2%** | **10.5%** |
+| 1339, after norm init | 11.1% | 2.2% | 5.7% | 1.9% |
+| 806 and 1190, the tiny table's | 5.5% | not run | 3.7% | not run |
+
+The tables do not run on side 0. ncu labels the 1363 samples line 1170, the
+scan's first read of a parameter, because a stall lands on the instruction
+after the barrier.
+
+**Which change raised it** (`barhist.sh`, `barhist.py`, `barhist.txt`: metrics
+only, 4 launches). One cell per binary, oldest first: barrier stall per
+issue, then issue active. `0c7dda1f` at 64/1024 reproduces `6148a21b`'s
+instruction counts to the digit shown and its stall exactly, so the cuts
+alone account for the step from `6148a21b` to `0c7dda1f`.
+
+| job, side | `6c7c2a84` norm gate | `d7defb03` emitter | `6148a21b` degree | `0c7dda1f` tier cuts | `0c7dda1f` at 64/1024 |
+|---|---:|---:|---:|---:|---:|
+| C135 side 1 | 1.54, 86.4% | 1.53, 86.4% | 1.46, 85.1% | **1.75, 83.4%** | 1.46, 85.1% |
+| C135 side 0 | 1.40, 81.7% | 1.40, 81.7% | 1.33, 80.3% | **1.71, 77.7%** | 1.33, 80.2% |
+| I16 side 1 | 0.96, 88.4% | 0.96, 88.4% | 0.92, 86.6% | **1.25, 85.3%** | 0.92, 86.6% |
+| I16 side 0 | 0.89, 80.8% | 0.89, 80.8% | 0.83, 79.1% | **1.22, 76.7%** | 0.83, 79.0% |
+
+`7cb58341` has no per-side instance. Over both sides it read 1.36 at C135
+and 0.83 at I16, with issue active 89.0% and 89.7%. So side 0 sits about 7
+points (C135) and 9 points (I16) below it since the norm gate. Finding 104
+saw that pattern in the lazy designs at a far larger scale; here it came
+with a net gain.
+
+**What it costs.** The tier cuts removed 8.9% (side 1) and 14.0% (side 0) of
+`k_apply`'s instructions at C135, and it got 7.2% and 11.5% faster. They are
+a net win, and the gap is the lower issue rate. Restoring the issue rate
+`6148a21b` had would save 1.5-3.2% of `k_apply`, or about 0.6-0.8% of wall at
+c135 and I16. That is an estimate from those two columns, not a measurement.
+It is not worth a design: finding 145's sweep already chose these cuts on
+wall.
+
+### C148's `k_resieve_scatter`: the summary's loads, and the coarse filter does not help (2026-11-01, 22:00-22:15)
+
+**Where it waits** (`work/stand-20261101/ncurs/`, `srcr.py`: SourceCounters, 4
+launches). At C148, 64.8% of not-issued samples are long_scoreboard, against
+37.3% at C135. By source line (`td.cuh`):
+
+| line | share of C148's long_scoreboard samples | share of C135's |
+|---|---:|---:|
+| 694, first use of the summary load's result | 42.6% | 24.2% |
+| 696, the survivor bitmap's load | 30.6% | 26.1% |
+| 646, the prime's own record | 15.4% | 32.9% |
+
+Its summary is 256 KB at C148 (2^27 positions, one bit per 64) against 64 KB
+at C135, and its L1 hit rate is 48% against 91%.
+
+**The coarse filter, tried and rejected.** I16 avoids this load with the
+shared-memory filter, which `PIPE_RS_COARSE_MIN` keeps off below 2^29
+positions per slab. The note above that constant says pipelined wall gained
+1-6% at 2^27 and 2^28 on 2026-10-16, so C148 looked held out by a gate set for
+the single-queued path. It is not. `work/rscoarse/` built an sm_120 copy with
+the gate read from the environment, host code only, and `timing.sh` ran it on
+and off, 8 rounds with the order swapped, relations identical to the
+installed binary's in every run:
+
+| job | positions | wall off → on (ms/q) | on / off, paired median | on faster in | resieve off → on (ms) |
+|---|---:|---|---|---:|---|
+| C148 | 2^27 | 9.545 → 9.780 | **1.025** (0.986-1.048) | 2 of 8 | 4.312 → 4.478 |
+| C143 | 2^26 | 4.450 → 4.545 | **1.018** (0.976-1.032) | 1 of 8 | 1.345 → 1.417 |
+| C135 | 2^25 | 2.560 → 2.630 | **1.035** (0.996-1.049) | 1 of 8 | 0.645 → 0.761 |
+
+The gate stands. The likely reason is density. The filter holds one bit per
+2048 positions, and if survivors fall evenly, about 47% of bits are set at
+C148 (41,509 survivors in 65,536 bits), 28% at C143, 31% at C135, and 10% at
+I16 (27,600 survivors a slab in 262,144 bits). So it passes about half of
+C148's steps, and those pay both loads. That is a calculation, not a
+measurement of the filter's pass rate. The note above `PIPE_RS_COARSE_MIN`
+still reads as if 2^27 gains; it should say otherwise when that code is next
+touched.
+
+**`UNROLL` 8, tried and rejected (2026-11-02, 06:26-06:41).** More summary
+loads in flight is `td.cuh`'s own fix for latency, and the pipeline's 4 came
+from the single-queued sweep. `work/rsunroll/` built an sm_120 copy that runs
+either depth from the environment, on both the plain walk and the coarse
+filter's. In isolation at C148 (ncu, 4 launches) 8 costs registers:
+
+| | `UNROLL` 4 | `UNROLL` 8 |
+|---|---:|---:|
+| registers per thread | 40 | 48 |
+| register limit, blocks per SM | 6 | 5 |
+| warps active, % of peak | 71 | 57 |
+| long_scoreboard stalls per issue | 14.9 | 11.0 |
+| instructions | | +7.0% |
+| duration, mean µs | 1,615 | 1,810 (+12.0%) |
+
+In the pipeline, 8 rounds with the order swapped, relations identical to the
+installed binary's in every run, host load 2.2-2.7:
+
+| job | wall, 4 → 8 (ms/q) | 8 / 4, paired median | 8 faster in | resieve, 4 → 8 (ms) |
+|---|---|---|---:|---|
+| C148 | 9.730 → 9.760 | **1.007** (0.995-1.097) | 2 of 8 | 4.396 → 4.563 |
+| C143 | 4.495 → 4.500 | **1.004** (0.978-1.016) | 2 of 8 | 1.336 → 1.476 |
+| C135 | 2.570 → 2.610 | **1.016** (0.996-1.054) | 1 of 8 | 0.629 → 0.708 |
+| I16 | 132.80 → 135.83 | **1.020** (0.994-1.091) | 1 of 8 | 14.243 → 17.700 |
+
+The stalls per issue fall, as intended, but the lost warps take back more
+than the extra loads in flight give. `UNROLL` 4 stands. With the coarse filter
+out too, C148's resieve has no cheap lever left.
+
+### Next
+
+1. **Fill is the largest kernel and the least touched.** Taken up by finding
+   148: it is bound by L2 request rate, and no large win is left on this card.
+
+## Finding 148 — what binds fill, and what a redesign can buy: `k_fill_atomic` is bound by L2 request rate, and its cost is additive per request. Warps, cursor spacing and fill beside apply do not help. Fill's largest stage gains do not reach wall: one launch for both tiers takes 12-18% off isolated fill and 18-24% off the fill stage on single-slab jobs, but −0.4 to −3.6% off wall. A gcd skip on 5 and 7 is −1.4 to −1.6% on multi-slab jobs. No large fill win is left on this card
+
+**Date:** 2026-11-02, 06:48-09:44. Card free, no client, host load 1-3.
+Everything was measured on sm_120 copies in `work/fillprof/`; the tree and
+`bench/bench` are untouched. Relations were compared with the installed
+`0c7dda1f` in every timed run, 0 differed. Scripts and logs there:
+`prof.sh`, `cut.sh`, `lab.sh`, `bothtime.sh`, `both2time.sh`, `skiptime.sh`,
+`gsh.sh`, `ovltime.sh`.
+
+### What binds it
+
+**Warps do not.** ncu, isolated launch, us, side 1 / side 0, with warps active
+going from about 45% to about 85%:
+
+| job | 32 x 4608 | 64 x 2304 | 128 x 1152 |
+|---|---:|---:|---:|
+| C135 | 643 / 470 | 667 / 491 | 658 / 580 |
+| C148 | 2,357 / 1,309 | 2,511 / 1,346 | 2,503 / 1,340 |
+| I16 | 8,342 / 4,176 | 9,114 / 4,767 | 8,602 / 4,857 |
+
+**The tail mostly does not, above `--fill-rows` 8.** Moving the cut takes the
+smallest moduli out of the walk, and its time then falls with its work, at
+about 85M warp instructions per ms on side 1 at both C148 and I16. Finding
+107's tail is real below that and at C135 still costs some warps.
+
+**The fill lab** (`k_fill_lab`, launched after each real fill on its inputs
+with scratch outputs, so the pipeline and relations are untouched) takes the
+memory operations out one at a time. Share of a normal launch:
+
+| | C135 | C148 | I16 |
+|---|---:|---:|---:|
+| side 1, walk only | 21% | 21% | 16% |
+| side 1, walk + no-return atomic | 55% | 59% | 53% |
+| side 1, walk + atomic with its result used | 71% | 68% | 57% |
+| side 1, normal | 100% | 100% | 100% |
+| side 0, walk only | 34% | 33% | 25% |
+| side 0, walk + gate load | 79% | 79% | 83% |
+| side 0, normal | 100% | 100% | 100% |
+
+So time adds up per request. Waiting for the atomic's result is 4-16 points;
+sending it is 34-38. The store is 29-43. On side 0 the gate probe is 45-58% and
+every record together about 20%. L2 throughput on a normal launch is 40-76% on
+side 1 and 29-82% on side 0, and adding warps does not raise it. A store-only arm with the
+slot scattered inside its region was 3.6 to 12 times slower: appends are what
+keep the stores cheap.
+
+**Cursor contention does not, here either.** Finding 80 ruled it out at c194
+scale. Spacing the cursors 64 B to 4 KB apart moved side 1 −4 to +5% at C135
+and C148 and +9 to +24% at I16.
+
+### One launch for both tiers (`k_fill_both`)
+
+The row tier is issue-bound and the walk is L2-bound, so they should share a
+card. `bothedit.py` and `both2edit.py` run them as one kernel, blocks evenly
+interleaved, with the fill's row cut set apart from resieve's and
+`k_rows_walk_next` carrying the walks resieve still needs across slabs.
+
+Isolated, it delivers: C135 1,326 → 1,123-1,157 us per side pair (−13 to
+−15%), C148 4,254 → 3,487-3,756 us (−12 to −18%), best at cut 8-16 and blocks
+of 64-256 threads. Blocks of 32 threads leave the row tier short of warps.
+
+Wall, against the tree's fill, 8 rounds on single-slab jobs at 128-thread
+blocks and 6 on multi-slab jobs at 64:
+
+| job | cut 8 | fill stage, cut 8 | cut 16 | faster at cut 8 |
+|---|---:|---:|---:|---:|
+| C135 | −1.0% | −23.5% | +0.8% | 8 of 8 |
+| C143 | −3.6% | −18.5% | +1.1% | 8 of 8 |
+| C148 | −2.3% | −18.1% | +0.4% | 8 of 8 |
+| C183 | −1.4% | −19.1% | +1.7% | 8 of 8 |
+| I16 | −1.0% | +2.3% | +2.8% | 6 of 6 |
+| C194 | −0.4% | +12.0% | +2.6% | 5 of 6 |
+| SNFS301 | −1.6% | +1.2% | +1.6% | 6 of 6 |
+
+Two things limit it. On one-slab plans `--fill-ahead` has side 1's fill beside
+the rest already, so it is off the chain, and a faster fill mostly moves idle
+time. And fill's wider blocks hold warps its neighbours want: in the c135 trace
+`k_td` went 168 → 247 us per launch. Narrower blocks on single-slab jobs were
+not wall-timed. At multi-slab jobs the row tier costs more, since a row spans
+four regions, and it needs `k_rows_walk_next`.
+
+The identity gate caught one bug here: a fixed-point block ratio rounded down
+dropped the last row block, and C135 lost 3 of 28,189 relations. Rounded up, 16
+arms on each of four jobs and 5 on each of three were identical.
+
+### Cheaper levers
+
+**Skipping 5 | gcd(i,j) and 7 | gcd(i,j)** in fill takes about 5.5% of records
+and gate probes away; `k_intersect_compact`'s test rejects those positions
+anyway. Relations identical. Wall, 6 rounds: I16 −1.4%, SNFS301 −1.6% (6 of 6
+each), C135 +0.2%, C148 +0.3%. Adding 11 and 13 gives nothing more.
+
+**`--fill-gate-shift`**, from 3 (`tune.sh`, 6 rounds): C148 −1.05% at 1
+(adopted by its rule), I16 −0.67% at 2, C135 flat. 0 is +28.4% at I16. It differs
+by job, so it belongs in `tune.sh`'s grid, not a new default.
+
+### Fill beside apply: no
+
+I16 runs 84% of the time with one kernel on the card, so taking fill off the
+chain, as `--fill-ahead` does for one-slab plans, looked like the big lever, and
+memory allows it (0.90 GB against 6.49 GB free). `ovledit.py` priced it first:
+an extra side-1 fill into scratch beside each slab's apply. A fill that shares
+the card costs nothing; one that does not costs its ~33 ms/q on the chain.
+
+| extra wall, ms/q | I16 | C194 | SNFS301 |
+|---|---:|---:|---:|
+| default priority, 3 blocks of apply | +30.0 | +28.6 | +28.2 |
+| default priority, 2 blocks | +30.0 | +28.7 | +28.5 |
+| greatest priority, 3 blocks | +29.0 | +28.4 | +28.3 |
+| greatest priority, 2 blocks | +28.8 | +28.5 | +27.9 |
+
+At default priority the trace shows why: the fill starts when apply has
+dispatched its last block (finding 134), so they run in turn. At greatest
+priority they start together and the fill is 96% overlapped, but apply goes
+from about 9.5 to 17.0 ms: it barely moves while the fill runs. Two blocks of
+apply cost +8.0 to +10.3% of wall and change nothing else. So a fill-ahead for
+multi-slab plans would save about 3%, not the side-1 fill's 25% of wall.
+
+### Not tried
+
+A buffered two-level partition (hits sorted in shared memory, whole sectors
+written, one atomic per batch) is the design that attacks requests per record.
+Against this data it looks poor: side 1 is off the chain on one-slab plans, and
+on multi-slab plans its extra pass over 0.9 GB meets the DRAM-bound regime of
+finding 81. An estimate, not a measurement.
+
+### An outside review's three follow-ups (ChatGPT, relayed by Kyle, same day)
+
+It checked this finding's numbers against the logs and proposed a control, a
+factorial and one new probe. All three ran from one sm_120 binary
+(`comboedit.py`, `matrix.sh`, `msum2.py`), relations identical in every run.
+
+**A control at cut 8, and narrower blocks** (`matrix1.txt`, 6 rounds; Firefox
+reached 23% of the 3D engine right after this run, so read it for direction):
+
+| arm | C135 | C143 | C148 |
+|---|---:|---:|---:|
+| separate kernels, fill cut 8 | +1.6% | +1.9% | +2.4% |
+| one launch, 32-thread blocks | +2.3% | +0.4% | +2.1% |
+| one launch, 64-thread blocks | −1.5% | −5.2% | −3.4% |
+| one launch, 128-thread blocks | −1.9% | −4.9% | −4.5% |
+
+The gain is the merge, not the cut: raising the cut alone loses. 64 and 128
+threads are level, and 32 loses, so `k_td`'s slowdown is not what limits it.
+
+**Dropping both-even positions before resieve's summary load**, the review's
+new idea. `k_resieve_scatter` loaded the summary for positions that can never
+be survivors. The test sets such an `xs[u]` to `NONE` during the walk (`rs1`),
+and also 3 | gcd(i,j) (`rs2`), with no extra register held. At C148 registers
+stay 40, 6 blocks per SM, and summary and bitmap loads fall 15% and 21%, but
+instructions rise 30% and isolated time does not fall (1,647 → 1,696 and 1,671
+us). Wall (`matrix3.txt`, 6 rounds):
+
+| arm | C135 | C143 | C148 | I16 | SNFS301 | C194 |
+|---|---:|---:|---:|---:|---:|---:|
+| `rs1` | +2.1% | +0.3% | −0.1% | +0.8% | +0.9% | −0.7% |
+| `rs2` | +1.2% | −0.1% | −0.5% | +0.3% | +0.5% | −0.1% |
+
+Closed: fewer loads, no less wall.
+
+**The factorial.** A first run (`matrix2.txt`) had rounds spread ±5-11% with
+Firefox on the card, so the arms were rerun on all six jobs with Windows GPU
+use logged each round (`matrix4.txt`; nothing above 0.5% but one sample at 3.8%).
+Wall, paired median, rounds faster:
+
+| arm | C135 | C143 | C148 | I16 | SNFS301 | C194 |
+|---|---:|---:|---:|---:|---:|---:|
+| one launch (128) | −0.4%, 4/6 | **−3.4%, 6/6** | **−3.4%, 6/6** | −1.2%, 4/6 | −1.9%, 5/6 | −0.9%, 5/6 |
+| gcd skip on 5, 7 | +1.0%, 1/6 | +0.8%, 0/6 | +0.1%, 2/6 | −1.2%, 5/6 | −1.9%, 6/6 | −1.8%, 5/6 |
+| both | −0.6%, 3/6 | −1.8%, 4/6 | −3.0%, 6/6 | −1.5%, 6/6 | −3.2%, 6/6 | −0.6%, 4/6 |
+
+The two do not add, and they suit different plans: the merge pays on one-slab
+plans, the skip on multi-slab ones and costs up to 1% on one-slab plans. Both
+together beat the better single arm at I16 and SNFS301 and lose at C194.
+
+### Next
+
+Kyle took all three: the gcd skip on multi-slab plans, the one launch on
+one-slab plans (by quantity the small jobs are the standalone client's), and
+`--fill-gate-shift` in `tune.sh`'s grid. Finding 150.
+
+## Finding 149 — the first `tune.sh` report from another generation: on a rented RTX 3060 (sm_86) the tier defaults hold, and `--fill-blocks 18432` wins four jobs of four, up to −5.26% at C194, the top of the grid. The 5070 prefers 4608. The optimum may lie past 18432
+
+**Date:** 2026-11-02, Kyle, rented RTX 3060, `5996c23f-dirty`, bench `b78b2f70`,
+driver 12.2, 6 rounds. Evidence: `work/tune3060/report.txt`.
+
+Wall against the defaults, paired median, rounds faster:
+
+| arm | C143 | C183 | C194 | c147 |
+|---|---:|---:|---:|---:|
+| default, ms/q (spread) | 11.515 (1.04%) | 141.480 (0.09%) | 712.890 (0.30%) | 20.715 (1.26%) |
+| block cut 40 / 48 / 64 | +0.09 / +1.34 / +2.43 | +0.08 / +0.31 / +0.67 | +0.10 / +0.13 / +0.62 | +0.19 / +0.39 / +1.21 |
+| warp cut 128 / 384 / 512 / 1024 | +0.17 / +0.22 / +0.35 / +1.65 | +0.14 / +0.08 / +0.07 / +0.46 | +0.09 / +0.00 / +0.08 / +0.33 | +0.19 / +0.10 / +0.19 / +0.72 |
+| fill 1152 | +1.78 | +4.08 | +3.99 | +4.05 |
+| fill 2304 | +0.65 | +1.82 | +1.56 | +1.62 |
+| fill 9216 | −0.69, 5/6 | +0.07 | −0.13, 6/6 | −0.12 |
+| **fill 18432** | **−1.35, 6/6, adopted** | **−1.72, 6/6, adopted** | **−5.26, 6/6, adopted** | −1.23, 6/6, kept |
+
+**The tier cuts:** no arm beat 36 and 256 on any job, so finding 145's defaults
+hold on sm_86 as on sm_120. Raising either cut costs the same way on both.
+
+**The fill grid:** more blocks help on this card, and the curve does not turn
+over inside the grid. On the 5070 18432 is slower (+0.78% at C135, +1.32% at
+C148, tune.c135 and tune.c148), so this is the card, not the jobs. No code path
+changes at 18432 (`fblocks` is only the launch size), and why 9216 is flat
+while 18432 is not, by 5% at C194, is not known.
+
+**The rule:** c147's −1.23%, 6 of 6, was kept out by a spread of 1.26%. Finding
+146 found that drift common to all arms inflates the spread but changed no
+verdict; here it does.
+
+The 5070's lead grows with job size: 2.6x at C143, 3.9x at C183, 5.0x at C194.
+
+### Next
+
+1. On a 3060 if one is rented again: `-a "F18432=--fill-blocks,18432
+   F27648=--fill-blocks,27648 F36864=--fill-blocks,36864
+   F73728=--fill-blocks,73728"` at C194 and C143.
+2. Defaults per arch still wait for several reports that agree; this is one.
+
+## Finding 150 — finding 148's three, landed: `--fill-merge` on one-slab plans, `--fill-skip57` on plans of several slabs per q, and `tune.sh`'s larger grid. Against the installed `0c7dda1f`, wall is −0.6 to −3.6% across eight jobs, relations byte-identical. Built and gated as fat `2c0b13b8` (`work/fillmerge/`), after Kyle's code review; installed 2026-11-02 17:02, Kyle's call
+
+**Date:** 2026-11-02. Kyle's call after finding 148: by quantity, the small jobs
+are what matters most to the standalone client.
+
+### The change (the tree, uncommitted)
+
+- **`k_fill_merged`** (`bench_kernels.cu`): the row tier and the walk as one
+  launch, each block one or the other, evenly interleaved by plain integer
+  division. The bodies of `k_fill_atomic` and `k_fill_rows` became
+  `fill_walk_thread` and `fill_rows_warp`, which all three call, so nothing is
+  duplicated.
+- **`--fill-merge` / `--no-fill-merge`**, on wherever the row tier is, off under
+  `--fill-concurrent`, and off, with the reason printed, at several slabs per q.
+  **`--fill-merge-cut N`** (default 8) is the fill's row tier alone, never below
+  `--fill-rows`; `pside_t.nrow_fill` holds it, and `nrow` stays resieve's.
+  Blocks are 128 threads; `--fill-threads` overrides that. The walk keeps its
+  `--fill-blocks` x `--fill-threads` threads either way, so the merge on and off
+  compare one launch against two and nothing else.
+- **`--fill-skip57` / `--no-fill-skip57`**, on at several slabs per q, needing
+  `--sieve-skip 2`. `pos_gcd_57` in both fill kernels, by a `skip57` argument of
+  their own.
+- **Every run log** gains `# fill-merge` and `# fill-skip57` lines, written
+  once the plan is known, on or off. `# fill-merge` gives each side's launches
+  and grid, from the same predicate and grid helper the launch uses.
+- **`tune.sh`'s grid:** `--fill-blocks 36864`, `--fill-gate-shift` 1, 2 and 4,
+  and `--no-fill-merge`, for 17 arms. It leaves out arms bench would refuse on
+  the job line, and does not time `--no-fill-merge` on a plan with no merge.
+  Dry-run with the fake bench.
+- **`cofcheck.sh`** gains five identity arms, which also require that a merge
+  arm ran as one launch, and seven refusals. **`fillcheck.sh`** gains seven arms
+  with the same requirement, and every arm now states both new options, so
+  that the new defaults cannot change what they test.
+
+Output is identical at every setting, so neither flag is in the resume
+fingerprint.
+
+### The code review
+
+Kyle ran `/code-review xhigh` on `a9cf9e0e`, which had passed every gate: 14
+findings, no correctness bug, all 14 checked against the code and all hold.
+
+- **Gate holes.** cofcheck's new loop reused one output file and hid bench's exit
+  status, so a failing arm compared the previous arm's file and printed PASS;
+  the tier-cut loop had the same hole. fillcheck's reference ran `--fill-skip57`
+  on slabbed jobs, the only plans where it is the default, so most arms compared
+  it with itself. Neither gate proved `k_fill_merged` ran, and no arm took fixed
+  bands or `--fill-rows` above the cut through it.
+- **Logs that did not match the run.** `# fill-merge` was silent when off, and
+  said on where a side fell back to two launches. The geometry note and the
+  banner gave the two-launch grid.
+- **`tune.sh`.** On a job line with `--no-fill-gate`, the three gate-shift arms
+  failed every round and voided the result. `--no-fill-merge` was timed on plans
+  with no merge, where noise could adopt it.
+- **`--fill-threads`.** Its comment still said a partial warp was harmless, which
+  `--fill-merge`'s row tier made false; 16 and 48 are now in cofcheck's
+  refusals. `--fill-blocks` did not mean the same walk threads with the merge on
+  and off once `--fill-threads` was given, so an A/B changed two things.
+- **The design.** The fixed-point `rowfrac`, correct only by its rounding, is now
+  plain integer division. The skip was a bit packed into the `sieve_skip` level
+  and is now its own argument. The `one_launch` flag is a plain if/else, the
+  block default has one home, and the stride uses `bench_grid_product_u64`.
+
+### Gates (`work/fillmerge/gate.sh`, 15:38-16:24, against the installed binary)
+
+`2c0b13b8`, the same gates as `a9cf9e0e` (kept with its results as `fat.a9cf9e0e`
+and `gate.a9cf9e0e`), all passed:
+
+- **S1:** the 582 function bodies outside fill are identical on every arch. The
+  fill kernels' 60 bodies changed, and the new kernel adds 12.
+- **S2:** all 582 keep their resource usage (`rescmp.py`; the first form of this
+  check failed through its own bug, pairing each `REG:` line with the next
+  function's name). `k_fill_merged` uses 31-40 registers across the archs, up
+  from 25-27 on sm_75 to sm_89 after the review's changes, and at most 40.
+- **G:** `work/emitw/gate.sh` passed: abcheck, the c135 20,000-q reference with
+  all 1,855,599 relations rebuilding both norms, both kill -9 resumes, the
+  SIGINT, SIGTERM and stop-file stops, SNFS301, and `make check` with cofcheck's
+  new cases.
+- **F:** `fillcheck.sh`, every arm byte-identical on all five jobs (105 ok).
+
+### Timing: new against installed, 8 rounds, relations identical in every run
+
+No Windows GPU use in any round.
+
+| job | plan | wall, ms/q | paired median | range | faster in |
+|---|---|---|---:|---:|---:|
+| C135 | one slab | 2.540 → 2.530 | **−0.6%** | −1.6 to +0.4 | 6 of 8 |
+| C143 | one slab | 4.425 → 4.325 | **−2.4%** | −2.9 to −2.3 | 8 of 8 |
+| C148 | one slab | 9.590 → 9.250 | **−3.6%** | −4.2 to −1.5 | 8 of 8 |
+| C183 | one slab | 35.535 → 35.155 | **−1.0%** | −1.3 to −0.7 | 8 of 8 |
+| I16 | 4 slabs | 132.025 → 130.290 | **−1.2%** | −1.5 to −1.0 | 8 of 8 |
+| SNFS301 | 4 slabs | 148.510 → 145.825 | **−2.0%** | −2.1 to −1.5 | 8 of 8 |
+| C194 | 4 slabs | 142.325 → 140.160 | **−1.5%** | −1.7 to −1.3 | 8 of 8 |
+| C1147 | 4 slabs | 203.405 → 198.865 | **−2.2%** | −2.4 to −2.1 | 8 of 8 |
+
+These supersede `a9cf9e0e`'s timing (−1.3 to −4.2%), which had Windows GPU use
+in four rounds of eight and read C135 at −2.3%. C135 gains least: `--fill-ahead`
+has most of its fill off the chain.
+
+### What this does not establish
+
+The defaults were measured on sm_120 only, and the block size and cut were
+chosen there. The other archs are compiled, and their code unexercised. On a
+3060, `tune.sh`'s `M0` arm answers whether the merge pays. `--fill-merge` makes
+finding 149's `--fill-blocks` advice due for a retest, since that report ran
+the two kernels apart.
+
+### Install
+
+**Installed** with Kyle's OK, 17:02 (`work/fillmerge/install.sh`, output in
+`install.txt`). `bench/bench` is `2c0b13b8`. `make all` left the binary alone,
+`make -q all` is clean, and the tree's `make check` printed "all gates passed",
+with cofcheck's new merge and skip cases. `0c7dda1f` is kept at
+`work/review/bench.installed.146r`, the new one copied to
+`work/fillmerge/bench.installed.150`.

@@ -622,6 +622,21 @@ typedef struct {
      * 0 = one per FILL_ROW_RUN rows. */
     int      fill_rows;
     int      fill_row_bands;
+    /* --fill-merge (finding 150): on a one-slab plan the row tier and the walk
+     * run as ONE launch, k_fill_merged, their blocks interleaved. The walk is
+     * bound by L2 requests and the row tier by issue, so they share a card
+     * that two launches in turn do not (finding 148). The fill's row tier
+     * then reaches q < fill_merge_cut * I; --resieve-rows keeps --fill-rows'
+     * cut. Output-identical. Resolved in bench_main: on wherever the row tier
+     * is, except under --fill-concurrent; several slabs per q turn it off. */
+    int      fill_merge;
+    int      fill_merge_cut;    /* 0 = FILL_MERGE_CUT_DEFAULT */
+    /* --fill-skip57 (finding 148): fill also drops positions where 5 or 7
+     * divides both i and j, which k_intersect_compact's gcd test rejects
+     * anyway: ~5.5% of the records and gate probes. Needs --sieve-skip 2.
+     * Output-identical. -1 = on for several slabs per q, where fill sits on
+     * the sieve chain; on one-slab plans it cost up to 1% of wall. */
+    int      fill_skip57;
     /* --resieve-rows: k_resieve_scatter's walk of the same --fill-rows tier
      * goes to k_resieve_rows, banded by row. Same (survivor, prime) pairs. */
     int      resieve_rows;
@@ -973,6 +988,15 @@ static inline uint32_t ss_warp_cut(const bench_cfg_t *cfg)
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* --fill-merge: the row tier's cut, and threads per block. 8 beat 4 and 16 on
+ * C135, C143, C148 and C183; 64 and 128 threads were level and 32 lost, the
+ * row tier needing warps the walk does not (findings 148, 150; sm_120 only).
+ * --fill-threads overrides the block. The walk keeps its threads,
+ * --fill-blocks x --fill-threads (auto 32), either way: the merged grid has
+ * fewer, wider blocks of them, so --fill-merge on and off compare one launch
+ * against two and nothing else. */
+#define FILL_MERGE_CUT_DEFAULT 8
+#define FILL_MERGE_THREADS     128
 /* --fill-rows auto bands: rows per band. ~ the visits of an average
  * k_fill_atomic thread, so a row-tier warp is no longer than the rest. */
 #define FILL_ROW_RUN         256

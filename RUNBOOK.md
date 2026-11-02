@@ -222,6 +222,16 @@ comparison with older logs. Every run log names the settings on its
 ungated can fit gated. `bench/fillcheck.sh` is the identity gate; it needs a
 card.
 
+**Two more since finding 150, also output-identical.** On a plan of one slab
+per q, `--fill-merge` runs the row tier and the walk as one launch and takes
+the fill's row tier to `8I` (`--fill-merge-cut`; resieve stays at `--fill-rows`).
+With several slabs per q, where it is off, `--fill-skip57` has fill drop
+positions where 5 or 7 divides both i and j. `--no-fill-merge` and
+`--no-fill-skip57` turn them off, and the run log's `# fill-merge` and
+`# fill-skip57` lines say what a run got. Under `--fill-merge`, `--fill-threads`
+sets the block (128 by default), and the walk keeps its `--fill-blocks` x
+`--fill-threads` threads.
+
 **Two special-q in flight (`--q-pipeline`, default on) is output-identical
 as well.** The next q is sieved on its own stream while this one is
 trial-divided: C143 first band 68.0 -> 59.2 s at I13 and 68.9 -> 61.9 s at
@@ -1527,15 +1537,15 @@ separate, and the startup lines print both. See RESULTS.md finding 52 (and 51,
 which it supersedes on the geometry).
 
 **`bench/tune.sh` times the speed-only knobs on your card, for one job.** It
-tries the small-sieve tier cutoffs (`--ss-block-cut`, `--ss-warp-cut`) and
-`--fill-blocks`, one at a time away from the defaults, on a short band of the
-job. The arms are interleaved on the same q over 6 rounds, the order
+tries the small-sieve tier cutoffs (`--ss-block-cut`, `--ss-warp-cut`),
+`--fill-blocks`, `--fill-gate-shift` and `--no-fill-merge`, one at a time away
+from the defaults, on a short band of the job. The arms are interleaved on the same q over 6 rounds, the order
 rotated and reversed in alternate rounds, and every run's relations are
 compared byte for byte with the defaults'. A setting is adopted only if it
 was slower than the defaults in no round, and faster by more than 1% and by
 more than the defaults' own spread between rounds; if two knobs win, it
 times the combination too. Pick `--nq` so one run takes 10-60 s; the default
-grid of 12 arms is then 15-75 minutes. It refuses to start with anything on
+grid of 17 arms is then 20-105 minutes. It refuses to start with anything on
 any card or an NFS@Home CUDA client running (the CPU client is fine), and
 stops if either appears. On a host with several cards, all must be idle.
 Under WSL, `nvidia-smi` cannot see Windows programs, so close them first

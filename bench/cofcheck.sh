@@ -198,8 +198,9 @@ TC="--cofactor --cof-rho --cof-rounds 2 --cof-budget 65536"
 run $TC --relations $TMP/t0.txt >/dev/null || true
 for cuts in "33 34" "128 32768"; do
     set -- $cuts
-    run $TC --ss-block-cut $1 --ss-warp-cut $2 --relations $TMP/t1.txt >/dev/null || true
-    if [ -s $TMP/t0.txt ] && cmp -s $TMP/t0.txt $TMP/t1.txt; then
+    rm -f $TMP/t1.txt $TMP/t1.txt.*
+    if run $TC --ss-block-cut $1 --ss-warp-cut $2 --relations $TMP/t1.txt >/dev/null &&
+       [ -s $TMP/t0.txt ] && cmp -s $TMP/t0.txt $TMP/t1.txt; then
         printf 'PASS   %-34s byte-identical\n' "tier cuts $1/$2"
     else
         printf 'FAIL   %-34s relations differ from the defaults\n' "tier cuts $1/$2"; fail=1
@@ -211,6 +212,42 @@ expect_refused "warp cut above 32768"         --ss-warp-cut 32769
 expect_refused "warp cut at the block cut"    --ss-block-cut 64 --ss-warp-cut 64
 expect_refused "warp cut at the default block" --ss-warp-cut 36
 expect_refused "tier cuts with no small sieve" --no-smallsieve --ss-block-cut 40
+
+# ---- fill: one launch, and the gcd skip on 5 and 7 ------------------------
+# --fill-merge changes how the fill is launched and --fill-skip57 drops only
+# positions k_intersect_compact rejects, so neither may change a relation
+# (RESULTS findings 148, 150). A cut and block that are not the defaults go
+# through the block interleave differently: it once lost the last row block.
+FC="--cofactor --cof-rho --cof-rounds 2 --cof-budget 65536"
+run $FC --no-fill-merge --no-fill-skip57 --relations $TMP/f0.txt >/dev/null || true
+for arm in "--fill-merge" "--fill-merge --fill-merge-cut 32 --fill-threads 64" \
+           "--fill-merge --fill-merge-cut 5 --fill-threads 256" "--fill-skip57" \
+           "--fill-merge --fill-skip57"; do
+    rm -f $TMP/f1.txt $TMP/f1.txt.*
+    name=$(echo "$arm" | sed 's/--fill-//g; s/--//g' | cut -c1-34)
+    if ! run $FC $arm --relations $TMP/f1.txt >$TMP/fo; then
+        printf 'FAIL   %-34s exited nonzero\n' "$name"; fail=1
+    elif ! { [ -s $TMP/f0.txt ] && cmp -s $TMP/f0.txt $TMP/f1.txt; }; then
+        printf 'FAIL   %-34s relations differ\n' "$name"; fail=1
+    else
+        # An arm that fell back to two launches would pass without testing this
+        case "$arm" in
+            --fill-merge*) if grep -q -- '--fill-merge: .*one launch' $TMP/fo; then
+                               printf 'PASS   %-34s byte-identical\n' "$name"
+                           else
+                               printf 'FAIL   %-34s did not run as one launch\n' "$name"; fail=1
+                           fi ;;
+            *) printf 'PASS   %-34s byte-identical\n' "$name" ;;
+        esac
+    fi
+done
+expect_refused "merge cut with the merge off" --no-fill-merge --fill-merge-cut 8
+expect_refused "merge with no row tier"       --fill-rows 0 --fill-merge
+expect_refused "merge cut out of range"       --fill-merge-cut 257
+expect_refused "merge with concurrent fill"   --fill-concurrent --fill-merge
+expect_refused "skip57 without skip level 2"  --sieve-skip 1 --fill-skip57
+expect_refused "fill threads under a warp"    --fill-threads 16
+expect_refused "fill threads, a partial warp" --fill-threads 48
 
 # ---- survivor allowance policy -------------------------------------------
 # The DERIVED default (mfb + ~1.5 bits, from our own quantisation) is tighter

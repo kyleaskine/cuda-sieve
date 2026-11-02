@@ -146,6 +146,15 @@ __device__ __forceinline__ int pos_both_even(uint32_t x, uint32_t j)
     return ((x | j) & 1u) == 0u;
 }
 
+/* --fill-skip57: 5 | gcd(i,j) or 7 | gcd(i,j), at offset o = i + I/2 in row j;
+ * ih5 and ih7 are I/2 mod 5 and 7. Fill only: unlike the helpers above, nothing
+ * else needs to agree with it, since a position it drops gets no large-prime
+ * logs and k_intersect_compact's gcd test rejects it either way (finding 148). */
+__device__ __forceinline__ int pos_gcd_57(uint32_t j, uint32_t o, uint32_t ih5, uint32_t ih7)
+{
+    return (j % 5u == 0u && o % 5u == ih5) || (j % 7u == 0u && o % 7u == ih7);
+}
+
 /* --fill-gate: the side filled SECOND stores a record only where the side
  * filled first has a survivor within the same 2^gate_shift positions. A
  * position the first side rejected is dropped by k_intersect_compact whatever
@@ -179,31 +188,34 @@ __device__ __forceinline__ void fill_store_index(uint32_t *__restrict index,
 /* ---- stage (a): naive single-level atomic append ---------------------- */
 
 /* One atomicAdd per record into a 2^log_nbuckets-way split. This is the
- * baseline the design doc says to beat. */
-template <int RECBYTES, bool SLABBED = false, bool INDEX = false>
-__global__ void k_fill_atomic(const plat_t *__restrict plat,
-                              const uint8_t *__restrict logp,
-                              uint32_t n, uint32_t xmax, int logI,
-                              int log_region,
-                              uint32_t *__restrict cursor,
-                              uint8_t *__restrict out, bklay_t lay,
-                              uint32_t *__restrict overflow,
-                              const uint64_t *__restrict walk_cur,
-                              uint64_t *__restrict walk_next,
-                              int sieve_skip, uint32_t j_base,
-                              const uint32_t *__restrict gate = nullptr,
-                              int gate_shift = 0,
-                              uint32_t *__restrict index = nullptr,
-                              uint32_t icap = 0, uint32_t ibase = 0,
-                              uint32_t *__restrict index_ovf = nullptr)
+ * baseline the design doc says to beat. One thread's share, the entries kk0,
+ * kk0 + stride, ...: k_fill_atomic and k_fill_merged differ only in those. */
+template <int RECBYTES, bool SLABBED, bool INDEX>
+__device__ __forceinline__ void fill_walk_thread(uint64_t kk0, uint64_t stride,
+                                                 const plat_t *__restrict plat,
+                                                 const uint8_t *__restrict logp,
+                                                 uint32_t n, uint32_t xmax, int logI,
+                                                 int log_region,
+                                                 uint32_t *__restrict cursor,
+                                                 uint8_t *__restrict out, bklay_t lay,
+                                                 uint32_t *__restrict overflow,
+                                                 const uint64_t *__restrict walk_cur,
+                                                 uint64_t *__restrict walk_next,
+                                                 int sieve_skip, uint32_t j_base,
+                                                 const uint32_t *__restrict gate,
+                                                 int gate_shift,
+                                                 uint32_t *__restrict index,
+                                                 uint32_t icap, uint32_t ibase,
+                                                 uint32_t *__restrict index_ovf,
+                                                 int skip57)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const uint32_t offmask = (1u << log_region) - 1;
-    const uint64_t stride = bench_grid_stride_x();
     /* --sieve-skip: 3 | i  <=>  (x & Imask) == I/2 (mod 3), since i = (x & Imask) - I/2. */
     const uint32_t ih3 = (1u << (logI - 1)) % 3u;
+    const uint32_t ih5 = (1u << (logI - 1)) % 5u, ih7 = (1u << (logI - 1)) % 7u;
 
-    for (uint64_t kk = bench_grid_thread_x(); kk < n; kk += stride) {
+    for (uint64_t kk = kk0; kk < n; kk += stride) {
         const uint32_t k = (uint32_t)kk;
         plat_t P = plat[k];
         if (P.inc_warp == PL_INVALID) {
@@ -260,6 +272,8 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
                 if (pos_both_even(xl, j)) continue;
                 if (sieve_skip > 1 && (j % 3u) == 0u && ((xl & Imask) % 3u) == ih3)
                     continue;
+                if (skip57 && pos_gcd_57(j, xl & Imask, ih5, ih7))
+                    continue;
             }
             if (fill_gate_drops(gate, gate_shift, xl)) continue;
             const uint32_t b = xl >> log_region;
@@ -282,6 +296,31 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
     }
 }
 
+template <int RECBYTES, bool SLABBED = false, bool INDEX = false>
+__global__ void k_fill_atomic(const plat_t *__restrict plat,
+                              const uint8_t *__restrict logp,
+                              uint32_t n, uint32_t xmax, int logI,
+                              int log_region,
+                              uint32_t *__restrict cursor,
+                              uint8_t *__restrict out, bklay_t lay,
+                              uint32_t *__restrict overflow,
+                              const uint64_t *__restrict walk_cur,
+                              uint64_t *__restrict walk_next,
+                              int sieve_skip, uint32_t j_base,
+                              const uint32_t *__restrict gate = nullptr,
+                              int gate_shift = 0,
+                              uint32_t *__restrict index = nullptr,
+                              uint32_t icap = 0, uint32_t ibase = 0,
+                              uint32_t *__restrict index_ovf = nullptr,
+                              int skip57 = 0)
+{
+    fill_walk_thread<RECBYTES, SLABBED, INDEX>(bench_grid_thread_x(), bench_grid_stride_x(),
+                                               plat, logp, n, xmax, logI, log_region,
+                                               cursor, out, lay, overflow, walk_cur, walk_next,
+                                               sieve_skip, j_base, gate, gate_shift,
+                                               index, icap, ibase, index_ovf, skip57);
+}
+
 /* ---- --fill-rows: the smallest bucketed moduli, row by row ------------ *
  *
  * k_fill_atomic gives each modulus ONE thread, and that thread visits all of
@@ -302,28 +341,32 @@ __global__ void k_fill_atomic(const plat_t *__restrict plat,
  * rts[k] is k_transform's rt_out: the root, or ROWRT_NONE where k_fill_atomic
  * would skip the entry (PL_INVALID). The row tier needs no walk state; when
  * k_resieve_scatter still walks it (--no-resieve-rows), k_rows_walk_next
- * supplies the cursor. j_base counts only under SLABBED, as in pos_row. */
-template <bool SLABBED, bool INDEX = false>
-__global__ void k_fill_rows(const uint32_t *__restrict primes,
-                            const uint32_t *__restrict rts,
-                            const uint8_t *__restrict logp,
-                            uint32_t n, uint32_t nbands, uint32_t rows,
-                            int logI, int log_region,
-                            uint32_t *__restrict cursor,
-                            uint8_t *__restrict out, bklay_t lay,
-                            uint32_t *__restrict overflow,
-                            int sieve_skip, uint32_t j_base,
-                            const uint32_t *__restrict gate, int gate_shift,
-                            uint32_t *__restrict index = nullptr,
-                            uint32_t icap = 0,
-                            uint32_t *__restrict index_ovf = nullptr)
+ * supplies the cursor. j_base counts only under SLABBED, as in pos_row. One
+ * warp's share, the warp'th (moduli, band); k_fill_rows and k_fill_merged
+ * differ only in how a warp finds that number. */
+template <bool SLABBED, bool INDEX>
+__device__ __forceinline__ void fill_rows_warp(uint64_t warp,
+                                               const uint32_t *__restrict primes,
+                                               const uint32_t *__restrict rts,
+                                               const uint8_t *__restrict logp,
+                                               uint32_t n, uint32_t nbands, uint32_t rows,
+                                               int logI, int log_region,
+                                               uint32_t *__restrict cursor,
+                                               uint8_t *__restrict out, bklay_t lay,
+                                               uint32_t *__restrict overflow,
+                                               int sieve_skip, uint32_t j_base,
+                                               const uint32_t *__restrict gate, int gate_shift,
+                                               uint32_t *__restrict index,
+                                               uint32_t icap,
+                                               uint32_t *__restrict index_ovf,
+                                               int skip57)
 {
     const uint32_t I = 1u << logI;
     const uint32_t offmask = (1u << log_region) - 1;
     const uint32_t jb = SLABBED ? j_base : 0u;
     const uint32_t ih3 = (I >> 1) % 3u;
+    const uint32_t ih5 = (I >> 1) % 5u, ih7 = (I >> 1) % 7u;
     const uint32_t lane = threadIdx.x & 31u;
-    const uint64_t warp = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     /* whole warps only (blockDim % 32 == 0), so this exit is warp-uniform and
      * the full-mask ballot below stays legal */
     if (warp >= (uint64_t)((n + 31u) >> 5) * nbands) return;
@@ -347,6 +390,7 @@ __global__ void k_fill_rows(const uint32_t *__restrict primes,
              * x & Imask == off: the same tests as k_fill_atomic */
             if (((off | j) & 1u) == 0u) hit = false;
             else if (sieve_skip > 1 && j % 3u == 0u && off % 3u == ih3) hit = false;
+            else if (skip57 && pos_gcd_57(j, off, ih5, ih7)) hit = false;
         }
         const uint32_t xl = (r << logI) + off;
         if (hit && fill_gate_drops(gate, gate_shift, xl)) hit = false;
@@ -379,6 +423,73 @@ __global__ void k_fill_rows(const uint32_t *__restrict primes,
             }
         }
         if (active) { off += rt; if (off >= q) off -= q; }
+    }
+}
+
+template <bool SLABBED, bool INDEX = false>
+__global__ void k_fill_rows(const uint32_t *__restrict primes,
+                            const uint32_t *__restrict rts,
+                            const uint8_t *__restrict logp,
+                            uint32_t n, uint32_t nbands, uint32_t rows,
+                            int logI, int log_region,
+                            uint32_t *__restrict cursor,
+                            uint8_t *__restrict out, bklay_t lay,
+                            uint32_t *__restrict overflow,
+                            int sieve_skip, uint32_t j_base,
+                            const uint32_t *__restrict gate, int gate_shift,
+                            uint32_t *__restrict index = nullptr,
+                            uint32_t icap = 0,
+                            uint32_t *__restrict index_ovf = nullptr,
+                            int skip57 = 0)
+{
+    fill_rows_warp<SLABBED, INDEX>(((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) >> 5,
+                                   primes, rts, logp, n, nbands, rows, logI, log_region,
+                                   cursor, out, lay, overflow, sieve_skip, j_base,
+                                   gate, gate_shift, index, icap, index_ovf, skip57);
+}
+
+/* --fill-merge (finding 150): the row tier and the walk as one launch, for a
+ * one-slab plan. The walk is bound by L2 requests and hardly uses the SMs; the
+ * row tier is bound by issue. As two launches they run in turn, since a launch
+ * waits behind the blocks another has yet to dispatch (finding 134), and as one
+ * they share the card. Each block is row work or walk, evenly interleaved so
+ * that neither tier waits for the other's blocks to dispatch: rblocks of row work
+ * among rblocks + nwalkblk, and block i has rb of them before it. The division
+ * is plain on purpose. It is exact by construction, reaching rblocks at the last
+ * block, where a fixed-point ratio has to be rounded the right way: rounded down,
+ * the last row block never ran (finding 148). Blocks hold whole warps, so a
+ * row warp's ballot stays legal. nrow entries go to the row tier and nwalk to the
+ * walk. */
+template <bool INDEX>
+__global__ void k_fill_merged(const uint32_t *__restrict primes,
+                              const uint32_t *__restrict rts,
+                              const uint8_t *__restrict logp,
+                              const plat_t *__restrict plat,
+                              uint32_t nrow, uint32_t nwalk, uint32_t nbands, uint32_t rows,
+                              uint32_t xmax, int logI, int log_region,
+                              uint32_t *__restrict cursor,
+                              uint8_t *__restrict out, bklay_t lay,
+                              uint32_t *__restrict overflow,
+                              int sieve_skip,
+                              const uint32_t *__restrict gate, int gate_shift,
+                              uint32_t *__restrict index, uint32_t icap,
+                              uint32_t *__restrict index_ovf,
+                              uint32_t rblocks, uint32_t nwalkblk, int skip57)
+{
+    const uint64_t i = blockIdx.x, nblk = (uint64_t)rblocks + nwalkblk;
+    const uint64_t rb = i * rblocks / nblk, ra = (i + 1) * rblocks / nblk;
+    if (ra != rb) {
+        fill_rows_warp<false, INDEX>(rb * (blockDim.x >> 5) + (threadIdx.x >> 5),
+                                     primes, rts, logp, nrow, nbands, rows, logI, log_region,
+                                     cursor, out, lay, overflow, sieve_skip, 0u,
+                                     gate, gate_shift, index, icap, index_ovf, skip57);
+    } else {
+        fill_walk_thread<4, false, INDEX>((i - rb) * blockDim.x + threadIdx.x,
+                                          bench_grid_product_u64(nwalkblk, blockDim.x),
+                                          plat + nrow, logp + nrow, nwalk, xmax, logI, log_region,
+                                          cursor, out, lay, overflow, nullptr, nullptr,
+                                          sieve_skip, 0u, gate, gate_shift,
+                                          index, icap, nrow, index_ovf, skip57);
     }
 }
 

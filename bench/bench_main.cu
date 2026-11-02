@@ -299,6 +299,16 @@ static void usage(void)
 "                   bands rather than one thread per q. 0 = off\n"
 "                   [4 at logI <= 15, else 0]\n"
 "  --fill-row-bands N  row bands per slab for --fill-rows; 0 = auto  [0]\n"
+"  --fill-merge / --no-fill-merge  one slab per q: the row tier and the walk\n"
+"                   in one launch, blocks interleaved, for less wall. Takes\n"
+"                   --fill-threads as its block; the walk keeps its\n"
+"                   --fill-blocks x --fill-threads threads. Output-identical\n"
+"                   [on with the row tier, off under --fill-concurrent]\n"
+"  --fill-merge-cut N  --fill-merge's row tier, q < N*I, for fill alone;\n"
+"                   resieve stays at --fill-rows. 0 = auto          [" BENCH_STR(FILL_MERGE_CUT_DEFAULT) "]\n"
+"  --fill-skip57 / --no-fill-skip57  fill also drops positions where 5 or 7\n"
+"                   divides both i and j. Needs --sieve-skip 2. Output-identical\n"
+"                   [on with several slabs per q, else off]\n"
 "  --resieve-rows / --no-resieve-rows  resieve the --fill-rows tier row by\n"
 "                   row too         [on at logI <= " BENCH_STR(RESIEVE_ROWS_LOGI_MAX) ", else off]\n"
 "  --fill-gate / --no-fill-gate  --pipeline only; side 0's fill stores\n"
@@ -335,7 +345,8 @@ static void usage(void)
 "                   counts, on a count the card gates as the host would.\n"
 "                   Output-identical; needs --cofactor without --candidates\n"
 "                                                  [on with --q-pipeline]\n"
-"  --fill-threads N fill only; 0 = auto (32), else a multiple of 32 in\n"
+"  --fill-threads N fill only; 0 = auto (32, or " BENCH_STR(FILL_MERGE_THREADS) " for --fill-merge's\n"
+"                   blocks), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
 "  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
@@ -1089,6 +1100,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_concurrent = 0;
     /* -1 = resolved below once logI and --fill-concurrent are known */
     cfg.fill_rows = -1; cfg.fill_row_bands = 0; cfg.resieve_rows = -1;
+    cfg.fill_merge = -1; cfg.fill_merge_cut = 0; cfg.fill_skip57 = -1;
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
     cfg.resieve_scan = -1; cfg.resieve_scan_cap = 0; cfg.resieve_scan_pairs = 0;
     cfg.norm_gate = -1;
@@ -1256,6 +1268,14 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                                     &cfg.fill_row_bands)) return 1;
             fill_row_bands_set = 1;
         }
+        else if (!strcmp(argv[i], "--fill-merge")) { cfg.fill_merge = 1; }
+        else if (!strcmp(argv[i], "--no-fill-merge")) { cfg.fill_merge = 0; }
+        else if (!strcmp(argv[i], "--fill-merge-cut") && i + 1 < argc) {
+            if (parse_int_range_arg("--fill-merge-cut", argv[++i], 0, 256,
+                                    &cfg.fill_merge_cut)) return 1;
+        }
+        else if (!strcmp(argv[i], "--fill-skip57")) { cfg.fill_skip57 = 1; }
+        else if (!strcmp(argv[i], "--no-fill-skip57")) { cfg.fill_skip57 = 0; }
         else if (!strcmp(argv[i], "--fill-gate")) { cfg.fill_gate = 1; }
         else if (!strcmp(argv[i], "--no-fill-gate")) { cfg.fill_gate = 0; }
         else if (!strcmp(argv[i], "--resieve-rows")) { cfg.resieve_rows = 1; }
@@ -1713,6 +1733,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (cfg.resieve_rows < 0)
         cfg.resieve_rows = (cfg.fill_rows &&
                             cfg.logI <= RESIEVE_ROWS_LOGI_MAX) ? 1 : 0;
+    /* --fill-merge (finding 150): wherever the row tier is, but for
+     * --fill-concurrent, whose sides have streams of their own. Several slabs
+     * per q turn it off in run_pipeline_impl, which says so. */
+    if (cfg.fill_merge < 0)
+        cfg.fill_merge = (cfg.pipeline && cfg.fill_rows && !cfg.fill_concurrent) ? 1 : 0;
     if (cfg.fill_gate < 0)
         cfg.fill_gate = (cfg.pipeline && !cfg.fill_concurrent) ? 1 : 0;
     /* --resieve-scan: wherever the gate is, since only gated side-0 records
@@ -1751,6 +1776,23 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     }
     if (cfg.pipeline && cfg.resieve_rows && !cfg.fill_rows) {
         fprintf(stderr, "--resieve-rows uses the --fill-rows tier; give both\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.fill_merge && !cfg.fill_rows) {
+        fprintf(stderr, "--fill-merge needs the row tier; it is off"
+                " (--fill-rows 0, or logI > 15)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.fill_merge && cfg.fill_concurrent) {
+        fprintf(stderr, "--fill-merge and --fill-concurrent exclude each other\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.fill_merge_cut && !cfg.fill_merge) {
+        fprintf(stderr, "--fill-merge-cut needs --fill-merge; it is off\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.fill_skip57 > 0 && cfg.sieve_skip != 2) {
+        fprintf(stderr, "--fill-skip57 needs --sieve-skip 2\n");
         return 1;
     }
     if (cfg.pipeline && cfg.resieve_scan && !cfg.fill_gate) {
@@ -1910,9 +1952,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 " have\n", cfg.threads);
         return 1;
     }
-    /* Fill has no warp-collective code, so a partial warp here would not be
-     * wrong -- just wasteful, since the tail lanes are launched and idle. The
-     * range matters more: 0 means "auto" so it can never be passed through, and
+    /* The multiple of 32 is safety, not tidiness: --fill-merge runs the row
+     * tier in these blocks, and its full-mask ballot needs whole warps. The
+     * range matters too: 0 means "auto" so it can never be passed through, and
      * above 1024 every launch fails at runtime with a message that does not
      * mention this flag. */
     if (cfg.fill_threads != 0 &&
@@ -2362,11 +2404,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * need. Every ?: at a launch site is therefore live, not a dead
          * fallback -- and there is exactly one place per kernel that knows its
          * own default. */
-        printf("grid: %d x %d for fill (absolute, not per SM)%s%s\n",
+        printf("grid: %d x %d for fill (absolute, not per SM)%s%s%s\n",
                cfg.fill_blocks  ? cfg.fill_blocks  : FILL_BLOCKS_DEFAULT,
                cfg.fill_threads ? cfg.fill_threads : FILL_THREADS_DEFAULT,
                cfg.fill_blocks  ? "  [--fill-blocks]"  : "",
-               cfg.fill_threads ? "  [--fill-threads]" : "");
+               cfg.fill_threads ? "  [--fill-threads]" : "",
+               cfg.fill_merge ? "; on a one-slab plan, as --fill-merge reports" : "");
         if (cfg.small_sieve)
             printf("small sieve tiers: block m < %u, warp m < %u%s%s\n",
                    ss_block_cut(&cfg), ss_warp_cut(&cfg),
@@ -2416,6 +2459,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--watchdog-kill",
             "--slab-j", "--qspan", "--fill-concurrent",
             "--fill-rows", "--fill-row-bands", "--fill-gate", "--resieve-rows",
+            "--fill-merge", "--no-fill-merge", "--fill-merge-cut",
+            "--fill-skip57", "--no-fill-skip57",
             "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
             "--no-q-pipeline", "--q-prep", "--fill-ahead", "--no-fill-ahead",
             "--td-ahead", "--no-td-ahead",
@@ -3419,13 +3464,14 @@ resume_artifacts_ready:
              * the number belongs in the run's own record and not only in the
              * source defaults. */
             runlog_note("geometry", "logI=%d J=%u (I%de, area %.4g) region=2^%d"
-                        " maxbits=%d blocks=%d threads=%d fill=%dx%d",
+                        " maxbits=%d blocks=%d threads=%d fill=%dx%d%s",
                         cfg.logI, cfg.J, cfg.logI,
                         (double)(1u << cfg.logI) * cfg.J, cfg.log_region,
                         maxbits, cfg.blocks, cfg.threads,
                         cfg.fill_blocks ? cfg.fill_blocks : FILL_BLOCKS_DEFAULT,
                         cfg.fill_threads ? cfg.fill_threads
-                                         : FILL_THREADS_DEFAULT);
+                                         : FILL_THREADS_DEFAULT,
+                        cfg.fill_merge ? " (or merged: # fill-merge)" : "");
             /* The factor-base convention, spelled out rather than implied. The
              * pipeline runs the FULL base while GGNFS truncates at q, and the
              * ratio between the two is 2.54x at q=50M and 1.03x at 130M on the

@@ -1,8 +1,12 @@
 #!/bin/sh
-# fillcheck.sh -- identity gate for --fill-rows, --resieve-rows, --fill-gate
+# fillcheck.sh -- identity gate for --fill-rows, --fill-merge, --fill-skip57,
+# --resieve-rows, --fill-gate
 # (with --norm-gate) and --q-pipeline.
 #
-# None of these changes which records the sieve needs. --fill-rows moves
+# None of these changes which records the sieve needs. --fill-merge runs the
+# row tier and the walk as one launch, a fill-only row cut above --fill-rows,
+# on one-slab plans; --fill-skip57 drops positions 5 or 7 divides, which the
+# intersection rejects anyway. --fill-rows moves
 # the smallest bucketed moduli to a row-banded kernel (same lattice points,
 # another order inside each bucket); --fill-gate drops side-0 records only at
 # positions side 1 already rejected, which k_intersect_compact discards
@@ -55,18 +59,26 @@ c194-i16|--poly ../oracle/c194.job --fb1 ../oracle/c194.roots1.m16 --logI 16 --J
 # rather than passing without testing the pipelined path. On a card too small
 # for the pipeline on these jobs this gate fails by design; that card cannot
 # certify it. `default` is the configuration of record (findings 107-109).
-OFF='--fill-rows 0 --no-fill-gate --no-q-pipeline'
-ARMS='rows4|--fill-rows 4 --no-resieve-rows --no-fill-gate
-rows16|--fill-rows 16 --no-resieve-rows --no-fill-gate
-rows16-bands7|--fill-rows 16 --fill-row-bands 7 --no-resieve-rows --no-fill-gate
-gate3|--fill-rows 0 --fill-gate
-gate3-nonorm|--fill-rows 0 --fill-gate --no-norm-gate
-gate0|--fill-rows 0 --fill-gate --fill-gate-shift 0
-rows16-gate3|--fill-rows 16 --no-resieve-rows --fill-gate
-rows4-rs|--fill-rows 4 --resieve-rows --no-fill-gate
-rows16-rs-gate3|--fill-rows 16 --resieve-rows --fill-gate
-concurrent|--fill-concurrent --fill-rows 4 --resieve-rows
-skip1|--sieve-skip 1 --fill-rows 4 --resieve-rows --fill-gate
+OFF='--fill-rows 0 --no-fill-gate --no-q-pipeline --no-fill-skip57'
+ARMS='rows4|--fill-rows 4 --no-fill-merge --no-fill-skip57 --no-resieve-rows --no-fill-gate
+rows16|--fill-rows 16 --no-fill-merge --no-fill-skip57 --no-resieve-rows --no-fill-gate
+rows16-bands7|--fill-rows 16 --no-fill-merge --no-fill-skip57 --fill-row-bands 7 --no-resieve-rows --no-fill-gate
+gate3|--fill-rows 0 --no-fill-skip57 --fill-gate
+gate3-nonorm|--fill-rows 0 --no-fill-skip57 --fill-gate --no-norm-gate
+gate0|--fill-rows 0 --no-fill-skip57 --fill-gate --fill-gate-shift 0
+rows16-gate3|--fill-rows 16 --no-fill-merge --no-fill-skip57 --no-resieve-rows --fill-gate
+rows4-rs|--fill-rows 4 --no-fill-merge --no-fill-skip57 --resieve-rows --no-fill-gate
+rows16-rs-gate3|--fill-rows 16 --no-fill-merge --no-fill-skip57 --resieve-rows --fill-gate
+merge|--fill-rows 4 --fill-merge --no-fill-skip57 --fill-gate
+merge-nogate|--fill-rows 4 --fill-merge --no-fill-skip57 --no-fill-gate
+merge32-t64|--fill-rows 4 --fill-merge --fill-merge-cut 32 --fill-threads 64 --no-fill-skip57 --fill-gate
+merge-bands7|--fill-rows 4 --fill-merge --fill-row-bands 7 --no-fill-skip57 --fill-gate
+merge-rows16|--fill-rows 16 --fill-merge --no-fill-skip57 --fill-gate
+skip57|--fill-rows 0 --fill-skip57 --no-fill-gate
+skip57-rows|--fill-rows 4 --no-fill-merge --fill-skip57 --fill-gate
+merge-skip57|--fill-rows 4 --fill-merge --fill-skip57 --fill-gate
+concurrent|--fill-concurrent --fill-rows 4 --no-fill-skip57 --resieve-rows
+skip1|--sieve-skip 1 --fill-rows 4 --no-fill-merge --no-fill-skip57 --resieve-rows --fill-gate
 single|--no-q-pipeline
 default|'
 
@@ -88,8 +100,18 @@ echo "$JOBS" | while IFS='|' read -r job jargs; do
         fi
         # whole tokens: --no-fill-gate must not count as the gate
         case " $aargs " in
-            *" --fill-gate "*|*" --sieve-skip "*) counts=1 ;;
+            *" --fill-gate "*|*" --sieve-skip "*|*" --fill-skip57 "*) counts=1 ;;
             *) [ "$arm" = default ] && counts=1 || counts=0 ;;
+        esac
+        # An arm that asks for the merge on a one-slab job must have had it:
+        # a fall back to two launches would pass without testing k_fill_merged.
+        case " $aargs " in
+            *" --fill-merge "*)
+                if ! grep -q "j-slabbing: [0-9]* slabs" "$TMP/$job.$arm.out" &&
+                   ! grep -q -- "--fill-merge: .*one launch" "$TMP/$job.$arm.out"; then
+                    echo "  FAIL $arm: asked for --fill-merge on a one-slab plan, and did not run as one launch"
+                    exit 1
+                fi ;;
         esac
         want=1
         case "$arm" in single|concurrent) want=0 ;; esac

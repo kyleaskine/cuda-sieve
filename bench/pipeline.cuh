@@ -188,9 +188,11 @@ typedef struct {
     uint64_t *walk_cur, *walk_next;
     /* --fill-rows: the first nrow bucketed entries (q < fill_rows * I) are
      * filled by k_fill_rows from their transformed roots, written here by
-     * k_transform; k_fill_atomic walks the rest. nrow == 0 is the old fill. */
+     * k_transform; k_fill_atomic walks the rest. nrow == 0 is the old fill.
+     * --fill-merge takes the fill's own tier further, to nrow_fill entries,
+     * whose roots rowrt holds; --resieve-rows stays at nrow. */
     uint32_t *rowrt;
-    uint32_t  nrow;
+    uint32_t  nrow, nrow_fill;
     /* --q-pipeline: the next q's transform output, written while this q's
      * trial division still reads plat/rowrt. pside_swap_alt trades the two
      * sets at the point the next q is issued. NULL when single-queued.
@@ -392,6 +394,43 @@ static double pipe_progress_fraction(const bench_cfg_t *cfg, int streaming,
     return fraction > 1.0 ? 1.0 : fraction;
 }
 
+/* --fill-merge's row cut, never below --fill-rows' */
+static inline int pipe_fill_merge_cut(const bench_cfg_t *cfg)
+{
+    const int cut = cfg->fill_merge_cut ? cfg->fill_merge_cut : FILL_MERGE_CUT_DEFAULT;
+    return cut > cfg->fill_rows ? cut : cfg->fill_rows;
+}
+
+/* Whether a side's fill is one launch, k_fill_merged: it takes both tiers */
+template <bool SLABBED>
+static inline bool pipe_fill_one_launch(const bench_cfg_t *cfg, uint32_t nrow, uint32_t n)
+{
+    return !SLABBED && cfg->fill_merge && nrow && n > nrow;
+}
+
+/* k_fill_merged's grid: rblocks of row work and fwalk of walk, bt threads each.
+ * fthreads is the walk's width without the merge, so the walk has as many
+ * threads either way (bench.h). */
+typedef struct { uint32_t bt, rblocks, fwalk; } fill_merge_grid_t;
+static inline fill_merge_grid_t pipe_fill_merge_grid(const bench_cfg_t *cfg, uint32_t nrow,
+                                                     uint32_t nband, int fblocks, int fthreads)
+{
+    fill_merge_grid_t g;
+    g.bt = cfg->fill_threads ? (uint32_t)cfg->fill_threads : FILL_MERGE_THREADS;
+    const uint32_t wblk = g.bt >> 5;
+    g.rblocks = (((nrow + 31u) >> 5) * nband + wblk - 1u) / wblk;
+    g.fwalk = (uint32_t)(((uint64_t)fblocks * fthreads + g.bt - 1u) / g.bt);
+    return g;
+}
+
+/* --fill-skip57, resolved: by default it follows the plan, since fill is on the
+ * sieve chain at several slabs per q and beside it on a one-slab plan. */
+template <bool SLABBED>
+static inline int pipe_fill_skip57(const bench_cfg_t *cfg)
+{
+    return cfg->sieve_skip == 2 && (cfg->fill_skip57 < 0 ? SLABBED : cfg->fill_skip57);
+}
+
 /* Everything that does NOT depend on the special-q: the factor base upload
  * (primes, roots, each entry's log), and the pinned staging. Hoisted out of the per-q path so a
  * band of q measures sieving rather than allocation churn. */
@@ -435,7 +474,13 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
          * has not passed it. */
         const uint64_t rb = (uint64_t)cfg->fill_rows << cfg->logI;
         while (S->nrow < fb->n && fb->primes[S->nrow] < rb) S->nrow++;
-        if (S->nrow) SIDE_INIT_CK(cudaMalloc(&S->rowrt, (size_t)S->nrow * 4));
+        S->nrow_fill = S->nrow;
+        if constexpr (!SLABBED) if (cfg->fill_merge) {
+            const int cut = pipe_fill_merge_cut(cfg);
+            const uint64_t rf = (uint64_t)cut << cfg->logI;
+            while (S->nrow_fill < fb->n && fb->primes[S->nrow_fill] < rf) S->nrow_fill++;
+        }
+        if (S->nrow_fill) SIDE_INIT_CK(cudaMalloc(&S->rowrt, (size_t)S->nrow_fill * 4));
     }
     SIDE_INIT_CK(cudaMemcpy(S->primes, fb->primes, (size_t)fb->n * 4,
                             cudaMemcpyHostToDevice));
@@ -853,7 +898,7 @@ static int pipe_side_prepare_q(const fb_t *fb, const fb_t *fbs,
     PERQ_CK(cudaEventRecord(S->ev[0], sx));
     k_transform<SLABBED><<<blocks, cfg->threads, 0, sx>>>(S->primes, S->roots, S->plat, fb->n,
         cfg->logI, cfg->J, L->a0, L->a1, L->b0, L->b1,
-        S->d_nproj, S->d_nlost, S->walk_cur, S->rowrt, S->nrow);
+        S->d_nproj, S->d_nlost, S->walk_cur, S->rowrt, S->nrow_fill);
     PERQ_CK(cudaEventRecord(S->ev[4], sx));
     /* NO SYNCHRONIZE HERE. This function used to block on the transform purely
      * to read t_transform, and nothing after that read touches device data --
@@ -1019,37 +1064,48 @@ static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                                              gshift, ngword, nbw);
             gate = gate_fold;
         }
-        const uint32_t nrow = S->nrow;
-        if (nrow) {
-            const uint32_t rows = xmax >> cfg->logI;
-            const uint32_t nband = pipe_row_bands(cfg, rows);
-            const uint64_t nthr = (uint64_t)((nrow + 31u) >> 5) * nband * 32u;
-            auto *const rows_kern = bk->index ? k_fill_rows<SLABBED, true>
-                                              : k_fill_rows<SLABBED, false>;
-            rows_kern<<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
-                S->primes, S->rowrt, S->logp, nrow, nband, rows, cfg->logI,
-                log_region, bk->cursor, bk->bucket, lay, bk->overflow,
-                cfg->sieve_skip, j_base, gate, gshift,
-                bk->index, bk->icap, bk->index_ovf);
-            /* Only k_resieve_scatter reads the row tier's walk state, and only
-             * when --resieve-rows is off; nothing else needs it. */
-            if (SLABBED && !cfg->resieve_rows)
-                k_rows_walk_next<<<(nrow + 255) / 256, 256, 0, st>>>(
-                    S->primes, S->rowrt, nrow, j_base + rows, cfg->logI,
-                    S->walk_cur, S->walk_next);
-        }
-        /* The rest by pointer offset: k_fill_atomic indexes every per-entry
-         * array by the same k. */
-        if (fb->n > nrow) {
-            auto *const fill_kern = bk->index ? k_fill_atomic<4, SLABBED, true>
-                                              : k_fill_atomic<4, SLABBED, false>;
-            fill_kern<<<fblocks, fthreads, 0, st>>>(
-                S->plat + nrow, S->logp + nrow, fb->n - nrow, xmax, cfg->logI,
-                log_region, bk->cursor, bk->bucket, lay, bk->overflow,
-                SLABBED ? S->walk_cur + nrow : NULL,
-                SLABBED ? S->walk_next + nrow : NULL,
-                cfg->sieve_skip, j_base, gate, gshift,
-                bk->index, bk->icap, nrow, bk->index_ovf);
+        const uint32_t nrow = S->nrow_fill;
+        const int skip57 = pipe_fill_skip57<SLABBED>(cfg);
+        const uint32_t rows = xmax >> cfg->logI;
+        const uint32_t nband = pipe_row_bands(cfg, rows);
+        if (pipe_fill_one_launch<SLABBED>(cfg, nrow, fb->n)) {
+            const fill_merge_grid_t g = pipe_fill_merge_grid(cfg, nrow, nband, fblocks, fthreads);
+            auto *const merged = bk->index ? k_fill_merged<true> : k_fill_merged<false>;
+            merged<<<g.rblocks + g.fwalk, g.bt, 0, st>>>(
+                S->primes, S->rowrt, S->logp, S->plat, nrow, fb->n - nrow, nband, rows,
+                xmax, cfg->logI, log_region, bk->cursor, bk->bucket, lay, bk->overflow,
+                cfg->sieve_skip, gate, gshift, bk->index, bk->icap, bk->index_ovf,
+                g.rblocks, g.fwalk, skip57);
+        } else {
+            if (nrow) {
+                const uint64_t nthr = (uint64_t)((nrow + 31u) >> 5) * nband * 32u;
+                auto *const rows_kern = bk->index ? k_fill_rows<SLABBED, true>
+                                                  : k_fill_rows<SLABBED, false>;
+                rows_kern<<<(unsigned)((nthr + 255) / 256), 256, 0, st>>>(
+                    S->primes, S->rowrt, S->logp, nrow, nband, rows, cfg->logI,
+                    log_region, bk->cursor, bk->bucket, lay, bk->overflow,
+                    cfg->sieve_skip, j_base, gate, gshift,
+                    bk->index, bk->icap, bk->index_ovf, skip57);
+                /* Only k_resieve_scatter reads the row tier's walk state, and only
+                 * when --resieve-rows is off; nothing else needs it. */
+                if (SLABBED && !cfg->resieve_rows)
+                    k_rows_walk_next<<<(nrow + 255) / 256, 256, 0, st>>>(
+                        S->primes, S->rowrt, nrow, j_base + rows, cfg->logI,
+                        S->walk_cur, S->walk_next);
+            }
+            /* The rest by pointer offset: k_fill_atomic indexes every per-entry
+             * array by the same k. */
+            if (fb->n > nrow) {
+                auto *const fill_kern = bk->index ? k_fill_atomic<4, SLABBED, true>
+                                                  : k_fill_atomic<4, SLABBED, false>;
+                fill_kern<<<fblocks, fthreads, 0, st>>>(
+                    S->plat + nrow, S->logp + nrow, fb->n - nrow, xmax, cfg->logI,
+                    log_region, bk->cursor, bk->bucket, lay, bk->overflow,
+                    SLABBED ? S->walk_cur + nrow : NULL,
+                    SLABBED ? S->walk_next + nrow : NULL,
+                    cfg->sieve_skip, j_base, gate, gshift,
+                    bk->index, bk->icap, nrow, bk->index_ovf, skip57);
+            }
         }
     }
     if (!do_apply) {
@@ -2886,7 +2942,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         size_t extra = 0;
         for (int side = 0; side < 2; side++) {
             const pside_t *S = side ? &S1 : &S0;
-            extra += (size_t)S->nfb * sizeof(plat_t) + (size_t)S->nrow * 4;
+            extra += (size_t)S->nfb * sizeof(plat_t) + (size_t)S->nrow_fill * 4;
             if (SLABBED) extra += (size_t)S->nfb * sizeof(uint64_t);
         }
         /* bench_main refuses these combinations on the command line; a caller
@@ -2912,8 +2968,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             for (int side = 0; side < 2 && e == cudaSuccess; side++) {
                 pside_t *S = side ? &S1 : &S0;
                 e = cudaMalloc(&S->plat_alt, (size_t)S->nfb * sizeof(plat_t));
-                if (e == cudaSuccess && S->nrow)
-                    e = cudaMalloc(&S->rowrt_alt, (size_t)S->nrow * 4);
+                if (e == cudaSuccess && S->nrow_fill)
+                    e = cudaMalloc(&S->rowrt_alt, (size_t)S->nrow_fill * 4);
                 if (e == cudaSuccess && SLABBED)
                     e = cudaMalloc(&S->walk_spare,
                                    (size_t)S->nfb * sizeof(uint64_t));
@@ -2971,7 +3027,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         size_t extra = need + (size_t)nregion_alloc * 4 + 4;
         for (int side = 0; side < 2; side++) {
             const pside_t *S = side ? &S1 : &S0;
-            extra += (size_t)S->nfb * sizeof(plat_t) + (size_t)S->nrow * 4;
+            extra += (size_t)S->nfb * sizeof(plat_t) + (size_t)S->nrow_fill * 4;
         }
         if (!qpipe) {
             snprintf(why, sizeof why, "the pipeline is single-queued");
@@ -3008,8 +3064,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 S->xrowrt[0] = S->rowrt; S->xrowrt[1] = S->rowrt_alt;
                 S->xev0[0] = S->ev[0];   S->xev4[0] = S->ev[4];
                 e = cudaMalloc(&S->xplat[2], (size_t)S->nfb * sizeof(plat_t));
-                if (e == cudaSuccess && S->nrow)
-                    e = cudaMalloc(&S->xrowrt[2], (size_t)S->nrow * 4);
+                if (e == cudaSuccess && S->nrow_fill)
+                    e = cudaMalloc(&S->xrowrt[2], (size_t)S->nrow_fill * 4);
                 for (int t = 1; t < 3 && e == cudaSuccess; t++) {
                     e = cudaEventCreate(&S->xev0[t]);
                     if (e == cudaSuccess) e = cudaEventCreate(&S->xev4[t]);
@@ -3121,6 +3177,35 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                " side 0: %u), %s\n", cfg->fill_rows, cfg->fill_rows,
                S1.nrow, S0.nrow,
                cfg->fill_row_bands ? "fixed row bands" : "auto row bands");
+    if (!cfg->fill_merge) {
+        runlog_note("fill-merge", "off");
+    } else if (SLABBED) {
+        printf("  --fill-merge: off, because this plan has several slabs per q\n");
+        runlog_note("fill-merge", "off: several slabs per q");
+    } else {
+        char who[2][80];
+        for (int side = 0; side < 2; side++) {
+            const pside_t *S = side ? &S1 : &S0;
+            const fill_merge_grid_t g = pipe_fill_merge_grid(cfg, S->nrow_fill,
+                    pipe_row_bands(cfg, slab_plan->jmax), fblocks, fthreads);
+            if (pipe_fill_one_launch<SLABBED>(cfg, S->nrow_fill, S->nfb))
+                snprintf(who[side], sizeof who[side],
+                         "one launch of %u+%u blocks x %u, %u row entries",
+                         g.rblocks, g.fwalk, g.bt, S->nrow_fill);
+            else
+                snprintf(who[side], sizeof who[side], "two launches");
+        }
+        printf("  --fill-merge: q < %d*I by row; side 1: %s; side 0: %s\n",
+               pipe_fill_merge_cut(cfg), who[1], who[0]);
+        runlog_note("fill-merge", "rows<%d*I side1: %s; side0: %s",
+                    pipe_fill_merge_cut(cfg), who[1], who[0]);
+    }
+    {
+        const int skip57 = pipe_fill_skip57<SLABBED>(cfg);
+        if (skip57)
+            printf("  --fill-skip57: fill also drops positions where 5 or 7 divides both i and j\n");
+        runlog_note("fill-skip57", "%s", skip57 ? "on" : "off");
+    }
     if (cfg->resieve_rows)
         printf("  --resieve-rows: the same tier is resieved by row\n");
     if (cfg->fill_gate)
