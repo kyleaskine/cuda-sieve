@@ -1578,6 +1578,11 @@ findings 48–53):
   larger sieve area explains part of that drop and the rest is unexplained.
   Treat any host load as a real, nonzero cost that the kernel timers cannot
   see.)
+  **Run competing CPU work at nice 19** (`nice -n 19 <cmd>`). On a 4-core box
+  without SMT (finding 152), twice the cores of nice-0 work cost C143 37%,
+  and the same load at nice 19 cost 1.6%. The sieve cannot raise its own
+  priority without root, so the competitors have to be lowered. BOINC already
+  runs CPU tasks at the lowest priority.
 
   **The pipeline** prints `GPU-accounted / wall (excl cofac)` for this — the
   standalone does not, so a wall-clock or ETA claim has to come from a pipeline

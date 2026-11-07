@@ -223,11 +223,13 @@ say "== stage 1: $(echo $NAMES | wc -w) arms, $(date +%T)"
 run_stage 1 "$NAMES" "$@"
 summarise 1
 
-# Each knob's winner: the adopted arm with the largest gain, by flag name;
-# BEST is the largest gain of all.
-WIN=$(awk '$3 == 1 { print }' "$DIR/s1.pick" 2>/dev/null | while read m g ok; do
-        printf '%s %s %s\n' "$(flags_of $m | cut -d' ' -f1)" "$g" "$m"; done |
-      sort -k1,1 -k2,2gr | awk '!seen[$1]++ { print $3 }')
+# Each knob's winner: the adopted arms by gain, largest first, each kept only
+# if it sets no flag a larger winner sets (arms that share a flag are one knob,
+# and an -a arm may set several); BEST is the largest gain of all.
+WIN=$(awk '$3 == 1 { print }' "$DIR/s1.pick" 2>/dev/null | sort -k2,2gr | while read m g ok; do
+        printf '%s %s\n' "$m" "$(for f in $(flags_of $m); do case $f in --*) printf '%s ' $f ;; esac; done)"; done |
+      awk '{ ok = 1; for (i = 2; i <= NF; i++) if ($i in used) ok = 0
+             if (ok) { for (i = 2; i <= NF; i++) used[$i] = 1; print $1 } }')
 BEST=$(awk '$3 == 1 { print }' "$DIR/s1.pick" 2>/dev/null | sort -k2,2gr | awk 'NR == 1 { print $1 }')
 COMBO=""; for m in $WIN; do COMBO="$COMBO $(flags_of $m)"; done; COMBO=$(echo $COMBO)
 nwin=$(echo $WIN | wc -w)

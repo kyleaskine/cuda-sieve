@@ -18057,12 +18057,326 @@ verdict; here it does.
 
 The 5070's lead grows with job size: 2.6x at C143, 3.9x at C183, 5.0x at C194.
 
+### After `--fill-merge` (2026-11-03, the same rental, `4583fbc7`)
+
+C143, 6 rounds, default 10.955 ms/q (11.515 before, a different session), spread
+1.19%: `--no-fill-merge` +5.71%, so the merge is worth about −5.4% on sm_86,
+against −2.4% on the 5070. `--fill-blocks` 18432 +1.37%, 36864 +2.28%, 73728
++3.83%, all 0 of 6. The merge has taken the two-launch fill's −1.35%, and the
+default stands at C143 on this card.
+
+C194, 6 rounds, default 693.070 ms/q (712.890 before, a different session),
+spread 0.35%. It has no merge, so the fill grid's gain stands and grows:
+`--fill-blocks` 9216 −0.21%, 18432 −5.21%, **36864 −8.53%**, all 6 of 6, and
+36864 is the top of the grid. 2304 +1.67%, 1152 +4.06%. The tier cuts hold again.
+`--fill-gate-shift` 4 −0.49% (6 of 6), 2 +1.72%, 1 +4.84%. Why a multi-slab plan
+on this card wants so many more blocks than the 5070 does is not known.
+
+C194 past the grid (`tune.3060.c194.b`, 6 rounds, default 693.345 ms/q, spread
+0.36%): `--fill-blocks` 36864 −8.42%, 73728 −12.71%, **147456 −16.50%**, all 6
+of 6. The curve has still not turned.
+
+The first C194 run's outputs put the gain in fill. Means per q, which overlap
+under `--q-pipeline`:
+
+| | wall | fill | apply |
+|---|---:|---:|---:|
+| 3060, default | 687 | 465 | 172 |
+| 3060, 36864 | 628 | 403 | 161 |
+| 5070, default (finding 150, 30 q) | 136.5 | 50.2 | 60.3 |
+| 3060 / 5070 | 5.0x | 9.3x | 2.8x |
+
+Apply scales with the card and fill falls much further. The plan targets 32768
+bucket regions per slab, so 4 MB of open lines, against this card's 2 MB of L2
+(28 SMs, banner) and the 5070's 48 MB. Finding 1's footprint rule is the leading
+suspect, not confirmed. The card has 11.76 GB.
+
+To the cap (`tune.3060.c194.c`, 13:55, load 0.48, default 693.330 ms/q, spread
+0.17%), all 6 of 6:
+
+| `--fill-blocks` x threads | threads | entries per thread, side 1 / side 0 | wall |
+|---|---:|---:|---:|
+| 147456 x 32 | 4.7M | 2.8 / 1.9 | −16.52% |
+| 294912 x 32 | 9.4M | 1.4 / 0.95 | −18.26% |
+| **589824 x 32** | 18.9M | 0.70 / 0.48 | **−19.02%** |
+| 1048576 x 32 | 33.6M | 0.39 / 0.27 | −18.50% |
+| 36864 x 128 | 4.7M | 2.8 / 1.9 | −13.36% |
+
+The bucketed entries are 13,153,734 (side 1) and 8,967,916 (side 0), from the
+banner. **The curve turns at the first grid that gives every entry its own
+thread on both sides.** Past it, idle blocks cost 0.5%. So the gain comes from
+the grid-stride loop running once, not from blocks as such. At the same 4.7M
+threads, 128-thread blocks keep most of it (−13.36% against −8.42% for 36864 x
+32) but lose 3.2 points to 32-thread blocks. Why one entry per thread pays this
+much here is not known.
+
+C183, one slab and merged (`tune.3060.c183.b`, 14:33, default 145.875 ms/q,
+spread 0.36%), all 6 of 6: 36864 −3.33%, 147456 −6.03%, 589824 −6.30%. Its
+bucketed entries are 7,601,776 and 3,953,784, so 147456 x 32 covers side 0, and
+589824 x 32 covers both. **This gain does not need several slabs.** Across the
+three jobs on this card, it follows the open-line footprint:
+
+| job | bucket regions | open lines | bigger grids |
+|---|---:|---:|---|
+| C143 | 8192 | 1 MB | lose (+2.28% at 36864) |
+| C183 | 32768 | 4 MB | −6.30% at 589824 |
+| C194 | 32768 per slab | 4 MB | −19.02% at 589824 |
+
+All three are against 2 MB of L2. The default is 3.1% above 2026-11-02's 141.480
+(`b78b2f70`, before the merge, another session). C143 and C194 came out faster
+across the same change. The 3060 has no M0 arm on C183, and its merged walk
+runs 128-thread blocks, which lost 3.2 points at C194.
+
+C183 with the merge off (`tune.3060.c183.c`, 14:49, default 145.955 ms/q,
+spread 0.40%), all 6 of 6:
+
+| arm | wall |
+|---|---:|
+| `--no-fill-merge` | −2.67% |
+| `--fill-blocks 589824` (merged) | −6.34% |
+| **`--no-fill-merge --fill-blocks 589824`** | **−9.86%** |
+
+Stage 2 timed the same flags again: −9.89%. **On this card the merge costs C183
+2.7% even at the default grid.** It is worth −5.4% at C143 here and −1.0% at
+C183 on the 5070 (finding 150). At the big grid the two-launch fill beats the
+merged one by 3.5 points. That fits C194's T128 result: the merged walk runs
+128-thread blocks, and at the same thread count those lose about 3 points to 32.
+So the rule a small-L2 card wants at C183 is no merge plus about one entry per
+thread. At C194, which has no merge, it is just the grid.
+
+Stage 2 had combined `F589824` and `M0F589824` into `--fill-blocks 589824
+--no-fill-merge --fill-blocks 589824`. `tune.sh` took each arm's first flag as
+its knob. It now treats any two arms that share a flag as one knob, keeping the
+larger gain, so this run would have recommended `M0F589824` without a stage 2.
+
+### The 5070 on C194 at the same grids: it loses
+
+2026-11-03 09:52, installed `2c0b13b8`, `work/tune5070.c194.big`. The CPU was
+busy (ECM and msieve, load 22 on 16 threads) and the spread was 5.54%. Windows
+GPU use was dwm and a browser, 0.3-1.1% (pid 8660 in the log is `vmwp`, which is
+bench itself). Default 145.040 ms/q:
+
+| arm | wall | rounds faster | sieve, both sides | TD + classify, wall |
+|---|---:|---:|---:|---:|
+| default | — | — | 112.75 | 101.64 |
+| 18432 | +1.13% | 1 of 6 | 111.68 | 101.31 |
+| 147456 | +1.65% | 2 of 6 | 113.23 | 105.14 |
+| 589824 | **+4.49%** | 0 of 6 | 104.71 | 111.76 |
+| 36864 x 128 | +0.35% | 2 of 6 | 112.01 | 102.59 |
+
+(Stage columns are means per q; they overlap under `--q-pipeline`.)
+
+At 589824, the sieve is 8 ms faster even here, and fill and apply both drop
+(48.2 and 52.7 ms against 50.2 and 58.7). But trial division, which runs beside
+the sieve, is 10 ms slower. A likely reason is finding 134's dispatch order: a
+launch waits behind another launch's undispatched blocks, and this grid queues
+589,824 of them. On the 3060 fill is two thirds of wall, so the trade pays. On
+the 5070 it doesn't. **A grid sized from the entry count cannot be the default
+on every card.** One rule that fits both cards so far is open-line footprint
+against L2. That would put most Turing and Ampere cards (2-6 MB of L2) on the big
+grid and Ada and Blackwell (24 MB and up) on 4608. Two cards don't establish it.
+
+### The RTX 4070 SUPER (sm_89, 48 MB of L2): C194 gains, C183 keeps the defaults, and C143 wants a higher warp cut
+
+2026-11-03 15:21-15:56, Kyle, rented, `0f8ae275` clean (bench `1eb307f0`),
+driver 13.3, 6 rounds, load about 1. Banner: 56 SMs, 48 MB of L2. Evidence:
+`work/tune4070s/report.txt`.
+
+| job, default ms/q (spread) | arm | wall | rounds faster |
+|---|---|---:|---:|
+| C194, 217.775 (0.37%) | `--fill-blocks` 18432 | −0.77% | 6 of 6 |
+| | 147456 | −3.56%, adopted | 6 of 6 |
+| | **589824** | **−4.17%, adopted** | 6 of 6 |
+| C183, 42.980 (0.21%) | `--no-fill-merge` | +3.34% | 0 of 6 |
+| | `--fill-blocks` 147456 | +0.12% | 0 of 6, 1 tied |
+| | 589824 (merged) | +2.08% | 0 of 6 |
+| | `--no-fill-merge --fill-blocks 589824` | +2.56% | 0 of 6 |
+| C143, 5.290 (0.00%) | `--ss-warp-cut` 128 / 384 / **512** / 1024 | +5.29 / −1.51 / **−1.70** / −0.95% | 0 / 6 / 6 / 6 of 6 |
+| | `--ss-block-cut` 40 / 48 / 64 | +0.09 / +0.95 / +1.70% | 0 of 6 |
+| | `--fill-blocks` 1152 / 2304 / 9216 / 18432 / 36864 | 0.00 / −0.19 / +0.66 / +0.95 / +1.51% | 0 / 5 / 0 / 0 / 0 of 6 |
+| | `--fill-gate-shift` 1 / 2 / 4 | +0.76 / +0.28 / +1.32% | 0 of 6 |
+| | `--no-fill-merge` | +3.50% | 0 of 6 |
+
+C194 recommends `--fill-blocks 589824`, C143 `--ss-warp-cut 512` (W384 and W512
+are one knob; W1024's 0.95% is under the 1% bar). C183 keeps the defaults.
+
+The same arms on the three cards:
+
+| arm | 3060, 2 MB | 4070S, 48 MB | 5070, 48 MB |
+|---|---:|---:|---:|
+| C194, `--fill-blocks 589824` | −19.02% | −4.17% | +5.83% quiet, +4.49% at load 22 |
+| C183, `--no-fill-merge` | −2.67% | +3.34% | about +1.0% (finding 150) |
+| C183, merged 589824 | −6.34% | +2.08% | not timed |
+| C183, `--no-fill-merge` + 589824 | −9.86% | +2.56% | not timed |
+| C143, `--no-fill-merge` | +5.71% | +3.50% | about +2.4% (finding 150) |
+
+**The footprint rule fails at C194.** Its 4 MB of open lines fit in 48 MB of L2
+twelve times over, and the big grid still wins every round. At C183 the rule
+still fits: the 4070S keeps the merge and the default grid. With the merge off,
+the big grid is worth 0.75% here against `--no-fill-merge` alone, and 7.4% on the
+3060. So most of the 3060's gain at both jobs follows its 2 MB of L2. Part of
+C194's gain does not.
+
+**The two 48 MB cards disagree at C194, and the cause is the card, not the
+load.** The 4070S gains 4.17%. The 5070 lost 4.49% under load 22 (spread 5.54%),
+so it was rerun on a quiet box. The rerun was at 2026-11-03 11:55, with the same
+installed `2c0b13b8` and the same arms. Load was 3 (two ECM threads), and
+Windows GPU use was dwm at about 1% and Firefox at 0-4.4%. Spread 2.24%,
+`work/tune5070.c194.quiet`. Default 139.925 ms/q. It loses by more, and in every
+round:
+
+| arm | wall | rounds faster | sieve | fill | apply | TD wall | TD on device |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| default | — | — | 115.79 | 50.54 | 60.91 | 102.66 | 95.63 |
+| 18432 | +1.30% | 0 of 6 | 115.19 | 51.54 | 59.29 | 105.42 | 99.33 |
+| 147456 | +3.01% | 0 of 6 | 117.25 | 53.83 | 58.99 | 107.85 | 100.46 |
+| 589824 | **+5.83%** | 0 of 6 | 106.91 | 48.99 | 53.59 | 115.94 | 99.44 |
+| 36864 x 128 | +1.19% | 0 of 6 | 114.90 | 51.80 | 58.82 | 104.98 | 98.13 |
+
+Stage columns are means per q from `work/tune4070s/stages.sh`. They overlap
+under `--q-pipeline`, and each includes the time it shares the card with the
+other q.
+
+At 589824, the sieve is 8.9 ms faster, mostly in apply (−7.3 ms, against −1.5 in
+fill). Trial division beside it is 13.3 ms slower, and 3.8 ms of that is in its
+device-timed kernels. The loaded run made the same trade (sieve −8.0, TD +10.1),
+but there TD's device time fell 1.2 ms. So neither run separates TD waiting
+from TD working. Finding 134's dispatch order is still the likely reason, but it
+is not measured. On the 4070S, trial division does not pay (below).
+
+**C143's warp cut is the first tier cut to differ by card.** Moving moduli 256
+to 512 from a thread per entry to a warp per entry wins every round on the
+4070S. On the 3060, 384 and 512 cost +0.22% and +0.35% here. On the 5070 they
+were not adopted at C135 or C148 (finding 146). That is one job on one card. C147
+on the same card would show whether it holds beyond C143.
+
+The 4070S is 1.22x behind the 5070 at C143 (same job line), and about 1.5x at
+C194. The multi-slab job is where the 5070's lead is largest.
+
+### The 4070 SUPER's warp cut: finding 145's 256 costs Ada 2.0-6.7%. The best is 1024, and 768 at C143, and it adds to the big fill grid at C194
+
+There were two rentals' worth of runs on 2026-11-03 (rental clock): 16:51-17:22
+and 19:19-19:42. Both used the same rental and build, 6 rounds, spread
+0.09-0.33%. The stage means for every 4070S run are in
+`work/tune4070s/report.txt`. Where an arm ran twice, both results are given
+(a / b).
+
+| job (region), default ms/q | 128 | 384 | 512 | 768 | 1024 | 2048 | 4096 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C143 (13), 5.290 | +5.29% | −1.51 / −1.42% | −1.70 / −1.70% | **−1.98%** | −0.95% | — | — |
+| C147 (14), 9.190 | +4.68% | −1.63% | −2.56% | — | **−2.94 / −2.83%** | −1.85% | +1.90% |
+| C183 (14), 43.090 | — | −1.68% | −2.75% | — | **−3.52 / −3.46%** | −2.23% | +0.84% |
+| C194 (14), 217.995 | — | −3.10% | −4.92% | — | **−6.64 / −6.71%** | −6.65% | −5.29% |
+
+All gains and all losses held in 6 of 6 rounds, and repeats agree within 0.11
+points. **The curve turns at 1024 on the three region-14 jobs.** At C194 it is
+flat from 1024 to 2048. At C143, with region 13, it turns at 768.
+`--ss-warp-cut 1024 --fill-blocks 589824` at C194 is **−10.85%** (6 of 6),
+which is the sum of −6.71 and −4.17, so the two knobs add. Its fill is 74.19 ms
+and its apply 83.12 ms, against 92.78 and 86.23 at 1024 alone.
+
+C147's full grid
+otherwise keeps the defaults: the block cuts lose (+0.05 to +0.76%), the fill
+grid ties or loses, the gate shift loses, and the merge is worth 5.0%.
+
+**The gain is in apply,** where the small sieve runs. Means per q at 1024 against
+the default (512 at C143):
+
+| job | apply | fill | TD wall |
+|---|---:|---:|---:|
+| C143 | 2.353 → 2.255 (−4.2%) | 3.777 → 3.774 | 4.05 → 3.96 |
+| C147 | 4.656 → 4.169 (−10.5%) | 6.220 → 6.088 | 7.16 → 6.90 |
+| C183 | 18.57 → 16.98 (−8.5%) | 26.53 → 26.69 | 32.91 → 31.69 |
+| C194 | 102.00 → 86.30 (−15.4%) | 91.81 → 92.90 | 167.90 → 156.70 |
+
+This reverses finding 145 on this card. That finding lowered the warp cut from
+1024 to 256 on the 5070, where 2048 and 4096 lost 0.9-8.1% at four jobs. On the
+3060, 1024 loses 0.33-1.65% (finding 149's first table). So Ada wants the
+opposite of Ampere and Blackwell, and by more as the job grows. Finding 145
+found 256 best on the 5070 at both region 13 (C135, C143) and region 14 (C148,
+I16). On the 4070S, the one region-13 job turns lower. At a cut of m, a
+thread-tier entry walks about region/m positions, so a doubled region at the
+same cut gives each thread twice the walk, which would explain it. But C143 is
+the only region-13 job, and it also differs in `--logI`, `--J` and the q side,
+so the region is a guess, not a finding (noted 2026-11-04, on a GPT review).
+C143 at `--region 14`, or C147 at `--region 13`, would separate them.
+
+One lead, not tested, comes from Kyle's question about integer rate. The
+thread tier walks one modulus per thread, a loop of adds, compares and
+shared-memory updates. Blackwell's SMs do 32-bit adds at twice Ada's rate per
+clock (NVIDIA's claim; IMAD did not double). If that holds, a thread-per-entry
+walk costs Ada relatively more, and moving moduli into the warp tier pays
+there. The 3060 has Ada's rate per SM, and it does not gain.
+
+**Tested on the 3060 with fill out of the way (2026-11-04, `tune.3060.c194.w`
+and `.c183.w`, bench `4583fbc7`, 6 rounds, spread 0.14-0.19%, load 0.1-1.1):
+the warp cut still loses, and apply is where it loses.** An earlier objection
+was that the 3060's slow fill might hide apply. With the big grid, fill is half
+its default size, and:
+
+| job, arm | wall vs default | apply ms |
+|---|---:|---:|
+| C194 `--fill-blocks 589824` | −18.90% | 136.02 |
+| + `--ss-warp-cut 512` | −18.83% | 136.60 |
+| + `--ss-warp-cut 1024` | −18.55% | 138.25 |
+| C183 `--no-fill-merge --fill-blocks 589824` | −9.86% | 35.36 |
+| + `--ss-warp-cut 512` | −9.79% | 35.49 |
+| + `--ss-warp-cut 1024` | −9.46% | 35.93 |
+
+At 1024, apply rises 1.6% at both jobs; on the 4070S it fell 15.4% at C194.
+Ampere has Ada's integer rate per SM, so the integer rate does not explain why
+Ada wants the higher cut, and the cause is open. An ncu pipe breakdown of
+apply at 256 and 1024 on an Ada card is still the way to find it. The repeats
+agree with the earlier 3060 runs: C194 589824 −18.90% (−19.02% before), C183
+`--no-fill-merge` 589824 −9.86% (−9.86%).
+
+**The 4070S's fill grid at C194, by stage:** at 589824, fill falls from 91.68
+to 73.26 ms (−20%), apply is level (101.84 to 99.54), and trial division's wall
+does not move (167.53 to 167.78). The 5070 at the same grid gains 1.5 ms in fill
+and loses 13.3 ms in trial division. At the default grid, the 4070S's stages
+against the quiet 5070 run are: fill 1.81x, apply 1.67x, TD on device 1.57x,
+wall 1.57x. No stage stands out, so trial division shows no separate
+integer-rate gap. Fill is the stage furthest behind, and it is the one the big
+grid recovers.
+
+**Clocks (run3, sampled every 30 s):** under load, the SM ran at 2565-2745 MHz,
+mostly 2700-2745. The 4070S's rated boost is 2475. Memory ran at 10251 of 10501
+MHz, power at 184-216 W of the stock 220 W limit, and the card at 61-71 °C. The
+card is not throttled. With 56 SMs, it has about 9% more SM cycles per second
+than the 5070 (48 SMs at 2887-2925 MHz).
+
+So clocks do not explain the 1.57x gap at C194. With both knobs set it closes
+to 1.40x: at C194 that run's wall is 191.61 ms against the quiet 5070's 137.14
+(means). Fill is 1.47x and apply 1.42x. The bandwidth ratio is 672 / 492 GB/s =
+1.37x at the clock seen. **That the rest is close to the bandwidth ratio does
+not show it is bandwidth** (corrected 2026-11-04, on a GPT review). No DRAM
+throughput was read on either card, and apply, which reads buckets from DRAM
+but sieves in shared memory, is nearly as far behind as fill. An ncu memory
+throughput read of fill and apply on both cards would test it. C143 runs 1.20x
+behind.
+
+At C183, the merged 589824 cuts fill from 26.49 to 18.61 ms, but wall rises 2.1%
+and TD's wall rises 3.4 ms. Under `--q-pipeline` the stage times include
+sharing the card, so the two may just have traded the card's time.
+
 ### Next
 
-1. On a 3060 if one is rented again: `-a "F18432=--fill-blocks,18432
-   F27648=--fill-blocks,27648 F36864=--fill-blocks,36864
-   F73728=--fill-blocks,73728"` at C194 and C143.
-2. Defaults per arch still wait for several reports that agree; this is one.
+1. A warp-cut default per arch, Kyle's call. The warp cut is host-only
+   (finding 146), so the resolver can pick it from the device's compute
+   capability. sm_86 keeps 256: the 3060 loses at 1024 with or without the
+   big grid. For sm_89 the 4070S supports 1024, and 768 at C143. A single
+   1024 still beats 256 on all four jobs (−0.95% at C143). Other Ada cards have
+   the same SM, which is what apply exercises, but this is one card, and the
+   fill grid showed that L2 and bandwidth can flip a result. A second Ada card
+   (a 4060 Ti or a 4090) on the warp-cut arms should agree before a default.
+2. Another small-L2 card (an RTX 3070 or 3080 at 4-5 MB, or a Turing card) on
+   C183 and C194 at 4608, 147456 and 589824, with C183 also run with
+   `--no-fill-merge`.
+3. At C194 the big grid now wins on sm_86 and sm_89 and loses on sm_120, with
+   one card of each. An opt-in `--fill-blocks` mode sized from each side's
+   entry count would let every report time one entry per thread directly. It
+   needs Kyle's go-ahead. Defaults per arch still wait for several reports that
+   agree.
 
 ## Finding 150 — finding 148's three, landed: `--fill-merge` on one-slab plans, `--fill-skip57` on plans of several slabs per q, and `tune.sh`'s larger grid. Against the installed `0c7dda1f`, wall is −0.6 to −3.6% across eight jobs, relations byte-identical. Built and gated as fat `2c0b13b8` (`work/fillmerge/`), after Kyle's code review; installed 2026-11-02 17:02, Kyle's call
 
@@ -18166,10 +18480,8 @@ has most of its fill off the chain.
 ### What this does not establish
 
 The defaults were measured on sm_120 only, and the block size and cut were
-chosen there. The other archs are compiled, and their code unexercised. On a
-3060, `tune.sh`'s `M0` arm answers whether the merge pays. `--fill-merge` makes
-finding 149's `--fill-blocks` advice due for a retest, since that report ran
-the two kernels apart.
+chosen there. On sm_86 the merge has since been timed at one job: −5.4% at C143
+(finding 149). Other archs are compiled, and their code unexercised.
 
 ### Install
 
@@ -18179,3 +18491,179 @@ the two kernels apart.
 with cofcheck's new merge and skip cases. `0c7dda1f` is kept at
 `work/review/bench.installed.146r`, the new one copied to
 `work/fillmerge/bench.installed.150`.
+
+<a id="finding-151"></a>
+## Finding 151 — on native Linux a blocking wait sleeps: 0.003 of a core over 10 ms waits, at ~23 µs more per wake. Plain events spin at a full core under every schedule flag, `--blocking-sync`'s included, as finding 106 said. `--blocking-sync` already takes C143 from 1.00 to 0.69 of a core on the 3060
+
+**Date:** 2026-11-04 (rental clock 11-05 00:35). The first step of STATUS
+NOW/NEXT row 12, prompted by a GPT review that restated finding 106's plan.
+Rented RTX 3060 (sm_86), native Linux, driver 610.57.04, 24 logical CPUs,
+load 0.5, after `run4` (finding 149) left the card idle. Bench `4583fbc7`
+(commit `0f8ae275-dirty`, before finding 150; nothing since has changed how
+the host waits). Script, source and log: `work/waitbench/` (`waitbench.cu`,
+`run.sh`, `run.3060.log`).
+
+### The wait check
+
+`waitbench` launches a one-thread kernel that spins for a fixed time on
+`%globaltimer`, then waits for it, n times. It runs one process per device
+schedule flag, since the flag must be set before the context exists, and
+checks that the flag took. CPU is the process's user + system time (all
+threads) per wall second. Overhead is the wall per wait minus the kernel's
+length, so it includes the launch. Selected rows:
+
+| schedule flag | wait | CPU at 100 µs | 1 ms | 10 ms | overhead |
+|---|---|---:|---:|---:|---:|
+| any of the four | `cudaEventSynchronize`, plain event | 1.000 | 1.000 | 1.000 | 6.6-7.8 µs |
+| any of the four | `cudaEventSynchronize`, `cudaEventBlockingSync` event | 0.20-0.22 | 0.03 | 0.003 | 27.6-38.6 µs |
+| auto, spin | `cudaStreamSynchronize` | 1.000 | 1.000 | 1.000 | 5.3-5.7 µs |
+| yield | `cudaStreamSynchronize` | 1.000 (70% system) | 1.000 | 1.000 | 5.6 µs |
+| block | `cudaStreamSynchronize` | 0.197 | 0.026 | 0.003 | 28.6-32.0 µs |
+
+- **A blocking wait really sleeps on native Linux.** Over a 10 ms wait it uses
+  0.3% of a core. Each wake costs about 23 µs more than spinning.
+- **The device flag covers stream syncs but not plain events.** Under
+  `cudaDeviceScheduleBlockingSync`, `cudaStreamSynchronize` sleeps, but a plain
+  event still spins at a full core. Only the event's own flag makes
+  `cudaEventSynchronize` sleep, under any schedule flag. That is finding 106's
+  reading of NVIDIA's documentation, now measured.
+- **`auto` spins here** (one context, 24 CPUs), and **`yield` frees nothing
+  that the accounting sees:** a full core, 70% of it system time.
+
+### C143 with and without `--blocking-sync`
+
+The C143 job line, 2000 q, two rounds alternating. CPU and wall are bash
+`time` over the whole process, startup included.
+
+| arm | round | user + sys s | wall s | CPU / wall | CPU ms per q | wall clock per q |
+|---|---:|---:|---:|---:|---:|---:|
+| default | 1 | 22.46 | 22.459 | 1.000 | 11.23 | 10.74 ms |
+| `--blocking-sync` | 1 | 15.51 | 22.497 | **0.689** | 7.75 | 10.74 ms |
+| default | 2 | 22.46 | 22.456 | 1.000 | 11.23 | 10.74 ms |
+| `--blocking-sync` | 2 | 15.64 | 22.617 | **0.692** | 7.82 | 10.82 ms |
+
+**The existing flag already frees 31% of a core at C143.** That comes from the
+stream and copy waits it does cover. Its wall cost was 0 and +0.7% in the two
+rounds. That is below the 1.0-1.2% spread `tune.sh` saw at C143 on this card,
+so two rounds don't settle it. Without the flag the process uses exactly one
+core, so the other threads' work is too small to show beside the spinning
+wait.
+
+### What this means for row 12
+
+- **Blocking events are worth building.** The remaining 0.69 of a core
+  includes the side, TD and intersection event waits, which still spin. How
+  much is real host work is not measured; making those events
+  `cudaEventBlockingSync` under `--blocking-sync` measures it directly. Keep
+  timing on events read by `cudaEventElapsedTime`. Finding 135's timed `E[14]`
+  hold is a separate effect.
+- **The cost is per wake, so small jobs pay most.** ~23 µs per wait on the
+  critical path, and C143 makes many waits per 10.7 ms q, though with two q in
+  flight some wakes may hide. Time it on C143 with enough rounds to beat its
+  spread, and on C183 or C194.
+- **Not yet run:** WSL2 (finding 107's question; `sh work/waitbench/run.sh
+  <bench dir> 5070` once the 5070 is idle), and native Windows. `waitbench.cu`
+  builds there too (`GetProcessTimes`), and native Windows is where most
+  volunteers are.
+- **Whether a saving reaches BOINC** depends on the CPU share the app's plan
+  class declares. That is a question for Greg.
+
+**Parked, 2026-11-04 (Kyle's call):** freeing part of a core is not worth wall
+time. The blocking events are not built, and `--blocking-sync` stays opt-in.
+The measurements above stand for when the question comes back.
+
+<a id="finding-152"></a>
+## Finding 152 — on a 4-core CPU without SMT, contention is a scheduling problem and priority removes it. Competing work at nice 0, twice the cores, costs C143 37%, C147 22% and C183 6.7%; the same load at nice 19 costs 1.6%, 0.8% and 0%. `--blocking-sync` is no fix
+
+**Date:** 2026-11-06, Kyle's basement box: Intel i5-2500K (4 cores, no SMT,
+3.3 GHz, PCIe gen 2), RTX 5060 Ti (sm_120), driver 617.42, native Linux. Bench
+`90114830`, built there from HEAD (`0f8ae27`) with `-march=native`. The
+installed bench here, built `-march=native` on the 9800X3D, uses AVX-512, AVX2
+and BMI2, so it cannot run on Sandy Bridge. Harness: `work/contend/contend.sh`
+and `run.sh`, 3 rotated rounds per job. Log: `work/contend/run.5060ti.log`.
+
+Kyle's aim (2026-11-04): when the CPU is busy, the sieve should work through it
+without losing time. Findings 56 and 96 measured contention on the 9800X3D
+(8 cores, 16 threads), where renicing the competitors bought almost nothing.
+A slow 4-core CPU without SMT should show the cost more plainly.
+
+### Arms
+
+Spinners are shell busy loops (pure ALU), started 2 s before each run and
+killed by PID after it. The sieve ran at nice 0.
+
+| arm | spinners | nice | runnable threads on 4 cores |
+|---|---:|---:|---:|
+| idle | 0 | — | 1 |
+| fit | 3 | 0 | 4 (the `nproc - 1` rule) |
+| busy | 4 | 0 | 5 |
+| busy19 | 4 | 19 | 5 |
+| over | 8 | 0 | 9 |
+| over19 | 8 | 19 | 9 |
+| busyB, overB | as busy, over | 0 | with `--blocking-sync` |
+
+### Result
+
+Median wall clock per q, and the change against idle. All 72 runs completed.
+Per-arm min..max and the per-run lines are in the log.
+
+| job, idle ms/q | fit | busy | busy19 | over | over19 | busyB | overB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C143, 6.970 | +2.15% | +10.47% | **+1.58%** | **+37.16%** | **+1.58%** | +10.19% | +33.72% |
+| C147, 10.690 | +1.12% | +9.26% | **+0.94%** | **+22.26%** | **+0.75%** | +6.45% | +26.94% |
+| C183, 54.190 | −0.11% | +2.23% | **+0.07%** | **+6.66%** | **−0.04%** | +2.10% | +7.10% |
+
+The sieve's CPU per wall second (bench's user + sys over wall, averaged):
+
+| job | idle | busy | busy19 | over | over19 |
+|---|---:|---:|---:|---:|---:|
+| C143 | 0.993 | 0.740 | 0.983 | 0.427 | 0.976 |
+| C147 | 0.966 | 0.729 | 0.959 | 0.431 | 0.985 |
+| C183 | 0.936 | 0.716 | 0.977 | 0.415 | 0.973 |
+
+### What it means
+
+- **Here the cost is time-slicing, and priority removes it.** At nice 0, the
+  sieve's thread gets about its fair share of the CPUs: 0.43 of a core with 9
+  runnable threads on 4 (4/9 is 0.44), and 0.72-0.74 with 5 (4/5 is 0.8).
+  While it waits its turn the GPU runs dry, so wall grows. At nice 19 the same
+  load, even twice the cores, costs 1.6% at C143 and nothing at C183, because
+  the sieve gets 0.96-0.99 of a core.
+- **Small jobs are the most exposed,** as findings 56 and 96 said: at `over`,
+  37% at C143, 22% at C147, 6.7% at C183. A short q has more host handoffs per
+  second, so each wait to be scheduled costs more of it.
+- **Keeping competitors to `nproc - 1` costs little without SMT:** 2.2% at
+  C143 and nothing at C183. On the 9800X3D at one thread per logical CPU it
+  was 3% at C183 and 6% at c147 (findings 96 and 56).
+- **This differs from the 9800X3D, and SMT is the likely reason.** There
+  (finding 56), renicing 12 sievers to 19 moved c147 from 24.72 to 24.50 ms/q.
+  At 13 runnable threads on 16 logical CPUs nothing time-slices, so priority
+  has nothing to act on, and the remaining cost would be the sibling thread on
+  the sieve's core. That is inferred, not measured: this box has no SMT to
+  compare.
+- **`--blocking-sync` is no fix.** busyB is −0.3 points against busy at C143
+  and −0.1 at C183, and −2.8 at C147 (ranges apart). overB is −3.4 at C143 but
+  +4.7 at C147 and +0.4 at C183. Its waits sleep, CPU falls (0.63-0.66 at busy,
+  0.23-0.30 at over), and system time rises (4.6-4.7 s of C143's 17-18 s at
+  busyB). But the thread still waits for the CPU when it wakes. Row 12 stays
+  parked.
+
+### For volunteers and for Kyle's box
+
+- **BOINC already runs CPU work at the lowest priority** by default, so a
+  volunteer running CPU tasks alongside should be near the nice-19 rows.
+  BOINC runs GPU tasks one step up, not at nice 0 (on Linux this should be
+  nice 10; not checked). The sieve at nice 10 against nice-19 work is not
+  measured.
+- **On a box where competing work runs at nice 0** (Kyle's ECM, msieve and
+  `krylov` all do, 2026-11-06), starting that work with `nice -n 19` should
+  remove the time-slicing part of the cost. It is zero code, and the sieve
+  cannot do it for itself: a non-root process cannot raise its own priority.
+  On the 9800X3D, finding 56 suggests most of the cost below one thread per
+  logical CPU is not time-slicing, so nice helps there only when the box is
+  oversubscribed.
+- **A code fix** for the nice-0 case would make the GPU need the host less
+  often per q: more q in flight (two are fixed now, with no option), counts
+  kept on the GPU, graphs. That is row 12's later steps, aimed at wall time
+  under load rather than at CPU. With nice available it pays only where
+  competing work runs at normal priority, and mostly on small jobs.
