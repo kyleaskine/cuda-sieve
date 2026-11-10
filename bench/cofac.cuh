@@ -488,9 +488,12 @@ CF_FN void x_dbl(mpt<L> *r, const mpt<L> *p, const mz<L> *an, const mz<L> *ad,
     mz_mul<L>(&s1, &t1, &t1, n, n0inv);            /* (X+Z)^2 */
     mz_mul<L>(&s2, &t2, &t2, n, n0inv);            /* (X-Z)^2 */
     d = s1; mz_sub_mod<L>(&d, &s2, n);             /* 4XZ     */
-    mz_mul<L>(&t1, ad, &s1, n, n0inv);
-    mz_mul<L>(&r->X, &t1, &s2, n, n0inv);          /* ad*(X+Z)^2*(X-Z)^2 */
+    /* ad*(X-Z)^2 serves both coordinates. X used to rebuild it as
+     * (ad*(X+Z)^2)*(X-Z)^2, one more product for the same residue: mz_mul
+     * returns the canonical a*b/R mod n in [0, n) (multest checks exactly
+     * that), so both groupings give the same bits (finding 154). */
     mz_mul<L>(&t2, ad, &s2, n, n0inv);
+    mz_mul<L>(&r->X, &t2, &s1, n, n0inv);          /* ad*(X+Z)^2*(X-Z)^2 */
     mz_mul<L>(&w, an, &d, n, n0inv);
     z = t2; mz_add_mod<L>(&z, &w, n);
     mz_mul<L>(&r->Z, &d, &z, n, n0inv);

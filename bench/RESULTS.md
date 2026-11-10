@@ -18811,7 +18811,9 @@ instructions). `abcheck` is 7 of 7 again, and `cofcheck` is 95 of 95.
   Z'.** X' = (ad·s2)·s1 reuses the second, so one product per ladder bit goes
   (13 -> 12), bit-identical. Left for its own step so that this finding
   measures the product alone.
-- **The small-constant ladder:** round 0's sigmas 6..13 all have Suyama
+- **Wrong, see finding 154:** round 0 runs sigmas 1006..1013, not 6..13,
+  so this does not keep the same curves. As first written:
+  **The small-constant ladder:** round 0's sigmas 6..13 all have Suyama
   constants (an : ad) and (u^3 : v^3) below 2^32. A single ladder over the
   product of the prime powers, with one-row products by those constants, would
   be about 8 full + 4 one-row products per bit against 13. The same curves.
@@ -18855,3 +18857,160 @@ Two changes to the procedure. The wait was for an empty card, not for no
 msieve process: the msieve then running was CPU-only. And
 `work/emitw/gate.sh` now blocks only on the CUDA client, not on the CPU
 sieving client that shares its name.
+
+<a id="finding-154"></a>
+## Finding 154 — `x_dbl`'s redundant product removed: 13 -> 12 products per ECM ladder bit, cofactor flush −3.7 to −4.7% on the four ECM-heavy jobs, relations byte-identical. Wall is about −0.2 to −0.6% by the flush savings, below this run's noise. Finding 153's small-constant ladder cannot keep the same curves, and Greg's ladder needs a curve family with a third of Suyama's torsion
+
+**Installed 2026-11-10 09:41, Kyle's call**: fat `5512830e`. See "Install" below.
+
+### The change
+
+`x_dbl` (`cofac.cuh`) formed ad·s1 only to build X' = (ad·s1)·s2, then formed
+ad·s2 again for Z'. X' is now (ad·s2)·s1, which reuses the second, so a
+doubling costs 6 products and a ladder bit 12 (x_add's 6 plus 6). That is what
+the comment above the curve setup always said it cost. `mz_mul` returns the
+canonical a·b/R mod n in [0, n) (`multest` checks exactly that against a
+bit-serial reference), so (ad·s1/R)·s2/R and (ad·s2/R)·s1/R are the same
+residue in the same bits. Every later value is unchanged, so this is identical
+by construction, not only "same gcds".
+
+SASS (sm_120, `work/xdbl/{base,new}`, base = `git archive` of `ad05510`): only
+the four ECM `k_cofac` kernels change. Every other function has the same
+instruction count and byte length. `k_cofac<3,ECM>` goes from 5,424 to 5,320
+instructions, `<3,ECM,s2>` from 11,360 to 11,072, `<4,ECM>` from 6,264 to
+6,088 and `<4,ECM,s2>` from 13,664 to 13,320. Registers: `<3,ECM>` 104 -> 94,
+`<4,ECM>` 128 -> 124, both stage-2 kernels 128 -> 128. Stage-2 stack is 16 B
+smaller at both widths (320 -> 304, 384 -> 368).
+
+### Gates
+
+On the card once Kyle's msieve-s sopt gate left it (`work/xdbl/after_card.sh`,
+06:56-07:19, no Windows 3D users):
+
+- `multest`: 0 of 34 failed.
+- `cofcheck.sh` on NEW: 95 PASS, 0 FAIL, golden test passed.
+- `abcheck.sh` BASE NEW, `SETS="cof stop"`: 7 of 7 identical. c143 and
+  c143.single (155,105 relations), c183 (9,041), c194 (2,218), nfs = I16
+  (2,840) and nfs.single (698), and the c143.target stop (172,906). The two
+  I16 cases ran separately (`runs-abcheck-nfs.txt`). An out-of-tree copy
+  needs `NFS_JOB`/`NFS_FB1` set, because `work/` is not tracked.
+- The timed A/B below: 30 runs, 0 failed, every relation file byte-identical
+  to BASE's.
+
+### Timing
+
+`work/xdbl/ab.sh 3` (finding 153's script and commands), interleaved,
+host load ~18 on 16 threads from Kyle's CPU sievers and GMP-ECM. 3-round
+means, ms/q:
+
+| job | flush | algebraic queue | wall per q |
+|---|---:|---:|---:|
+| c135 | 0.08 -> 0.08 | 0.04 -> 0.04 | 3.64 -> 3.65 |
+| I16 | 4.99 -> 4.76 (−4.7%) | 4.51 -> 4.30 | 130.86 -> 130.23 |
+| c183 | 2.69 -> 2.58 (−4.3%) | 2.43 -> 2.31 | 34.88 -> 34.50 |
+| AS276 | 18.80 -> 17.91 (−4.7%) | 17.49 -> 16.71 | 151.06 -> 147.88 |
+| SNFS-301 | 11.72 -> 11.29 (−3.7%) | 11.01 -> 10.61 | 139.19 -> 141.08 |
+
+The flush times are steady to ~0.3 ms across rounds. Wall per q is not: AS276
+base alone ran 145.7 to 153.8, and SNFS-301 new's round 2 was 146.3 against
+137.9 and 139.0. So the wall column is noise at this load. The flush savings
+put the real wall effect at about −0.6% on AS276, −0.3% on SNFS-301 and c183,
+−0.2% on I16, and nil on c135.
+
+### The small-constant ladder (finding 153's next step) does not work as written
+
+- **Round 0 is not sigmas 6..13.** `cf_run_rounds` launches `k_cofac` with
+  c0 = r + 1 and `mz_split` uses sigma = c0·1000 + cv + 6, so round 0 runs
+  1006..1013 at the default 8 curves. Their Suyama constants (an : ad) are
+  82 and 76 bits, and still 64 or more after dividing out their gcd. Only
+  small sigmas fit in 32 bits: 6..13, and 15 once the gcd is divided out.
+  No caller passes c0 = 0. So no small-constant ladder keeps the same
+  curves.
+- **Greg's 8 + 1 is a different curve family.** His
+  `gpu_stage1_kernel.cuh` ladder is GMP-ECM's `-param 3`: A = 4d/2^32 − 2
+  with x0 = 2, one ladder over all of s. A one-row Montgomery multiply by d is
+  then exactly a24·K, and the difference point (2 : 1) costs one add instead
+  of two products. GMP-ECM's own `EXTRA_SMOOTHNESS_32BITS_D` (`ecm.c`) puts
+  param 3's expected torsion at 1/(3·3^(1/128)) ≈ 0.33 of Suyama's.
+  - Smoothness at our sizes: for a 30-bit factor and B1 ≈ 300 that moves
+    Dickman's u from about 3.10 to 3.29, so ρ ≈ 0.039 against 0.026. That is
+    ~1.5x the curves, against ~0.72x the products per curve. A net loss of
+    about 8% by this estimate. It changes the relations, so trying it means
+    measuring yield, not identity. Not pursued.
+  - GMP-ECM's param 2 keeps Suyama's torsion with x0 = 2, but its d(k) is a
+    large rational needing a modular inverse per record, and this file has
+    none.
+- **A single ladder over all of s, keeping Suyama**, would not even be
+  identical. Today's per-prime-power ladders use the current point as the
+  difference. When the point after 2^e is the 2-torsion point (0 : 1) mod p,
+  every later x_add gives Z ≡ 0 mod p and p is found, though [s]P ≠ O. That
+  is an accidental extra hit at a rate of roughly 2/B1 of the normal ones,
+  which a single ladder would lose.
+
+### What is still identity-preserving
+
+Greg's `gm_sqr_solo` is a dedicated squaring: the off-diagonal products once,
+doubled, plus the diagonal, then a separate Montgomery reduction. 4 of our 12
+products per bit are squares (s1 and s2 in x_dbl, s² and t² in x_add). At 3
+limbs that is ~6 word products for a² instead of 9, with the reduction
+unchanged, so perhaps 10-15% per square. That would be a few percent off the
+flush and ~0.3% of AS276 wall. Like finding 153 it would be new carry-chain
+code, needing mutants.
+
+**Probed the same day, on the CPU only, and refuted (`work/sqr/`).** `sqr.cuh`
+holds a 3- and a 4-limb square in PTX: the cross products once, doubled, plus
+the diagonal, then L reduction rows. Each row's top carry goes into a word that
+the next row absorbs, instead of rippling. `sqmodel.cpp` runs the same chains
+line for line on the host, with PTX carry semantics, against a 128-bit
+reference: 0 mismatches at both widths, and 47 of 47 live single-carry
+mutants caught. The algorithm is right, but the code ptxas makes from it is
+not better. Per square on sm_120 (CUDA 13.4), excluding the probe kernels'
+loads and stores:
+
+| | `mz_mul(a, a)` | square |
+|---|---|---|
+| 3 limbs | 46 instructions, 21 IMAD-type | 50 instructions, 20 IMAD-type, 8 MOV |
+| 4 limbs | 58 instructions, 37 IMAD-type | 77 instructions, 32 IMAD-type, 17 MOV |
+
+The even and odd reduction chains share words, so IMAD.WIDE's aligned
+64-bit addend pairs conflict. ptxas pays for that in MOVs and in products split
+into IMAD + IMAD.HI, which is exactly what `mz_mul`'s even/odd CIOS layout
+avoids. At 3 limbs, where most cofactors are, even an ideal square saves only
+3 of 21 multiplies, against about 5 ALU instructions of doubling. Not taken
+to the card. The two mutants that survived are carries that can never fire, and are
+not counted. One is the 4-limb doubling's carry out of word 6: n < 2^127 keeps
+the cross products below 2^223, so the probe drops that instruction. The other
+is row 0's pending word, which is always 0.
+
+### Install
+
+The fat build of exactly the tree's source, `5512830e` (`ad05510f-dirty`: six
+SASS targets plus compute_80 PTX; `work/xdbl/build.sh fat`). Gated against
+the installed `e3cae1b4` by `work/xdbl/gate.sh` once the card was free
+(09:18-09:41, `gate.txt`):
+
+- **SASS, every arch:** 630 of 654 function bodies identical. The 24 that
+  differ are the four ECM `k_cofac` kernels on each of the six archs;
+  `k_cof_enqueue`, which finding 153 changed, did not change this time.
+- **Resources:** all 618 functions outside `k_cofac` identical. Inside it,
+  registers fell or held at 128 on every arch (for example 104 -> 94 at sm_120
+  `<3,ECM>`, 122 -> 114 at sm_90 `<3,ECM,s2>`).
+- **The timed code:** fat's sm_120 cofactor SASS is identical to the build
+  timed above (46,093 instructions).
+- **`work/emitw/gate.sh`**, installed against fat:
+  - `abcheck`: 36 of 36 identical, all four sets.
+  - c135 20,000 q: identical to finding 138's reference (1,855,599
+    relations), and all of them rebuild both norms exactly.
+  - kill -9 at 20 s and at 45 s, then resume: both identical to the
+    reference.
+  - SIGINT, SIGTERM and a stop file: each drained and resumed to the
+    reference.
+  - SNFS-301 over 10 q: identical (669 relations).
+  - `make check` in fat: all gates passed.
+
+`work/xdbl/install.sh` then installed it the way finding 153's was, with the
+CUDA client off: fat's objects copied, the binary swapped by `mv`, then
+`make all` and `make -q all` clean. `make check` in the tree printed "all
+gates passed" (`tree.check.txt`), with `multest` at 0 of 34 failed.
+`bench/bench` is `5512830e`, copied to `work/xdbl/bench.installed.154`; the
+previous `e3cae1b4` is `work/eomul/bench.installed.153`.
