@@ -145,7 +145,7 @@ There is still no unsafe override of the local arithmetic bounds.
 | local sieve slab | `2^31` positions | bucket/bitmap/rank positions remain `uint32_t` |
 | full pipeline rectangle | no total-area cap under `--pipeline`; `logI` in [2,20] | host scheduler splits `J` into safe slabs. Outside `--pipeline` the old `I*J <= 2^31` refusal still stands (`bench_main.cu`, the `!cfg.pipeline` check) |
 | `lpb` | 64 | a resulting prime is stored in one `uint64_t` (was 32 until 2026-08-17) |
-| `mfb` | 128 | the cofactor queue narrows residuals to `mz<4>`; 96 in a `CF_LMAX=3` build |
+| `mfb` | 127 | the cofactor queue narrows residuals to `mz<4>`, whose even/odd product needs them below 2^127 (128 until 2026-11-09); 96 in a `CF_LMAX=3` build |
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 | exact norm | 384 bits (`BN_LIMBS` 12) | build-time knob, even limbs 4..16; a lattice needing more is SKIPPED with a warning, never wrapped (was 256 until 2026-08-27) |
 
@@ -560,7 +560,8 @@ not a high-value standalone optimisation.
 
 ### Four-limb cofactors — BUILT 2026-08-18, NOT YET TIMED
 
-`mfb` up to 128 is supported, and the width is chosen **per side** at run time
+`mfb` up to 128 is supported (127 since 2026-11-09, finding 153: the 4-limb
+product needs its modulus below 2^127), and the width is chosen **per side** at run time
 as the narrowest instantiation that holds that side's `mfb`. Everything up to
 and including a C194's `mfba 95` still gets 3/3 and is unchanged.
 
@@ -2031,6 +2032,21 @@ finding 92.
    it sleeps, and plain events spin under every flag. WSL2 and native Windows
    are not run (`work/waitbench/`). **Parked 2026-11-04, Kyle's call:**
    freeing part of a core is not worth wall time.
+
+   **2026-11-09, for wall time under load rather than CPU (finding 152):**
+   two count reads per q set the size of trial division's launches, after
+   the intersect and after the rank scan. They are the remaining points
+   where the GPU waits on the host. Traced so far on the 5070, with a quiet
+   host and before finding 150, the card's total idle time is 2.8-5.0% of
+   wall on small jobs (C143 and c135, findings 134, 135 and 147), 1.4% at
+   C148 and 0.5% at I16. TD's survivor-count round trip is 0.4-0.6% at c135.
+   C183 and C194 are not traced. If an `nsys` trace of C143 on HEAD shows
+   they cost wall on an idle card, first size those launches on the device, as
+   `--td-ahead` does for the record pass. Then try a third q in flight where
+   VRAM allows, which means the small jobs. More depth without removing the
+   count reads only buys slack. A general scheduler for N q in flight is the
+   cleaner design, but it would rewrite `run_pipeline_impl`'s staging
+   drains, speculative issue and checkpoint replay; not worth it for this.
 
    **First: complete and measure the blocking-wait option.** The device
    scheduling flag set by `--blocking-sync` does not cover

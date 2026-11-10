@@ -256,8 +256,9 @@ is short of memory there gets slower rather than refusing.
 The remaining representation limits are:
 
 - `lpbr` or `lpba` above 64;
-- `mfbr` or `mfba` above 128 (above 96 in a `CF_LMAX=3` build — see
-  [Cofactorisation](#cofactorisation-width-and-method-both-per-side) below);
+- `mfbr` or `mfba` above 127, or above 96 in a `CF_LMAX=3` build (the 4-limb
+  product needs a residual below 2^127; 128 was accepted until 2026-11-09) —
+  see [Cofactorisation](#cofactorisation-width-and-method-both-per-side) below;
 - a ratio `ceil(mfb/lpb)` above 3 on either side;
 - `lim^2 <= 2^lpb` on either side, which makes the "prime by size" test in the
   splitter unsound (it binds around `lpb 55` at an `alim` of 240M); or
@@ -349,7 +350,8 @@ LPB and MFB should not be conflated. LPB is the bound on each resulting prime;
 raising it above 32 widened the split-prime, emission, and validation paths to
 64 bits (done 2026-08-17). MFB is the maximum composite residual sent to
 cofactorisation and sets the arithmetic width: up to 64 bits can use two 32-bit
-limbs, up to 96 three, and up to 128 four. Thus `lpb 33` with `mfb 64/95` does
+limbs, up to 96 three, and up to 127 four (the 4-limb product needs its
+modulus below 2^127; finding 153). Thus `lpb 33` with `mfb 64/95` does
 not require four-limb rho or ECM, and is exactly the configuration the C194
 runs.
 
@@ -361,14 +363,14 @@ at run time, as the narrowest instantiation that holds that side's `mfb`:
 | `mfb` | limbs | bits | example |
 |---|---|---|---|
 | ≤ 96 | 3 | 96 | SNFS `mfbr 88`; C194 `mfba 95`; AS276 `mfbr 64` |
-| 97–128 | 4 | 128 | AS276 `mfba 101` |
+| 97–127 | 4 | 127 (128 stored; the product needs n < 2^127) | AS276 `mfba 101` |
 
 **AS276** (the C208, `~/code/ggnfs-distributed/AS276.job`: `lpbr 33 / lpba 35`,
 `mfbr 64 / mfba 101`) therefore runs **4/3** — wide on the hard side, narrow on
 the easy one — without any flag. Nothing needs setting for it to be picked, and the choice is
 printed at the head of every cofactoring run:
 
-    cofactor width: side 0 3 limbs (96 bits), side 1 4 limbs (128 bits); this build carries 3..4
+    cofactor width: side 0 3 limbs (96 bits), side 1 4 limbs (127 bits); this build carries 3..4, up to 127 bits
 
 Two knobs exist, and neither is tuning advice:
 
@@ -594,7 +596,7 @@ cross-siever claim:
 Note the ceiling that actually binds first is **not** the width. `CF_MAXFAC`
 caps a split at 3 large primes, so `mfb <= 3 * lpb` regardless — and at
 `lpb 32` that is 96 bits, exactly what 3 limbs already hold. **A side only
-needs 4 limbs once its `lpb` is 33 or more.** Widening past 128 bits would mean
+needs 4 limbs once its `lpb` is 33 or more.** Widening past 127 bits would mean
 4LP, which is a different change (`CF_MAXFAC` and `mz_split`'s stack guard),
 not another limb.
 

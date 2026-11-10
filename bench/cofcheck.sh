@@ -416,18 +416,50 @@ fi
 
 # ---- cofactor WIDTH (3 limbs vs 4) ----------------------------------------
 # The width is now a per-side run-time choice: 3 limbs (96 bits) covers this
-# job and a C194, 4 limbs (128) is what a C208's algebraic mfb needs. Which
-# widths a build carries is a compile-time knob (CF_LMAX), so the cases below
-# ask the binary what it has rather than assuming, and the boundary case is
-# computed from the answer instead of being pinned at 97.
-LMAX=$(run --cofactor --cof-rounds 1 --cof-budget 4096 --relations $TMP/w.txt \
-       | sed -n 's/.*this build carries [0-9]*\.\.\([0-9]*\).*/\1/p' | head -1)
+# job and a C194, 4 limbs (to 127 bits) is what a C208's algebraic mfb needs.
+# Which widths a build carries is a compile-time knob (CF_LMAX), and since
+# finding 153 the widest width's ARITHMETIC stops short of its storage (the
+# 4-limb product needs n < 2^127), so the cases below ask the binary for both
+# -- its widest width and the bits that width takes -- rather than assuming,
+# and the boundary cases are computed from the answer.
+out=$(run --cofactor --cof-rounds 1 --cof-budget 4096 --relations $TMP/w.txt || true)
+LMAX=$(printf '%s' "$out" | sed -n 's/.*this build carries [0-9]*\.\.\([0-9]*\).*/\1/p' | head -1)
+WBITS=$(printf '%s' "$out" | sed -n 's/.*this build carries [0-9]*\.\.[0-9]*, up to \([0-9]*\) bits.*/\1/p' | head -1)
 case "$LMAX" in
     3|4) printf 'PASS   %-34s %s limbs\n' "build reports its widest cofactor" "$LMAX" ;;
     *)   printf 'FAIL   %-34s no width line in the output\n' "build reports its widest cofactor"
          fail=1; LMAX=3 ;;
 esac
-expect_refused "mfb above the widest cofactor" --cofactor --mfb $((32 * LMAX + 1))
+case "$WBITS" in
+    ''|*[!0-9]*) printf 'FAIL   %-34s no "up to N bits" in the width line\n' "build reports its widest bits"
+                 fail=1; WBITS=$((32 * LMAX)) ;;
+    *)           printf 'PASS   %-34s %s bits\n' "build reports its widest bits" "$WBITS" ;;
+esac
+expect_refused "mfb above the widest cofactor" --cofactor --mfb $((WBITS + 1))
+
+# The same boundary through a .job file, the path an NFS@Home work unit takes:
+# the CLI parser never sees it, so this is resolve_and_check_cofactor_config's
+# refusal and nobody else's. lpba 43 keeps the parts rule out of the way
+# (ceil(128/43) = 3), so the refusal must carry the WIDTH's reason, which is
+# checked by its text and not just by the exit status. mfb = WBITS itself must
+# then RUN, at the widest width -- or the boundary is merely somewhere below.
+sed -e "s/^lpba:.*/lpba: 43/" -e "s/^mfba:.*/mfba: $((WBITS + 1))/" ../oracle/input.job > $TMP/wide.job
+if ./bench --pipeline --cadofb $FB --poly $TMP/wide.job $Q $PIN --cofactor \
+           --relations $TMP/wide.txt > $TMP/o 2>&1; then
+    printf 'FAIL   %-34s accepted, should have been refused\n' "job-file mfb above the widest"; fail=1
+elif grep -q "side-1 mfb $((WBITS + 1)): .*cofactor" $TMP/o; then
+    printf 'PASS   %-34s refused for the width\n' "job-file mfb above the widest"
+else
+    printf 'FAIL   %-34s refused, but not for the width\n' "job-file mfb above the widest"; fail=1
+fi
+sed -e "s/^lpba:.*/lpba: 43/" -e "s/^mfba:.*/mfba: $WBITS/" ../oracle/input.job > $TMP/edge.job
+out=$(./bench --pipeline --cadofb $FB --poly $TMP/edge.job $Q $PIN --cofactor --cof-rounds 1 \
+              --cof-budget 4096 --relations $TMP/edge.txt 2>&1) && rc=0 || rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "side 1 $LMAX limbs ($WBITS bits)"; then
+    printf 'PASS   %-34s runs at %s limbs\n' "job-file mfb at the widest ($WBITS)" "$LMAX"
+else
+    printf 'FAIL   %-34s exit %s, or not at %s limbs\n' "job-file mfb at the widest ($WBITS)" "$rc" "$LMAX"; fail=1
+fi
 
 if [ "$LMAX" -ge 4 ]; then
     # THE case for the 4-limb work, and the only one that can be run without a
@@ -473,7 +505,7 @@ if [ "$LMAX" -ge 4 ]; then
     # asymmetry: side 1 wide, side 0 narrow, chosen by nobody.
     out=$(run --cofactor --cof-rounds 2 --cof-budget 65536 --lpb 33 --mfb 99 \
               --relations $TMP/w99.txt || true)
-    got=$(printf '%s' "$out" | grep -c 'side 0 3 limbs (96 bits), side 1 4 limbs (128 bits)' || true)
+    got=$(printf '%s' "$out" | grep -c 'side 0 3 limbs (96 bits), side 1 4 limbs (127 bits)' || true)
     n99=$(printf '%s' "$out" | grep 'total relations' | tail -1 | awk '{print $NF}')
     # Not pinned to a number: mfb 99 admits candidates the pinned lpb-33 case
     # (mfb 92) never saw, so the count is a property of the wider gate and not

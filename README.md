@@ -26,11 +26,11 @@ moves with `--region`; a per-card automatic policy is still open work.
 There is no cap on the total pipeline area: `--pipeline` slabs any geometry
 through `logI 20`, and `2^32` has been sieved on a 5070 and an L40.
 `lpb <= 64`,
-`mfb <= 128`, at most three large primes per side, and an exact norm within
+`mfb <= 127`, at most three large primes per side, and an exact norm within
 this build's `BN_LIMBS * 32` bits (384 by default) remain checked limits.
 Cofactor arithmetic width and
 factorisation method are both chosen **per side, automatically**, from that
-side's `mfb` and `lpb`: 3 limbs (96-bit residuals) or 4 (128-bit), and
+side's `mfb` and `lpb`: 3 limbs (96-bit residuals) or 4 (up to 127-bit), and
 Pollard-Brent rho for a two-large-prime side or ECM for a three-large-prime
 one. The separate representation, memory,
 cofactor-performance, and filtering implications of lifting them are laid out
@@ -94,7 +94,7 @@ target. `make -C bench GPU_ARCH=native` builds only for the card in this machine
 anywhere else.
 
 `make -C bench CF_LMAX=3` builds a narrower binary carrying only the 3-limb
-cofactor kernels: `mfb` is then capped at 96 rather than 128, the device code
+cofactor kernels: `mfb` is then capped at 96 rather than 127, the device code
 halves (8.99 MB to 4.02 MB), and `ptxas` has roughly half as much to do. Its
 relations are byte-identical to a full build's on any job both can run, so it
 is a shippable variant rather than a debug one.

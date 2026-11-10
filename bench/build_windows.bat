@@ -8,7 +8,7 @@ rem
 rem Knobs, matching bench/Makefile so a Windows binary is the same build:
 rem   GPU_ARCH  all (default) | native | full | a bare compute capability,
 rem             e.g. 86 -- full needs CUDA <= 12.8 on PATH, see :arch_full
-rem   CF_LMAX   4 (default, 128-bit cofactors) | 3 (96-bit)
+rem   CF_LMAX   4 (default, cofactors up to 127 bits) | 3 (96-bit)
 rem   DEFS      extra -D's for pricing experiments, e.g. -DNORM_FAST_LOG2
 rem             (dash form: these reach nvcc too, which rejects /D)
 rem
@@ -156,7 +156,7 @@ rem exist, and a CF_LMAX=3 binary is shippable. See bench/Makefile.
 if not defined CF_LMAX set "CF_LMAX=4"
 if "%CF_LMAX%"=="3" goto :cflmax_ok
 if "%CF_LMAX%"=="4" goto :cflmax_ok
-echo error: CF_LMAX must be 3 (96-bit cofactors) or 4 (128-bit) -- got "%CF_LMAX%".
+echo error: CF_LMAX must be 3 (96-bit cofactors) or 4 (up to 127-bit) -- got "%CF_LMAX%".
 exit /b 1
 :cflmax_ok
 rem Dash form deliberately: cl.exe accepts -D as happily as /D, and nvcc

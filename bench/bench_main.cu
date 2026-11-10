@@ -222,7 +222,7 @@ static void usage(void)
 "                   that have split once; 0 = off [2] (finding 126). Refused\n"
 "                   where no side is 3LP ECM, as it would do nothing\n"
 "  --cof-limbs N / --cof-limbs0 N   cofactor width in 32-bit limbs\n"
-"                   [narrowest that mfb needs: 3 up to 96 bits, 4 above].\n"
+"                   [narrowest that mfb needs: 3 up to 96 bits, 4 to 127].\n"
 "                   Force it UP to time the same job at both widths; forcing\n"
 "                   it below what mfb needs is refused.\n"
 "  --allowance B / --allowance0 B   survivor cofactor BITS, overriding the\n"
@@ -442,8 +442,10 @@ static int validate_qsel_or_report(qsel_t *sel, const poly_t *P, int side,
  * were a single uint32, which capped lpb at 32. They are 64-bit now, which is
  * why the bound below is 64 and why an NFS@Home C194 (lpba 33, mfba 95) runs.
  * 2026-08-18: the COFACTOR width became a per-side run-time choice between 3
- * and 4 limbs, so mfb is bounded by 32*CF_LMAX rather than by a constant, and
- * this function is where the choice is resolved as well as checked.
+ * and 4 limbs, so mfb is bounded by cf_width_bits(CF_LMAX) rather than by a
+ * constant, and this function is where the choice is resolved as well as
+ * checked. 2026-11-09 (finding 153): that bound is 127, not 128, at 4 limbs --
+ * the even/odd mz_mul<4> needs its modulus below 2^127.
  *
  * This MUST run after the .job file has been read. It used to sit inline in
  * main() ahead of poly_load, so it only ever saw command-line values -- and
@@ -451,6 +453,27 @@ static int validate_qsel_or_report(qsel_t *sel, const poly_t *P, int side,
  * cases (mfba 120 from a job file, or a 4LP mfb/lpb ratio) were exactly the
  * ones it could not see. The RUNBOOK's own SNFS recipe takes mfbr and lpbr
  * from the file. */
+/* Why an mfb has no cofactor width, with the remedy that applies. Three
+ * cases since finding 153: the build's widest width STORES the residual but
+ * its product does not take it (mfb 128 at 4 limbs: lower mfb); a 3-limb
+ * build that a 4-limb one would serve (rebuild); and past every width. */
+static void cf_refuse_mfb(const char *side, uint32_t mfb)
+{
+    const uint32_t wb = cf_width_bits(CF_LMAX);
+    if (mfb <= 32u * CF_LMAX)
+        fprintf(stderr, "%s mfb %u: the %d-limb cofactor product needs residuals"
+                " below 2^%u, so mfb is at most %u\n", side, mfb, CF_LMAX, wb, wb);
+    else if (CF_LMAX < 4 && mfb <= cf_width_bits(4))
+        fprintf(stderr, "%s mfb %u: the widest cofactor this build has is %d"
+                " limbs (%u bits), so a residual above that loses its high limbs"
+                " -- rebuild with CF_LMAX=4 (up to %u bits)\n",
+                side, mfb, CF_LMAX, wb, cf_width_bits(4));
+    else
+        fprintf(stderr, "%s mfb %u: no cofactor width takes more than %u bits"
+                " (4 limbs, whose product needs residuals below 2^%u)\n",
+                side, mfb, cf_width_bits(4), cf_width_bits(4));
+}
+
 /* NAMED FOR WHAT IT DOES: it RESOLVES as well as checks. It fills in
  * cof_limbs0/cof_limbs, cof_meth0/cof_meth1 and the ECM parameters, and both
  * cofq_init() and run_cofac() read those, so this must run before either. A
@@ -476,8 +499,8 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
         bad = 1;
     }
     /* THE COFACTOR WIDTH. Each side runs at the narrowest instantiation that
-     * holds its mfb -- 3 limbs (96 bits) up to a C194's mfba 95, 4 limbs (128)
-     * for a C208 -- unless --cof-limbs/--cof-limbs0 forces it wider. Forcing
+     * holds its mfb -- 3 limbs (96 bits) up to a C194's mfba 95, 4 limbs (to
+     * 127 bits) for a C208 -- unless --cof-limbs/--cof-limbs0 forces it wider. Forcing
      * is only ever upward: a width below what mfb needs is the silent
      * truncation this check exists to refuse, so it is refused whether it
      * comes from a job file or from the command line.
@@ -488,20 +511,8 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
     {
         const int w1 = cf_limbs_for_mfb(mfb1);
         const int w0 = cf_limbs_for_mfb(cfg->mfb0);
-        if (!w1) {
-            fprintf(stderr, "side-1 mfb %u: the widest cofactor this build has"
-                    " is %d limbs (%d bits), so a residual above that loses its"
-                    " high limbs -- rebuild with a larger CF_LMAX\n",
-                    mfb1, CF_LMAX, 32 * CF_LMAX);
-            bad = 1;
-        }
-        if (!w0) {
-            fprintf(stderr, "side-0 mfb %u: the widest cofactor this build has"
-                    " is %d limbs (%d bits), so a residual above that loses its"
-                    " high limbs -- rebuild with a larger CF_LMAX\n",
-                    cfg->mfb0, CF_LMAX, 32 * CF_LMAX);
-            bad = 1;
-        }
+        if (!w1) { cf_refuse_mfb("side-1", mfb1); bad = 1; }
+        if (!w0) { cf_refuse_mfb("side-0", cfg->mfb0); bad = 1; }
         if (cfg->cof_limbs && cfg->cof_limbs < w1) {
             fprintf(stderr, "--cof-limbs %d is narrower than side-1 mfb %u"
                     " needs (%d limbs)\n", cfg->cof_limbs, mfb1, w1);
@@ -1468,7 +1479,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                             " ignored; drop it\n");
         else if (!strcmp(argv[i], "--blocking-sync")) blocking_sync = 1;
         else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb0 %ld out of range 1..64\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
-        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32 * CF_LMAX) { fprintf(stderr, "--mfb0 %ld out of range 1..%d\n", v, 32 * CF_LMAX); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
+        else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > (long)cf_width_bits(CF_LMAX)) { fprintf(stderr, "--mfb0 %ld out of range 1..%u\n", v, cf_width_bits(CF_LMAX)); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
         /* Cofactor width in 32-bit limbs, per side. Only useful FORCED UPWARD
          * -- the default already picks the narrowest width mfb needs -- and
          * that is the point: it is what lets the same job be timed at 3 limbs
@@ -1634,7 +1645,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             cfg.log_every_s = v;
         }
         else if (!strcmp(argv[i], "--lpb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb %ld out of range 1..64\n", v); return 1; } cfg.lpb = (uint32_t)v; lpb_set = 1; }
-        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 32 * CF_LMAX) { fprintf(stderr, "--mfb %ld out of range 1..%d\n", v, 32 * CF_LMAX); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
+        else if (!strcmp(argv[i], "--mfb") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > (long)cf_width_bits(CF_LMAX)) { fprintf(stderr, "--mfb %ld out of range 1..%u\n", v, cf_width_bits(CF_LMAX)); return 1; } cfg.mfb = (uint32_t)v; mfb_set = 1; }
         else if (!strcmp(argv[i], "--cofgate") && i + 1 < argc) {
             if (bench_boinc_resolve_path("--cofgate", argv[++i], &cfg.cofgate)) return 1;
         }

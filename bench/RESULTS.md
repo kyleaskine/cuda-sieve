@@ -18667,3 +18667,191 @@ The sieve's CPU per wall second (bench's user + sys over wall, averaged):
   kept on the GPU, graphs. That is row 12's later steps, aimed at wall time
   under load rather than at CPU. With nice available it pays only where
   competing work runs at normal priority, and mostly on small jobs.
+
+<a id="finding-153"></a>
+## Finding 153 — the cofactor products rebuilt on even/odd accumulators, after Greg's GPU ECM: per product 95 -> 46 SASS instructions at 3 limbs and 158 -> 59 at 4, the cofactor flush −29-30% on 3-limb sides and −40-41% on 4-limb ones, wall −1.2% (c135) to −8.6% (AS276), relations byte-identical. mfb 96 stays on 3 limbs; mfb 128 is now refused
+
+**Date:** 2026-11-09. Card free (msieve had just left it), client not running,
+no Windows GPU users above 0.3%, host load ~7 from the CPU client (round 2 of
+the timing ran under a spike to 11-23). Evidence:
+[`../work/eomul/`](../work/eomul/) (`NOTES.md`, `eoprobe.cu`, `mutants.py`,
+`search.cu`, `ab.sh`, `runs-*.txt`).
+
+### Where it came from
+
+Greg Childers' rewrite of GMP-ECM's GPU code (`~/code/gmp-ecm`, branch
+`gpu-stage1-dynamic`, October 2026, GPLv3) has a one-thread-per-curve product
+whose carry chains are laid out so that ptxas issues each `mad.lo.cc` +
+`madc.hi.cc` pair as one `IMAD.WIDE.U32(.X)`. Ours wrote a row's low words as
+one chain and its high words as another, and compiled to `IMAD` + `IMAD.HI` +
+`IADD.X` per limb product: `k_cofac<3, ECM, s2>` had 5,802 IMADs and 27
+IMAD.WIDEs. The layout is reimplemented here, not copied (cuda-sieve is CC0).
+
+### The change (the tree, uncommitted)
+
+- **`mz_mul<3>` and `mz_mul<4>`** (`cofac.cuh`, "THE PRODUCT"): the CIOS
+  accumulator is two arrays, E (pairs starting at even word positions) and O
+  (odd), so every product's low and high word share a register pair. The
+  division by W flips parity: the next row's E is this row's O, its O is this
+  row's E two words down, taken as the odd chain's addends.
+- **The bound** ("THE BOUND"): with a < n every partial sum is < (a + n) W.
+  `mz_mul<4>` needs n < 2^127 so that nothing carries out of position 4.
+  `mz_mul<3>` keeps one carry word for position 4 and takes any n < 2^96, at 6
+  instructions a product (40 without it). That keeps mfb 96, I16's mfba, on
+  3 limbs.
+- **The width rule** (`bench.h`): `cf_width_bits()` / `CF_WIDTH_BITS` is 96 at 3
+  limbs and 127 at 4. It drives `cf_limbs_for_mfb`, the `--mfb`/`--mfb0` range
+  checks, `k_cof_enqueue`'s overflow test (bit 127 now counts as overflow at 4
+  limbs) and the `--cofac` narrowing test (`cf_over_width`). **mfb 128 is
+  refused** where it was accepted. No job is near it: the widest on disk is
+  C1147's mfba 111. cofcheck's boundary case moved to 128. README, RUNBOOK and
+  the STATUS limits row now say 127.
+
+### The products are exact
+
+`eoprobe.cu` compares both against the CIOS rows word for word: random odd n
+of every size from 34 bits to the width's limit, n just under the limit, n
+built from {~0, ~1, 1, 0, random} words, edge operands {0, 1, 2, n−1, n−2, x}
+in all pairings, chained runs, 75 checks, 0 failed.
+
+Random and near-limit moduli alone were not enough. `mutants.py` drops one
+carry at a time, and 2 of its 10 mutants survived them: the reduction step's
+odd-chain carry arriving at an all-ones E3 is a ~2^−32 event per row. A
+dropped carry there would lose a split, never make a wrong one (every factor
+is a gcd or an exact quotient), but it is still a wrong product. `search.cu`
+found inputs that trigger it: 147,000 hits per 3×10^8 products with structured
+words, none with random ones. Six of them are now fixed vectors, the
+structured mode runs on both widths, and **10 of 10 mutants are caught**.
+
+### Gates
+
+- **`make mulcheck`** (new, in `check`): `multest.cu` runs `mz_mul<3>` and
+  `mz_mul<4>` from `cofac_arith.cuh`, the code `k_cofac` runs, against a
+  bit-serial reference: 34 checks covering every size, near-limit and
+  structured moduli, and the search vectors, in 1.5 s. `work/eomul/mutants_tree.py`
+  applies the ten mutants to a copy of the tree's products: **10 of 10 caught**,
+  and the unmutated copy passes.
+- `cofcheck.sh` on NEW: 92 PASS, 0 FAIL, including rho and ECM at 4 limbs
+  identical to 3. After the review, 95 PASS: the new width cases below pass,
+  and the same script fails (exit 1) on BASE.
+- `abcheck.sh` BASE NEW, `SETS="cof stop"`: 7 of 7 identical (c143 both
+  queues, c183, c194, I16 both queues, c143's target stop).
+- Resources: every `k_cofac` stays within its 128 registers, and the stage-2
+  kernels' local traffic moves by 3 loads and 3 stores. Code shrinks a lot:
+  `k_cofac<3, ECM, s2>` 18,056 -> 10,984 SASS instructions, `<4, ECM, s2>`
+  27,913 -> 13,233.
+
+### Timing (`ab.sh`, three interleaved rounds, relations byte-identical in all 15 pairs)
+
+Cofactor queues in ms per q, mean of three rounds (device time). Wall per q is
+the mean of rounds 1 and 3 (load ~7); c135's is rounds 1 and 2, because
+BASE's round 3 ran at load 21.
+
+| job (width alg/rat) | rational queue | algebraic queue | flush | wall per q | wall |
+|---|---:|---:|---:|---:|---:|
+| c135 (3/3, 2LP) | 0.04 -> 0.03 | 0.06 -> 0.04 | 0.10 -> 0.07 | 2.60 -> 2.57 | −1.2% |
+| I16 (3/3, mfba 96) | 1.62 -> 1.16 | 6.35 -> 4.49 | 6.92 -> 4.90 | 129.63 -> 127.52 | −1.6% |
+| c183 (3/3) | 0.74 -> 0.52 | 3.45 -> 2.43 | 3.81 -> 2.68 | 34.77 -> 33.53 | −3.6% |
+| AS276 (4/3) | 2.58 -> 1.89 | 30.11 -> 17.30 | 31.57 -> 18.48 | 156.56 -> 143.09 | **−8.6%** |
+| SNFS-301 (4/3) | 3.72 -> 2.56 | 18.95 -> 10.95 | 19.50 -> 11.68 | 144.38 -> 135.25 | **−6.3%** |
+
+- **The flush is on the critical path.** On every job, wall per q falls by
+  about what the flush does: I16 −2.0 ms flush / −2.1 ms wall, AS276 −13.1 /
+  −13.5.
+- **The queues fall by less than the product.** 3-limb queues are 0.70x
+  against a 0.48x product, 4-limb 0.57-0.58x against 0.37x. The ladder's adds
+  and subtracts, the gcds and the primality tests are unchanged.
+- **The big gain is where Greg's jobs run.** The 3LP NFS@Home shapes at 4 limbs
+  gain 6-9% wall. Small jobs gain about 1%, because the cofactor stage is
+  ~3% of them.
+
+### The code review
+
+Kyle ran `/code-review xhigh` on the change: 14 findings, **no correctness bug**.
+The reviewer traced both chains position by position, and checked that the
+2^127 bound holds for every caller. All 14 are fixed, and none of them
+changed the code the timing measured: the SASS of every `k_cofac` and
+`k_cof_enqueue` instantiation is identical to the timed build's (47,005
+instructions). `abcheck` is 7 of 7 again, and `cofcheck` is 95 of 95.
+
+- **The gate was not in the tree.** The probe that caught the rare-carry
+  mutants lived in `work/`. The arithmetic is now `bench/cofac_arith.cuh`, a pure
+  move of 493 lines out of `cofac.cuh`, so that `multest.cu` can test those very
+  functions (above).
+- **The boundary test proved nothing.** `--mfb 128` was refused by the CLI
+  parser, and at lpb 32 by the parts rule, before the width rule ran.
+  cofcheck now reads the widest width's bits from the binary. It feeds a
+  .job file with mfba 128 at lpba 43 (the work-unit path) and requires the
+  refusal to give the width's reason. It also requires mfba 127 to run at 4
+  limbs.
+- **Messages.** The width banner now prints the bits the arithmetic takes
+  (`4 limbs (127 bits)`, `up to 127 bits`). The mfb-128 refusal said
+  "rebuild with a larger CF_LMAX", which no build has; it now says that mfb is
+  at most 127.
+- **One copy of each rule.** The top-word test is `cf_top_over<W>`, shared by
+  `k_cof_enqueue` and `cf_over_width`. `static_assert`s next to the products
+  tie `CF_WIDTH_BITS` to them.
+- **Asm constraints.** Every output in the PTX section, including finding
+  125's add/sub, is now `"=&r"`: each block writes outputs before it has read
+  all its inputs. NVVM's fresh registers made `"=r"` work; it was still the
+  wrong constraint. The dead `e0` copies are gone.
+- **Docs and comments** that still said 128 (RUNBOOK's width table, README,
+  STATUS's four-limb section, `--help`, `bench_main.cu`, `build_windows.bat`),
+  the PTX header's stale evidence, a broken parenthesis in RUNBOOK, and this
+  finding's own heading, which disagreed with its table.
+- **Left as it was:** `k_cof_enqueue`'s overflow tests, the old limbs-above-L
+  one and the new bit-127 one, are assertions on a chain that `cof_classify`
+  makes unreachable. No gate triggers either, and none can without a test
+  hook.
+
+### Not done, and next
+
+- **Installed 2026-11-10 01:28, Kyle's call**: see "Install" below.
+- **`x_dbl` forms `ad*s1` only to make X' = ad·s1·s2, and `ad*s2` again for
+  Z'.** X' = (ad·s2)·s1 reuses the second, so one product per ladder bit goes
+  (13 -> 12), bit-identical. Left for its own step so that this finding
+  measures the product alone.
+- **The small-constant ladder:** round 0's sigmas 6..13 all have Suyama
+  constants (an : ad) and (u^3 : v^3) below 2^32. A single ladder over the
+  product of the prime powers, with one-row products by those constants, would
+  be about 8 full + 4 one-row products per bit against 13. The same curves.
+- **A full-range `mz_mul<4>`** is about 75 instructions, against 59. Not
+  worth it for an mfb no job uses.
+
+### Install
+
+The fat build of exactly the tree's source, `e3cae1b4` (`891c41ba-dirty`; six
+SASS targets plus compute_80 PTX; `work/eomul/build.sh fat`), gated against
+the installed `2c0b13b8` by `work/eomul/gate.sh` once the card was free
+(00:55-01:22, `gate.txt`). Host load was ~22 (msieve on the CPU), and none
+of these gates is timed.
+
+- **SASS, every arch:** 600 of 654 function bodies identical. The 54 that
+  differ are all `k_cofac` and `k_cof_enqueue`.
+- **Resources:** all 594 functions outside them identical. Inside them, at
+  most 128 registers everywhere; the stage-2 kernels' stack is +32 B on
+  sm_120 and +16 B at 4 limbs on sm_75 and sm_90.
+- **The timed code:** fat's sm_120 cofactor SASS is identical to the build
+  timed above (47,005 instructions).
+- **`work/emitw/gate.sh`**, installed against fat:
+  - `abcheck`: 36 of 36 identical, all four sets.
+  - c135 20,000 q: identical to finding 138's reference (1,855,599
+    relations), and all of them reconstruct both norms.
+  - kill -9 at 20 s and at 45 s, then resume: both identical to the
+    reference.
+  - SIGINT, SIGTERM and a stop file: each drained and resumed to the
+    reference.
+  - SNFS-301 over 10 q: identical (669 relations).
+  - `make check` in fat: all gates passed, `mulcheck` included.
+
+`work/eomul/install.sh` did the install the way finding 150's was, with the
+CUDA client off: fat's objects copied, the binary swapped by `mv`, then
+`make all` and `make -q all` clean. `make check` in the tree printed "all gates
+passed" (`tree.check.txt`), with `multest` at 0 of 34 failed. `bench/bench` is
+`e3cae1b4`, copied to `work/eomul/bench.installed.153`; the previous
+`2c0b13b8` is `work/fillmerge/bench.installed.150`.
+
+Two changes to the procedure. The wait was for an empty card, not for no
+msieve process: the msieve then running was CPU-only. And
+`work/emitw/gate.sh` now blocks only on the CUDA client, not on the CPU
+sieving client that shares its name.

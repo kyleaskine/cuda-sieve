@@ -483,9 +483,21 @@ int  bench_boinc_finish(enum bench_outcome outcome, int status);
 #define CF_LMAX 4
 #endif
 #if CF_LMAX != 3 && CF_LMAX != 4
-#error "CF_LMAX must be 3 (96-bit cofactors) or 4 (128-bit)"
+#error "CF_LMAX must be 3 (96-bit cofactors) or 4 (up to 127-bit)"
 #endif
 #define CF_LMIN 3
+
+/* The widest residual, in bits, that an L-limb width's ARITHMETIC accepts --
+ * not always the 32*L bits it stores. mz_mul<4>'s even/odd product needs the
+ * modulus below R/2 = 2^127 (cofac.cuh, "THE BOUND"); mz_mul<3> keeps a carry
+ * word and takes the full 96. Every fit test and mfb bound goes through this,
+ * so the two can never disagree. A macro as well as a function because the
+ * device-side fit tests need it as a constant and this header is also C. */
+#define CF_WIDTH_BITS(L) ((L) == 4 ? 127u : 32u * (uint32_t)(L))
+static inline uint32_t cf_width_bits(int L)
+{
+    return CF_WIDTH_BITS(L);
+}
 
 /* Narrowest width that can hold an mfb-bit residual, or 0 if this build has
  * none. Not `(mfb + 31) / 32` clamped up: below 96 bits there is no narrower
@@ -493,8 +505,8 @@ int  bench_boinc_finish(enum bench_outcome outcome, int status);
  * get to think it has a 1- or 2-limb path. */
 static inline int cf_limbs_for_mfb(uint32_t mfb)
 {
-    if (mfb <= 32u * CF_LMIN) return CF_LMIN;
-    if (mfb <= 32u * CF_LMAX) return CF_LMAX;
+    if (mfb <= cf_width_bits(CF_LMIN)) return CF_LMIN;
+    if (mfb <= cf_width_bits(CF_LMAX)) return CF_LMAX;
     return 0;
 }
 

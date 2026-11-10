@@ -19,7 +19,7 @@
  * and both the arithmetic WIDTH and the METHOD are sized to them PER SIDE,
  * chosen on the host from that side's mfb and lpb (2026-08-18/19):
  *
- *     width   3 limbs (96 bits) up to mfb 96, 4 (128) above    -- CF_LMAX
+ *     width   3 limbs (96 bits) up to mfb 96, 4 to mfb 127 above  -- CF_LMAX
  *     method  rho at 2LP, ECM at 3LP                           -- cof_meth[]
  *
  * Both rules are in bench.h, both are printed by every run, and both exist
@@ -122,391 +122,11 @@
  * and resolve --cof-limbs without pulling in a header full of device code.
  * Everything that USES the width is here; only the three names are there. */
 
-#if defined(__CUDACC__)
-#define CF_FN __device__ __forceinline__
-#define CF_NOINLINE __device__ __noinline__
-#define CF_HD static __host__ __device__ __forceinline__
-#else
-#define CF_FN static inline
-#define CF_NOINLINE static
-#define CF_HD static inline
-#endif
-
-/* ---- L-limb arithmetic ------------------------------------------------- *
- *
- * Templated on the limb count so the rational side pays for 64 bits and the
- * algebraic side for 96, rather than both paying prp.cuh's fixed 128. At three
- * limbs the CIOS inner loop is 9 multiply-adds against 16 -- the modmul is the
- * whole cost of this stage, so the limb count is not a detail.
- */
-
-template <int L> struct mz { uint32_t v[L]; };
-
-template <int L> CF_FN int mz_cmp(const mz<L> *a, const mz<L> *b)
-{
-    #pragma unroll
-    for (int i = L - 1; i >= 0; i--)
-        if (a->v[i] != b->v[i]) return a->v[i] < b->v[i] ? -1 : 1;
-    return 0;
-}
-
-template <int L> CF_FN int mz_is_zero(const mz<L> *a)
-{
-    uint32_t o = 0;
-    #pragma unroll
-    for (int i = 0; i < L; i++) o |= a->v[i];
-    return o == 0;
-}
-
-template <int L> CF_FN int mz_is_one(const mz<L> *a)
-{
-    uint32_t o = a->v[0] ^ 1u;
-    #pragma unroll
-    for (int i = 1; i < L; i++) o |= a->v[i];
-    return o == 0;
-}
-
-template <int L> CF_FN uint32_t mz_sub(mz<L> *a, const mz<L> *b)
-{
-    uint64_t borrow = 0;
-    #pragma unroll
-    for (int i = 0; i < L; i++) {
-        uint64_t d = (uint64_t)a->v[i] - b->v[i] - borrow;
-        a->v[i] = (uint32_t)d;
-        borrow = (d >> 32) & 1u;
-    }
-    return (uint32_t)borrow;
-}
-
-/* a = a - b mod n, given a, b < n */
-template <int L> CF_FN void mz_sub_mod(mz<L> *a, const mz<L> *b, const mz<L> *n)
-{
-    if (mz_sub<L>(a, b)) {
-        uint64_t c = 0;
-        #pragma unroll
-        for (int i = 0; i < L; i++) {
-            uint64_t s = (uint64_t)a->v[i] + n->v[i] + c;
-            a->v[i] = (uint32_t)s;
-            c = s >> 32;
-        }
-    }
-}
-
-/* a = a + b mod n, given a, b < n */
-template <int L> CF_FN void mz_add_mod(mz<L> *a, const mz<L> *b, const mz<L> *n)
-{
-    uint64_t c = 0;
-    #pragma unroll
-    for (int i = 0; i < L; i++) {
-        uint64_t s = (uint64_t)a->v[i] + b->v[i] + c;
-        a->v[i] = (uint32_t)s;
-        c = s >> 32;
-    }
-    if (c || mz_cmp<L>(a, n) >= 0) mz_sub<L>(a, n);
-}
-
-/* a = 2a mod n */
-template <int L> CF_FN void mz_dbl_mod(mz<L> *a, const mz<L> *n)
-{
-    uint32_t carry = 0;
-    #pragma unroll
-    for (int i = 0; i < L; i++) {
-        uint32_t hi = a->v[i] >> 31;
-        a->v[i] = (a->v[i] << 1) | carry;
-        carry = hi;
-    }
-    if (carry || mz_cmp<L>(a, n) >= 0) mz_sub<L>(a, n);
-}
-
-template <int L> CF_FN void mz_rshift1(mz<L> *a)
-{
-    #pragma unroll
-    for (int i = 0; i < L - 1; i++)
-        a->v[i] = (a->v[i] >> 1) | (a->v[i + 1] << 31);
-    a->v[L - 1] >>= 1;
-}
-
-template <int L> CF_FN int mz_bits(const mz<L> *a)
-{
-    #pragma unroll
-    for (int i = L - 1; i >= 0; i--)
-        if (a->v[i]) return i * 32 + (32 - __clz(a->v[i]));
-    return 0;
-}
-
-/* -n^{-1} mod 2^32, Newton. n odd. */
-CF_FN uint32_t mz_n0inv(uint32_t n0)
-{
-    uint32_t inv = n0;
-    for (int k = 0; k < 5; k++) inv *= 2u - n0 * inv;
-    return (uint32_t)(0u - inv);
-}
-
-/* r = a*b*R^-1 mod n, R = 2^(32L). CIOS. */
-template <int L>
-CF_FN void mz_mul(mz<L> *r, const mz<L> *a, const mz<L> *b,
-                  const mz<L> *n, uint32_t n0inv)
-{
-    uint32_t t[L + 2];
-    #pragma unroll
-    for (int i = 0; i < L + 2; i++) t[i] = 0;
-
-    #pragma unroll
-    for (int i = 0; i < L; i++) {
-        uint64_t C = 0;
-        #pragma unroll
-        for (int j = 0; j < L; j++) {
-            uint64_t p = (uint64_t)a->v[j] * b->v[i] + t[j] + C;
-            t[j] = (uint32_t)p;
-            C = p >> 32;
-        }
-        {
-            uint64_t p = (uint64_t)t[L] + C;
-            t[L] = (uint32_t)p;
-            t[L + 1] = (uint32_t)(p >> 32);
-        }
-        {
-            uint32_t m = t[0] * n0inv;
-            uint64_t p = (uint64_t)m * n->v[0] + t[0];
-            C = p >> 32;
-            #pragma unroll
-            for (int j = 1; j < L; j++) {
-                p = (uint64_t)m * n->v[j] + t[j] + C;
-                t[j - 1] = (uint32_t)p;
-                C = p >> 32;
-            }
-            p = (uint64_t)t[L] + C;
-            t[L - 1] = (uint32_t)p;
-            t[L] = t[L + 1] + (uint32_t)(p >> 32);
-        }
-    }
-    #pragma unroll
-    for (int i = 0; i < L; i++) r->v[i] = t[i];
-    if (t[L] || mz_cmp<L>(r, n) >= 0) mz_sub<L>(r, n);
-}
-
-/* ---- PTX carry chains for the two widths that run: L = 3 and L = 4 ------ *
- *
- * Specialisations of mz_mul, mz_add_mod, mz_sub_mod and mz_dbl_mod above, bit
- * for bit the same results FOR REDUCED OPERANDS, a, b < n -- the only kind any
- * caller passes, since every value here lives in [0, n) (work/gpuecm-probe/mul/
- * arithcheck.cu: 262,144 random moduli per width from 2 to 32L bits, 256
- * chained steps, output files identical; an injected borrow bug and an
- * injected madc->mad bug each make them differ). They are NOT the generic
- * code on unreduced input: with a >= n, or a + b >= R + n, the final reduce
- * keeps the truncated value where the generic `t[L] || cmp >= 0` subtracts n.
- * Reduce first before feeding anything raw to them. Device only: CF_FN is __device__ under nvcc, and a host build
- * of this header keeps the generic templates.
- *
- * WHY. The generic add/sub end in mz_cmp, a loop with an early return. Inlined
- * into every x_add/x_dbl of the ECM ladder and unrolled, that is one divergent
- * region per add or sub: k_cofac<3, ECM>'s SASS was 293,632 instructions with
- * 4,965 BSSY regions, ~4.7 MB, far past the instruction cache. Here the reduce
- * is a borrow mask (sub) or a select on the borrow of sum - n (add): 18,224
- * instructions, 76 BSSY. The 64-bit C products also lowered to IADD.64 plus a
- * MOV/HFMA2 per zeroed high half; mad/madc with carry is about 2/3 of that.
- * Registers unchanged under __launch_bounds__(256, 2). Measured on the I16
- * NFS@Home batch: ECM 0.37x and rho 0.56x the time, I16 end to end 187.5 ->
- * 170.4 ms/q with byte-identical relations (work/ptx-ab/NOTES.md). */
-#if defined(__CUDACC__)
-template <>
-CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
-                      const mz<3> *n, uint32_t n0inv)
-{
-    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4, m;
-    const uint32_t a0 = a->v[0], a1 = a->v[1], a2 = a->v[2];
-    const uint32_t n0 = n->v[0], n1 = n->v[1], n2 = n->v[2];
-    #pragma unroll
-    for (int i = 0; i < 3; i++) {
-        const uint32_t bi = b->v[i];
-        asm("mad.lo.cc.u32  %0, %5, %8, %0;\n\t"
-            "madc.lo.cc.u32 %1, %6, %8, %1;\n\t"
-            "madc.lo.cc.u32 %2, %7, %8, %2;\n\t"
-            "addc.u32       %3, %3, 0;\n\t"
-            "mad.hi.cc.u32  %1, %5, %8, %1;\n\t"
-            "madc.hi.cc.u32 %2, %6, %8, %2;\n\t"
-            "madc.hi.cc.u32 %3, %7, %8, %3;\n\t"
-            "addc.u32       %4, 0, 0;"
-            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "=r"(t4)
-            : "r"(a0), "r"(a1), "r"(a2), "r"(bi));
-        m = t0 * n0inv;
-        asm("mad.lo.cc.u32  %0, %5, %6, %0;\n\t"
-            "madc.lo.cc.u32 %1, %5, %7, %1;\n\t"
-            "madc.lo.cc.u32 %2, %5, %8, %2;\n\t"
-            "addc.cc.u32    %3, %3, 0;\n\t"
-            "addc.u32       %4, %4, 0;\n\t"
-            "mad.hi.cc.u32  %1, %5, %6, %1;\n\t"
-            "madc.hi.cc.u32 %2, %5, %7, %2;\n\t"
-            "madc.hi.cc.u32 %3, %5, %8, %3;\n\t"
-            "addc.u32       %4, %4, 0;"
-            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4)
-            : "r"(m), "r"(n0), "r"(n1), "r"(n2));
-        t0 = t1; t1 = t2; t2 = t3; t3 = t4;
-    }
-    {
-        uint32_t s0, s1, s2, bw;
-        asm("sub.cc.u32  %0, %4, %7;\n\t"
-            "subc.cc.u32 %1, %5, %8;\n\t"
-            "subc.cc.u32 %2, %6, %9;\n\t"
-            "subc.u32    %3, %10, 0;"
-            : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(bw)
-            : "r"(t0), "r"(t1), "r"(t2), "r"(n0), "r"(n1), "r"(n2), "r"(t3));
-        const bool keep = bw != 0;
-        r->v[0] = keep ? t0 : s0; r->v[1] = keep ? t1 : s1; r->v[2] = keep ? t2 : s2;
-    }
-}
-
-template <>
-CF_FN void mz_sub_mod<3>(mz<3> *a, const mz<3> *b, const mz<3> *n)
-{
-    uint32_t d0, d1, d2, m;
-    asm("sub.cc.u32  %0, %4, %7;\n\t"
-        "subc.cc.u32 %1, %5, %8;\n\t"
-        "subc.cc.u32 %2, %6, %9;\n\t"
-        "subc.u32    %3, 0, 0;"            /* m = 0 or 0xffffffff (borrow) */
-        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(m)
-        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
-    asm("add.cc.u32  %0, %0, %3;\n\t"
-        "addc.cc.u32 %1, %1, %4;\n\t"
-        "addc.u32    %2, %2, %5;"
-        : "+r"(d0), "+r"(d1), "+r"(d2)
-        : "r"(n->v[0] & m), "r"(n->v[1] & m), "r"(n->v[2] & m));
-    a->v[0] = d0; a->v[1] = d1; a->v[2] = d2;
-}
-
-template <>
-CF_FN void mz_add_mod<3>(mz<3> *a, const mz<3> *b, const mz<3> *n)
-{
-    uint32_t s0, s1, s2, s3, r0, r1, r2, bw;
-    asm("add.cc.u32  %0, %4, %7;\n\t"
-        "addc.cc.u32 %1, %5, %8;\n\t"
-        "addc.cc.u32 %2, %6, %9;\n\t"
-        "addc.u32    %3, 0, 0;"
-        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3)
-        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
-    asm("sub.cc.u32  %0, %4, %7;\n\t"
-        "subc.cc.u32 %1, %5, %8;\n\t"
-        "subc.cc.u32 %2, %6, %9;\n\t"
-        "subc.u32    %3, %10, 0;"          /* borrow out of (s3:s) - n */
-        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(bw)
-        : "r"(s0), "r"(s1), "r"(s2), "r"(n->v[0]), "r"(n->v[1]), "r"(n->v[2]), "r"(s3));
-    const bool keep = bw != 0;              /* s < n: keep the sum */
-    a->v[0] = keep ? s0 : r0; a->v[1] = keep ? s1 : r1; a->v[2] = keep ? s2 : r2;
-}
-
-template <>
-CF_FN void mz_dbl_mod<3>(mz<3> *a, const mz<3> *n)
-{
-    const mz<3> b = *a;
-    mz_add_mod<3>(a, &b, n);
-}
-
-template <>
-CF_FN void mz_mul<4>(mz<4> *r, const mz<4> *a, const mz<4> *b,
-                      const mz<4> *n, uint32_t n0inv)
-{
-    uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5, m;
-    const uint32_t a0 = a->v[0], a1 = a->v[1], a2 = a->v[2], a3 = a->v[3];
-    const uint32_t n0 = n->v[0], n1 = n->v[1], n2 = n->v[2], n3 = n->v[3];
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const uint32_t bi = b->v[i];
-        asm("mad.lo.cc.u32  %0, %6, %10, %0;\n\t"
-            "madc.lo.cc.u32 %1, %7, %10, %1;\n\t"
-            "madc.lo.cc.u32 %2, %8, %10, %2;\n\t"
-            "madc.lo.cc.u32 %3, %9, %10, %3;\n\t"
-            "addc.u32       %4, %4, 0;\n\t"
-            "mad.hi.cc.u32  %1, %6, %10, %1;\n\t"
-            "madc.hi.cc.u32 %2, %7, %10, %2;\n\t"
-            "madc.hi.cc.u32 %3, %8, %10, %3;\n\t"
-            "madc.hi.cc.u32 %4, %9, %10, %4;\n\t"
-            "addc.u32       %5, 0, 0;"
-            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "=r"(t5)
-            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bi));
-        m = t0 * n0inv;
-        asm("mad.lo.cc.u32  %0, %6, %7, %0;\n\t"
-            "madc.lo.cc.u32 %1, %6, %8, %1;\n\t"
-            "madc.lo.cc.u32 %2, %6, %9, %2;\n\t"
-            "madc.lo.cc.u32 %3, %6, %10, %3;\n\t"
-            "addc.cc.u32    %4, %4, 0;\n\t"
-            "addc.u32       %5, %5, 0;\n\t"
-            "mad.hi.cc.u32  %1, %6, %7, %1;\n\t"
-            "madc.hi.cc.u32 %2, %6, %8, %2;\n\t"
-            "madc.hi.cc.u32 %3, %6, %9, %3;\n\t"
-            "madc.hi.cc.u32 %4, %6, %10, %4;\n\t"
-            "addc.u32       %5, %5, 0;"
-            : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5)
-            : "r"(m), "r"(n0), "r"(n1), "r"(n2), "r"(n3));
-        t0 = t1; t1 = t2; t2 = t3; t3 = t4; t4 = t5;
-    }
-    {
-        uint32_t s0, s1, s2, s3, bw;
-        asm("sub.cc.u32  %0, %5, %9;\n\t"
-            "subc.cc.u32 %1, %6, %10;\n\t"
-            "subc.cc.u32 %2, %7, %11;\n\t"
-            "subc.cc.u32 %3, %8, %12;\n\t"
-            "subc.u32    %4, %13, 0;"
-            : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(bw)
-            : "r"(t0), "r"(t1), "r"(t2), "r"(t3), "r"(n0), "r"(n1), "r"(n2), "r"(n3), "r"(t4));
-        const bool keep = bw != 0;
-        r->v[0] = keep ? t0 : s0; r->v[1] = keep ? t1 : s1;
-        r->v[2] = keep ? t2 : s2; r->v[3] = keep ? t3 : s3;
-    }
-}
-
-template <>
-CF_FN void mz_sub_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
-{
-    uint32_t d0, d1, d2, d3, m;
-    asm("sub.cc.u32  %0, %5, %9;\n\t"
-        "subc.cc.u32 %1, %6, %10;\n\t"
-        "subc.cc.u32 %2, %7, %11;\n\t"
-        "subc.cc.u32 %3, %8, %12;\n\t"
-        "subc.u32    %4, 0, 0;"
-        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3), "=r"(m)
-        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
-          "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
-    asm("add.cc.u32  %0, %0, %4;\n\t"
-        "addc.cc.u32 %1, %1, %5;\n\t"
-        "addc.cc.u32 %2, %2, %6;\n\t"
-        "addc.u32    %3, %3, %7;"
-        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
-        : "r"(n->v[0] & m), "r"(n->v[1] & m), "r"(n->v[2] & m), "r"(n->v[3] & m));
-    a->v[0] = d0; a->v[1] = d1; a->v[2] = d2; a->v[3] = d3;
-}
-
-template <>
-CF_FN void mz_add_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
-{
-    uint32_t s0, s1, s2, s3, s4, r0, r1, r2, r3, bw;
-    asm("add.cc.u32  %0, %5, %9;\n\t"
-        "addc.cc.u32 %1, %6, %10;\n\t"
-        "addc.cc.u32 %2, %7, %11;\n\t"
-        "addc.cc.u32 %3, %8, %12;\n\t"
-        "addc.u32    %4, 0, 0;"
-        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(s4)
-        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
-          "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
-    asm("sub.cc.u32  %0, %5, %9;\n\t"
-        "subc.cc.u32 %1, %6, %10;\n\t"
-        "subc.cc.u32 %2, %7, %11;\n\t"
-        "subc.cc.u32 %3, %8, %12;\n\t"
-        "subc.u32    %4, %13, 0;"
-        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(bw)
-        : "r"(s0), "r"(s1), "r"(s2), "r"(s3),
-          "r"(n->v[0]), "r"(n->v[1]), "r"(n->v[2]), "r"(n->v[3]), "r"(s4));
-    const bool keep = bw != 0;
-    a->v[0] = keep ? s0 : r0; a->v[1] = keep ? s1 : r1;
-    a->v[2] = keep ? s2 : r2; a->v[3] = keep ? s3 : r3;
-}
-
-template <>
-CF_FN void mz_dbl_mod<4>(mz<4> *a, const mz<4> *n)
-{
-    const mz<4> b = *a;
-    mz_add_mod<4>(a, &b, n);
-}
-#endif
+/* The L-limb Montgomery arithmetic -- mz<L>, the generic templates, and the
+ * PTX products and add/sub for L = 3 and 4 -- lives in cofac_arith.cuh, so
+ * that mulcheck.cu can test exactly the code k_cofac runs without the rest of
+ * this header. */
+#include "cofac_arith.cuh"
 
 /* Binary GCD. Both arguments are destroyed. n is odd, which removes half the
  * usual bookkeeping: the common power of two is always 1. */
@@ -1801,7 +1421,7 @@ typedef struct {
     uint32_t *d_sel, *d_nsel;             /* compacted job list per round  */
     /* Records whose residual did not fit L0/L1 limbs. Unreachable while
      * resolve_and_check_cofactor_config holds -- cof_classify has already rejected
-     * anything above mfb, and mfb is refused above 32*L -- so this is an
+     * anything above mfb, and mfb is refused above CF_WIDTH_BITS(L) -- so this is an
      * assertion on that chain, in the same spirit as the rcap check in
      * cofq_flush. It is one predicated OR per record and it converts the one
      * failure mode this whole width machinery exists to prevent, a silently
@@ -1981,6 +1601,9 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
                 for (int i = 0; i < L0; i++) Q.d_c0[(size_t)d * L0 + i] = v.v[i];
                 #pragma unroll
                 for (int i = L0; i < BN_LIMBS; i++) hi |= v.v[i];
+                /* and the bits above what the width's arithmetic takes
+                 * (mz_mul<4>: n < 2^127) */
+                hi |= cf_top_over<L0>(v.v[L0 - 1]);
                 Q.d_sm0[d] = 0;
                 if (hi) { Q.d_st0[d] = CF_OVERFLOW; atomicAdd(Q.d_ovf, 1u); }
                 else      Q.d_st0[d] = CF_INCOMPLETE;
@@ -1995,6 +1618,9 @@ __global__ void k_cof_enqueue(const bn_t *__restrict cof0, const uint8_t *__rest
                 for (int i = 0; i < L1; i++) Q.d_c1[(size_t)d * L1 + i] = v.v[i];
                 #pragma unroll
                 for (int i = L1; i < BN_LIMBS; i++) hi |= v.v[i];
+                /* and the bits above what the width's arithmetic takes
+                 * (mz_mul<4>: n < 2^127) */
+                hi |= cf_top_over<L1>(v.v[L1 - 1]);
                 Q.d_sm1[d] = 0;
                 if (hi) { Q.d_st1[d] = CF_OVERFLOW; atomicAdd(Q.d_ovf, 1u); }
                 else      Q.d_st1[d] = CF_INCOMPLETE;
@@ -2247,9 +1873,10 @@ static int cofq_init(cofq_t *Q, cofq_out_t *O, uint32_t cap,
      * only has 3", and those are different facts when the question is whether
      * a wider job could have run at all. It is also what lets cofcheck.sh
      * discover which cases this build can even attempt. */
-    printf("  cofactor width: side 0 %d limbs (%d bits), side 1 %d limbs"
-           " (%d bits); this build carries %d..%d\n",
-           Q->L0, 32 * Q->L0, Q->L1, 32 * Q->L1, CF_LMIN, CF_LMAX);
+    printf("  cofactor width: side 0 %d limbs (%u bits), side 1 %d limbs"
+           " (%u bits); this build carries %d..%d, up to %u bits\n",
+           Q->L0, CF_WIDTH_BITS(Q->L0), Q->L1, CF_WIDTH_BITS(Q->L1),
+           CF_LMIN, CF_LMAX, CF_WIDTH_BITS(CF_LMAX));
     /* A plan per ECM side (finding 126). Two identical plans when both sides
      * ask for the same B1 cost a few KB, not worth a sharing scheme. */
     if (meth0 && cf_ecm_dev_init(&Q->ecm[0], b1[0], b2[0], ecm_curves, 0)) goto done;
@@ -2965,7 +2592,7 @@ static int cofq_flush(cofq_t *Q, cofq_out_t *O, uint64_t lim0, uint32_t lpb0,
     COF_FLUSH_CK(cudaMemcpy(&nr, Q->d_nrel, 4, cudaMemcpyDeviceToHost));
     /* The width invariant, asserted rather than trusted: cof_classify rejects
      * a residual above mfb and resolve_and_check_cofactor_config refuses an mfb above
-     * 32*L, so a record that did not fit its side's limbs means one of those
+     * CF_WIDTH_BITS(L), so a record that did not fit its side's limbs means one of those
      * two is wrong. Stop -- the alternative is a relation built from a
      * truncated cofactor, which reconstructs to the wrong norm and is far
      * harder to trace back here. */
@@ -3063,6 +2690,14 @@ template <int L, int HI> CF_HD uint32_t cf_hi_limbs(const mz<L> *x)
     uint32_t o = 0;
     for (int i = HI; i < L; i++) o |= x->v[i];   /* L - HI is 1 or 2 */
     return o;
+}
+
+/* Nonzero if x does not fit width W's arithmetic: anything in the limbs
+ * above W, and where CF_WIDTH_BITS(W) stops short of 32*W bits (W = 4, whose
+ * product needs n < 2^127), the bits above that too. */
+template <int L, int W> CF_HD uint32_t cf_over_width(const mz<L> *x)
+{
+    return cf_hi_limbs<L, W>(x) | cf_top_over<W>(x->v[W - 1]);
 }
 
 /* Decimal to L limbs. Returns 0 if it does not fit. */
@@ -3239,13 +2874,14 @@ static int cf_run_side_at(const mz<CF_LMAX> *h_n, uint32_t nj, uint64_t lim,
         return -1;
     }
     for (uint32_t k = 0; k < nj; k++) {
-        /* cf_hi_limbs, not a hand-rolled loop: the helper exists precisely so
-         * that a fit test is written once as a loop over the width, and a
+        /* cf_over_width, not a hand-rolled loop: the helper exists precisely
+         * so that a fit test is written once as a loop over the width, and a
          * second copy here would be the one place a new limb went unexamined
-         * if CF_LMAX ever moves again. */
-        if (cf_hi_limbs<CF_LMAX, L>(&h_n[k])) {
-            fprintf(stderr, "  cofac: %s record %u does not fit %d limbs\n",
-                    side_name ? side_name : "cofactor", k, L);
+         * if CF_LMAX ever moves again. It also holds L = 4 to 127 bits. */
+        if (cf_over_width<CF_LMAX, L>(&h_n[k])) {
+            fprintf(stderr, "  cofac: %s record %u does not fit %d limbs"
+                    " (%u bits)\n", side_name ? side_name : "cofactor", k, L,
+                    CF_WIDTH_BITS(L));
             free(nn); return -1;
         }
         for (int i = 0; i < L; i++) nn[k].v[i] = h_n[k].v[i];
