@@ -774,10 +774,11 @@ uint32_t verify_apply_region(const uint32_t *records, uint32_t nrec,
  * wrong congruence). Comparing all 32K region counts against the GPU's cursors
  * gates PLACEMENT, at the same host cost.
  *
- * This runs the device's own transform, pl_transform_fast, so it validates the
- * walk and the fill, not the transform. verify_transform gates
+ * This runs the device's transform source, pl_transform_fast, so it validates
+ * the walk and the fill, not the transform. verify_transform gates
  * pl_transform_enc against the definition, and verify_transform_fast gates
- * pl_transform_fast against both. */
+ * pl_transform_fast against both -- host-compiled; the device's own
+ * primitives (PL_MULHI32, PL_CLZ32) are xftest's. */
 uint64_t verify_count_updates(const fb_t *fb, const qlat_t *L,
                               int logI, uint32_t J,
                               int log_region, uint32_t *per_region)

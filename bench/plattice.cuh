@@ -5,7 +5,10 @@
  * Ported from CADO-NFS sieve/las-plattice.hpp and
  * sieve/las-reduce-plattice-simplistic.hpp so that the benchmark walks the
  * same positions a real lattice siever does. Marked __host__ __device__ so
- * verify_cpu.c and the GPU kernels run bit-identical code.
+ * verify_cpu.c and the GPU kernels run the same source and get the same bits.
+ * Two primitives are spelled per platform, PL_CLZ32 and PL_MULHI32, with equal
+ * results; the device's are exercised by xftest (make check), not by the CPU
+ * gates.
  *
  * Proposition 1 of [FrKl05]: a basis <(i0,j0),(i1,j1)> of the p-lattice
  * inside the q-lattice with j0,j1 > 0, -I < i0 <= 0 <= i1 < I, i1-i0 >= I.
@@ -41,6 +44,16 @@ static inline int pl_clz32_host(uint32_t x)
     return n;
 }
 #define PL_CLZ32(x) pl_clz32_host(x)
+#endif
+
+/* The high word of a 32x32-bit product. On the device the 64-bit form made
+ * nvcc compare pl_redc's two high words as a 64-bit pair (finding 155): 9
+ * instructions a montmul where 6 do. xftest checks the device's against the
+ * host's. */
+#if defined(__CUDA_ARCH__)
+#define PL_MULHI32(a, b) __umulhi((a), (b))
+#else
+#define PL_MULHI32(a, b) ((uint32_t)(((uint64_t)(a) * (b)) >> 32))
 #endif
 
 /* Walk parameters. The increments must be 64-bit even while a slab-local
@@ -436,8 +449,9 @@ PL_FN uint32_t pl_transform_enc(uint32_t q, uint32_t r_enc,
  *   - REDC(T) = T * 2^-32 (mod q) for T < q * 2^32 replaces the 64-bit `%`.
  *     The four lattice terms reduce to D * 2^-32 and N * 2^-32, and the
  *     factors 2^-32 cancel in N/D.
- *   - the inverse is D^(q-2) by Montgomery square-and-multiply, the multiply
- *     computed on every bit and selected, so lanes stay converged.
+ *   - the inverse is D^(q-2) by Montgomery exponentiation in fixed 2-bit
+ *     windows, every window's multiply computed and selected, so lanes stay
+ *     converged (finding 155; finding 116's version went a bit at a time).
  *   - D * D^-1 == 1 is then CHECKED. That check, not primality, is what
  *     admits the result. It passes ONLY when D is invertible mod q -- always,
  *     for a prime q; for a prime power p^k only when D^(q-1) == 1, so an
@@ -451,7 +465,7 @@ PL_FN uint32_t pl_redc(uint64_t T, uint32_t q, uint32_t qinv)
     /* T < q * 2^32. The low words of T and m*q agree, so (T - m*q) / 2^32 is
      * the difference of the high words: no 65-bit intermediate for q >= 2^31. */
     const uint32_t m = (uint32_t)T * qinv;
-    const uint32_t u = (uint32_t)(((uint64_t)m * q) >> 32);
+    const uint32_t u = PL_MULHI32(m, q);
     const uint32_t h = (uint32_t)(T >> 32);
     return (h >= u) ? h - u : h - u + q;
 }
@@ -473,6 +487,18 @@ PL_FN uint32_t pl_subq(uint32_t a, uint32_t b, uint32_t q)
     return (a >= b) ? a - b : a + (q - b);
 }
 
+/* The exponent window's table entry, w in {1, 2, 3} (w == 0 gives d, which
+ * the caller drops). Two plain selects: written as one nested ?: nvcc made it
+ * a branch, which diverges, since every lane has its own q. One copy, so that
+ * shape cannot come back in one of its two uses. */
+PL_FN uint32_t pl_sel3(uint32_t w, uint32_t d, uint32_t d2, uint32_t d3)
+{
+    uint32_t t = d;
+    t = (w == 2u) ? d2 : t;
+    t = (w == 3u) ? d3 : t;
+    return t;
+}
+
 /* The fast path alone: returns 1 and writes rt when it applies (then
  * m == q and g == 1), 0 when the caller must use pl_transform_enc. */
 PL_FN int pl_transform_fast_try(uint32_t q, uint32_t r_enc,
@@ -485,7 +511,7 @@ PL_FN int pl_transform_fast_try(uint32_t q, uint32_t r_enc,
     if ((q & 1u) && q > 1u && r < q &&
         a0 > -LIM && a0 < LIM && a1 > -LIM && a1 < LIM &&
         b0 > -LIM && b0 < LIM && b1 > -LIM && b1 < LIM) {
-        uint32_t qinv = q, d, n, acc, t, e;
+        uint32_t qinv = q, d, n, d2, d3, acc, t, e, w;
         int bit;
         /* q^-1 mod 2^32 by Newton: q*q == 1 (mod 8) for odd q, and each
          * step doubles the correct bits, 3 -> 48. */
@@ -501,14 +527,30 @@ PL_FN int pl_transform_fast_try(uint32_t q, uint32_t r_enc,
         }
         if (d) {
             /* acc = d^(q-2) * 2^(-32(q-3)), each montmul dropping a 2^32:
-             * d^-1 * 2^64 for prime q. Left to right from the top bit, so no
-             * 2^32 mod q is needed to start. */
+             * d^-1 * 2^64 for prime q. Read as Montgomery forms, d stands for
+             * x = d * 2^-32 and acc for x^m, so any chain of montmuls that
+             * reaches m = q-2 gives the same residue (pl_redc returns [0, q)).
+             * Left to right in fixed 2-bit windows over a table {d, d^2, d^3}:
+             * two squares and one multiply per window, against two of each
+             * per pair of bits a bit at a time. For q-2 of nb bits that is
+             * 2 + 3(nb-2)/2 montmuls (nb even) or 2 + 3(nb-1)/2 (odd) against
+             * 2(nb-1): 21-24% fewer at q near 2^30 (44 v 58 at nb = 30, 47 v
+             * 60 at 31). The first window takes the top one or two bits, so
+             * the windows below it align to bit 0; no 2^32 mod q is needed to
+             * start. Window 00 computes its multiply and drops it, so lanes
+             * stay converged (pl_sel3 says how the entry is picked). */
             e = q - 2u;
-            acc = d;
-            for (bit = 30 - (int)PL_CLZ32(e); bit >= 0; bit--) {
+            d2 = pl_montmul(d, d, q, qinv);
+            d3 = pl_montmul(d2, d, q, qinv);
+            bit = (31 - (int)PL_CLZ32(e)) & ~1;      /* bits below the top window */
+            w = e >> bit;                            /* 1, 2 or 3 */
+            acc = pl_sel3(w, d, d2, d3);
+            for (bit -= 2; bit >= 0; bit -= 2) {
                 acc = pl_montmul(acc, acc, q, qinv);
-                t = pl_montmul(acc, d, q, qinv);
-                acc = ((e >> bit) & 1u) ? t : acc;
+                acc = pl_montmul(acc, acc, q, qinv);
+                w = (e >> bit) & 3u;
+                t = pl_montmul(acc, pl_sel3(w, d, d2, d3), q, qinv);
+                acc = w ? t : acc;
             }
             /* REDC(REDC(d * acc)) == 1  <=>  acc * 2^-64 is d's inverse */
             if (pl_redc(pl_montmul(d, acc, q, qinv), q, qinv) == 1u) {

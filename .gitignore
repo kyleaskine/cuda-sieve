@@ -39,6 +39,7 @@ bench/ckpttest
 bench/stoptest
 bench/slabtest
 bench/multest
+bench/xftest
 # wintest.bat outputs (cross-platform byte-comparison harness)
 bench/wintest.dat*
 bench/wintest.out

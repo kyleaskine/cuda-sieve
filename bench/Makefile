@@ -570,14 +570,14 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE
 -include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest multest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest multest xftest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck mulcheck cofcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
+.PHONY: all clean check ckptcheck stopcheck mulcheck xfcheck cofcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck stopcheck mulcheck cofcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
+check: all ckptcheck stopcheck mulcheck xfcheck cofcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 # The cofactor products' gate (finding 153): cofac_arith.cuh's PTX mz_mul<3>
@@ -590,6 +590,18 @@ multest: multest.cu cofac_arith.cuh bench.h $(ARCH_STAMP) $(DEFS_STAMP) $(CF_LMA
 
 mulcheck: multest
 	./multest
+
+# The transform fast path's device half (finding 155): pl_transform_fast_try
+# and its device-only primitives (PL_MULHI32, PL_CLZ32) as compiled for the
+# card, against the host's. A device-only fault there is silent in a run -- the
+# self-check fails, every entry falls through, relations stay identical -- and
+# no CPU gate compiles the device spelling. Needs a card, like mulcheck. Rerun
+# work/twin/xfmutants.py against it after changing those primitives.
+xftest: xftest.cu plattice.cuh $(ARCH_STAMP) $(DEFS_STAMP)
+	$(NVCC) $(NVCC_FLAGS) -o $@ xftest.cu
+
+xfcheck: xftest
+	./xftest
 
 ckptcheck: ckpttest
 	./ckpttest

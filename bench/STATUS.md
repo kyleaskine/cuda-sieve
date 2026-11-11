@@ -4,14 +4,21 @@
 the order they were discovered, including the ones later refuted, because the
 refutations are the most useful part. That makes them bad at answering "what
 does this thing do today". This file answers only that, and holds nothing that
-is not current. **Last updated 2026-10-31.**
+is not current. **Last updated 2026-11-10.**
+
+**Pruned 2026-11-10.** Closed items are cut to their outcome, their finding and
+whatever they left open; superseded measurements are gone, and the finding in
+`RESULTS.md` has the rest. The text as it stood before the prune is
+`git show eaba635:bench/STATUS.md` (and before the 2026-10-29 prune,
+`git show cadcf3c:bench/STATUS.md`).
 
 ## Architecture
 
-One process, both sides, one special-q at a time:
+One process, both sides, **two units of work in flight** (a slab, or a whole
+special-q on one-slab plans):
 
 ```
-per special-q:
+per special-q (per slab where the plan has several):
   host    reduce the q-lattice, build the three modulus tiers
   device  k_transform    plattice transform of the factor base
           k_fill_rows    bucketed q < 4I at logI <= 15: row-banded, one
@@ -27,51 +34,77 @@ per special-q:
                          (both-even cells get no norm and no small-prime hits;
                          side 0 computes the norm only under side 1's
                          survivors, --norm-gate)
-  (repeat for the other side)
+  (side 1 first, then side 0)
   device  k_intersect_compact   both-sides bitmap AND, gcd filter, rank scan
           trial division, classification, resieve
-                               (resieve of q < 4I row-banded at logI <= 13)
+                               (resieve of q < 4I row-banded at logI <= 13;
+                               side 0 resieves from its gated bucket records,
+                               --resieve-scan)
                                (the candidate RECORDING pass is
                                k_td_record_warp, one warp per candidate;
                                the two dense passes are k_td, one thread
-                               per survivor -- see the slab section)
-          cofactorisation (Pollard rho and ECM)
-  host    emit relations
+                               per survivor)
+          k_cof_enqueue  into a cross-q device queue; at each flush, k_cofac
+                         (ECM on both sides) splits the queue
+  host    emit relations (on a writer thread)
 ```
 
-By default, two sides run **sequentially through one shared bucket
-allocation**, side 1 first, and side 0's fill stores records only where side
-1's survivor bitmap (folded to 8 positions per bit) has a survivor
-(`--fill-gate`), and side 0's apply computes the log norm only at side 1's
-survivors (`--norm-gate`, on wherever the fill gate is, finding 141).
+**Two units in flight (findings 108-109, 121, 123, 136; `--q-pipeline`).** Once
+a slab's intersection is done, the next slab -- or, after a q's last slab, the
+next q -- is prepared and both its sides are sieved on a non-blocking stream,
+while this slab's trial division and cofactorisation run on the legacy stream.
+On one-slab plans, fill ahead (`--fill-ahead`) also runs the q after next's
+side-1 fill during this q's TD, `--q-prep auto` prepares the next q during
+this q's TD when its sieve has already finished, and `--td-ahead` queues TD's
+record pass ahead of its count readback. Only `plat` and `rowrt` are doubled,
+plus a third walk-cursor buffer on slabbed plans; the bucket array is not.
+When that extra does not fit in free VRAM the run stays single-queued, and the
+banner and run log say so (`# q-pipeline` line). `--fill-concurrent` and
+`--qspan` exclude it; `--no-q-pipeline` turns it off. Per-stage times then
+include sharing the card: only wall clock per q is additive, and `unaccounted`
+and acc/wall are reported as n/a; use a `--no-q-pipeline` band to diagnose
+host starvation.
+
+**The two sides share one bucket allocation and run in turn**, side 1 first.
+Side 0's fill stores records only where side 1's survivor bitmap (folded to
+8 positions per bit, `--fill-gate-shift 3`) has a survivor (`--fill-gate`),
+and side 0's apply computes the log norm only at side 1's survivors
+(`--norm-gate`, on wherever the fill gate is, finding 141).
 `--fill-concurrent` is an opt-in two-stream path with a second bucket
-allocation (finding 94); it overlaps sides of the same q, so it turns both
-gates off.
+allocation (finding 94); it overlaps the sides of one q, so it turns both
+gates off, and it excludes `--q-pipeline`.
 
-**Two units of work in flight by default since 2026-10-13 (findings
-108-109, `--q-pipeline`).** Once a slab's intersection is done, the next
-slab -- or, after a q's last slab, the next q -- is prepared and both its
-sides are sieved on a non-blocking stream, while this slab's trial division
-and cofactorisation run on the legacy stream. Only `plat` and `rowrt` are
-doubled, plus a third walk-cursor buffer on slabbed plans (0.05 GB at C143,
-0.26 GB at c183, 0.66 GB at C194); the bucket array is not. When that extra
-does not fit in free VRAM the run stays single-queued, and the banner and
-run log say so (`# q-pipeline` line). `--fill-concurrent` and `--qspan` exclude
-it; `--no-q-pipeline` turns it off. Per-stage times then include sharing the
-card, only wall clock per q is additive, and `unaccounted` and acc/wall are
-reported as n/a; use a `--no-q-pipeline` band to diagnose host starvation.
+**Defaults, all output-identical** (each has a `--no-` form or a level that
+restores the old path, and the run log names what a run got):
 
-**Fill defaults since 2026-10-13 (finding 107), all output-identical:**
-`--fill-gate` on (off under `--fill-concurrent`), `--fill-rows 4` at
-logI <= 15, `--resieve-rows` at logI <= 13. They remove the tail
-`k_fill_atomic` and `k_resieve_scatter` had, where the thread for the smallest
-bucketed modulus walks `xmax/I` hits while the average walks a few hundred.
-`bench/fillcheck.sh` is the identity gate. `--fill-rows 0`, `--no-fill-gate`
-and `--no-resieve-rows` restore the old fill; every run log names them on a
-`# fill` line. **Since finding 150**, `--fill-merge` runs the row tier and the
-walk as one launch on one-slab plans, and `--fill-skip57` drops positions 5 or
-7 divides on plans of several slabs per q. Both are output-identical, and the
-run log's `# fill-merge` and `# fill-skip57` lines say what a run got.
+- **Sieve skip** (finding 100, `--sieve-skip 2`): both-even positions are
+  never sieved, `3 | i, 3 | j` is skipped in fill, and (finding 150) 5 or 7
+  dividing both on plans of several slabs per q (`--fill-skip57`).
+- **Fill** (findings 107, 132, 150): the row tier (`--fill-rows 4` at
+  logI <= 15, `--resieve-rows` at logI <= 13), the side-0 fill gate,
+  bucket regions sized by row class (`--row-cap`), one launch for both
+  tiers on one-slab plans (`--fill-merge`, row cut 8, 128-thread blocks),
+  and 4608 x 32 fill blocks elsewhere (`--fill-blocks`). `bench/fillcheck.sh`
+  is the identity gate.
+- **Small-prime sieve** (findings 101-102, 129, 131, 145-146): the block and
+  warp tiers share their per-entry setup; powers of two <= 32 are folded
+  (`--tiny-fold`) and 3, 5, 7, 9 come from tables (`--tiny-table`); moduli
+  below 36 are walked by the whole block and below 256 by one warp each
+  (`--ss-block-cut`, `--ss-warp-cut`, runtime flags since finding 146).
+- **Bucket records carry log p** (finding 130); slices start only where the
+  log changes (finding 128).
+- **Cofactorisation**: ECM on both sides with an effort ladder by `lpb`
+  (finding 125), a per-side plan and the 3LP abort rule (finding 126); see
+  "Cofactorisation" below.
+- **Output** (findings 137, 138, 142): relations are formatted by hand and
+  written by a writer thread; the in-loop checkpoint waits at least 30 s.
+
+`bench/tune.sh` (finding 146) times the speed-only knobs (the tier cutoffs,
+`--fill-blocks`, `--fill-gate-shift`, `--fill-merge`) for one job on one card,
+interleaved and rotated on the same q, relations compared, and adopts a value
+only if it is slower in no round and faster by more than 1% and by more than
+the defaults' spread. The defaults above were chosen on the 5070 (sm_120);
+row 44 has what other cards want.
 
 **The algebraic factor base is generated in-process by default, added
 2026-08-24.** With `--fb1` omitted the pipeline calls the same GPU root finder
@@ -81,14 +114,15 @@ carry only the job. `FBGEN_GPU.md` is the reference and `fbgpucheck.sh` gates it
 across degrees; `--fb1`/`--cadofb` still take a file when one is wanted.
 
 `--relations NAME` stages to `NAME.part` and renames to `NAME` only when the
-band completes. The `.part` is the **durable artifact**, not scratch: after
-every cofactor flush it is fsynced and `NAME.part.ckpt` records the next
-`(q, rho)`, the byte offset, the relation count, the derived scale/allowance
-and a job fingerprint. Rerunning the same command resumes there; `--restart`
-discards; SIGINT/SIGTERM and `--stop-file` stop cleanly at the next special-q;
-`NAME.lock` refuses a second writer. Verified on a GPU 2026-08-16: a stopped
-and resumed band reproduces the uninterrupted one byte for byte, `kill -9` and
-a torn final line included. See item 12a.
+band completes. The `.part` is the **durable artifact**, not scratch: at most
+every 30 s, at a flush boundary under `--cofactor`, it is fsynced and
+`NAME.part.ckpt` records the next `(q, rho)`, the byte offset, the relation
+count, the derived scale/allowance and a job fingerprint. Rerunning the same
+command resumes there; `--restart` discards; SIGINT/SIGTERM and `--stop-file`
+stop cleanly at the next special-q; `NAME.lock` refuses a second writer. A
+stopped and resumed band reproduces the uninterrupted one byte for byte,
+`kill -9` and a torn final line included, and the install gates re-check
+that on c135 (kill -9 at 20 s and 45 s, and each clean stop). See item 12a.
 
 `--log PATH` appends a run log: a header block naming the commit, argv, job
 fingerprint, card, geometry and factor-base convention, then a timestamped
@@ -120,10 +154,12 @@ letting it surface as a bare "invalid device ordinal".
 **Reviewed and deployed 2026-08-17**: Greg Childers — who reported the
 original all-tasks-on-device-0 failure — signed off on the assignment change,
 and a BOINC queue is running with it. That closes item 13 as far as the
-application is concerned. There are no checkpoint files in the BOINC sense
-either: a suspended process resumes,
-but a process that exits and restarts begins the current band again (12a's
-sidecar is the repo's own mechanism, not BOINC's).
+application is concerned. There are no checkpoint files in the BOINC sense:
+a BOINC client quits a GPU task whenever it suspends it, and the restarted
+task resumes from 12a's last checkpoint (the repo's own sidecar, not BOINC's),
+so each suspend loses up to ~30 s at c135 (Known defects). Under a BOINC
+client, unusable staging or checkpoint artifacts are discarded and recomputed,
+up to three times per work unit; standalone runs still refuse them.
 
 **Native Windows is now a supported build target.** `platform.c` carries the
 filesystem/process/stop-hook differences, `build_windows.bat` builds a static-CRT
@@ -136,9 +172,9 @@ handler, so use `--stop-file` for a clean stop.
 
 ## Current size limits and j-slabbing
 
-The cofactor-width work landed on 2026-08-18 and the production pipeline now
-also supports rectangles larger than `2^31` positions by **j-slabbing** them.
-There is still no unsafe override of the local arithmetic bounds.
+The production pipeline supports rectangles larger than `2^31` positions by
+**j-slabbing** them (since 2026-08-24). There is no unsafe override of the
+local arithmetic bounds.
 
 | quantity | current limit | immediate reason |
 |---|---:|---|
@@ -149,192 +185,35 @@ There is still no unsafe override of the local arithmetic bounds.
 | large primes per side | 3 | `ceil(mfb/lpb) <= 3` is checked before the run |
 | exact norm | 384 bits (`BN_LIMBS` 12) | build-time knob, even limbs 4..16; a lattice needing more is SKIPPED with a warning, never wrapped (was 256 until 2026-08-27) |
 
-Automatic planning uses `2^29` positions as a performance target once the full
-sieve reaches `2^30` positions; below that trigger it does not split for
-performance alone. With default `J=2^(logI-1)` and `bkthresh=I`, I15 uses 1
-slab, I16 4, I17 16, I18 64, I19 256, and I20 1024. The target is empirical
-and is a performance/memory default, not a correctness bound or a claim of a
-universal speed optimum. RTX 3090 and RTX 5070 both minimized complete time at
-`2^29` per slab. On an L40, `2^30` was instead 4.6% faster than `2^29`
-(531.16 vs 555.70 ms/q), but `2^29` still beat the former `2^31` behavior by
-1.5% (564.13 ms/q) while reducing steady VRAM from 7.76 GB to 3.20 GB.
-`--slab-j N` can override the default upward or downward for
-regression/memory/performance tuning, while the `2^31` position bound and the
-actual largest direct-tested prime remain mandatory safety constraints. Raising
-`bkthresh` can therefore still make the planner choose smaller slabs.
+**Slab planning.** Automatic planning targets **32,768 bucket regions per
+slab** (`SLAB_PERF_REGIONS`), which at the default `--region 14` is `2^29`
+positions, and splits only an area of at least twice the target (deliberate
+hysteresis; `slab.h` and `slabtest` pin both). With default `J=2^(logI-1)` and
+`bkthresh=I`, I15 uses 1 slab, I16 4, I17 16, I18 64, I19 256, and I20 1024.
+`--slab-j N` overrides it; the `2^31` position bound stays mandatory. Raising
+`bkthresh` can still make the planner choose smaller slabs. What the target
+rests on, all on the 5070 at c194 I16:
 
-> **What `2^29` actually is — MEASURED 2026-08-26, finding 79.** It is **not a
-> slab-size constant.** `--region` x `--slab-j` swept jointly shows `fill`
-> minimised at a fixed bucket-region COUNT in all three rows tested, so the
-> optimal AREA halves with the region: `2^29` at `--region 14`, `2^28` at 13,
-> `2^27` at 12. **Refined the same day by finding 80:** `fill = L(nregion) +
-> 1.178 x nslab` collapses both sweeps to 2.3-4.2%, `L` is minimised at
-> **nregion 16,384**, and the 32,768 that finding 79 reported is the *reachable*
-> optimum at region 14 — getting to 16,384 there needs twice the slabs, and the
-> re-stream cancels the gain. `2^29` is what 32,768 regions means at the default
-> `log_region 14`, and nothing more. Region 14 remains the joint optimum
-> because `k_apply` launches one block per region and costs +52% at region 13,
-> +157% at region 12 — so the defaults are right, and that is exactly why the
-> coupling was never noticed. Consequence: **the card-dependent quantity to
-> autotune is `nregion`, not slab size**, and the L40's preference for `2^30`
-> is a preference for 65,536 regions.
->
-> **Cause SETTLED 2026-08-26 by `ncu` (finding 81): read-modify-write on
-> partially-filled bucket lines.** Profiling `k_fill_atomic` with everything but
-> `nregion` held constant, **L2 read sectors are flat within 3% while DRAM read
-> sectors rise 135%** (18.5M -> 43.5M) — the memory system fetching lines the
-> kernel never requested, which in a write-only stream is RMW and nothing else.
-> Records are 4 B and a sector is 32 B, so eight consecutive appends fill a
-> sector; past the knee the frontier is evicted before they arrive. DRAM writes
-> go from **1.15x to 1.96x** the theoretical floor, and total DRAM traffic tracks
-> finding 80's `L` curve (1.00/1.17/1.49/1.94 against 1.00/1.07/1.44/2.09) at a
-> flat effective bandwidth, so fill is DRAM-traffic-bound and `L(nregion)` is a
-> traffic curve. Earlier candidates are both dead: cursor atomic contention (a
-> 16x thread sweep does not move the argmin) and L2 *capacity* (the frontier is
-> 2 MB against 48 MB). Being associativity/sector-bound rather than
-> capacity-bound is why a 6 MB 3090 and a 48 MB 5070 agree — **and it means the
-> L40's preference for 65,536 regions now needs its own explanation, since
-> capacity was never the reason. That is the only part still open.**
->
-> **No action at the operating point:** the default already runs at 1.28x the
-> write floor, and the best reachable point is worth ~4 ms of fill against
-> +53 ms of apply.
-
-**Open investigation -- slab target on large-L2 GPUs. NARROWED 2026-08-24
-(finding 74).** The 5070 now has the complete matched sweep on `c194` I16/J32768,
-including the two points that were previously missing:
-
-| local area | slabs | bucket array | complete ms/q | vs best |
-|---|---:|---:|---:|---:|
-| `2^31` | 1 | 5.20 GB | 521.16 | +18.1% |
-| `2^30` | 2 | 2.60 GB | 465.92 | +5.6% |
-| **`2^29`** | **4** | **1.30 GB** | **441.30** | **best** |
-| `2^28` | 8 | 0.65 GB | 454.44 | +3.0% |
-
-So `2^29` is this job's optimum outright, not a memory compromise -- it is both
-the fastest point and a quarter of the `2^31` footprint.
-
-> **The ORDERING above is current; the ABSOLUTE numbers are not.** A paired
-> re-sweep on 2026-08-25 (finding 75), after `k_apply` got 12% faster, measures
-> the same points at 486.55 / 436.48 / **411.32** / 424.00 ms/q for that same
-> reference binary and 467.77 / 414.84 / **392.28** / 404.39 after the change
-> -- about 7% below this table, with the gap concentrated in cofactorisation
-> rather than in `fill` or `apply`. The two sweeps ran under different machine
-> conditions, so quote ms/q from finding 75 and treat this table as the shape.
-> `2^29` remains the optimum on both binaries, and the re-sweep adds `2^27`
-> (+15.8%), which brackets the minimum from below for the first time.
-
-**Superseded 2026-08-26 by a full-range sweep on the current binary (finding
-78).** Same job, total area held at `2^31`, `--slab-j` swept so only the slab
-COUNT moves, three repeats, idle card. **Quote these numbers.**
-
-| slabs | local area | fill | apply | dense TD | **complete** |
-|---:|---:|---:|---:|---:|---:|
-| 1 | `2^31` | 184.17 | 131.19 | 10.91 | 439.63 |
-| 2 | `2^30` | 130.02 | 132.87 | 9.96 | 386.25 |
-| **4** | **`2^29`** | **99.85** | 131.63 | 10.39 | **355.65** |
-| 8 | `2^28` | 100.17 | 131.99 | 13.34 | 361.11 |
-| 16 | `2^27` | 115.97 | 132.29 | 22.03 | 396.27 |
-| 32 | `2^26` | 128.07 | 135.54 | 41.83 | 460.30 |
-| 64 | `2^25` | 166.15 | 137.22 | 82.05 | 611.05 |
-
-`2^29` is now bracketed four doublings below instead of one, and `apply` is flat
-across a 64x range in slab count, which is the control. Going one step past the
-optimum is nearly free (+1.5% at 8 slabs); the penalty then compounds, and both
-halves of it -- `fill` and dense TD -- are quantified in item 18.
-
-**Settled 2026-08-25 by a second sweep at double the area.** An earlier draft
-claimed the two cards genuinely disagree; that was retracted as confounded
-(finding 72's L40 run is area `2^32`, this one area `2^31`, so "`2^30` per slab"
-meant 4 slabs there and 2 here), and by slab COUNT both cards appeared to
-optimise at four. The discriminating run — same 5070, same job, `J 65536`,
-area `2^32` — was then done:
-
-| local area | slabs | complete ms/q |
-|---|---:|---:|
-| `2^31` | 2 | 892.78 |
-| `2^30` | 4 | 795.78 |
-| **`2^29`** | **8** | **766.04** |
-| `2^28` | 16 | 801.33 |
-
-**The optimum stayed at `2^29` positions while the count doubled 4 -> 8, so slab
-SIZE is the controlling variable and the count hypothesis is dead.** Fill cost
-normalised per unit area traces the same curve at both total areas (27.92 vs
-26.66 ms per `2^29` at the optimum), which is the locality mechanism behaving as
-it should. The `2^29` default is correctly parameterised.
-
-That also restores finding 72's conclusion on sound evidence: at the matched
-area `2^32` the L40 prefers `2^30` and this 5070 prefers `2^29`, so the cards do
-differ and neither optimum generalises. **Remaining gap:** finding 72 does not
-name the L40's job and this sweep is c194, so card-vs-card still needs a matched
-JOB, not just a matched area.
-
-What finding 74 adds beyond another data point is the mechanism. The curve is
-two terms crossing: **fill** improves 41% from `2^31` to `2^29` and then
-saturates (190.65 -> 111.68 -> 112.22 ms; finding 77 extends the sweep and
-finds it *reverses* below that, not merely saturates), while the **`record
-candidate factorisations` pass grows linearly at ~1.33 ms per slab** (1.39 ms
-at 1 slab, 10.64 at 8) and is what makes `2^28` lose. Apply is flat across the
-whole range. A card whose fill term keeps improving past `2^29` crosses later,
-which is exactly the L40's behaviour. **The recording half of that crossing was
-removed on 2026-08-26 (finding 77) and the dense trial-division pass took its
-place; see below.**
-
-The per-slab tax was then run down to its cause (finding 74's mechanism note):
-`k_td` gives one thread per candidate and each thread marches the whole
-small-prime list, so a recording launch costs ~0.65 ms flat -- 5,342 candidates
-or 577, it makes no difference. **Sizing the grid to the candidate count does
-not help and was measured not to.** The effective fix is to split that march
-across a warp per candidate; batching the pass across slabs is the weaker
-variant that only removes the surplus launches.
-
-**BUILT 2026-08-26 -- finding 77.** `k_td_record_warp` gives one warp per
-candidate and takes the hit mask from `__ballot_sync`, whose ascending lane
-order is ascending entry order, so factors are divided out in exactly the order
-`k_td` produces and **relations are byte-identical at every slab count on
-c194, c147 and AS276**. Batching across slabs was not built and is not needed.
-
-The pass is now `O(nacc)` rather than `O(nsm)`: measured across the sweep, a
-launch costs **56.6 us fixed + 55 ns per candidate**, against the old flat
-653 us. The **per-slab fixed tax is 1,306 -> 113 us, 11.5x**, and the operating
-point gains **wall -1.09%** (349.69 -> 345.87 ms/q, arms non-overlapping) with
-`fill` unmoved as the control. Finding 74's ~32x projection applied to the
-march alone; what remains per launch is the serial norm-and-division work,
-which is per candidate and was always real. `--td-record-scalar` restores the
-old path for A/B.
-
-`2^29` remains the optimum, as projected. What the change buys is the shape
-below it: `2^28` now costs **+1.7% instead of +3.4%**, and `2^27` +12.1%
-instead of +15.9% -- the memory decoupling that makes small slabs affordable
-for an A=32 job on a 12 GB card, which was always the reason to do this rather
-than throughput.
-
-**The tax then changed hands.** Below `2^29` the two terms that now grow are
-the DENSE `norms + trial division` pass (10.34 / 13.18 / 21.83 ms at 4 / 8 / 16
-slabs) and `fill`, which does not merely saturate but **reverses** -- 98.90 /
-99.59 / 115.20 over the same range. The dense pass has the same disease, and
-the arithmetic names its fix: `k_td` runs the `nsm` march inside its grid-stride
-loop, so a launch costs `ceil(n/(blocks*threads))` marches. From 1 to 4 slabs
-`iters` falls 4 -> 2 -> 1 in lockstep with the split, the total march count
-stays at 8, and the cost is flat. At 4 slabs `iters` bottoms out at 1, and every
-halving after that doubles the marches -- 16 then 32 -- which is the column
-exactly. Its fix is NOT this one applied again: warp-per-item would lose
-wherever survivors exceed the thread count, which is the common case at large
-slabs. It wants lanes-per-item chosen from `n` against the grid -- and NOT a
-bigger grid, which was tested on 2026-08-26 and is worth 0.0-2.5% at every
-slabbed geometry (item 18), nor on the unslabbed one either (finding 78b).
-`fill`'s reversal was **measured on 2026-08-26 (finding 78)** and is not "walk
-re-entry": `k_fill_atomic` streams 42 B per factor-base entry per slab --
-`plat` 24 + `slice` 2 + `walk_cur` 8 + `walk_next` 8 -- x 22.1M entries =
-**929 MB per slab**, independent of slab size. It is bandwidth, it is close to
-irreducible, and the slope is **1.18 ms/slab**, not the 1.98 the three-point
-window implied. Both terms are item 18's, but only the TD one is addressable.
-
-Collecting matched sweeps on more large-L2 Ada/Hopper parts remains worthwhile.
-A cache-aware automatic target is now less blocked than it was -- the recording
-tax it had to balance against is 11.5x smaller -- but the dense-TD term has
-replaced it in that role, so the same argument for waiting still applies, with a
-different term named.
+- **Fill is minimised at a fixed region count, not a fixed area** (findings
+  79-80): `fill = L(nregion) + 1.178 x nslab`, `L` least at 16,384 regions
+  and 32,768 the reachable optimum at region 14. Region 14 is the joint
+  optimum because `k_apply` launches one block per region and costs +52% at
+  region 13, +157% at region 12. **The card-dependent quantity is
+  `nregion`, not slab size.**
+- **`L(nregion)` is DRAM traffic** (finding 81): past the knee, bucket lines
+  are evicted before eight 4-byte appends fill a 32-byte sector, so the
+  memory system read-modify-writes them (DRAM reads +135% at flat L2 reads).
+  That is associativity/sector-bound, not capacity-bound, which is why a 6 MB
+  3090 and a 48 MB 5070 agree.
+- **The sweep** (finding 78, total area `2^31`, slab count the only variable):
+  complete ms/q 439.6 / 386.3 / **355.7** / 361.1 / 396.3 / 460.3 / 611.1 at
+  1 / 2 / **4** / 8 / 16 / 32 / 64 slabs. Each slab streams ~42 B per
+  factor-base entry (929 MB at c194), 1.18 ms per slab of fill; below `2^29`
+  the dense TD pass grows too (item 18). At area `2^32` the optimum stayed at
+  `2^29` per slab (8 slabs), so slab size is what controls it.
+- **Open:** an L40 preferred `2^30` slabs (65,536 regions) at area `2^32`
+  (finding 72), 4.6% faster; capacity was never the reason, so that needs its
+  own explanation, on a matched job.
 
 ### Why the lattice walk itself is wide
 
@@ -485,7 +364,7 @@ raising the other:
 - Raising `mfb` above 96 requires `mz<4>` arithmetic even when the actual
   maximum is only 101 bits. Rho, ECM, probable-prime testing, GCD, and exact
   division all pay the wider modular-arithmetic cost. **Built 2026-08-18** —
-  see "Four-limb cofactors" below.
+  see "Cofactorisation" below.
 
 The useful dispatch is fixed-width kernels selected on the host, independently
 for each side:
@@ -494,7 +373,7 @@ for each side:
 |---:|---|---|
 | `<= 64` | `mz<2>` | **not built, and deliberately so** — see below |
 | `<= 96` | `mz<3>` | built |
-| `<= 128` | `mz<4>` | built 2026-08-18 |
+| `<= 127` | `mz<4>` | built 2026-08-18; 127 since finding 153 |
 
 The underlying `mz<L>` arithmetic was already templated; what was hardcoded was
 the production queue/storage and its launches at `mz<3>`. Runtime
@@ -537,7 +416,7 @@ On a 400-q c147 band at `lpb 33`, 8,810 of 2,075,496 emitted factors exceed
 `2^32`, the largest `0x1ffd77b3b`.
 
 What this does **not** cover is `mfb > 96`, which is the four-limb change
-described next.
+under "Cofactorisation" below.
 
 This makes `lpb=33` with `mfb=64/95` a materially smaller extension than
 `lpb=35` with `mfb=64/101`: the former needed 64-bit factor outputs but retains
@@ -545,419 +424,183 @@ two- and three-limb cofactor kernels; the latter needs a four-limb kernel on
 the 101-bit side. Both ratios still ask for at most three large primes, so
 `CF_MAXFAC` is not the blocker.
 
-The output-width change itself should be cheap. The TD factor lists remain
-32-bit because factor-base primes remain 32-bit; only the much smaller residual
-and split-prime arrays need widening. The expensive part is any extra limb in
-the repeatedly executed modular arithmetic.
+### Cofactorisation
 
-There is one direct measurement of the per-side dispatch opportunity. Widening
-the formerly two-limb rational queue to three limbs changed that queue from
-2.15 to 3.94 ms/q (**+83%**) while changing the then-current whole pipeline
-from 172.65 to 173.75 ms/q (**+0.64%**). Narrow arithmetic matters greatly to
-the stage that uses it, but the easy side was only about 1% of wall time. That
-makes per-side dispatch sensible work while the queue is already being changed,
-not a high-value standalone optimisation.
+**Width, per side.** Each side's cofactors run in the narrowest instantiation
+that holds its `mfb`: `mz<3>` up to 96 bits, `mz<4>` up to 127 (no `mz<2>`
+tier, for the reason under "LPB and MFB" above). `lpb >= 33` is necessary but
+not sufficient for a fourth limb: `mfb` decides. AS276 (`~/code/ggnfs-distributed/AS276.job`, the C208, `lpbr/mfbr`
+33/64, `lpba/mfba` 35/101) resolves to 3 limbs on the rational side and 4 on
+the algebraic with no flag.
 
-### Four-limb cofactors — BUILT 2026-08-18, NOT YET TIMED
+Forcing the wide shape on a job that does not need it cost a widened queue
+x1.72 and **+8.8% of wall on the c183, +8.2% on the C194** (finding 70, before
+the PTX arithmetic), so the dynamic per-side selector is what ships; it costs
+one host-side switch per flush. `--cof-limbs N` / `--cof-limbs0 N` force a side
+**wider** than its `mfb` needs (to time one job at both widths); narrower is
+refused. `make CF_LMAX=3` builds the 3-limb splitter alone: same 3-limb
+kernels, about half the `.nv_fatbin` and the `ptxas` time, a packaging
+option, not a speed one.
 
-`mfb` up to 128 is supported (127 since 2026-11-09, finding 153: the 4-limb
-product needs its modulus below 2^127), and the width is chosen **per side** at run time
-as the narrowest instantiation that holds that side's `mfb`. Everything up to
-and including a C194's `mfba 95` still gets 3/3 and is unchanged.
-
-**AS276 (`~/code/ggnfs-distributed/AS276.job`, the C208) is the motivating job
-and it resolves to 4/3 with no flag.** Its parameters, and what each one does
-here:
-
-| | value | consequence |
-|---|---|---|
-| `lpbr / mfbr` | 33 / 64 | 2 parts, **3 limbs** — 64 bits, but `CF_LMIN` is 3 |
-| `lpba / mfba` | 35 / 101 | 3 parts, **4 limbs** — 101 bits does not fit 96 |
-| `rlim / alim` | 181.6M / 268.4M | `lim^2` ~ 2^54.7 / 2^56, both well above `2^lpb` |
-| derived allowance | 102.63 bits (side 1) | sits just above `mfba 101`, as it should |
-| `log2(maxnorm)` | 205.02 at `logI 15, J 16384` | inside `bn_t`'s 256-bit budget, 51 bits spare |
-
-Two things fall out of that table. The **rational** side is the exact case an
-`mz<2>` tier would serve — `mfbr 64` is 64 bits carried in 96 — and it is still
-not worth building, for the reason given above: that queue is ~1% of a
-special-q. And `lpb >= 33` is **necessary but not sufficient** for a fourth
-limb; AS276's rational side has `lpbr 33` and still runs 3 limbs, because
-`mfbr` is what decides.
-
-**AS276 was sieved end to end on 2026-08-18** at `logI 15, J 16384`, factor
-base from `fbgen --maxbits 15` (44 s, 230 MB). Three special-q, `--cofactor`:
-
-- width line reports `side 0 3 limbs (96 bits), side 1 4 limbs (128 bits)` —
-  derived, no flag;
-- 134 relations, 44.67 rel/q, 39.00 of them from cofactorisation;
-- **134 of 134 rebuild both norms exactly** through `--check-relations`;
-- 130 emitted factors exceed `2^32`, the largest `2^34.96` — hard against the
-  `lpba 35` ceiling.
-
-That is the end-to-end proof the golden test cannot give: a genuine 4-limb
-population, split by the 4-limb kernel, emitted through the 64-bit output path,
-and verified against the norms. **No timing was taken** — the ECM job had the
-GPU, and a 3-q band amortises the final queue flush over nothing.
-
-**Cross-validated 2026-08-19 against the 1.5B-relation GGNFS corpus for this
-job** (`~/code/ggnfs-distributed/AS276/`, already filtered): over the identical
-30 special-q and an identical sub-rectangle, **recall 3,044 / 3,045 = 99.97%**,
-with 64 of our 4,089 relations existing nowhere in their corpus and all 64
-reconstructing exactly. Full method and the re-find analysis in RESULTS finding
-69. This is the strongest correctness evidence the 4-limb path has: an
-independent siever, an independently filtered corpus, and set membership rather
-than self-comparison.
-
-**It also surfaced the one thing the width change actually broke, which is not
-the width.** At `--cof-rounds 2 --cof-budget 65536` (the default until
-2026-08-19) the same run
-lost **389 of GGNFS's 2,846 relations (13.7%)**; `6 / 262144` recovered all but
-2, for **+19.3% relations**. Rho's iteration count scales as the square root of
-the factor sought, so a 35-bit large prime costs 5.7x a 30-bit one, and the
-default was calibrated on the c183's `lpba 32`. An exhausted budget returns
-`CF_INCOMPLETE` and the relation is silently dropped — it presents as a yield
-hole in the siever, not as a cofactoriser problem. **The schedule around the
-splitter needs re-deriving per width class; the splitter itself did not.**
-
-Note `A = 29` there, not the `A = 32` NFS@Home's own geometry for this job
-would want; the area limit is a separate, still-open blocker and does not stop
-the job being sieved at a smaller rectangle.
-
-What moved:
+Where the width lives:
 
 - `CF_LMAX` / `CF_LMIN` / `cf_limbs_for_mfb` in `bench.h` — the build's width
-  range and the mfb → limbs rule. `CF_LMAX` defaults to 4;
-  `make CF_LMAX=3` compiles the 3-limb splitter alone.
+  range and the mfb → limbs rule. `CF_LMAX` defaults to 4.
 - `cofq_t.d_c0/d_c1` are **raw limb arrays plus `L0`/`L1`**, not `mz<3> *`. The
   stride is a run-time choice and `mz<3>`/`mz<4>` are distinct types, so the
   array cannot carry one of them in its type. `cf_run_rounds_dyn` is the only
   place that casts back.
 - `k_cof_enqueue` is templated on `<L0, L1>` (four cheap instantiations) and
   the standalone `--cofac` batch parses at `CF_LMAX` and narrows per side.
-- `--cof-limbs N` / `--cof-limbs0 N` force a side **wider** than its `mfb`
-  needs. Narrower is refused, in `resolve_and_check_cofactor_config`, which is the one
-  place that has seen both the `.job` file and the command line.
+- `resolve_and_check_cofactor_config` is the one place that has seen both the
+  `.job` file and the command line, and refuses an `mfb` above what the
+  chosen width holds.
 
 The width invariant is asserted rather than trusted. `cof_classify` rejects a
-residual above `mfb` and `resolve_and_check_cofactor_config` refuses an `mfb` above
-`32*L`, so nothing can reach the queue too wide for its side — and if it does,
-`k_cof_enqueue` marks it `CF_OVERFLOW`, counts it, and `cofq_flush` stops the
-run. The failure mode being closed is a *silently truncated* cofactor, which
-does not crash: it emits a relation that reconstructs to the wrong norm. Both
-previous versions of this array (2 limbs, then 3) had exactly that bug.
+residual above `mfb` and `resolve_and_check_cofactor_config` refuses an `mfb`
+the side's width cannot hold, so nothing can reach the queue too wide for its
+side — and if it does, `k_cof_enqueue` marks it `CF_OVERFLOW`, counts it, and
+`cofq_flush` stops the run. The failure mode being closed is a *silently
+truncated* cofactor, which does not crash: it emits a relation that
+reconstructs to the wrong norm. Both previous versions of this array (2 limbs,
+then 3) had exactly that bug.
 
 **The ceiling that binds first is not the width.** `CF_MAXFAC` caps a split at
-3 large primes, so `mfb <= 3*lpb` regardless, and at `lpb 32` that is 96 bits —
-precisely what 3 limbs already held. A side needs 4 limbs only once its `lpb`
-reaches 33. Going past 128 bits means 4LP, which is `CF_MAXFAC` and
-`mz_split`'s `sp + 2 > CF_MAXFAC` stack guard, not another limb.
+3 large primes, so `mfb <= 3*lpb` regardless. Going past 127 bits means 4LP,
+which is `CF_MAXFAC` and `mz_split`'s `sp + 2 > CF_MAXFAC` stack guard, not
+another limb.
 
-#### What the correctness gate can and cannot prove without a C208
+**Method: ECM on every side, the default since 2026-10-21** (finding 125), at 8
+curves x 4 rounds, `B2 = 30 * B1`, and `B1` on a ladder by `lpb`, one step
+higher for a 3LP side: 2LP 100 / 140 / 200 / 280 / 400 at lpb 29 / 30-31 /
+32-33 / 34-35 / 36-37, 3LP 140 / 200 / 280 / 400 / 560, continuing the ladder
+(unmeasured) at 38 and up to 1120, each side its own plan from its own lpb
+(`cof_auto_b1`, `COF_AUTO_CURVES`; per side since finding 126). On a 3LP ECM
+side, after round 2 only records that have split once are run again
+(`--cof-abort`, default 2, finding 126: +0.7-4.9% relations per second on C183
+to C208 and SNFS-301 for 0.09-0.24% of relations). Measured within 0.067% of
+saturated yield at every lpb 29-36 on c135, c183 and I16. ECM beat rho at 2LP
+by 1.2x (lpb 29) to 3.3x (lpb 35) once the PTX carry chains landed.
+`--cof-rho` forces rho on both sides; cofcheck pins the automatic method and
+the derived plan for a mixed and a 2LP-only shape. A record that exhausts its
+budget or its curves returns `CF_INCOMPLETE` and is dropped silently, so an
+under-provisioned schedule shows up as a yield hole, not as a cofactoriser
+error (finding 69: AS276 lost 13.7% of GGNFS's relations to a rho budget
+calibrated on `lpba 32`).
 
-`cofcheck.sh` gained a width block. The load-bearing case is **byte-identical
-output between a 3-limb and a 4-limb run of the same job**. That is a real
-proof, not a smoke test: rho and ECM are Montgomery-domain algorithms whose
-iteration is `y <- y^2 + c` in the *true* domain regardless of `R = 2^(32L)`
-(`c = c0*R`, `y0 = 2*R`), and `gcd(qR^k, n) = gcd(q, n)` because `n` is odd. So
-widening a side must change the cost and nothing else. The 2 → 3 limb widening
-of the rational side produced the same md5, which is the precedent.
+**The arithmetic.** The curves are Suyama's, projective `A24 = (an : ad)`,
+sigma = `c0 * 1000 + cv + 6`, with `c0 = r + 1` in round `r` (so round 0 runs
+sigmas 1006 and up). The ladder costs 12 products per bit (finding 154: x_dbl's
+redundant one removed). Products are PTX carry chains (finding 125), and since
+finding 153 `mz_mul<3>`/`<4>` use the even/odd carry-chain layout of Greg
+Childers' gmp-ecm branch `gpu-stage1-dynamic`, reimplemented (that code is
+GPLv3, this tree CC0): 95 -> 46 SASS instructions per product at 3 limbs, 158
+-> 59 at 4, which is what needs the 4-limb modulus below 2^127. `mz_mul`
+returns the canonical `a*b/R mod n` in `[0, n)`, so regrouping products cannot
+change a result. Not adopted from that branch: its ladder (GMP-ECM's param 3,
+a third of Suyama's expected torsion) and its dedicated square (more SASS than
+`mz_mul(a, a)` at 3 and 4 limbs). `make mulcheck` (`multest`, needs a card)
+checks both widths against a bit-serial reference on structured words; rerun
+`work/eomul/mutants.py` against it after changing a chain.
 
-Cases added: the build reports its own width range; `mfb` above `32*CF_LMAX` is
-refused; rho at 4/4, rho at 4/3, and ECM-with-stage-2 at 4/3 are each
-byte-identical to the 3/3 run; `lpb 33 / mfb 99` **derives** 4/3 with nobody
-choosing it, emits relations, and every one reconstructs; and that same shape
-with `--cof-limbs 3` is refused.
+**`k_cofac` carries `__launch_bounds__(256, 2)`** (finding 97): at 256 threads
+per block, 128 registers per thread is exactly two blocks per SM, and where
+the stage-2 kernel lands without the bound depends on the toolkit and the
+target, not on the source alone (130 registers on CUDA 13.4, 150 on 13.2, 168
+on 12.8 for sm_120). Every instantiation is at or under 128 registers (finding
+154). **The 256 is a hard launch ceiling** (`COFAC_THREADS_MAX`,
+bench.h): `cf_run_rounds` launches `k_cofac` at `min(--threads, 256)` and the
+chunk floor uses the same width, so a wider `--threads` still applies to every
+other kernel instead of failing at the first cofactor flush.
 
-**All 45 cases pass on 2026-08-18**, `sm_120`, including the four new ones. The
-`lpb 33 / mfb 99` case derives 4/3 with nobody choosing it and emits 64
-relations that all reconstruct, so the 4-limb splitter is not merely compiled —
-it has produced verified relations.
-
-What no gate here can reach is a genuine 4-limb *population*. `lpb 33 / mfb 99`
-on the c183 admits a few candidates above 96 bits; a C208 is made of them —
-which is what AS276 and its GGNFS corpus were used for (finding 69).
-
-#### The three deployment options — RESOLVED 2026-08-19
-
-All three questions this section used to pose are answered; the numbers are in
-finding 70 and the decisions are made.
-
-- **Dynamic per-side selector — CHOSEN, and it is what ships.** Forcing the
-  wide shape on a job that does not need it costs **+8.8% of wall on the c183
-  and +8.2% on the C194** (a widened queue is ×1.72), which is too much to
-  give away for the simplicity of always running wide. The selector costs
-  nothing at run time — one host-side switch per flush.
-- **"Always 4/3" — rejected**, on those same numbers.
-- **Separate executables — rejected as a performance measure**, kept as a
-  packaging option. The 3-limb kernels are register-identical in both builds
-  (78 / 86 / 122, verified against a `CF_LMAX=3` compile), so a wide build does
-  not slow the narrow path. What `make CF_LMAX=3` does buy is **binary size**:
-  `.nv_fatbin` 8.99 MB → 4.02 MB, and about half the `ptxas` time. That is an
-  argument about BOINC distribution, not about sieving.
-
-#### Register cost of the fourth limb — measured 2026-08-18, no GPU needed
-
-The register question was the one genuinely new risk: ECM stage 2 holds
-`mpt<L> baby[CF_ECM_NBABY]` plus four more points, which at `L = 4` is 64
-registers of live state before any working value. `ptxas -v` answers it without
-touching the card. `sm_120`, `-O3`, all six `k_cofac` instantiations:
-
-| `k_cofac<L, method, stage2>` | registers | stack frame | spills | reg-limited warps/SM |
-|---|---:|---:|---:|---:|
-| `<3, rho, ->` | 78 | 96 B | **0** | 25 |
-| `<4, rho, ->` | 94 | 112 B | **0** | 21 |
-| `<3, ECM, no s2>` | 86 | 96 B | **0** | 25 |
-| `<4, ECM, no s2>` | 112 | 112 B | **0** | 18 |
-| `<3, ECM, s2>` | 122 | 368 B | **0** | 16 |
-| `<4, ECM, s2>` | 154 | 448 B | **0** | 12 |
-
-(warps/SM from 65,536 registers per SM and 8-register granularity; it is an
-upper bound from registers alone, not a measured occupancy.)
-
-**Nothing spills at any width**, which was the failure mode that would have made
-the 4-limb ECM path far worse than the CIOS ratio predicts. It does not happen.
-
-What the table does show is that **the cost compounds on the ECM stage-2 path
-and only there.** Rho loses 25 → 21 warps (−16%) on top of ~1.8x arithmetic;
-ECM with stage 2 loses 16 → 12 (−25%) on top of the same arithmetic.
-
-**That worry did not materialise.** Measured a day later, ECM at 4 limbs is
-2.7x *cheaper* than rho on AS276 at matched yield and is now the default on a
-3LP side (finding 70) — the occupancy penalty is real but far smaller than
-rho's `sqrt(p)` growth over the same width step. `CF_ECM_NBABY` is still the
-knob to reach for if 4-limb ECM ever does look disproportionate; it has not
-needed touching.
-
-The 3-limb instantiations are **identical in both builds** — 78 / 86 / 122
-registers, measured on a `CF_LMAX=3` compile of the same source. They are
-separate template instantiations and ptxas allocates registers per kernel, so a
-wide build does not make the narrow kernel slower. That closes "separate
-executables" as a *performance* option; it survives only as the binary-size
-argument above.
-
-### Cofactor width and method — MEASURED 2026-08-19, GPU idle
-
-Both questions the width work opened are now answered. The box's ECM job was
-suspended (`kill -STOP`) so these are contention-free.
-
-**1. What the fourth limb costs on work that does not need it.** c183, 200 q,
-and C194, 100 q, forced wide with `--cof-limbs`. **All four width combinations
-emit byte-identical relation files** (c183 md5 `17d8f1d8…`, 9,363 relations),
-so this is a pure width price on unchanged work:
-
-| job | side0/side1 | rational q | algebraic q | stage ms/q | wall ms/q |
-|---|---|---:|---:|---:|---:|
-| c183 | 3/3 | 2.86 | 13.90 | 16.88 | 112.17 |
-| c183 | 4/3 | 4.93 | 14.18 | 19.22 | 116.37 |
-| c183 | **3/4** (the C208 shape) | 2.85 | 23.46 | 26.38 | **121.99** |
-| c183 | 4/4 | 4.89 | 23.74 | 28.72 | 124.38 |
-| C194 | 3/3 | 3.32 | 12.10 | 15.48 | 116.30 |
-| C194 | **3/4** | 3.26 | 20.87 | 24.18 | **125.82** |
-
-A side's queue costs **x1.72** at four limbs (rational 2.86 -> 4.93; algebraic
-13.90 -> 23.46 and 12.10 -> 20.87), against the 1.8-2x the CIOS ratio
-predicted. Wall cost of running the C208 shape on a job that does not need it:
-**+8.8% (c183), +8.2% (C194)**.
-
-**Verdict: keep the dynamic selector.** 8-9% of wall is too much to give away
-for the simplicity of "always 4/3", and the selector costs nothing at run time
-(a host-side switch per flush). Separate executables remain unjustified —
-the 3-limb kernels are register-identical in both builds. **This is the
-decision the width work was blocking, and it is now made.**
-
-**2. rho vs ECM. ECM on every side is the default since 2026-10-21**
-(finding 125), at 8 curves x 4 rounds, `B2 = 30 * B1`, and `B1` on a ladder
-by `lpb`, one step higher for a 3LP side: 2LP 100 / 140 / 200 / 280 / 400 at
-lpb 29 / 30-31 / 32-33 / 34-35 / 36-37, 3LP 140 / 200 / 280 / 400 / 560,
-continuing the ladder (unmeasured) at 38 and up to 1120, each side its own plan from
-its own lpb (`cof_auto_b1`, `COF_AUTO_CURVES`; per side since finding 126).
-On a 3LP ECM side, after round 2 only records that have split once are run
-again (`--cof-abort`, default 2, finding 126: +0.7-4.9% relations per second on
-C183 to C208 and SNFS-301 for 0.09-0.24% of relations). Measured
-within 0.067% of saturated yield at every lpb 29-36 on c135, c183 and I16, at
-0.66-0.92x the ECM time of the previous rule. `--cof-rho` forces rho on both
-sides; cofcheck pins the automatic method and the derived plan for a mixed and
-a 2LP-only shape.
-
-Why it changed: the PTX carry chains (finding 125, `cofac.cuh`) cut ECM's
-time to ~0.37x and rho's to ~0.55x, and finding 70 had priced 2LP only at
-lpb 29/30. ECM now beats rho at 2LP by 1.2x (lpb 29) to 3.3x (lpb 35).
-
-History: from 2026-08-19 the method was per side from `ceil(mfb/lpb)`, rho at
-2LP and ECM at 3LP with `B1` 200/300/500 by `lpb` and 12 curves, and the
-requeue round default went 2 -> 4. Zero-flag effect then: c183 17.21 -> 14.30
-ms/q *and* 9,363 -> 9,394 relations; C194 15.48 -> 13.95; AS276 3,443 ->
-4,089 relations. The measurement behind it (finding 70): ECM 2-4x at 3LP,
-rho ~1.1x at 2LP lpb 29/30; guidance in RUNBOOK "Method".
-
-*(An earlier version of finding 70 reported 15-18x. That was wrong: rho had
-been priced at an over-large budget rather than swept from below — the same
-one-sided-tuning error the finding was written to expose. Corrected in place.)*
-
-**Finding 70's sweep rows and its applied table disagree, and the gap is
-unexplained (noted 2026-09-15).** The sweep prices c183 `lpb 32 / mfb 93`
-ECM-best at 19.71 ms/q; the applied table ~40 lines BELOW it (RESULTS.md:4289,
-not above — an earlier version of this note misdirected the reader) records the
-shipped c183 config (`lpb 31/32`, `mfb 60/92`) at 14.30 ms/q stage on the same
-date. Finding 98 re-measured the shipped config at **14.60 ms/q** (two-side
-total; algebraic side alone 11.71), i.e. 2% slower than the applied table and
-consistent with it — so the applied table, not the sweep row, is the number to
-compare a current build against. Finding 98's first draft read the sweep row as
-the comparator and claimed a 26% improvement from `3e15fec`..`2bc1c6e`; that
-claim is withdrawn, and no ECM speedup is demonstrated there.
-
-Part of the residual 19.71-vs-14.30 gap is a third mismatch neither doc named
-at first: the sweep row is `mfb 93` (finding 70's `3*lpb-3` convention) while
-the shipped c183 algebraic side is `mfb 92` (`3*lpb-4`, per `oracle/input.job`).
-Finding 98 measures ~3% of relations and 62-72% of cofactor-stage time per bit
-of `mfb`, so one bit bounds a real share of it.
-
-Finding 98's saturation gate also does NOT re-confirm the `B1` ladder, contrary
-to what an earlier version of this paragraph said: it held `B1` at its derived
-value and varied only curves and rounds (24/6 against 12/4), which found
-relation counts *identical* to the default on all four matched arms. That
-proves the default is not under-provisioned; it is silent on `B1` itself.
-
-**Finding 98's LEVEL ranking was superseded by finding 99 and is now
-REINSTATED (2026-09-16).** 98 took the per-step growth in required relations on
-trust at 1.75x. 99 measured it, first controlling on digits — which gave GNFS
-1.52 against SNFS 1.79 and made the level a coin flip — and then, after Kyle
-pointed out that digits means nothing for SNFS, controlling both arms on
-**Murphy-E**, where they agree at **1.62-1.74x**. c183 flips at 1.632 and C194
-at 1.612, both at the bottom edge, so the lower rung wins across essentially
-the whole range and 98's direction stands. The margin does not: it runs from
-under 1% at the bottom to 9% at the top. Kyle's 1.75-1.80 rule sits just above
-the range and is mildly conservative. The ideal-count model's 1.94x — which
-98 argued for — remains an upper bound a real job never approaches.
-
-AS276 is a separate story: with the raw-vs-unique correction applied uniformly
-most of its configs had no admissible window, and the earlier claim that the
-shipped gap-2 `33/35` beat the gap-1 `34/35` by 7.8% is withdrawn. **The job
-then finished (2026-09-16), and it says the target was the problem:** it
-factored at `33/35`, A=32, on 1.671B raw relations over q = 80-427M — 0.913x
-the target this project carried — and at that count `33/35` has an ordinary
-117M-692M window. A=31 would have needed span 7.84x from the same floor,
-breaking the duplicate rule, which confirms 98's area argument from outside the
-harness. What survives 98 untouched either way is the BALANCE asymmetry and the
-`mfb`-96 cap — neither has a relation target in it, so R cancels.
-
-**The absolute GPU-day figures in finding 98 are optimistic and always were.**
-The harness counts raw relations per q; the targets are unique relations. The
-two sources in finding 99 disagree on the level of that correction (Kyle's
-dedup sheet says ~59% unique on a 6x span, msieve's own duplicate line says
-~78% on the same 40 jobs, most likely because NFS@Home dedups server-side
-first) and the disagreement is unresolved. They agree on the *slope* — for
-GNFS, ~1 pt per `lpb` and ~9.8 pt from a 3x to a 6x span — and only the slope
-enters a ranking, so the comparisons are safe and the absolute day counts are
-not. (An earlier version of this paragraph quoted ~2 pt per `lpb` from a fit
-that pooled GNFS and SNFS; the SNFS points are 6 of 40 and carry a slope four
-times steeper, and the targets they correct are GNFS jobs.)
-
-**`k_cofac` carries `__launch_bounds__(256, 2)` since 2026-09-14 -- finding 97.**
-At 256 threads per block, 128 registers per thread is exactly two blocks per
-SM, and where the stage-2 kernel lands depends on the toolkit and the target,
-not on the source alone (the same code: 130 registers on CUDA 13.4, 150 on
-13.2, 168 on 12.8 for sm_120; 118 on 12.1 for sm_86). ECM stage 2's shared
-denominator (4ae5308) crossed it on 13.4 and made the change a net loss on
-sm_120; with the bound the change is kept and the kernel is back to two blocks.
-Cofactor device time -10.3% (5070) and -5.2% (5090); on a 3060 that had no
-cliff it is -1.0% with wall flat. Relations md5-identical on all three cards.
-**The 256 is a hard launch ceiling** (`COFAC_THREADS_MAX`, bench.h):
-`cf_run_rounds` launches `k_cofac` at `min(--threads, 256)` and the chunk floor
-uses the same width, so a wider `--threads` still applies to every other kernel
-instead of failing at the first cofactor flush. The measurement protocol
-(`rentalcof.sh` and `rentalcof/*.patch` at `e47f205`) predates the fix and does
-not run against it as-is: its bound patch no longer applies and its HEAD arm is
-already bounded.
+**Gates.** `cofcheck.sh`'s width block: a 3-limb and a 4-limb run of the same
+job are byte-identical (rho and ECM iterate in the true domain whatever
+`R = 2^(32L)` is, and `gcd(qR^k, n) = gcd(q, n)` for odd `n`, so widening a
+side changes the cost and nothing else); `lpb 33 / mfb 99` derives 4/3 with
+nobody choosing it and every relation reconstructs; the same shape with
+`--cof-limbs 3` is refused. The genuine 4-limb population is AS276's, checked
+against the 1.5B-relation GGNFS corpus for that job (finding 69): over 30
+special-q and an identical sub-rectangle, recall 3,044 / 3,045 = 99.97%, and
+the 64 relations of ours that exist nowhere in their corpus all reconstruct.
 
 ### Performance accounting
 
-**The host's wall clock was steered; bench now reads CLOCK_MONOTONIC_RAW
-(findings 133-134, 2026-10-27/28).** The WSL guest's CLOCK_MONOTONIC
-(`clocksource tsc`) averaged 1.0545-1.0566 against Windows time (finding
-133), but not steadily. adjtimex's `tick` toggles every 1-8 s between
-nominal and +6.6-8.3%, so over 10 s it ran 1.0525-1.0766 of the card's
-event timer, and one run's wall could read 0-8% long against the next
-(finding 134). It was already there on 2026-10-20.
+**bench reads CLOCK_MONOTONIC_RAW (finding 134).** The WSL guest's
+CLOCK_MONOTONIC is steered between nominal and 6.6-8.3% fast every few
+seconds, so wall figures taken on this host before finding 134 read ~5% long
+and carry up to ~8% of clock noise per run; RAW matches the card's timer to 1
+part in 10,000. Two time sources are active (`systemd-timesyncd` and
+`hv_utils`); which one steers is not identified, and choosing between them is
+Kyle's call. **The wall clock (CLOCK_REALTIME) is stepped back instead**: about
+2.48 s every ~32 s, measured 2026-11-11 at load ~18 (`work/twin/mtime/`).
+`/usr/bin/time`'s elapsed and file mtimes use it. So a process time comes out
+~2.5 s short when a step lands inside the run (finding 155's process-time
+column), and `make -q` can find an object newer than the link that used it.
+Time processes in-process on RAW, or over enough runs to average the steps.
+**Cause, 2026-11-11 (`work/twin/mtime/fight.txt`):**
+- The Windows clock is 4.07 s fast against NTP (`w32tm /stripchart`). The
+  Windows Time service is stopped, with Manual start.
+- WSL's host-time sync slews the guest towards Windows' time with the kernel
+  tick at 10833 (+8.3%).
+- `systemd-timesyncd` steers the guest to `ntp.ubuntu.com` and steps it back
+  ~2.5 s at every 32 s poll.
 
-Two time sources are active: `systemd-timesyncd` (`ntp.ubuntu.com`), and
-`hv_utils` stepping realtime toward Windows time. Which one writes `tick`
-is not identified. Choosing between them is Kyle's call.
-`hyperv_clocksource_tsc_page` is available but would not help: steering
-acts on CLOCK_MONOTONIC whatever the clocksource.
+The two never agreed.
 
-**From finding 134 on, `bench_monotonic_ms` reads CLOCK_MONOTONIC_RAW**,
-which ran 1.0000 of the card's timer in every interval. ms/q here reads
-~5% lower than before (C135 3.29 -> 3.115). `unaccounted` and
-GPU-accounted / wall lose the ~5% of wall that did not exist: about
-0.23 ms of C135's ~0.34 ms single-queued. Earlier wall figures from this
-host are ~5% pessimistic, and comparisons among them carry this clock
-noise: up to ~8% for a single run, less for paired medians over several
-rounds.
+**Fixed 2026-11-11 ~07:52 by Kyle.** The Windows Time service now runs with
+Automatic start (time.windows.com, 1024 s poll), and `systemd-timesyncd` is
+disabled in the guest, so the guest follows Windows alone. Afterwards:
+- Windows is within 16 ms of NTP;
+- the tick is 10000 in every sample;
+- there are 0 wall-clock steps in 300 s;
+- CLOCK_MONOTONIC / RAW is 1.00000 (`work/twin/mtime/*.after.txt`).
 
-**Where the time is after `--sieve-skip` (finding 100, 2026-09-23).** Positions
-`gcd(i,j)` rules out are no longer sieved: default level 2 drops both-even
-positions everywhere and `3 | i, 3 | j` in fill. Relations are byte-identical;
-wall fell **12.3%** on c183 I15, **13.1%** on C194 I16 and **10.0%** on AS276
-I17. **Then finding 101 (same day)** removed the small-prime sieve's replicated
-per-entry setup: apply −19 to −24%, wall −7 to −9%, again byte-identical, and
-**finding 102** did the same for the warp tier (apply −4 to −5%, wall −2 to
-−3%). c183 read **fill 16.6 / apply 18.8 of 68.9 ms/q** after finding 102; the three findings
-compound to **~−21.8%** at matched host load (raw figures across the day mix
-host loads from ~4 to ~14.5). On the ALGEBRAIC side's `k_apply`, what leads now is the block tier's
-hits and their shared-memory atomics (~21% of its samples) and the norm (~15% of
-samples, 22.6% of instructions);
-the rational side's shares differ. Findings 103-104 tried to recover the norm
-lazily in five designs: the best wins on c183 (apply −13.6%) but loses on
-C194 and AS276, so it is not shipped and item 10 is parked, although a
-`--norm const` control removes 24-28% of apply. Fresh profile at `6997d77`
-(finding 103): **fill 16.5 / apply 18.7 / TD + classify 14.6 / cofactor 10.1
-of 67.5 ms/q**. The older numbers below are all from before these findings.
+Timings taken before then carry the caveats above. Bench keeps reading RAW.
 
-**`k_fill_atomic` is L2-bound, measured 2026-08-25 (finding 76).** ncu on a
-5070: L2 throughput 68.7%, DRAM 24.7%, SM throughput 9.4%, IPC 0.22 of 4.0,
-101 warp-cycles per issued instruction. Its theoretical occupancy is 50%,
-capped by `Block Limit SM` = 24 because 32-thread blocks are one warp each --
-not by registers (limit 64) or shared memory (32). **That ceiling is benign.**
-Raising block width to reach 100% occupancy is measurably SLOWER at matched
-total threads (101.84 ms at 32 threads against 106.70 at 64), because extra
-resident warps contend for the resource that is actually scarce. This is the
-opposite character to `k_apply`, which is issue-bound with DRAM at 8.5% and
-where occupancy was worth -12.6% (finding 75). The two large sieve kernels
-need opposite tuning; do not carry a conclusion from one to the other.
+**Where the time goes** (finding 147, nsys, installed `0c7dda1f`, 2026-11-01;
+findings 150 and 153-154 have changed fill and `k_cofac` since). Share of
+summed kernel time:
 
-Three-to-four-limb Montgomery multiplication expands the CIOS inner product
-from `3*3 = 9` to `4*4 = 16` limb multiply-adds. That suggests roughly a
-1.8–2x cofactor-stage cost from width alone, subject to register pressure. A
-quoted **5x** is not a four-limb estimate: it combines the width cost with a
-pessimistic rho workload in which the factor being sought is three bits larger
-and therefore takes about `sqrt(8) = 2.8x` as many expected iterations. ECM
-also pays for four-limb operations, but does not have rho's square-root scaling;
-the rho/ECM crossover for the new cofactor population is unmeasured.
+| kernel | c135 | C148 | I16 |
+|---|---:|---:|---:|
+| `k_fill_atomic` | **32.8%** | **29.3%** | 34.8% |
+| `k_apply` | 25.6% | 22.3% | **37.0%** |
+| `k_resieve_scatter` | 9.9% | 16.7% | 8.1% |
+| `k_td` | 8.7% | 7.8% | 6.1% |
+| `k_transform` | 4.8% | 12.1% | 2.4% |
+| `k_fill_rows` | 5.9% | 4.9% | — |
+| `k_classify` | 3.3% | 2.6% | 1.2% |
+| `k_cofac` | 2.6% | (no flush in the window) | 5.2% |
+| card idle | 5.0% | 1.4% | 0.5% |
 
-On the current measured profile, cofactorisation is 14.37 of 98.26 ms/q
-(14.6%). If the *entire* stage changed and everything else remained fixed:
+What binds each, on the 5070:
 
-| cofactor-stage multiplier | total ms/q | whole-pipeline slowdown |
-|---:|---:|---:|
-| 1.8x | 109.8 | 11.7% |
-| 2x | 112.6 | 14.6% |
-| 3x | 127.0 | 29.3% |
-| 5x | 155.7 | 58.5% |
+- **`k_fill_atomic` is bound by L2 request rate, additive per request**
+  (finding 148): side 1's time splits walk 16-21%, atomic 41-50%, store
+  29-43%; side 0's is 45-58% gate. More warps, cursor spacing and running fill
+  beside apply do not help (beside apply at greatest priority the two overlap
+  96% and apply slows from 9.5 to 17.0 ms: +28-30 ms/q of wall either way).
+  One launch for both tiers (`--fill-merge`) and the 5/7 gcd skip are what
+  landed (finding 150). No large fill win is left on this card; on the 3060
+  the fill grid is worth up to 19% (row 44).
+- **`k_apply` is issue-bound** (~88%, findings 110-111), with the block
+  tier's shared-memory atomics and the norm leading; occupancy was the cheap
+  win there (finding 75, `__launch_bounds__(512, 3)`, three blocks per SM).
+  Its barrier stall after the bucket add comes from the tier cuts, worth
+  about 0.6-0.8% of wall (finding 147). The two big kernels want opposite
+  tuning: do not carry a conclusion from one to the other.
+- **`k_transform`** is balanced (issue 61%, DRAM up to 52% at I16); its
+  inverse is branch-free square-and-multiply since finding 116. Row 47 is
+  the open lead.
+- **`k_resieve_scatter`** at C148 waits on its summary and bitmap loads; the
+  coarse filter below 2^29 positions is slower, so `PIPE_RS_COARSE_MIN`
+  stands; `UNROLL` 8 is slower (48 registers cost a block per SM), so 4
+  stands (finding 147).
 
-**Measured against this table 2026-08-19:** the widened queue came in at
-**x1.72**, inside the 1.8-2x row, and whole-pipeline cost moved **+8.8%**
-(c183) and **+8.2%** (C194) — close to the 11.7% the 1.8x row predicts, and
-lower because only ONE side widens on a real job. The 5x row never applied: it
-priced rho's `sqrt` growth into the width, and the fix for that was to stop
-using rho on the side that suffers it.
+**Card idle** is 5.0% at c135 in finding 147's trace (3.6% after findings
+133-137, rising as the kernels shrank), 1.4% at C148 and 0.5% at I16. What is left of it is listed in row 33 and item 4.
 
-That table is an Amdahl illustration, not a projection for AS276. The larger
-job has a different area, cofactor distribution, stage mix, and yield. The 5x
-case would normally apply only to its hard four-limb subset, not every queued
-record.
-
-The final metric is **time to a filterable matrix**, not raw relations/s:
+**The final metric is time to a filterable matrix**, not raw relations/s:
 
 ```
 new time / old time
@@ -973,405 +616,170 @@ about 7.31x. Those are **not** required-relation multipliers—a run does not
 sample the entire prime universe—but they show why extra raw yield cannot be
 credited without filtering. MFB does not directly enlarge the ideal universe
 at fixed LPB, but admitting more and larger 3LP products can still raise the
-required surplus.
+required surplus. A change that shrinks the sieve area per q (a shorter J, say)
+has to be priced the same way: it needs more special-q for the same relations,
+at higher q where yield is lower and duplicates more common.
 
-### Work status and rough scope
+### Work status
 
-| item | status | rough engineering scope, including GPU validation |
-|---|---|---:|
-| A=32 by j-slabbing, state carried across slabs | **done 2026-08-24**, merged from `greg/slab`, tuned through 2026-08-26, **validated at NFS@Home's own shape 2026-09-01** (finding 82) | — |
-| A=32 as ONE unslabbed rectangle (`2^32` exclusive endpoint) | not started, **and not wanted** — finding 78 makes the slabbed path the faster one | about 1 week if a reason appears |
-| 64-bit large-prime outputs and gates | **done 2026-08-17** | — |
-| per-side `mz<3>` / `mz<4>` dispatch | **done 2026-08-18**, gated and timed (+8-9% wall when forced wide) | — |
-| per-side rho/ECM dispatch, default | **done 2026-08-19**, gated and timed (finding 70) | — |
-| PTX carry chains for the cofactor arithmetic (L = 3, 4) | **done 2026-10-21**, byte-identical (abcheck 36/36), I16 1.10x end to end (finding 125) | — |
-| ECM on every side, effort ladder by `lpb` | **done 2026-10-21**, swept at lpb 29-36, <= 0.067% of relations for 0.66-0.92x the ECM time (finding 125) | — |
-| ECM plan per side, and the 3LP abort rule | **done 2026-10-21**, byte-identical when off (6 jobs), +0.7-4.9% rel/s on every job with a 3LP side at the default abort 2 (finding 126) | — |
-| cofactor outcome reporting (`split / dead / stuck`) | **done 2026-08-19** | — |
-| C208 validated against a 1.5B-relation GGNFS corpus | **done 2026-08-19**, 99.97% recall (finding 69) | — |
-| 384-bit exact norms, `BN_LIMBS` a build knob | **done 2026-08-27**, byte-identical gate on AS276, +0.45 ms of a 90 ms q | — |
-| `normscan` band width survey, wired into `testsieve.sh` | **done 2026-08-27** | — |
-| in-process GPU factor-base generation | **done 2026-08-24** | — |
-| filter test on a real corpus | **captured — a C123 was factored end to end from our relations, 2026-08-05** (`work/c123run/msieve.log`) | — |
-
-**The 3–5 engineering-week slabbing estimate that stood here was spent: the
-implementation landed 2026-08-24 and was tuned to 2026-08-26.** What is left of
-A=32 is the unslabbed whole-area path, which nothing currently needs. The
-remaining estimates are source review, not measured schedules.
+| item | status |
+|---|---|
+| A=32 by j-slabbing, state carried across slabs | **done 2026-08-24**, tuned to 2026-08-26, validated at NFS@Home's own shape 2026-09-01 (finding 82) |
+| A=32 as ONE unslabbed rectangle | not wanted: finding 78 makes the slabbed path the faster one |
+| 64-bit large-prime outputs and gates | **done 2026-08-17** |
+| per-side `mz<3>` / `mz<4>` dispatch | **done 2026-08-18** (finding 70) |
+| ECM on every side, effort ladder by `lpb`, per-side plan, 3LP abort | **done 2026-10-21** (findings 125-126) |
+| PTX carry chains, then the even/odd products | **done 2026-10-21** (finding 125) and **2026-11-09** (finding 153) |
+| cofactor outcome reporting (`split / dead / stuck`) | **done 2026-08-19** |
+| C208 validated against a 1.5B-relation GGNFS corpus | **done 2026-08-19**, 99.97% recall (finding 69) |
+| 384-bit exact norms, `BN_LIMBS` a build knob | **done 2026-08-27** |
+| `normscan` band width survey, wired into `testsieve.sh` | **done 2026-08-27** |
+| in-process GPU factor-base generation | **done 2026-08-24** |
+| a complete factorisation from our relations | **done 2026-08-05**, a C123 (`work/c123run/msieve.log`) |
 
 ## Validated
 
 | | what | where |
 |---|---|---|
-| **Golden suite** | `./cofcheck.sh` — 30 cases on c183 q=120000053, exact relation counts, not ranges | `cofcheck.sh` |
-| **Reconstruction gate** | every emitted factor divides, is prime, is within lpb, and both norms rebuild to exactly 1 | `--check-relations` |
-| **Transform gates** | root transform against its definition, over a real factor base | `fbtest` |
+| **Golden suite** | `./cofcheck.sh` — c183 q=120000053 and the width, method, tier-cut, skip and gate cases, exact relation counts, not ranges | `cofcheck.sh` |
+| **Install gates** | `abcheck.sh` (36 runs over four job sets, relations byte-identical against the installed binary), the c135 20,000-q reference (1,855,599 relations, all reconstructing), `kill -9` resumes and clean stops back to that reference, SNFS301, `make check`, `fillcheck.sh`; SASS and resource identity outside the kernels a change touches | `bench/*.sh`, `work/*/gate.sh` |
+| **Product gate** | `mz_mul<3>`/`<4>` against a bit-serial reference, with mutants for every carry | `make mulcheck` |
+| **Reconstruction gate** | every emitted factor divides, is prime, is within lpb, `gcd(a,b) == 1`, and both norms rebuild to exactly 1 | `--check-relations` |
+| **Transform gates** | root transform against its definition, over a real factor base; the fast path against the general path exactly | `fbtest` |
 | **Band runs** | c147: 1340 q → 159,837 relations, both sides PASS | 5070, 5090, 4090, A100 |
 | **Real job** | snfs236, ~20M relations before deliberate interruption | 5070 |
 | **Full NFS factorisation** | C123 sieved entirely by us, filtered and solved by msieve: `p42 * p82` | `work/c123run` |
 | **`A = 32`** | AS276 at `2^17 x 2^15`, 8 slabs: 1,322/1,322 norms rebuilt, rectangle confirmed from the relations (finding 82) | 5070 |
 | **Completeness at `A = 32`** | AS276 at GGNFS's own `2^17 x 2^15`, 8 slabs, 30 q: 4,563 of GGNFS's 4,564 relations found (99.98%), no loss at any slab boundary (finding 100) | 5070 |
-| **`--sieve-skip` identity** | relations byte-identical at levels 0/1/2 on c183 I15, C194 I16 (4 slabs) and c183 with odd slab starts (`--slab-j 4095`), and at 0/2 on AS276 I17 (8 slabs); gated in `cofcheck.sh` (finding 100) | 5070 |
+| **Older cards** | GTX 1080 (sm_61) and RTX 2080 Ti (sm_75): `--verify-only`, `fbgen_gpu`, `cofcheck.sh` and a c183 band reproduce the 3090/4090 counts (item 15) | k8s pods |
 
-Cards with measured band data: **RTX 5070** (WSL2), **RTX 5070 Ti Laptop** (WSL2, 115 W; finding 139), **RTX 5090**, **RTX 4090**,
-**A100 80GB** (native Linux), and an **RTX 3090** via an external reporter.
+Cards with measured band data: **RTX 5070** (WSL2, the development card),
+**RTX 5070 Ti Laptop** (WSL2, 115 W; finding 139), **RTX 5090**, **RTX 4090**,
+**A100 80GB** (native Linux), an **RTX 3090** via an external reporter, and
+`tune.sh` reports from a rented **RTX 3060** and **RTX 4070 SUPER** (row 44).
 
 `--check-relations` runs on a machine with no GPU.
 
 ## Measured, and what it means
 
-- **C143 against cado-gpu, 2026-10-12/13** (findings
-  [105](RESULTS.md#finding-105), [107](RESULTS.md#finding-107) and
-  [108](RESULTS.md#finding-108)). On the first 6,983-q band, external clocks,
-  with 2026-10-13's defaults (fill row tier, gate, two q in flight):
+- **Against cado-gpu** (row 27; latest finding 147, 2026-11-01, installed
+  `0c7dda1f`, quiet host, raw relations per second at equal yield, its
+  `p < 96` skip off): cado-gpu 1.031x ours at c135, within the rounds' noise;
+  ours 1.139x cado-gpu at I16. Findings 150 and 153-154 have landed since and
+  have not been compared. CADO's `p < 96` skip is worth 1.13x (c135) to 1.27x
+  (I16) per relation to it (finding 124). CADO's ~8 CPUs are GPU-feeding
+  threads spinning in `cudaStreamSynchronize`; its real host work is ~1.2
+  cores, and ours is under one.
 
-  | | µs per raw relation | raw relations/q |
-  |---|---:|---:|
-  | CADO (A=26, its default `p < 96` skip) | 34.2 | 118.3 |
-  | CADO with the skip off | 34.8 | 153.6 |
-  | cuda-sieve I13 | 55.1 (**1.61x**) | 153.8 |
-  | cuda-sieve I14 | 51.0 (**1.49x**) | 173.7 |
+- **Against GGNFS on the CPU** (item 0): on this box, c183 I15e, GGNFS at 16
+  workers, **~3x the time and ~2.8-2.9x the whole-box energy** per unique
+  relation, on two rectangles and three q (findings 71, 83, 87, 2026-08/09).
+  The GPU side is several times faster since (findings 100-154); the margin
+  has not been re-measured. **Yield matches GGNFS at matched geometry**:
+  46.09 against 46.47 relations per (q, rho) pair on the c183 (finding 57),
+  0.979-0.981 of GGNFS's on the C194 at all four matched rectangles (finding
+  65), and 99.97-99.98% recall on AS276 (findings 69, 100).
 
-  The cuda-sieve rows ran at host load 11-13. Before findings 107-108 they
-  were 2.49x and 1.86x.
+- **Geometry: the GPU prefers smaller areas than the CPU, and buys area with
+  I.** Doubling J at fixed I costs 2.03x the time for 1.47x the relations
+  (finding 57); the CPU's reason for large rectangles is amortising its per-q
+  root transform, 12% of its wall and about 1% of ours. At equal area the wide
+  rectangle beats the square, +11.7% relations at `2^28` and +16.3% at `2^30`
+  for −0.3% device time and less VRAM (findings 64-65), because `i`
+  multiplies the shorter vector of the reduced q-lattice. Take the larger J
+  only when the q range, not speed, binds.
 
-  CADO's lower yield is its skip: with it off, the two I13 relation sets
-  overlap 99.9%. Our extras are marginal relations (87% with two algebraic
-  large primes), so the useful-yield advantage is below the raw 30%. The
-  completed 78M-raw campaigns (62m24s against 133m54s, before the fill fix)
-  hold 54.24M and 54.35M unique relations; singleton removal on both is open.
-  **Per kernel we are within ~1.4x of CADO** (5.58 against ~7.8 ms/q of GPU
-  work at one q in flight). CADO's eight q in flight are worth 1.77x to it;
-  our two are worth 8-20% (finding 108), because our single-q gaps were
-  smaller to begin with. CADO's ~8 CPUs
-  are GPU-feeding threads spinning in `cudaStreamSynchronize`; its real host
-  work is ~1.2 cores, and ours is under one. This 2LP/2LP job does not
-  establish the comparison on cofactor-heavy jobs.
+- **Our relations filter and factor.** The C123 `223187...173681` was sieved
+  entirely by this siever (29,933 special-q over `[400000, 800000]`, CADO for
+  polynomial selection, msieve for everything downstream) and msieve took it
+  to `p42 * p82` on 2026-08-05: 29,339,493 relations, 24.0% duplicates,
+  22,387,804 unique, 849,784 cycles against 825,717 needed (2.9% surplus).
+  It settles that the relations are filterable and sufficient; it does not
+  say how many unique relations GGNFS would have needed.
 
-- **Our relations filter and factor — a complete NFS run, not a gate.** The
-  C123 `223187...173681` was sieved entirely by this siever (29,933 special-q
-  over `[400000, 800000]`, CADO for polynomial selection, msieve for
-  everything downstream) and msieve took it to `p42 * p82` on 2026-08-05.
-  `work/c123run/msieve.log` is the record:
+- **The C143 campaigns** (findings 105, 107, 108; 2026-10-12/13): both
+  sievers' completed 78M-raw campaigns hold 54.24M (CADO) and 54.35M (ours)
+  unique relations; with CADO's skip off the two I13 relation sets overlap
+  99.9%, and our extras are marginal (87% with two algebraic large primes).
+  Singleton removal on both is row 15.
 
-  | | |
-  |---|---:|
-  | relations in the file | 29,339,493 (+121,515 free) |
-  | duplicates removed | 7,073,204 — **24.0%** |
-  | unique relations | 22,387,804 |
-  | cycles found / needed | 849,784 / 825,717 — **2.9% surplus** |
-  | matrix | 823,658 x 823,845, 114.50 weight/col |
-  | outcome | `p42` x `p82`, BLanczos 61 s, sqrt 153 s |
+- **Choosing lpb and the relation target** (findings 98-99). Per-step growth
+  in required relations, controlled on Murphy-E, is 1.62-1.74x (finding 99),
+  so the lower `lpb` rung wins across essentially the whole range, by under
+  1% at the bottom to 9% at the top; Kyle's 1.75-1.80 rule is mildly
+  conservative, and the ideal-count model's 1.94x is an upper bound. The
+  harness counts raw relations per q while targets are unique: the two
+  sources disagree on the level of that correction (~59% unique on a 6x span
+  by Kyle's dedup sheet, ~78% by msieve's duplicate line on the same 40 jobs,
+  most likely because NFS@Home dedups server-side first) but agree on the
+  slope (GNFS ~1 pt per `lpb`, ~9.8 pt from a 3x to a 6x span), so rankings
+  are safe and absolute GPU-day counts are not. AS276 factored at `33/35`,
+  A=32, on 1.671B raw relations over q = 80-427M, 0.913x the target this
+  project carried. Compare a current c183 build against finding 70's applied
+  table (14.30 ms/q stage; 14.60 in finding 98), not its sweep row (19.71,
+  `mfb 93` rather than the shipped 92).
 
-  **What this does and does not settle.** It settles that the relations are
-  filterable and sufficient — no structural defect survives to the matrix, and
-  the 2.9% cycle surplus says the band was sized about right. It does **not**
-  give the comparative number a performance claim needs: how many unique
-  relations GGNFS would have needed for this same job. The 24.0% duplicate
-  share is our own, at a band covering the full factor-base range, and it sits
-  at the top of the 15.8-25% range under Known defects — which is what that
-  defect predicts for full-band coverage.
+- **Power and the undervolt.** The card has run at stock since 2026-09-11
+  (the undervolt was removed on Kyle's hypothesis that it caused this box's
+  hangs; the hangs are the card's, item 12d). Numbers taken 2026-08-17 to
+  2026-09-11 are undervolted: stock is 5.10% faster and draws 29.57% more
+  (finding 94). Whole-box rel/J needs the UPS meter (item 6), so the
+  cross-card rel/J table from rented machines is board-only, an architecture
+  note and not a verdict input: by board power the 5070 and 5090 tie (28.1
+  against 29.5) and the 4090 trails (18.1); with this box's host constant the
+  5090 would lead by ~1.3x.
 
-- **Fill does not scale with the GPU.** 5090 has 3.5× the SMs of a 5070 and
-  returns far less than that on fill, against 3.33× transform and 2.01× apply.
-
-  **Two halves of this bullet were superseded on 2026-08-25/26; read the
-  correction before the profile below.**
-
-  *(a) The block default is 4608, not 1152.* The "absolute knee at 1152 blocks
-  × 32 threads, flat above it" was measured on one job; finding 76's two-axis
-  sweep on the production shape moved the default **1152 -> 4608** (fill −8.6%,
-  wall −5.7% on c194). **Wherever this file still says "the shipped 1152
-  blocks", read 4608.** No single constant serves every job — c147 unslabbed
-  wants more than 4608, c147 slabbed wants 1152 — which is item 2.
-
-  *(b) The mechanism is settled, and it is not work granularity.* Finding 81
-  profiled `k_fill_atomic` with `ncu` at the production geometry: **L2 read
-  sectors flat within 3% while DRAM read sectors rise 135%** (18.5M -> 43.5M)
-  as `nregion` moves past its knee, with DRAM writes going **1.15x -> 1.96x**
-  the theoretical floor. That is read-modify-write on partially-filled bucket
-  lines — 4 B records into 32 B sectors, the frontier evicted before eight
-  consecutive appends can fill one. Fill is **DRAM-traffic-bound at a flat
-  effective bandwidth**, so the tuned quantity is `nregion` (findings 79/80),
-  and "work granularity" is retired. This does not contradict the 12.8%
-  throughput row below: the cost is excess traffic, not saturation.
-
-  The profile that follows is retained for what it establishes about the
-  configuration it was taken on — `work/c147/fill_5070.ncu-rep`, a single
-  `k_fill_atomic` launch on a local 5070. `ncu` remains blocked on the rented
-  boxes (`ERR_NVGPUCTRPERM`). It did kill the L2-capacity story outright:
-
-  | | |
-  |---|---:|
-  | DRAM throughput | 12.83% |
-  | L2 hit rate | 96.45% |
-  | L2 (max bandwidth) | 52.11% |
-  | L1/TEX hit rate | 18.91% |
-  | bytes used per 32-byte load sector | 8.7 |
-  | bytes used per 32-byte store sector | 4.6 |
-  | stall cycles on L1TEX scoreboard | 157.7 of 191.0 (82.6%) |
-  | SM busy | 3.75% |
-  | waves per SM | 1.00 |
-  | SM active / elapsed cycles | 8.00M / 10.88M |
-
-  Read together: it is not DRAM-limited (12.8%), not L2-capacity-limited
-  (96.5% hit — independent confirmation that story was dead), and **not at an
-  L2 bandwidth ceiling either** (52%). It is latency-bound on uncoalesced
-  scatter — 82.6% of stall cycles waiting on L1TEX, at 4.6 useful bytes per
-  32-byte store sector. That last number matters for item 11: the prior-art
-  claim that scatter tuning here "dies at the L2 transaction ceiling" does not
-  describe this kernel, and ~7× store-sector waste is headroom, not a wall.
-
-  **Waves per SM = 1.00 is the granularity mechanism made visible.** The whole
-  grid is resident at once, so a block that draws a heavy chunk has no queued
-  block to backfill its slot — and SMs sit idle for 26.5% of elapsed cycles,
-  which is that tail. More, smaller blocks fix it twice over: finer chunks
-  shorten the tail, and more resident warps hide the 157-cycle L1TEX stall.
-
-  **Caveat: this profile is at 288 blocks × 256 threads** — the pre-finding-52
-  geometry, and 256 threads is precisely the held-fixed axis that made
-  finding 51 an artifact. So it characterises a configuration the project has
-  abandoned twice over, since the block default has since moved to 4608. The
-  288-vs-1152 A/B **at 32 threads** was never run and is **no longer the
-  decisive experiment**: finding 81 settled the mechanism from traffic
-  counters instead.
-- **Finding 51's Ada-vs-Blackwell block response was an artifact.** It held
-  `--threads` at 256; at 32 the 4090's degradation reverses to improvement and
-  all three cards behave alike. See finding 52.
-- **rel/J is flat between the 5070 and 5090** — 28.1 vs 29.5 on sampled board
-  power, i.e. a tie, with the 5090 1.68× faster. The Ada 4090 is the outlier at
-  18.1. Generation separates these cards; width does not. **This tie is an
-  artifact of board-only power and probably does not survive the metric of
-  record.** First wall reading on the local box (2026-08-07, UPS, monitors
-  excluded): **395–400 W whole-box against 165 W GPU board**, so the card is
-  ~42% of the box and host overhead is roughly as large as the GPU's own draw.
-  Host overhead is approximately *fixed*, so the faster card amortises it over
-  more work: `whole-box rel/J = board rel/J × W_gpu / (W_gpu + W_host)`. With
-  the host constant now measured at **~105 W idle / ~115 W with the sieve's own
-  core** (item 6), that puts the 5090 at ~23.5 against the 5070's ~17.8 — the
-  5090 **ahead by ~1.3×** rather than tied. The tie was an artifact of pricing
-  only the card. Caveat: this places both cards in *this* box; the 5090 numbers
-  came from a rented machine whose own host draw is unknown and probably
-  higher, and per the next bullet that can never be measured.
-- **The cross-card rel/J table can never be restated on the metric of record.**
-  Whole-box power needs a physical meter on the box, and the 5090/4090/A100
-  numbers came from rented machines. Those rows are permanently board-only.
-  What *is* answerable with a meter is the thing the project was chartered to
-  answer — the local 5070 against the local CPU box, item 0 — because both
-  sides of that comparison are on this UPS. Treat cross-card rel/J as an
-  architecture note, not as a verdict input.
-- **THE UNDERVOLT IS BEING REMOVED, 2026-09-11**, on the owner's hypothesis that
-  it is the cause of this box's intermittent GPU hangs rather than a free
-  efficiency win. **Reasonable, cheap to test, and NOT supported by the one hang
-  that was actually instrumented.** On 2026-09-10 a band arm wedged for 57
-  minutes -- main thread `R` at 100% user CPU with zero syscall time, GPU at 3%
-  and 30 W, which is what a wedged card looks like when CUDA's default sync
-  policy spin-waits -- and it happened while the undervolt was **OFF**, cleared
-  by a reboot and not yet reapplied. The undervolted band run later the same
-  night completed cleanly. That is one hang at stock against one clean run at
-  stock and one clean run undervolted: too little to conclude anything, and what
-  little there is points away from the undervolt.
-  **If the hangs continue at stock, the 35% board rel/J was given up for
-  nothing** -- so treat this as an experiment with a stated outcome, not a fix.
-  The watchdog is now armed on every timed arm and `--watchdog-log` records the
-  phase, so the next hang produces evidence instead of an anecdote.
-
-  **And it moves the corpus convention a second time.** Finding 61 exists so a
-  post-undervolt timing is not read as a regression; removing the undervolt fires
-  that warning in reverse, and **every number taken between 2026-08-17 and
-  2026-09-11 is the undervolted kind.** The conversion is measured rather than
-  estimated, on a paired same-night band with integrated board draw:
-  **stock is 5.10% faster and draws 29.57% more** (90.547 ms/q at 199.0 W against
-  95.163 at 140.1 W, c183 I15e, three interleaved pairs each). Finding 94.
-
-  *The undervolt as it stood:* **THE BOX IS UNDERVOLTED AS OF 2026-08-17, and
-  every timing taken after that date is ~6.7% slower than one taken before it.** The card's V/F curve is
-  pinned to ~2900 MHz at 950 mV (stock was 2910 MHz at 1080 mV), which trades
-  6.7% of throughput for 28% of board power — **+14.6% whole-box rel/J**,
-  finding 61. It is *not* a code change and it is *not* reflected in any
-  finding numbered below 61: finding 58's 108.27 ms/pair, finding 60's apply
-  breakdown and every c147/c183 timing in this file were measured at stock.
-  Comparing a new measurement against an old one without accounting for this
-  will read as a 6.7% regression that is not there. Board draw is now ~140 W
-  and the card sits at 50–56 °C rather than 69 °C.
-- **Superseded:** an earlier rel/J table built on *nameplate* TDP concluded the
-  design "does not want wide expensive GPUs". It is retracted — see the
-  RETRACTED block in `RESULTS.md`. Do not quote the old numbers.
-- **Confirmed on a second job, at every rectangle tested** *(findings 58, 65)*.
-  On the NFS@Home C194, sieving above `alim` so GGNFS cannot truncate its base
-  either, yield is **0.979–0.981 of GGNFS's at all four matched rectangles**
-  (`2^14 × 2^13`, `2^15 × 2^13`, `2^15 × 2^14`, `2^16 × 2^14`) — flat in
-  aspect ratio, flat in area, and flat in `j` within a rectangle. The earlier
-  "−14.4% at a 1:1 rectangle" was a geometry mismatch: `-J 15` covers our
-  `2^16 × 2^14`, so it compared our square against GGNFS's wide rectangle. There is
-  no measured cost of the norm approximation (item 5).
-  Throughput at that equal-work point is **3.31×** the CPU box and **2.74×** on
-  energy, against the c183's 3.11× and 2.53×. The same measurement at q=20M
-  reads 4.91×, inflated by the factor-base convention alone.
-- **Yield matches GGNFS at matched geometry, and the verdict margin is ~2.5×
-  rather than 4.3–5.5×.** A same-session control (finding 57) sieved the c183
-  over one q interval with `gnfs-lasieve4I15e` and with this pipeline at the
-  identical `2^15 × 2^14` rectangle: **46.09 vs 46.47 relations per (q, rho)
-  pair**, a 0.8% agreement, with our side carrying 11% more factor base. The
-  correction to the margin is a *unit* error, not a performance one — the CPU
-  rows are per **prime q** and ours are per **(q, rho) pair**, and this
-  polynomial averages 1.528 roots per prime. **Always state which.**
-
-Measured end-to-end on the 5070 (c147 band, 1340 q, same binary, geometry the
-only variable): fill −6.1%, apply +0.06%, wall −2.1%, relations byte-identical.
-`--fill-threads` is measured to be necessary, not assumed: at the shipped 1152
-blocks the 5090 costs **23%** at 256 threads (3.239 ms) against 32 (2.633), so
-raising the block default alone would have left that on the table.
-
-Projected but **not** measured end-to-end: the same pipeline A/B on the 5090,
-where the standalone gain is largest (16.7%).
+- **Fill does not scale with SM count** (findings 52, 76, 81): a 5090 has
+  3.5x a 5070's SMs and returns far less on fill, against 3.33x on the
+  transform and 2.01x on apply. At 1152 blocks (finding 52), 32 threads per
+  fill block were necessary: the 5090 cost 23% at 256 threads.
 
 ## Known defects
 
-- **ENV 2026-09-03 — `nvidia-smi` segfaulted until WSL was restarted
-  (RESOLVED 2026-09-04), and the driver API moved 13.3 -> 13.4.** For one
-  session `nvidia-smi` exited 139 (SIGSEGV, core dumped) with no output, from
-  the WSL-injected binary at `/usr/lib/wsl/lib/nvidia-smi`. **Cause: a Windows
-  display-driver update landed underneath a running WSL session**, leaving the
-  injected user-mode libraries out of step with the new KMD. `wsl --shutdown`
-  and a restart cleared it -- 2026-09-04 it exits 0 and reports `NVIDIA-SMI
-  615.65.06 / KMD 616.56 / CUDA UMD 13.4`. **Restart WSL after any Windows
-  driver update** before trusting, or filing, anything measured here.
-
-  **CUDA execution was unaffected throughout** -- a direct runtime probe
-  returned `count=1`, `dev0=NVIDIA GeForce RTX 5070 SM=48 cc=12.0`, no error --
-  so this only ever blocked *monitoring* (clocks, temperature, power, the
-  underclock check item 0's energy work relies on), never sieving. Do not read
-  an `nvidia-smi` failure as "no GPU available": exercise the runtime before
-  concluding that, which an outside review of this repo did not, and wrongly
-  declined the GPU suite over.
-
-  **The timing consequence outlives the segfault.** The probe reports driver
-  API 13040 against runtime 13030, so **timings from 2026-09-03 on are not
-  comparable to findings 87-91's numbers**; interleaved A/B against a fresh
-  same-session baseline is still valid, cross-day absolute comparison is not.
-  A fresh confound for item 19, not a resolution of it -- item 19's magnitude
-  already swung 2.83 <-> 6.67 ms/q overnight *before* this driver change.
-
-- **DOC 2026-09-01 — `normscan.c`'s calibration numbers for the 2,1139+ octic
-  do not reproduce.** The comment at `normscan.c:256` justifies the `4 + 4*beta`
-  margin with "(98 bits clear, beta 5.0)" — while the same comment block,
-  eleven lines earlier, gives that same polynomial **beta = 5.9**. One job
-  cannot have both, and the pair dates from when three comments called it a
-  septic. Re-run 2026-09-01 on the real coefficients over 60M-460M:
-  **49.5-57.5 bits clear at beta 5.96-5.99** across three geometries, matching
-  neither parenthetical. `testsieve.sh`'s "250 bits at 15e and 257 at 16e"
-  lands near the measured **99th percentile** (253.1 / 261.1), not near the
-  projected maximum the tool judges on. **No behavioural defect** — the
-  verdicts are the intended ones (pass at 384, refuse at 256 and 320) and the
-  `4 + 4*beta` scale still holds against the measured beta. The unreproduced
-  pair is now flagged in place in `normscan.c`; re-derive from a fresh survey
-  before tightening the rule.
-
-- **NO GATE EXERCISES `PIPE_Q_SKIP` — noted 2026-09-02.** The norm-width skip
-  path is now load-bearing: finding 89's async H2D uploads depend on it
-  carrying its own `cudaStreamSynchronize`, because it never reaches the slab
-  loop's `ev[3]` sync. Nothing in the repo triggers it — c183's norms are
-  ~197 bits and AS276's fit inside 384 — so the fix is reasoned and compiled
-  but **not run**. Repro for a gate: `make BN_LIMBS=6` (192 bits, allowed by
-  the Makefile's `4 6 8 10 12 14 16` filter) and sieve any c183 band; most q
-  will skip. Cheap to add and it covers a path that is otherwise only ever
-  taken in production by the jobs we cannot sieve.
-
-- **FIXED 2026-09-01 (shipped in `57480cd`) — the slab target was silently
-  coupled to `log_region` (finding 79).** `slab_perf_jmax` computed
-  `rows = 2^29 / I` with no reference to `cfg->log_region`, but the quantity
-  the target tunes is the **bucket region count** (32,768), not the slab area.
-  Auto planning picked 8192 rows at `--region` 14, 13 and 12 alike, leaving the
-  target wrong by the same factor — **+28.4% fill at region 13, +68.3% at
-  region 12**. Never a live regression: `--region` defaults to 14 and
-  production never moves it.
-
-  **Both halves are now region-relative**, which is the part worth noting —
-  the cap became `rows = (SLAB_PERF_REGIONS << log_region) / I` *and* the split
-  trigger became `area < target * 2`, where it had been left as an absolute
-  `2^30`. Fixing only the cap would have left an area of `2^29` at
-  `--region 12` never splitting, i.e. 131,072 regions in one slab: the exact
-  shape finding 79 measured at +68.3% fill. `slabtest` pins regions 12/13/15,
-  the trigger in both directions, and out-of-range rejection on the auto and
-  forced paths. Behaviour-preserving at the default; see item 2 and the policy
-  block in `slab.h`.
-
-- **FIXED 2026-08-18 — non-primitive relations at small q (finding 68).**
-  `k_intersect_compact` filtered on `gcd(i,j) == 1` and assumed that made
-  `(a,b)` primitive. The lattice map has determinant q, not 1, so positions
-  with `q | b` gave `gcd(a,b) = q`; msieve rejects those with `error -6`. They
-  survive the sieve because such a point lies on the plattice line of *every*
-  root of q, so the sieve subtracts `deg * log(q)` — exactly the `q^deg` in the
-  norm — and the position looks as smooth as the much smaller `(a',b')` it is a
-  multiple of. Affected positions per q go as `I*J / q`, so it is invisible at
-  production q (~2 per q on a C194 at `2^29`) and conspicuous on a small SNFS
-  (~335 per q at `2^27` against q = 400009, giving 0.0995% bad relations).
-  Fixed by also rejecting `q | b`; the c147 band is byte-identical.
-  **`--check-relations` now tests `gcd(a,b) == 1`** — it previously verified
-  every factor and both norms, all of which a non-primitive relation passes,
-  which is why this shipped.
-
 - **Remaining-norm approximation.** The largest-term approximation differs from
   the true rectangle maximum by ~2 bits and costs ~0.13% of CADO's relations.
-  The band-wide fixed scale is a second, unchecked approximation. This is the
-  main known yield loss.
-- **Duplicate share 15.8–25%** from the full special-q-side factor base, at
-  ~1.34× the downstream TD/cofactor work for the same unique yield.
-  **These are whole-FB-band numbers.** Measured raw inflation runs 1.0021× on
-  the c147's 0.4%-wide band, 1.1877× on the c151's full-FB band and 1.2325× on
-  the snfs2 corpus, so the defect scales with band coverage rather than being a
-  fixed property of the design.
-  **Truncating at `q` is now measured and does not fix it (finding 67):** on a
-  real 275M-relation band it removes only 1.78% of the duplicate finds, and on
-  a band stopping below `lim` it destroys more unique relations than it saves
-  in duplicate work. On a generous-`mfb` job — the c183's `mfba 92`, the C195's
-  95 — it does essentially nothing either way. Item 3 is closed; **this defect
-  stands, without that remedy.**
-  Note also that a corpus can carry duplication that is not ours at all: the
-  snfs2 corpus holds a hand-stitched restart's re-sieved q window (finding 67),
-  worth 1.4% of its relations. The `k = 1` stratum detects it.
-- **The walk gate tops out at logI 10, and every deployed geometry is 14–16.**
-  `--verify`'s eight cases (4:1 through 1:2, `make check` runs them via
-  `walkcheck`) establish that the Franke-Kleinjung walk is aspect-ratio-correct,
-  which is what finding 63 needed — but at I ≤ 1024. The x packing
-  `i + I/2 + (j << logI)` is a uint32 and only gets tight in the untested
-  logI 11–16 range, so a `pl_make`/`pl_next` bug specific to a large logI would
-  still ship. **CORRECTED 2026-09-03 (finding 92): there is no blocker, and
-  this entry used to name the wrong one.** It said the insertion sort at
-  `verify_cpu.c:33` costs ~2.7e8 comparisons per (p, root) at logI 15.
-  Measured: **zero** inner-loop swaps at logI 10, 14, 15 and 16, and 28 ms for
-  all four widths at 24 primes x 5 roots each. `verify_walk` starts at
-  `p = I + 1`, so there is at most one hit per j row, so `ref` is already
-  sorted on emission and the sort is linear. The fix is to add `{15, 32768}`
-  and `{16, 32768}` to `walk_cases[]` (`bench_main.cu:546`) — a table edit,
-  no sort work. **The real ceiling is `uint32_t xmax = I * J`
-  (`verify_cpu.c:18`):** logI=16 x J=32768 = 2^31 is the last shape that fits
-  and J=65536 wraps, which is `verify_walk_slabs`' 64-bit territory, not this
-  gate's. Comment the table when extending it. (This stale diagnosis was read
-  off this entry and repeated by an outside reviewer, which is the cost of
-  leaving a wrong mechanism in a defect list.)
-- **`k_fill_l1` (twolevel path) has never been swept** at any geometry. It
-  takes an explicit `--fill-blocks` but defaults to its own 144 × 512, because
-  the 1152 × 32 result was measured on `k_fill_atomic` — a different kernel
-  with a different write pattern. (That reference point is now 4608 × 32 on
-  `k_fill_atomic`; `k_fill_l1` still ships its own untuned 144 × 512.)
-- **Power is board-only.** The metric of record is whole-box
-  relations/sec/watt; host draw is unmeasured. The A100 has no sampled power.
-- **Host contention costs up to 29% of wall clock, invisibly.** Saturating the
-  CPU leaves every `cudaEvent`-timed kernel flat within 1% while wall goes
-  24.30 → 31.27 ms/q; half the cores already costs +22.6%. All GPU counters we
-  have are blind to it, so a busy box reports perfect kernel times and a bad
-  ETA. Stated as throughput that is an **18.4% relation-rate loss at half load
-  and 22.3% at full** — not the 22.6/28.7% wall figures, which are
-  percent-of-baseline and overstate the bar for co-scheduling. **Any cross-box
-  wall-clock or ETA comparison is invalid without knowing host load on both.**
-  The pipeline prints `GPU-accounted / wall (excl cofac)` to expose it; the
-  first published pair used a formula since corrected, so current values await
-  a confirmed-idle box. Finding 53 is canonical for the GPU counters'
-  blindness, **not for the current magnitude: see finding 96** (2026-09-13,
-  c183 `2^29`), which measures a few percent and holds the figures. Only part
-  of the gap to these c147 numbers is explained by sieve area.
+  The band-wide fixed scale (derived from the band's first q and carried in the
+  checkpoint) is a second, unchecked approximation. This is the main known
+  yield loss; item 5.
+- **Duplicate share 15.8–25%** from sieving the full special-q-side factor
+  base, at ~1.34x the downstream TD/cofactor work for the same unique yield.
+  These are whole-FB-band numbers: raw inflation runs 1.0021x on the c147's
+  0.4%-wide band, 1.1877x on the c151's full-FB band and 1.2325x on the snfs2
+  corpus. Truncating at `q` does not fix it (finding 67): on a real 275M-relation
+  band it removes only 1.78% of the duplicate finds, and on a band stopping
+  below `lim` it destroys more unique relations than it saves. A corpus can
+  also carry duplication that is not ours (the snfs2 corpus holds a
+  hand-stitched restart's re-sieved window, 1.4%); the `k = 1` stratum
+  detects it.
+- **Under BOINC every suspend quits a GPU task without a checkpoint**, so each
+  suspend loses up to ~30 s of sieving at c135 and a minute or more at I16.
+  Handling BOINC's quit as a clean stop is open with Greg (row 35).
+- **Pipelined 2,1147+ sometimes takes another 1.1-1.3 GB after setup** that is
+  none of the program's allocations; cause not identified (row 32).
+- **`--mode twolevel`'s `k_fill_l1` has a live race** and has never been
+  swept; benchmark-only, nothing in `--pipeline` reaches it (item 17).
+- **Power is board-only** in every cross-card figure; host draw is measured
+  only on this box (item 6). The A100 has no sampled power.
+- **Host contention.** On the 9800X3D it costs a few percent at the geometry
+  we run: ~3% near one runnable thread per logical CPU, ~6% at 1.7x (finding
+  96, c183). On a 4-core i5-2500K the cost is time-slicing: competing work at
+  nice 0 on twice the cores costs C143 37%, C147 22%, C183 6.7%, and at nice 19
+  1.6%, 0.8%, 0% (finding 152). GPU counters are blind to it: quote
+  `acc/wall` (run log and band summary) beside any timing from a shared box,
+  and never compare wall clock across boxes without host load on both.
+  Finding 53's much larger c147 figures remain unexplained.
+- **`normscan.c`'s calibration comment for the 2,1139+ octic does not
+  reproduce** ("98 bits clear, beta 5.0" beside a measured beta 5.9; the 2026-09-01
+  survey gives 49.5-57.5 bits clear at beta 5.96-5.99). No behavioural defect:
+  the verdicts are the intended ones. Flagged in place; re-derive from a fresh
+  survey before tightening the rule.
+- **Environment.** Restart WSL (`wsl --shutdown`) after any Windows display-driver
+  update before trusting anything measured here (an update under a running
+  session once left `nvidia-smi` segfaulting while CUDA still ran), and do not
+  compare absolute timings across a driver or toolkit change: interleave
+  against a fresh same-session baseline. Windows-side GPU users are invisible to
+  `nvidia-smi` in WSL: a Firefox tab at 4.0-4.4% of the 3D engine coincided
+  with runs 6-8% slower (finding 137). Read the Windows GPU Engine counters.
 
 ## Open experiments, in order
 
@@ -1380,14 +788,13 @@ survive; if work is worth returning to, it belongs here. Two lists drifted
 apart once already — items 7–9 below existed only in a chat session and were
 absent from every document in the repo.
 
-### NOW / NEXT — agreed 2026-09-03, updated 2026-10-29
+### NOW / NEXT — agreed 2026-09-03, updated 2026-11-10
 
 The numbered list below is the full record and contains many *closed* items;
 this block is the short open-only view. Order is by what is actually blocking,
 not by size. Closed rows here and closed items below are cut to their outcome,
-their finding and anything they left open (2026-10-29); the finding in
-`RESULTS.md` has the rest, and `git show cadcf3c:bench/STATUS.md` the text
-that stood here.
+their finding and anything they left open (rows 1-32 on 2026-10-29, the rest
+on 2026-11-10); the finding in `RESULTS.md` has the rest.
 
 | # | do | needs | state |
 |---|---|---|---|
@@ -1427,19 +834,21 @@ that stood here.
 | 30 | Bucket records carry log p (finding 129's review, item 7) | local GPU | **DONE 2026-10-22, finding 130** — fill writes each prime's log into its bucket record and apply adds `r >> 16`; the slice table and its shared memory are gone, speed unchanged within ~1% |
 | 31 | Small-sieve moduli 3, 5, 7, 9 from tables (item 8b stage B) | local GPU | **DONE 2026-10-22, finding 131 (`--tiny-table`, default)** — apply c135 −4.3%, c183 −4.4%, C194 −2.7%, I16 −1.6%; I16 pipelined wall −2.1% |
 | 32 | Bucket regions by row class; the side-0 record index sized by them (rows 9, 28) | local GPU | **DONE 2026-10-27, finding 132 (`--row-cap`, default; `--no-row-cap` the uniform layout)** — each bucket region is sized by its row class, and side 0's record index shares the bucket's slots: 2,1147+ resieves every slab from records, wall −4.3% single-queued, −4.5% pipelined; bucket + index −10% (2,1147+) to −18-19% (c135, c183). Open: pipelined 2,1147+ sometimes takes another 1.1-1.3 GB after setup that is none of the program's allocations (cause not identified). Measured 2026-10-30 (finding 140): no class is undersized on the NFS@Home I16 job or SNFS301 (q 60-450M). Side 1's fullest region is 88-90% of its class's capacity on every job, and side 0's at most 85% on these two (SNFS301 at q 60M); 2,1147+'s side 0 reaches 86%. No overflow in 3,030 fills a side. An undersized class would show up only as skipped slabs (the exit status changes at 1,000, `PIPE_SLAB_SKIP_MAX`), so the skip counters remain the gate |
-| 33 | Small-job idle at c135: cross-stream waits and late launches | local GPU, `nsys` | **Measured 2026-10-27, finding 133; pairs 2 and 3 DONE 2026-10-28 (finding 134), pairs 1 and 4 (finding 135); the pass ahead's candidate gate and review fixes 2026-10-29 (finding 136); fat `bench/bench` `7cb58341`, relations identical** — c135 idle 8.4% -> 3.6%; RAW-clock paired medians C135 −1.9% then −2.9%, C143 −0.7% then −1.1%. `--no-td-ahead` turns TD's pass ahead off, and `bench/qhcheck.sh` checks it (card needed). Finding 136's fixes timed in finding 137: no cost (C135 1.0000 over 36 rounds). The ~35 µs hold before the first record kernel follows the host waiting on a timing event (`E[14]`, never timed); created untimed it is gone, but the wall did not move (C135 1.0016, C143 0.9954; the sieve stream sets the pace), so the tree is unchanged (finding 137). Open: the fill prologue's copies and memsets on `st_sv` (0.3%) and the memset before the early apply (0.2%), one zeroing kernel built in `work/hold/src/` (`PIPE_ZERO`) and not measured; TD's survivor-count round trip (0.42% at c135; finding 133's review item); single CUDA calls stalling 1-13 ms on the host (~1% of one C143 run). Kernels running 6-8% slower at a steady SM clock: probably Firefox holding 4.0-4.4% of the 3D engine (Windows GPU Engine counters), not confirmed |
-| 34 | The cofactor flush's relation output | local GPU, `nsys` | **DONE 2026-10-29, finding 137; fat `bench/bench` `a1081c4d`, relations identical** — `cofq_flush` printed relations with `fprintf` and `qsort` (~2 µs a relation, 0.195 ms/q at C135) while the card idled. Now formatted by hand into a buffer (0.053 ms/q): C135 −5.1%, C143 −4.5%, C148 −2.7% (12 of 12 rounds each), C183 and I16 flat. With it, cado-gpu's c135 lead (1.19x on `7cb58341`) should be ~1.13x; not measured. Finding 138: timed against a fat build, which makes no difference (1.0000-1.0015). The checkpoint at every flush: row 35. Measured in finding 140: the emit's 49 ms a flush with the card idle, ~1.9% of c135's wall (a writer thread: row 37); `k_cofac`'s rounds after the first, which run 2-20% of SMs for ~27 ms a flush, ~1.2% at c135 (row 38) |
-| 35 | The `--cofactor` band's in-loop checkpoint | local GPU | **DONE 2026-10-29, finding 138, Kyle's call; fat `bench/bench` `3d312d7d` after the review (2026-10-30), relations identical** — the checkpoint after a mid-band flush (an `fsync` of the relation file every 2.6-6.7 s) now waits at least 30 s (`PIPE_CKPT_MS`), like the non-cofactor path's. A crash loses up to ~30 s more sieving. Each skipped checkpoint is ~15-30 ms of flush here: c135 −0.7% on a 20,000-q band, C143 −0.4%, C148 −1.3%, C183 and I16 flat. Its crash gate found that a crash before a band's first in-loop checkpoint could not be resumed (the resume check sampled the torn tail it would truncate; seconds of exposure before, 30 s now); fixed in the resume sampler. Under BOINC every suspend quits a GPU task without a checkpoint, so each suspend loses up to ~30 s at c135 and ~a minute at I16; Kyle kept 30 s there too (the review, finding 138). The ~35 ms of the gap after a c135 flush that finding 138 left unexplained is gone on this build: the card resumes 0.05-0.1 ms after the flush returns (finding 140), so the gap was all the checkpoint. Open: handling BOINC's quit as a clean stop (with Greg) |
-| 36 | Side 0's norm gated by side 1's survivors | local GPU, `ncu` | **DONE 2026-10-30, findings 140-141; fat `bench/bench` `6c7c2a84` installed 23:40, Kyle's call** — `--norm-gate`, default on wherever the fill gate is, refused without it. In side 0's `k_apply` init a cell whose bit in side 1's unfolded bitmap is clear starts at 0 with no norm, as a both-even cell does; `k_intersect_compact` drops it anyway. Relations byte-identical (abcheck 36/36 and 18/18 with `--no-norm-gate`, c135 20,000 q against finding 138's reference, SNFS301, all 336 timing runs). Wall −2.5% c135, −2.4% C148, −2.5% c183, −2.7% C194, −3.2% I16, −1.4% SNFS301; apply −5.7 to −6.8% (−3.2%). The gate is a template parameter (`NGATE`, side 0's four instances): a runtime test of the pointer cost both sides' apply 2.5-4.0% with the gate off. One bitmap load per word; gathering 16 ahead was slower. Work copies `work/ngate/new/` (sm_120 `cf53e396`, timed) and `work/ngate/fat/` (`6c7c2a84`, gated, installed). Review follow-ups 2026-10-31 (finding 141's last section): one instance table for launch, opt-in and occupancy banner; the banner over every instance a run launches; `--help`; `fillcheck.sh` `gate3-nonorm`; `cofcheck.sh` identity and refusal cases. `work/ngate2/fat/` (`aff3bc31`), device SASS identical to `6c7c2a84`, all gates passed, **installed 2026-10-31 13:07, Kyle's call** (`6c7c2a84` kept as `work/ngate/bench.installed.141`) |
-| 37 | The cofactor flush's emit on a writer thread | local GPU, `nsys` | **DONE 2026-10-31, finding 142; fat `bench/bench` `d7defb03` installed 23:32 with the review's fixes (`73901347` 21:49 before them), Kyle's call** — `cofq_flush` hands each batch's relations to a writer thread, and the next flush, every checkpoint and the band's end wait for it; byte-identical (abcheck 36/36, c135 20,000 q against finding 138's reference, kill -9 and SIGINT/SIGTERM/stop-file resumes, SNFS301, `make check`). Wall c135 −1.6%, C143 −1.3%, C148 −0.8% (8 of 8 rounds each; first read as −1.8/−1.5/−0.9% with the band-end wait left out of COMPLETE, corrected after the review), I16 flat; c135's idle gap after a flush 42.0 → 1.8 ms. Work copies `work/emitw/new/` (sm_120 `bed719e8`) and `work/emitw/base/` (HEAD `2dc0490d`). The fat build (`work/emitw/fat/`) matched the installed `aff3bc31`'s device SASS in all 642 bodies and passed the same gates against it (`work/emitw/fatgate.sh`); `aff3bc31` is kept as `work/ngate2/bench.installed.141b`. The review's fixes (`work/emitw2/`): the final flush waits for the writer inside its timer, '= device time per q' includes the waits again, the writer and watchdog threads start with every signal blocked (BOINC's SIGALRM), the wait is its own watchdog phase, `pipe_finalize_outputs` stops the writer, and a non-idle post fails the flush |
-| 38 | The cofactor flush's tail rounds | local GPU, `ncu` | **closed 2026-10-31, Kyle's call: not worth the complexity; (a) measured, finding 143, not adopted** — rounds 2+ run on one SM for ~27 ms a flush (~1.2% at c135, less at C148, nothing at I16). (a) spreading a round's live records over the SMs: tail launches −3.5%, fuller rounds up to +69% (uncoalesced), `k_cofac` +5.4%; the tail is each record's ECM chain. Not pursued: (b) an asynchronous flush on its own stream with a second queue (~86 MB) and checkpoints at completion (finding 142's next 2), at most ~1.2% for a second queue, a stream and moved checkpoints; (c) curves in parallel, rejected (changes results) |
-| 39 | The norm's degree as a compile-time constant (an outside review's lead) | local GPU, `ncu` | **DONE 2026-11-01, finding 144; fat `bench/bench` `6148a21b` installed 00:19, Kyle's call** — `k_apply`'s init loop as a lambda over a compile-time degree, one of eight copies picked per block by `N.deg`: the first Horner step's multiplies by 1.0 and the guards fold away. Byte-identical (abcheck 36/36, c135/SNFS301/C1147 relations, 96 timing runs); 3 blocks/SM, no stack. Wall C135 −1.5%, C143 −1.7%, C148 −2.2%, I16 −3.0%, SNFS301 −2.7%, C1147 −2.2% (8 of 8 rounds each); sm_120 kernel compile +17%. The tiny fold priced alongside: 1.9-4.1% of a side's instructions, parked. Prototype `work/deg/proto2/` (`aba4dcba`); the tree's fat build `work/deg2/fat/` (`6148a21b`) has proto2's sm_120 SASS, passed abcheck, the c135 reference, resumes, stops, SNFS301, C1147, `make check` and fillcheck, and keeps every arch's blocks per SM (registers rose to the cap of 40 on sm_80/86/89, 42 on sm_75) |
-| 40 | The small-sieve tier cutoffs and the fill grid, re-swept (an outside review's third lead) | local GPU | **DONE 2026-11-01, finding 145; fat `bench/bench` `c07d3c75` installed 06:28, Kyle's call** — `SS_BLOCK_CUT` 64 → 36 (the floor: folded moduli must stay below it, none lies in 33-35) and `SS_WARP_CUT` 1024 → 256: wall C135 −3.2%, C143 −5.3%, C148 −2.0%, I16 −2.7%, SNFS301 −1.4%, C1147 −1.1% (8/8 rounds each), relations byte-identical. Four stages (`work/sweep/`): raised cutoffs slower everywhere (up to +8%), the warp cutoff bottoms out at 256-384, the block cutoff falls to its floor. `--fill-blocks` 4608 stands. Fat `c07d3c75` (`work/tier/`) passed every gate; `6148a21b` kept at `work/deg2/bench.installed.144`. Measured on sm_120 only |
-| 41 | The tier cutoffs as runtime flags, and `bench/tune.sh` (Kyle's per-card question after row 40) | local GPU | **DONE 2026-11-01, finding 146; fat `bench/bench` `9e67c7e4` installed 10:00, review fixes `0c7dda1f` 18:46, Kyle's calls** — `--ss-block-cut` (33-128, default 36) and `--ss-warp-cut` (above it, at most 32768, default 256) replace the `#define`s. Host code only: 642 of 642 function bodies and their resource usage identical on every arch; relations identical at 33/34, 128/32768 and 64/1024; every gate passed. At the defaults −0.5% to +0.3% wall against the installed `c07d3c75`, at 64/1024 −0.3% to +0.6% against the old compiled build (four jobs, 4 rounds); `c07d3c75` kept at `work/tier/bench.installed.145`. `bench/tune.sh` times the cutoffs and `--fill-blocks` for one job on one card: interleaved, rotated, same q, relations compared, adopted only if slower in no round and faster by more than 1% and more than the defaults' spread. On the 5070 it keeps the defaults at C135 and C148; C148 leans −1.0% toward `--fill-blocks` 2304 (8 rounds), below the bar. Kyle's `/code-review xhigh` raised 15 findings, all valid. Fixed: 11 in `tune.sh`, and `cofcheck.sh` gains the tier-cut cases (passes). Three `bench_kernels.cu` fixes (MSVC constexpr bound, static_assert on the defaults, tier comment) are built as fat `0c7dda1f` in `work/review/`: same SASS and resource usage, host code differs only in moved `__LINE__` constants. Installed 18:46, Kyle's call; tree `make check` passed. Next: `tune.sh` reports from other archs |
-| 42 | Where findings 137-146 leave us, and where the time goes now | local GPU, `nsys`, `ncu` | **measured 2026-11-01, finding 147** — against cado-gpu, see row 27. The installed `0c7dda1f` is 1.153x `7cb58341` at c135 and 1.076x at I16 in the same session, relations identical. Kernel shares at c135 / C148 / I16: `k_fill_atomic` 32.8 / 29.3 / 34.8%, `k_apply` 25.6 / 22.3 / 37.0%, `k_resieve_scatter` 9.9 / 16.7 / 8.1%. The four installs since finding 137 cut `k_apply` 18.7% and `k_td` 10.9% per launch at c135; fill is flat. Fill is latency-bound: long_scoreboard 78-80% of its stalls, issue 22-25%, half the lanes idle, L2 35-80%. Wider fill blocks retimed at C135 (+0.8 to +2.5%) and C148 (−0.3 to −1.3%, below the bar): keep the defaults. `k_apply`'s barrier stall sits at the `__syncthreads` after the bucket add and comes from the tier cuts, worth about 0.6-0.8% of wall: not a lever. C148's `k_resieve_scatter` waits on its summary and bitmap loads (73% of its long_scoreboard samples); the coarse filter below 2^29 positions is slower (+1.8 to +3.5% wall at C135, C143, C148), so `PIPE_RS_COARSE_MIN` stands. `UNROLL` 8 is slower too (+0.4 to +2.0% wall at C148, C143, C135, I16: 48 registers cost a block per SM), so 4 stands. Fill: see row 43 |
-| 43 | Fill redesign: what binds it, and what a redesign buys | local GPU, `ncu`, `nsys` | **measured 2026-11-02, finding 148; nothing landed** — `k_fill_atomic` is bound by L2 request rate, additive per request (side 1: walk 16-21%, atomic 41-50%, store 29-43%; side 0: gate 45-58%). Warps, cursor spacing and fill beside apply (+28-30 ms/q at I16, C194, SNFS301 whatever the priority or apply's blocks) do not help. Prototypes, relations identical: one launch for both tiers at cut 8, wall −1.0 to −3.6% on single-slab jobs and −0.4 to −1.6% on multi-slab; gcd skip on 5 and 7, −1.4 to −1.6% on multi-slab, nothing on single-slab. `--fill-gate-shift` is job-dependent: C148 −1.05% at 1, I16 −0.67% at 2. An outside review's follow-ups: the gain is the merge, not the cut; dropping both-even positions before resieve's summary load is flat (closed); clean factorial, wall: one launch C135 −0.4, C143 −3.4, C148 −3.4, I16 −1.2, SNFS301 −1.9, C194 −0.9%; skip +1.0, +0.8, +0.1, −1.2, −1.9, −1.8%; both −0.6, −1.8, −3.0, −1.5, −3.2, −0.6%. Kyle took all three: row 45 |
-| 44 | `tune.sh` on other generations | rented cards | **first report 2026-11-02, finding 149** — RTX 3060 (sm_86), four jobs: the tier defaults hold; `--fill-blocks 18432` wins all four, faster in 6 of 6 rounds (−1.2 to −5.26%, C194 most; c147 kept by the spread rule), at the top of the grid, and 18432 is slower on the 5070. After finding 150 on the 3060: at C143 the merge is worth −5.4% and 18432 and up now lose; at C194, with no merge, 18432 is −5.21% and 36864 −8.53%, the top of the grid; past it, 147456 −16.5% and 589824 −19.02%, where every bucketed entry first gets its own thread (13.15M side 1); 1048576 −18.50%; 36864 x 128 threads −13.36%. The gain is in fill (fill 9.3x the 5070's, apply 2.8x; 4 MB of open bucket lines against 2 MB of L2 is the suspect). C183 (one slab, merged, also 4 MB of lines) −6.30% at 589824; C143 (1 MB) loses: the gain follows the footprint, not the slab count. The 5070 on C194 loses at the same grids (589824 +4.49%, 0 of 6: the sieve gains 8 ms, trial division beside it loses 10), so no single grid suits both cards. On the 3060, C183 also wants the merge off: `--no-fill-merge` −2.67%, with 589824 −9.86% (merged 589824 −6.34%). RTX 4070 SUPER (sm_89, 48 MB, 2026-11-03): C194 589824 −4.17% (6 of 6), so the footprint rule fails at C194. C183 keeps the defaults (no merge +3.34%, merged 589824 +2.08%, both +2.56%), so at C183 it still fits. C143: `--ss-warp-cut` 512 −1.70% and 384 −1.51%, 6 of 6, the first tier cut to differ by card; the fill grid and gate shift hold, and the merge is worth 3.5%. The 5070's C194 loss is the card, not the load: rerun quiet (load 3, spread 2.24%), 589824 +5.83% and 147456 +3.01%, 0 of 6; the sieve is 8.9 ms faster (mostly apply) and trial division beside it 13.3 ms slower. On the 4070S, C194's 589824 gain is all in fill (91.7 to 73.3 ms) and trial division does not pay. **The 4070S wants `--ss-warp-cut` 1024 on every larger job:** C147 −2.94%, C183 −3.52%, C194 −6.64% (512 at C143, −1.70%), all 6 of 6 and all in apply. That reverses finding 145's 1024-to-256 move made on the 5070; the 3060 loses at 1024. Repeated and extended: the curve turns at 1024 on the region-14 jobs (2048 −1.85/−2.23/−6.65%, 4096 +1.90/+0.84/−5.29% at C147/C183/C194), and at 768 at C143 (−1.98%; C143 is the only region-13 job and differs in logI too, so region is not shown to be the cause). At C194, 1024 plus `--fill-blocks 589824` gives −10.85%: the two add. The 3060 with fill out of the way (2026-11-04) still loses at 1024: C194 589824 −18.90%, +W1024 −18.55%; C183 no merge + 589824 −9.86%, +W1024 −9.46%; apply +1.6% at both. Ampere has Ada's integer rate, so that is not the cause; Ada's preference is unexplained. Next: a warp-cut default chosen by compute capability (sm_89: 1024; sm_86 and sm_120 keep 256), Kyle's call, after a second Ada card agrees; a small-L2 card |
-| 45 | One launch for fill, the gcd skip on 5 and 7, and `tune.sh`'s larger grid | local GPU | **DONE 2026-11-02, finding 150; fat `bench/bench` `2c0b13b8` installed 17:02, Kyle's call** — `--fill-merge` (`k_fill_merged`, one-slab plans, row cut 8, 128-thread blocks) and `--fill-skip57` (several slabs per q), both output-identical. Wall against `0c7dda1f`, 8 quiet rounds: C135 −0.6, C143 −2.4, C148 −3.6, C183 −1.0, I16 −1.2, SNFS301 −2.0, C194 −1.5, C1147 −2.2%. Kyle's `/code-review xhigh` raised 14 findings, no correctness bug, all fixed. SASS changes only in fill (582 of 582 other bodies identical); abcheck, the c135 reference, resumes, stops, SNFS301, `make check` and `fillcheck` passed. `tune.sh` gains `--fill-blocks 36864`, `--fill-gate-shift` 1, 2, 4 and `--no-fill-merge`. Measured on sm_120 only; `0c7dda1f` kept at `work/review/bench.installed.146r` |
+| 33 | Small-job idle at c135: cross-stream waits and late launches | local GPU, `nsys` | **DONE 2026-10-28/29, findings 133-137** — c135 idle 8.4% -> 3.6%; C135 −1.9% then −2.9%, C143 −0.7% then −1.1%, relations identical. `--td-ahead` (TD's pass ahead, default; `bench/qhcheck.sh`, card needed). Open, each under 1%: the fill prologue's copies and memsets on `st_sv` (0.3%) and the memset before the early apply (0.2%), one zeroing kernel built in `work/hold/src/` (`PIPE_ZERO`) and not measured; TD's survivor-count round trip (0.42% at c135, item 4); single CUDA calls stalling 1-13 ms on the host (~1% of one C143 run) |
+| 34 | The cofactor flush's relation output | local GPU, `nsys` | **DONE 2026-10-29, finding 137** — relations formatted by hand instead of `fprintf`/`qsort` (0.195 -> 0.053 ms/q at C135): C135 −5.1%, C143 −4.5%, C148 −2.7%, C183 and I16 flat, byte-identical. Follow-ups rows 35, 37, 38 |
+| 35 | The `--cofactor` band's in-loop checkpoint | local GPU | **DONE 2026-10-29, finding 138, Kyle's call** — the checkpoint after a mid-band flush waits at least 30 s (`PIPE_CKPT_MS`): c135 −0.7%, C143 −0.4%, C148 −1.3%; a crash loses up to ~30 s more sieving. Its crash gate found and fixed an unresumable crash before a band's first checkpoint (the resume sampler). Open, with Greg: handling BOINC's quit as a clean stop (Known defects) |
+| 36 | Side 0's norm gated by side 1's survivors | local GPU, `ncu` | **DONE 2026-10-30/31, findings 140-141** — `--norm-gate`, default wherever the fill gate is: a cell whose bit in side 1's bitmap is clear starts at 0 with no norm. Wall −1.4% (SNFS301) to −3.2% (I16), byte-identical. The gate is a template parameter (`NGATE`): a runtime test cost both sides' apply 2.5-4.0% with the gate off |
+| 37 | The cofactor flush's emit on a writer thread | local GPU, `nsys` | **DONE 2026-10-31, finding 142** — `cofq_flush` hands each batch to a writer thread; the next flush, every checkpoint and the band's end wait for it. Wall c135 −1.6%, C143 −1.3%, C148 −0.8%, I16 flat, byte-identical; c135's idle gap after a flush 42.0 -> 1.8 ms. The writer and watchdog threads start with every signal blocked (BOINC's SIGALRM) |
+| 38 | The cofactor flush's tail rounds | local GPU, `ncu` | **closed 2026-10-31, Kyle's call: not worth the complexity (finding 143)** — rounds 2+ run on one SM for ~27 ms a flush (~1.2% at c135, nothing at I16); spreading a round over the SMs made `k_cofac` +5.4%. Not pursued: an asynchronous flush with a second queue (~86 MB), at most ~1.2%; curves in parallel (changes results) |
+| 39 | The norm's degree as a compile-time constant | local GPU, `ncu` | **DONE 2026-11-01, finding 144** — `k_apply`'s init loop over a compile-time degree, one of eight copies picked per block: wall −1.5% (C135) to −3.0% (I16), byte-identical, 3 blocks/SM kept; sm_120 compile +17%. The tiny fold priced alongside (1.9-4.1% of a side's instructions), parked |
+| 40 | The small-sieve tier cutoffs and the fill grid, re-swept | local GPU | **DONE 2026-11-01, finding 145** — `SS_BLOCK_CUT` 64 -> 36 (the floor) and `SS_WARP_CUT` 1024 -> 256: wall −1.1% (C1147) to −5.3% (C143), byte-identical. `--fill-blocks` 4608 stands. Measured on sm_120 only (row 44) |
+| 41 | The tier cutoffs as runtime flags, and `bench/tune.sh` | local GPU | **DONE 2026-11-01, finding 146** — `--ss-block-cut` (33-128, default 36) and `--ss-warp-cut` (above it, at most 32768, default 256), host code only; `tune.sh` (Architecture). On the 5070 it keeps the defaults at C135 and C148 |
+| 42 | Where findings 137-146 leave us | local GPU, `nsys`, `ncu` | **measured 2026-11-01, finding 147** — see row 27 and Performance accounting. Closed there: wider fill blocks (C135 +0.8 to +2.5%), the resieve coarse filter below 2^29 (+1.8 to +3.5%), `UNROLL` 8 (+0.4 to +2.0%), `k_apply`'s barrier stall (0.6-0.8%, not a lever) |
+| 43 | Fill redesign: what binds it, and what a redesign buys | local GPU, `ncu`, `nsys` | **measured 2026-11-02, finding 148** — L2 request rate, additive per request (Performance accounting); fill beside apply +28-30 ms/q whatever the priority. `--fill-gate-shift` is job-dependent (C148 −1.05% at 1, I16 −0.67% at 2), default 3 kept. Not tried: a buffered two-level partition (sorted in shared memory, whole sectors written), estimated poor. What landed: row 45 |
+| 44 | `tune.sh` on other generations | rented cards | **open; findings 149-150 and their follow-ups, 2026-11-02 to 11-04** — RTX 3060 (sm_86, 2 MB of L2): the tier defaults hold; the fill grid wins where the open bucket lines (4 MB at C183 and C194) outgrow L2: `--fill-blocks 589824` (every bucketed entry its own thread) C194 −19.02%, C183 −6.30% merged and −9.86% with `--no-fill-merge`; C143 (1 MB) loses. RTX 4070 SUPER (sm_89, 48 MB): `--ss-warp-cut 1024` on the larger jobs, C147 −2.94%, C183 −3.52%, C194 −6.64% (C143 wants 512-768, −1.70 to −1.98%), all in apply, 6 of 6; C194 also gains from 589824 (−4.17%, all in fill, so the footprint rule fails there), and the two add (−10.85%); C183 keeps the fill defaults. The 5070 (sm_120, 48 MB) loses with both (C194 589824 +5.83% on a quiet rerun; finding 145's sweep had the warp cut bottoming out at 256-384). The 3060 loses at warp cut 1024 even with fill out of the way (apply +1.6%); Ada's preference is unexplained. Next: defaults chosen per card (sm_89 warp cut 1024; sm_86 and sm_120 keep 256; the fill grid by footprint against L2), Kyle's call, after a second Ada card agrees; a small-L2 card |
+| 45 | One launch for fill, the gcd skip on 5 and 7, and `tune.sh`'s larger grid | local GPU | **DONE 2026-11-02, finding 150** — `--fill-merge` (`k_fill_merged`, one-slab plans) and `--fill-skip57` (several slabs per q), output-identical. Wall against `0c7dda1f`: C135 −0.6, C143 −2.4, C148 −3.6, C183 −1.0, I16 −1.2, SNFS301 −2.0, C194 −1.5, C1147 −2.2%. `tune.sh` gains `--fill-blocks 36864`, `--fill-gate-shift` 1, 2, 4 and `--no-fill-merge`. Measured on sm_120 only |
+| 46 | ECM products from Greg's gmp-ecm GPU branch | local GPU | **DONE 2026-11-09/10, findings 153-154; fat `bench/bench` `5512830e` installed 2026-11-10 09:41, Kyle's call** — the even/odd carry-chain products (Cofactorisation): wall AS276 −8.6%, I16 −1.6%, c135 −1.2%, relations byte-identical; mfb capped at 127. Then x_dbl's redundant product (13 -> 12 per bit): flush −3.7 to −4.7%, wall below the noise, byte-identical. Not adopted: Greg's param-3 ladder, the dedicated square (finding 154). Evidence `work/eomul/`, `work/xdbl/`, `work/sqr/` |
+| 47 | The transform's inverse in 2-bit windows | local GPU | **DONE 2026-11-10/11, finding 155; fat `bench/bench` `2c590187` installed 2026-11-11 09:54, Kyle's call** — `pl_transform_fast_try`'s exponentiation in fixed 2-bit windows over `{d, d^2, d^3}`, still branch-free (21-24% fewer montmuls per inverse by the parity of q's bit length), and `pl_redc`'s high word by `PL_MULHI32` (`__umulhi` on the device; nvcc's 64-bit compare made a montmul 9 instructions where 6 do). On the device only `k_transform` changes (inverse loop 23 SASS instructions per bit -> 29 per 2 bits; fat: sm_90 `k_transform<1>` REG 30 -> 34, untimed); on the host the per-q small-sieve tables run the same loop. Bit-identical by construction; eqv and devcheck on the same 92M inputs (hash-checked) 0 mismatches, 9 of 9 host mutants, abcheck 36 of 36, 40 timed runs byte-identical. Transform + plattice stage −8.3 to −10.5% (c143 −6.4%); per-q wall −1.0% c135 (every round), −1.3% C148, noise elsewhere; whole-process time by `/usr/bin/time` +0.5 to +4.6%, the size and shape of the wall clock's ~2.5 s steps (this host stepped CLOCK_REALTIME back every ~32 s until Kyle fixed its clock 2026-11-11), so not evidence either way. After Kyle's `/code-review`: `bench/xftest.cu` + `make xfcheck` (device == host, in `make check`), `pl_sel3`, stale comments fixed. On the card before the install: xfcheck 0 of 4 failed (9.7M transform inputs, device == host), and all 7 device-only mutants in `work/twin/xfmutants.py` caught. `work/twin/install_card.sh` then gated it: SASS and resources differ only in `k_transform`; abcheck 36/36; the c135 20000-q reference; kill -9 and clean-stop resumes; SNFS-301; make check. It installed it after those passed; `5512830e` is kept as `work/xdbl/bench.installed.154`. Work in `work/twin/` |
 
 **On (6).** The barrier keeps `k_cof_enqueue`'s device work inside the
 host-timed `tm.cofac` bucket. Removing it could overlap only the small enqueue
@@ -1455,555 +864,51 @@ fill and proposed removing the enqueue barrier, and withdrew both. Its
 `qsort` proposal and the first rebuttal of it were *both* wrong -- see
 finding 92.
 
-0. **The verdict band — RUN 2026-08-20, finding 71. 2.99x time and 2.94x
-   whole-box relations per joule, every term measured on this box in one
-   session.**
-
-   Both sievers over the **same q bands** (same first q, width `10000 * ln q`,
-   ~10,000 (q, rho) pairs each), `I15e`, neither running while the other was on
-   the box. GPU probes at 50M / 130M / 190M; matched GGNFS 16-worker controls
-   at 50M and 190M.
-
-   **Grade on q=190M.** It is above `alim`, so GGNFS cannot truncate — both
-   sides run the identical 7,605,406-entry base, and yield then agrees to
-   **0.07%**:
-
-   | q=190M | GPU | CPU, 16 workers | advantage |
-   |---|---:|---:|---:|
-   | wall ms/pair | 100.95 | 301.47 | **2.99x** |
-   | unique rel/pair | 41.98 | 41.95 | 1.001 |
-   | whole box, at the wall | 240 W | 236 W | |
-   | **J per unique relation** | **0.5771** | **1.6958** | **2.94x** |
-
-   **Do not quote the q=50M band's 3.12x.** There GGNFS trims to 39% of the
-   base while we sieve all of it, and our 24% yield surplus is duplicate work
-   that a truncating siever re-finds later (finding 67). It measures a
-   convention, not the hardware.
-
-   **The margin grows with q** (2.57x at 50M, 2.99x at 190M) because GGNFS's FB
-   discount shrinks as q rises: it sieves 3.0M entries at 50M and all 7.6M at
-   190M, costing it +10.9% wall, while ours falls 4.8%. A real job spends most
-   of its range where the discount is small.
-
-   Power measured both sides, monitors (45 W) subtracted: GPU sieving 285 ->
-   **240 W**, CPU sieving 280-282 -> **~236 W**. Implied host constant 106.5 W,
-   1.4% from item 6's measured ~105 W. **Item 6's 220 W CPU row is superseded**
-   — this box idles its GPU at 30 W, not the ~16 W assumed, which is 14 of the
-   16 W difference. Dedup measured at 1.0002-1.0009 on both sievers, so the
-   RUNBOOK's band-scale 1.19-1.34x does not apply at probe width. All 1,455,951
-   GPU relations pass `--check-relations`.
-
-   **Finding 43's `N_eff` 10.24 is vindicated**: it implied 306 ms/pair whole
-   box, measured 301.47. **Retire finding 57's 2.53x** (stock card, derived
-   270 W) and **item 10's 3.14x** (a C194 figure on a different job).
-
-   **TWO OF THE THREE HOLES CLOSED 2026-09-01 (finding 83).** A full 2x2 --
-   both sievers on both rectangles, one session, idle box, metered watts:
-
-   | | time | energy |
-   |---|---:|---:|
-   | at `2^15 x 2^14` (each siever's own best shape) | **3.09x** | **2.89x** |
-   | at `2^16 x 2^14` | **3.03x** | **2.77x** |
-
-   Yield agrees to 0.07% and 0.08%. **The margin is rectangle-invariant**, and
-   the premise this item carried is refuted: the bigger rectangle is a rel/J
-   loss for BOTH sievers (0.785x for us, 0.819x for them), so we pay slightly
-   *more* to grow it. The phrase "our better rel/J shape" below was sloppy --
-   `2^16 x 2^14` is the better of the `2^30` shapes, not better than the `2^29`
-   we deploy. **Quote ~3x time and ~2.8-2.9x energy**, now confirmed on two
-   rectangles rather than one.
-
-   The control also reproduced 2026-08-20 **byte for byte** (same md5), which
-   is the first end-to-end proof that 12-limb norms, the 4608 fill default,
-   `k_apply`'s launch bounds and the warp recorder are all performance-only on
-   a real job.
-
-   **THE LAST HOLE IS CLOSED, 2026-09-02 (finding 87).** The matched CPU
-   control at 130M was run, and the GPU arm re-run the same day so both sides
-   are current:
-
-   | q = 130M | GPU | CPU, 16 workers | advantage |
-   |---|---:|---:|---:|
-   | wall ms/pair | 103.13 | 298.98 | **2.90x** |
-   | unique rel/pair | 46.095 | 45.927 | 1.0037 |
-   | whole box | 252.5 W | 240 W | |
-   | **J per unique relation** | **0.5649** | **1.5624** | **2.77x** |
-
-   Yield agrees to 0.37%. **Item 0 now has three probes and three matched
-   controls**, plus both rectangles from finding 83. The margin's q-dependence
-   is visible on the CPU side directly: 271.95 -> 298.98 -> 301.47 ms/pair
-   across 50M / 130M / 190M as GGNFS's truncated base grows toward the full
-   one, with yield falling 46.44 -> 45.93 -> 41.95.
-
-   Two cautions from that session, both recorded in finding 87:
-
-   - **The August-to-September wall differences are ENVIRONMENTAL, not our
-     code -- finding 88, and it is now item 19.** Rebuilding `4b581b33`, the
-     exact commit August was built from, reproduces `unaccounted`
-     0.50 -> 7.86 ms/q with no source change. **The CUDA toolkit line is RULED
-     OUT** -- linking August's own cudart 13.2.75 gives 7.83, against 7.87 at
-     13.2.86 and 7.96 at 13.3.29 -- as is the Windows driver. It is narrowed to
-     the broad `apt upgrade` of 2026-08-27. The environmental penalty is
-     ~10.6 ms/q and has been masking **9.44 ms/q of real apply+fill work**;
-     the picture closes to 0.01 ms: `102.01 + 10.62 - 9.44 = 103.19`.
-   - **Cross-session timing comparisons spanning 2026-08-20 -> 2026-09-01 are
-     confounded**, including finding 83's attribution of the 190M speedup to
-     our work. **The verdict rows themselves are fine** -- each arm was
-     measured within one session on one runtime.
-
-   Ambient still matters: the same 950 mV curve drew 133.5 W board in August
-   and 147-152.8 W in September heat, so a rel/J figure is comparable across
-   sessions only with its board draw quoted alongside.
-
-   *Original statement of the item follows.* The question the
-   project was chartered to answer — unique relations/sec/watt on the **c183**
-   against the measured CPU box — has never actually been run; every
-   end-to-end number so far is a proxy job (c147, c151, snfs236). The CPU side
-   is already frozen: 3.12 core-s/q at q=130M and N_eff 10.24 at 16 workers
-   give **0.295 s/q for the whole box**, so green is ≤ 0.54 s/q and beating
-   the CPU outright on component-proxy perf/watt is **≤ 0.179 s/q end to end**
-   (prototype.md, "The GPU's per-special-q budget").
-
-   **Energy bar from measured wall power** *(2026-08-07)*. Those s/q bars were
-   derived without a meter. Item 6 now has one, including the host constant
-   (~105 W), so the comparison can be made in joules per special-q rather than
-   in seconds against an assumed wattage. **Assuming the 16-worker CPU
-   baseline is this same box** — it is a 9800X3D, 8 cores / 16 threads, so a
-   16-worker sweep fits it, but confirm it:
-
-   Both sides' wattage is now measured (item 6). The GPU side draws ~270 W
-   whole-box; the CPU side draws 220 W and its throughput was measured in the
-   same session. But **which CPU throughput** turns out to be the whole
-   question:
-
-   | CPU comparator | J/q | GPU at 70–90 ms/q × 270 W | **margin** |
-   |---|---:|---:|---:|
-   | `I14e`, measured | 37.4 | 18.9–24.3 J/q | **1.5–2.0×** |
-   | `I15e`, measured | 104.5 | 18.9–24.3 J/q | **4.3–5.5×** |
-   | `I15e`, finding 43 | 64.9 | 18.9–24.3 J/q | 2.7–3.4× |
-
-   > **RETRACTED 2026-08-17 — the two columns are in different units.** The
-   > CPU J/q above are **per prime q**; the GPU column is **per (q, rho)
-   > pair**, which is what `--nq` and the band summary count. GGNFS averages
-   > **1.528 roots per prime** on this polynomial, so every margin in the table
-   > is inflated by that factor. Finding 57 measured both sides in one session
-   > at matched geometry and matched yield (46.47 rel/pair against GGNFS's
-   > 46.09, a 0.8% agreement) and the honest figure is:
-   >
-   > | | per (q, rho) pair | per prime q |
-   > |---|---:|---:|
-   > | GPU wall / energy | 98.5 ms / 26.6 J | 150.5 ms / 40.6 J |
-   > | CPU whole box / energy | 306 ms / 67.4 J | 468 ms / 103.0 J |
-   > | **advantage** | **3.11× time, 2.53× energy** | same |
-   >
-   > **~2.5× on whole-box relations/joule**, which still clears the "beats the
-   > CPU outright" bar. Do not quote 4.3–5.5×.
-   >
-   > **State the unit in every future number.** "Per q" is ambiguous in this
-   > project and has now cost two corrections; item 0's own `3.12 core-s/q` is
-   > per *pair* while item 6's `474.8 ms/q` is per *prime*, in the same file.
-
-   **Geometry: checked 2026-08-16, and it matches — finding 55.** The concern
-   was that the GPU sieved an `I14e` rectangle (`2^14 × 2^13`) while being
-   graded against finding 43's `I15e` CPU baseline (`2^15 × 2^14`, four times
-   the area), flattering the verdict by up to 4×. It did not: the standalone
-   benchmark defaults to `logI 15, J 16384` (`bench_main.cu:426`, unchanged
-   since the initial checkin), the finding 43/44 commands pass neither flag,
-   and `5.369e8` positions is what this file's own header records. **So
-   64.371 ms/q is an `I15e` number, the `I15e` row is its comparator, and the
-   margin for it is 4.3–5.5×.**
-
-   What is still unpinned is the *pipeline*: every pipeline run on record uses
-   `--logI 14 --J 8192`, so item 0's 70–90 ms/q projection takes standalone
-   `I15e` milliseconds and calls them a pipeline number. **A verdict band
-   states its geometry in its log header and is graded against the matching CPU
-   row** — `I14e` → 37.4 J/q, `I15e` → 104.5 J/q. Mixing them is still worth
-   4×; it is now a run-discipline requirement rather than an open question.
-
-   **The mismatch that survives is the factor-base convention, and it is
-   q-dependent** (finding 55). Standalone side 1 truncates the base at q, as
-   GGNFS does (`bench_main.cu:773-774`); the pipeline does not (`:1360`,
-   `fbbound = alim`), because per-q truncation is item 3 and unbuilt. Counted
-   on `oracle/c183.fb1`, the pipeline's full base carries **2.54× the bucketed
-   entries GGNFS sieves at q ≈ 50M**, 1.11× at 120M, 1.03× at 130M, and 1.00×
-   at 190M (above `alim`, where truncation is a no-op). So the 70–90 ms/q
-   projection — anchored at q=120M, truncated, standalone — is roughly right at
-   the 130M probe and **optimistic at the 50M probe**, the three probes will
-   show a q-dependence in ms/q that is not yield drift, and the item-3 A/B has
-   no signal at all at 190M.
-
-   Note also that `I14e` and `I15e` are not interchangeable for the CPU: the
-   larger area wins 2.2× the relations per special-q (68.9 vs 31.6) while
-   costing 2.9× the time, so `I14e` is the better rel/J (0.846 vs 0.659) and
-   `I15e` the better relations-per-q-range. A real c183 job picks `I15e` or
-   above. Which of those the GPU should be held to is a question about the
-   deployment, not about the hardware.
-
-   **The GPU shows the same trade and a worse one** *(finding 57,
-   2026-08-17)*. Doubling J at fixed I — `2^15 × 2^14` → `2^15 × 2^15` — costs
-   **2.03× the time for 1.47× the relations**, so rel/J falls 27% (2.57 →
-   1.87). The CPU's reason for large rectangles is amortising its per-q root
-   transform, 12% of its wall and about 1% of ours, so **the GPU should prefer
-   smaller areas than the CPU does**. Take the larger J only when the q range,
-   not energy, is the binding constraint.
-
-   **But if you do want more area, buy it with I** *(finding 65)*. The two axes
-   are not interchangeable: at equal area the wide rectangle beats the square
-   by **+11.7% relations at `2^28` and +16.3% at `2^30`, for −0.3% device
-   time** — `2^16 × 2^14` returns 10,671 relations against `2^15 × 2^15`'s
-   9,176 on the same window. Doubling I costs 1.86 bits of `log2(maxnorm)`
-   against doubling J's 3.86, because `i` multiplies the shorter vector of the
-   reduced q-lattice and `j` the longer one. Measured rel per device-second
-   across the grid: `2^14 × 2^13` 390.6, `2^15 × 2^13` 387.2, `2^14 × 2^14`
-   336.0, `2^15 × 2^14` 323.9, `2^16 × 2^14` 260.6, `2^15 × 2^15` 223.4.
-
-   **And it is the cheaper shape too** *(finding 64, row added 2026-08-18)*:
-   `2^16 × 2^14` sizes at **4.98 GB** against the square's 5.32 GB, because
-   `bkthresh` defaults to `1 << logI` and so a wider I shortens the bucketed
-   prime range — 2.60 GB of bucket array against 2.91 GB. Same mechanism as the
-   yield win, so there is no trade-off to weigh: at fixed area, wider is better
-   on relations, on device time, and on VRAM simultaneously.
-
-   The c183's own standalone
-   sieve measures 38.2 + 26.2 ms for the two sides (RESULTS.md "Reproduce",
-   `I15e` geometry, side 1 truncated at q, at q=120M), so with TD and the
-   heavier mfba-92 3LP cofactor load the pipeline projects to roughly
-   **70–90 ms/q — about 2× inside the harder bar**. That is a projection, not a measurement, and nothing measured
-   contradicts it — which is exactly why the run should happen now: it is a
-   wall-plug meter and a weekend, not a project. Needs: the meter (item 6);
-   bands at q ≈ 50M / 130M / 190M for the yield drift; relations
-   **deduplicated before quoting** (raw is inflated 1.19–1.34×, see RUNBOOK);
-   an idle host per finding 53. Fold item 3's full-vs-truncated A/B into the
-   same bands — the FB convention moves both the yield accounting and the
-   downstream load, so it should be settled in the graded configuration.
-   **But not in these bands as specified.** Three narrow probes at 50M / 130M
-   / 190M are the right shape for yield drift and the wrong shape for the FB
-   convention: a band covering a fraction of a percent of `lim` has almost no
-   duplicates to remove (measured 1.0021× on the c147), and under truncation
-   the relations whose re-finding q lies outside the probe are lost outright
-   rather than deduplicated. Grade perf/watt on the three probes; settle the
-   FB convention on one contiguous band wide enough to contain both q of a
-   duplicate pair, or by replaying the attribution offline as item 3 now does.
-1. **Concurrent-q throughput. MEASURED 2026-09-01 on the 5070 (finding 84):
-   the knee is per-KERNEL, and two concurrent fills run in 85% of serial time.**
-   The gain saturates at two streams. Built since as `--fill-concurrent`
-   (finding 94, row 5) and several q in flight (findings 108-109, rows 14 and
-   17). Left open: whether Ada shares the pre-Blackwell fill mechanism (the
-   3090 takes 13.5% off fill under concurrency where the 5090 takes 23.7%); an
-   L40S would answer it.
-2. **Startup fill autotune. LADDER BUILT AND DELETED 2026-09-01; the DEFAULT
-   CONFIRMED IN-BAND and the ladder's WRONG-ANSWER failure pinned to its
-   repeat-fill regime 2026-09-02 (finding 85).** Finding 85 addressed two of
-   the three recorded failures -- wrong regime and (as a rival explanation)
-   sample count. **The third is untouched:** the intermittent ~1.9 s stall
-   inside the fill event window remains unexplained, and the redesign below
-   measures that same window, so it inherits the outlier. The redesign's
-   *measurement regime* is validated; the design as a whole is not, and the
-   guard constants below need re-deriving before anyone builds it.
-   `nregion` remains the untouched axis.
-
-   **STRONGER CASE 2026-08-25 (finding 76).** The
-   two-axis sweep that item warned about has now been run on the production
-   shape, and it moved the block default 1152 -> 4608 (**fill -8.6%, wall
-   -5.7%** on c194). It also showed why one constant cannot serve: c147
-   unslabbed prefers MORE blocks than 4608, c147 slabbed prefers 1152, and
-   c194 prefers 4608 -- two of those share a factor base and still disagree on
-   direction. The new default is right for the I16 production class and costs
-   c147-slabbed ~0.8%; the autotuner is what removes that trade entirely. The
-   thread axis needs no sweep: 32 is optimal at every block count measured, and
-   raising it to buy occupancy makes fill slower (see below).
-
-   **A THIRD AXIS, added 2026-08-26 by finding 79: `nregion`.** `fill`'s
-   optimum is a fixed bucket-region count (32,768 measured here), not a slab
-   area — so the card-dependent number to tune is `nregion`, and both
-   `SLAB_PERF_TARGET_LOG2` and `log_region` are derived views of it. The L40's
-   preference for `2^30` slabs is a preference for 65,536 regions. Fixing the
-   slab/region coupling logged under Known defects belongs in this item, not on
-   its own, because the constant should become an autotuned quantity rather
-   than a better-derived hardcode. Note that `nregion` trades fill against
-   apply in opposite directions (finding 79's second table), so it is the one
-   axis here that cannot be tuned on `fill` alone. **Finding 81 makes this axis
-   cheap to tune:** `L(nregion)` is a DRAM-traffic curve, and traffic is
-   predictable from `nregion` alone — so a candidate geometry can be priced from
-   the model or from counters, without running trial fills for it.
-
-   **BUILT 2026-09-01: the block axis and the region/slab coupling fix.**
-
-   - `slab_perf_jmax` now takes `log_region` and targets **32,768 bucket
-     regions** rather than `2^29` positions, deriving rows as
-     `(SLAB_PERF_REGIONS << log_region) / I`. Arithmetically identical at the
-     default `--region 14`, which is why every pre-existing `slabtest` row is
-     unchanged; three new rows pin region 12/13/15, all of which returned the
-     region-14 answer before.
-   - **The split TRIGGER moved too, and that is the half that changes
-     behaviour.** It had been left as an absolute `2^30` while the target went
-     region-relative; it is now `area < target * 2`. Fixing only the cap would
-     have left an area of `2^29` at `--region 12` never splitting -- 131,072
-     regions in one slab, the shape finding 79 measured at +68.3% fill. Four
-     `slabtest` assertions cover it in both directions. The `* 2` is deliberate
-     hysteresis, not a bug; `slab.h`'s policy block now says so in three
-     places, because a reviewer proposed "correcting" it to `area < target`
-     and `slabtest` caught that.
-   - **Upward consequence, documented 2026-09-02:** holding the region count
-     fixed means the slab AREA scales with region size, so `--region 15` now
-     auto-plans a `2^30` slab where the old absolute target gave `2^29`, and
-     region 16 gives `2^31`. Peak bucket memory follows. Intended policy, but a
-     `--region 16` run that fit before may not now.
-   - **Out-of-range `log_region` now fails on the FORCED path too**
-     (2026-09-02). The only range check lived in `slab_perf_jmax`, which
-     `forced_j != 0` never reaches, so `slab_make_plan` accepted any region
-     there and silently ignored it. `bench_main.cu` validated independently, so
-     nothing shipped wrong; the header's contract is now enforced. That closes
-     the Known-defects entry.
-   - **`--fill-blocks` autotune -- built, then DEFAULTED OFF the same day when
-     it was measured against a band (see below).** Times the ladder
-     `{1152, 2304, 4608, 9216, 18432}` on the first special-q's real data,
-     three reps, keeping the minimum. `--fill-autotune` forced it on for
-     experiments; **an explicit `--fill-blocks` disabled it** -- a knob the
-     operator set must not be silently overridden. The choice went to stdout
-     and to the run log, and the log distinguished `chosen-by-ladder` from
-     `kept-default-or-refused` so a guard firing was visible.
-
-     **All of that is past tense: NONE of it exists in the tree.** The deletion
-     took the flags with the harness, so `--fill-autotune`, `chosen-by-ladder`
-     and `kept-default-or-refused` appear in this file and nowhere else. Where
-     the disposition below says "keep the guards and the flags", read it as
-     *keep the design decisions on record* -- which is what this prose is.
-     There is no flag to find and nothing to re-enable.
-     Repeating the fill is safe on slab 0 including SLABBED, because
-     `k_fill_atomic` reads `walk_cur` and writes `walk_next` and the host swaps
-     only after the slab, so every trial reads the same input.
-
-   **Two guards, both learned by accident the same day.** The first run of the
-   tune fired while a GGNFS sieve client had the GPU at 96% and **picked 1152
-   over the 4608 default** -- a choice that would then have stood for the whole
-   multi-hour band, on evidence that was pure scheduling noise.
-
-   - **Unstable-device guard:** if any ladder point's slowest rep exceeds its
-     fastest by **>10%**, the device is busy, no timing means anything, and the
-     tune abandons and keeps the default, printing the observed spread. The
-     threshold is calibrated, not guessed: 1.05 was the first value and it sat
-     *inside* natural jitter -- an idle 5070 prints spreads of 2.1-6.6% -- so
-     one run in three discarded a real result, while the case it must catch ran
-     at ~2x inflation. The observed spread is printed on every outcome so the
-     next person recalibrates from data.
-   - **Margin guard:** the winner must beat the default by >3% to be adopted.
-     4608 is a *measured* value (finding 76), not an arbitrary start, and a
-     tune that switches on a 1% difference is picking noise.
-
-   This is the same lesson as finding 53 in a new place: **a number measured on
-   a contended box is not a number.** A startup autotune is exactly where that
-   bites hardest, because one bad instant sets a parameter for hours.
-
-   **VERIFIED 2026-09-01, and guard 1 was exercised for real.** A 1,000-q c183
-   I15e band on the new binary emitted 42,184 relations and **every one of them
-   appears in finding 83's arm A file** (`comm -23` of the sorted sets: 0
-   lines). That one check clears three things at once -- the slab region-count
-   fix is behaviour-preserving, the autotune is output-neutral, and the binary
-   is sound despite two overlapping `make` runs having touched the tree.
-
-   The run went in deliberately against a GGNFS sieve client holding the GPU at
-   97%, and the guard did its job:
-
-   ```
-   fill autotune, on this q:  1152:28.73  2304:27.34  4608:27.09
-                              9216:23.90  18432:24.49
-     -> keeping 4608: reps disagree by >5%, the device is busy
-   ```
-
-   Note what an unguarded tuner would have taken from that: 9216 looks like a
-   12% win. It is scheduling noise, and the run would have carried it for the
-   whole band. **That transcript is from the 1.05 build** -- the message format
-   and threshold both changed afterwards -- so it is evidence that the guard
-   concept works, not that the shipped 1.10 constant has fired in anger. It has
-   not; the contended case is ~2x inflation and clears 1.10 by a wide margin on
-   arithmetic, but nobody has re-run it.
-
-   **THE TUNER AS BUILT DOES NOT WORK -- MEASURED 2026-09-01, DO NOT SHIP IT.**
-   On an idle 5070 it reproducibly picks 18432 (12.57-12.67 ms, 4/4 runs) over
-   the 4608 default, an apparent 8.5% win. Against a real 200-q band, three
-   reps each, spread 0.18%:
-
-   | `--fill-blocks` | band fill | vs default |
-   |---:|---|---:|
-   | 4608 (default) | 26.035 / 26.048 / 26.081 | -- |
-   | **9216** | **25.505 / 25.507 / 25.461** | **-2.1%** |
-   | 18432 (the tuner's pick) | 26.116 / 26.100 / 26.080 | **+0.2%** |
-
-   **The tuner picks the worst of the three** -- 2.4% behind the right answer
-   and 0.2% behind doing nothing.
-
-   **Cause: the ladder measures the wrong regime.** It runs repeated fills of
-   ONE lattice back-to-back, which is steady-state and cache-warm. A band gives
-   every q a freshly transformed `plat` and fills it ONCE. The proxy does not
-   predict the target, and the single-q numbers are internally consistent
-   (4/4 runs agree) while being wrong about production -- which is the most
-   dangerous shape a measurement can have.
-
-   **CONFIRMED 2026-09-02 by controlled comparison -- finding 85.** The rival
-   explanation was sample count: maybe any short measurement is unreliable.
-   It is not. On **the same job, geometry and axis the ladder got wrong**
-   (c183/I15e), a 10-q band picks **9216** -- the in-band answer -- while the
-   ladder picked 18432. Sample count is exonerated and the repeat-fill
-   structure is the cause. **A short band is not a bad measurement; a
-   repeat-fill proxy is.**
-
-   **The 4608 default is CONFIRMED IN-BAND, 2026-09-02 (finding 85).** The
-   check this paragraph asked for was run: `--fill-blocks` swept at `--nq 200`,
-   arms interleaved, on finding 76's own c194/I16 configuration.
-
-   | arm | in-band fill, n=3 | `--nq 10`, n=4 |
-   |---:|---:|---:|
-   | 2304 | 102.343 | 103.233 |
-   | **4608** | **99.872** | **100.535** |
-   | 9216 | 102.200 | 102.277 |
-   | 18432 | 103.492 | 103.653 |
-
-   4608 wins both, arms non-overlapping (its worst rep beats the runner-up's
-   best by 1.9 ms), and the whole *ranking* is identical across regimes. So
-   finding 76's `--nq 10` sweep was never in the ladder's regime -- `--nq 10`
-   is a real band with ten distinct q, each freshly transformed and filled
-   once. **Do not move the constant.**
-
-   What remains true is that the optimum is geometry-dependent: c183/I15e
-   prefers 9216 by 2.4%, and 4608 sits at the bottom of the four arms there --
-   last outright at `--nq 10`, and in-band tied with 18432 for last (26.438
-   against 26.443, a 0.02% gap inside a 1.46-3.35% spread). That is an
-   argument for tuning per geometry, which is this item, not for a different
-   hardcode.
-
-   **A third failure, 2026-09-01, after the warm-up fix.** With the spread now
-   printed on every outcome, two runs in three abort with a **130x spread**
-   (`reps disagree by 12936.3%`) on a completely idle card, while every printed
-   per-rung minimum is a normal 12-15 ms -- so one REP of some rung took ~1.9
-   seconds. Not contention, not jitter: a stall inside the event window that
-   the earlier build simply could not see. Unverified hypothesis: an
-   asynchronous side-0 transform still in flight when the ladder starts, so a
-   trial queues behind it.
-
-   **Disposition: delete the ladder harness, keep the guards and the flags.**
-   Three distinct failures in one session -- wrong regime, wrong answer against
-   a band, intermittent multi-second outlier -- each surfaced by fixing the
-   last. That is a design to rebuild, not to patch, and ~95 lines of
-   permanently-disabled code inside the per-q loop is a standing cost to every
-   future reader of `run_pipeline_impl`. What is worth keeping is the part that
-   was validated: the two guard constants and their calibration, the
-   distinction between `chosen-by-ladder` and `kept-default-or-refused` in the
-   run log, and the rule that an explicit `--fill-blocks` always wins.
-
-   **The redesign, if this is taken up again:** tune IN-BAND. Run the first N q
-   of the band at each candidate grid -- 20 q per candidate is ~100 q against a
-   50,000-q work unit, i.e. free -- and compare the band-average fill each
-   produced. That measures exactly the quantity being optimised, needs no
-   proxy, and the guards built today (unstable-device, margin) carry over
-   unchanged.
-
-   **The ladder code exists in NO ref.** It was written and deleted between
-   commits, so `git grep` finds it on no branch and there is nothing to rebase
-   -- verified 2026-09-02 across every ref (`main`, `greg/main`, `greg/slab`,
-   `origin/main`, `origin/fix/windows-review`). An earlier sentence here said
-   "the code is on the branch and the flags work"; that was wrong and is
-   withdrawn. This item's prose is the only surviving record, which is why it
-   is written at the length it is.
-
-   **Finding 85 validates the measurement regime and sharpens it, but it also
-   breaks two of the constants this design was going to reuse. Read all five
-   points before building.**
-
-   - **N=10 is enough TO RANK.** A 10-q band picked the in-band winner on both
-     jobs and reproduced the full four-arm ranking on c194.
-   - **N=10 is NOT enough to size the effect**, and the design depends on that
-     more than on ranking. c183 reports a 4.37% margin at `--nq 10` against
-     2.42% in-band; c194 reports 1.70% against 2.28%. Errors in both
-     directions, up to ~1.8x.
-   - **INTERLEAVE the candidates, and the rep count collapses.** Ranking each
-     rep on its own, **15 of 16 interleaved reps** across two jobs and two
-     regimes picked the in-band winner outright; the single miss took 2304
-     over 9216 by 0.19%, between the two best arms. This held despite
-     within-arm spreads up to 4.09%, because whatever the host and clocks do
-     during a rep, all candidates see it. A tuner that runs each candidate to
-     completion in turn cannot borrow this and needs many more reps.
-   - **THE >3% MARGIN GUARD MUST BE RE-DERIVED -- as written it refuses every
-     win this tuner exists to capture.** Both real margins finding 85 measured
-     are *below* the threshold: 2.42% in-band on c183 and 2.28% on c194. The
-     guard was calibrated against the ladder's fictitious 8.5% and 12%
-     readings, not against true in-band effect sizes, which live at 2-3%.
-     Lowering it is not simply safe either: finding 85 saw the same margin
-     double run-to-run under an identical protocol (0.84% -> 1.70% in August
-     vs September on c194 at `--nq 10`), so a 2% threshold against a
-     10-q estimate is inside the noise it must reject. **This is the open
-     design problem, and it is not a constant to guess -- it needs the
-     margin's own reproducibility measured on an idle box.**
-   - **THE >10% UNSTABLE-DEVICE GUARD GOES INERT at 2 reps.** Slowest-vs-
-     fastest over two samples is a single pairwise difference with no power to
-     detect anything. Worse, it would not fire even with more: every spread
-     finding 85 measured on a *contended* box tops out at 4.09%, comfortably
-     under 10% -- and c183 under contention is exactly the case the caveat
-     below calls unreadable without interleaving. The threshold was calibrated
-     against the ladder's ~2x inflation and does not transfer to in-band
-     spreads. Re-derive it too, or replace it with an idle-box precondition.
-
-   **The shape, stated precisely** -- the earlier one-line version was
-   ambiguous in a way that matters:
-
-   - The grid is **five rungs** `{1152, 2304, 4608, 9216, 18432}`, not the four
-     finding 85 swept. Do not drop 1152: it is c147-slabbed's measured optimum
-     (finding 76), so a four-rung grid cannot find the winner on one of the
-     three documented geometries.
-   - `for rep in 1..2, for candidate in grid, sieve the SAME 10 q`. Every
-     candidate must see identical lattices, because finding 85's 15-of-16
-     single-rep result is *paired on q* -- give each candidate its own 10 q and
-     the pairing that cancels drift is gone, and that result does not transfer.
-   - That is 2 x 5 x 10 = **100 q**, matching this item's original estimate;
-     the "~80 q" figure that stood here assumed the four-rung grid.
-   - **Two consequences of re-sieving the same q that are NOT yet measured.**
-     (a) Relations from tune passes must be suppressed or deduplicated, or the
-     band emits each of those q 10 times. (b) Re-sieving one lattice
-     repeatedly is structurally closer to the ladder than a normal band is:
-     each pass does its own transform, so it is not the ladder, but L2 is warm
-     from the previous candidate's fill of the *same* lattice. Whether that
-     warmth biases the comparison is untested, and it is the first thing to
-     check when building this.
-
-   Keep `--no-fill-autotune`-equivalent behaviour until then: **the default
-   must stay off.** The "or ship 9216 instead" alternative that stood here is
-   withdrawn -- finding 85 shows 9216 is right for c183/I15e and wrong for
-   c194/I16 by 2.3%, so swapping the constant just moves the loss to the
-   production class.
-
-   **Contention caveat for whoever builds this** (finding 85). Across both
-   regimes on the same busy box, within-arm spreads were **0.18-1.71% on
-   c194/I16** and **1.46-4.09% on c183/I15e**, against an idle-box figure of
-   0.18% -- so contention inflated the small geometry **8x to 23x** and left
-   the large one comparatively alone. On c183 the effect being measured (2.4%)
-   was smaller than one arm's spread (3.35%); only interleaving made it
-   readable.
-
-   **The mechanism for that difference is NOT established.** The natural story
-   -- host work per q is fixed while GPU work is not, and the fill event window
-   includes two `cudaMemset`s and the launch (`pipeline.cuh:554-560`) so host
-   stalls land inside it -- fails its own arithmetic: that window is entered
-   once per side per slab, so slabbed c194 has 8 host-issued windows per q
-   against unslabbed c183's 2, and the 4x exposure roughly cancels the 3.8x
-   GPU-work ratio. **So do not treat "large geometry is contention-tolerant"
-   as a property that transfers.** Tune on an idle box, or measure the spread
-   on the geometry in front of you.
-
-   **`nregion` is NOT addressed and cannot be, by this design.** The bucket
-   array sizing, `k_apply`'s shared memory and the slab plan all derive from
-   `log_region`, so it must be chosen BEFORE allocation -- a predict-then-
-   allocate design, not measure-then-use -- and it cannot be judged on fill
-   alone, since it trades against apply in opposite directions (+52% apply at
-   region 13). Finding 81's traffic model is the way in. Still open.
-
-   The **stream count** (item 1) is a third per-card axis and belongs here once
-   item 1 ships: 2 on a 5070, 4 on a 5090, N=8 matching N=4 to 0.1%.
-
-   `--fill-threads` is done; the `nregion` autotuner is not.
-   Sweep both axes, since holding one fixed is how the old default was reached.
-   Opt-in for the standalone benchmark, where reproducibility is the point;
-   default-on is defensible for `--pipeline`, where a per-job knee cannot be
-   derived and 15 trial fills cost ~60 ms of a multi-hour run.
+0. **The verdict band against the CPU — RUN 2026-08-20 to 09-02, findings 71,
+   83 and 87.** Both sievers over the same q bands (same first q, width
+   `10000 * ln q`, ~10,000 (q, rho) pairs each), c183 `I15e`, GGNFS at 16
+   workers on this 9800X3D, neither running while the other was on the box,
+   watts from the UPS with the monitors' 45 W subtracted:
+
+   | | wall ms/pair, GPU / CPU | time | J per unique relation, GPU / CPU | energy |
+   |---|---:|---:|---:|---:|
+   | q = 130M | 103.13 / 298.98 | **2.90x** | 0.5649 / 1.5624 | **2.77x** |
+   | q = 190M | 100.95 / 301.47 | **2.99x** | 0.5771 / 1.6958 | **2.94x** |
+   | `2^15 x 2^14`, each siever's own best shape | | **3.09x** | | **2.89x** |
+   | `2^16 x 2^14` | | **3.03x** | | **2.77x** |
+
+   Yield agrees to 0.07-0.37%. **Quote ~3x time and ~2.8-2.9x energy**; the
+   margin is rectangle-invariant and grows with q, because GGNFS's truncated
+   factor base grows toward the full one (271.95 -> 298.98 -> 301.47 ms/pair at
+   50M / 130M / 190M). These predate findings 100-154, which made the GPU side
+   several times faster; the margin has not been re-measured. Rules that
+   survive: **state the unit** (per (q, rho) pair or per prime q: the c183
+   averages 1.528 roots per prime, and mixing them cost two corrections);
+   **grade where the factor-base conventions agree** (above `alim`, or the
+   q=50M band's 3.12x measures GGNFS's truncation, not the hardware); state the
+   geometry in the log header and grade against the matching CPU row; dedup
+   before quoting (raw is inflated 1.19-1.34x at band scale, 1.0002-1.0009 at
+   probe width).
+1. **Concurrent-q throughput — CLOSED.** Measured 2026-09-01 (finding 84): the
+   knee is per kernel, and the gain saturates at two streams. Built as
+   `--fill-concurrent` (finding 94, row 5) and two units in flight (findings
+   108-109, rows 14 and 17). Left open: whether Ada shares the pre-Blackwell
+   fill mechanism (the 3090 takes 13.5% off fill under concurrency where the
+   5090 takes 23.7%).
+2. **Startup fill autotune — BUILT AND DELETED 2026-09-01 (finding 85).** The
+   ladder timed repeated fills of one lattice, warm and steady-state, and picked
+   the worst of three grids against a real band. `tune.sh` (finding 146) is the
+   offline replacement, and the per-card answers are row 44. If an in-band
+   tuner is ever built, finding 85 sets its shape: run the candidates
+   interleaved on the **same** first q of the band (15 of 16 interleaved reps
+   picked the in-band winner; 10 q rank but do not size the effect), suppress
+   or deduplicate the tune passes' relations, check whether L2 warmth from the
+   previous candidate's fill of the same lattice biases it, and re-derive both
+   guards (a >3% margin refuses the real 2-3% wins; a >10% spread guard never
+   fires at two reps). `nregion` cannot be tuned this way: it sizes the bucket
+   array, `k_apply`'s shared memory and the slab plan before allocation, and
+   trades fill against apply, so it needs finding 81's traffic model. The ladder
+   code exists in no ref.
 3. **Full vs q-truncated factor base — CLOSED 2026-08-18, do not build it
    (finding 67).** Worth 10-15%, not the ~25% an entry count suggests:
    cutting the base 53% cuts the bucket records only 8%, since they go as
@@ -2126,236 +1031,57 @@ finding 92.
 
 5. **True rectangle maximum** for the norm approximation — one safe band-wide
    scale, or a few scale/slice-table buckets, gated at low/mid/high q on more
-   than one job. Note the payoff is job-shaped: for the snfs236 polynomial the
-   special-q side is degree 1 with `d = [1, -3.5e-24]`, so largest-term and
-   true-rectangle are the *same number* and this buys nothing there. The ~2-bit
-   gap is a GNFS-side problem.
-
-   **The 1:1 anomaly that drove this item DOES NOT EXIST — finding 65,
-   2026-08-17.** `gnfs-lasieve4I15e -J 15` covers what we call `2^16 x 2^14`,
-   while our `--J 32768` sieves `2^15 x 2^15`. (It is a `2^15 x 2^15` square in
-   GGNFS's own axes; the two sievers order the reduced basis oppositely, so
-   their (i,j) is our (j,i) — and because their j is non-negative while our i
-   is signed, the swap also halves one axis and doubles the other rather than
-   being a plain transpose. Corrected 2026-08-18 — see finding 65.) Findings 58 and 63 compared a square against a wide
-   rectangle. Recovering each run's rectangle from its own relations (invert
-   the q-lattice) and re-comparing at **matched** rectangles gives ours/theirs
-   = 0.9795, 0.9805, 0.9797, 0.9786 at `2^14 x 2^13`, `2^15 x 2^13`,
-   `2^15 x 2^14` and `2^16 x 2^14` — **flat, with no aspect-ratio dependence
-   and no j-dependence within a rectangle**. Finding 63 is retracted; its four
-   eliminations stand.
-
-   `sieve_allowance` and `sieve_bound_checked` are **exonerated by
-   arithmetic**, no GPU needed: the allowance is `mfb + max(2/scale, 1.5)` with
-   no geometry term, so the gate in *bits* goes 96.63 → 96.67 between those two
-   rectangles — very slightly looser. The bound falling 119 → 117 is
-   `las_scale` renormalising for a 3.86-bit larger norm, and both values
-   reproduce exactly from the source. Do not start there.
-
-   So this item is back to being justified only by its original ~2-bit argument
-   and the ~0.13% of CADO's relations under "Known defects": **low value at the
-   geometry we deploy, and no longer blocking anything.** The ~2% we sit below
-   GGNFS is uniform across every rectangle and every j, which is the shape of a
-   constant downstream residual (finding 62), not of a norm approximation that
-   degrades as the rectangle grows.
-
-   **What replaced it is an operational rule — buy area with I, not J.** At
-   equal area the wide rectangle yields +11.7% at `2^28` and +16.3% at `2^30`
-   for −0.3% device time, because doubling I costs 1.86 bits of
-   `log2(maxnorm)` where doubling J costs 3.86: `i` multiplies the shorter
-   vector of the reduced q-lattice and `j` the longer one. See item 0.
-6. **Whole-box power**, to close the metric of record — the meter half of
-   item 0. **The meter exists**: the UPS reports real watts. It is not a
-   parallel task to item 10, it is a **prerequisite** for it (see there).
-
-   Readings (2026-08-07, UPS, real watts). Monitors measured once at **~45 W**
-   and subtracted throughout; the raw readings were taken with them on.
-
-   | state | monitors off | notes |
-   |---|---:|---|
-   | **everything idle** | **95–115 W** | GPU P8 ~16 W, load avg 1.06 |
-   | CPU full (14 `ecm`), GPU idle | 240 W | ≈9.6 W per busy core |
-   | CPU full, GPU sieving | 395–400 W | GPU board 165 W |
-
-   | derived | |
-   |---|---:|
-   | **host constant** (idle box incl. P8 GPU) | **~105 W** |
-   | GPU **delta**, at the wall | 155–160 W |
-   | GPU **delta**, board sensor (165 − 16) | ~150 W |
-   | implied delivery loss | 3–7% |
-   | power factor (W ÷ VA) | 0.96 |
-
-   The idle reading is **jumpy, ±7%** — normal for a desktop drifting through
-   C-states — so average it rather than taking an instant. Everything derived
-   from it inherits that spread.
-
-   **The board sensor is trustworthy.** Compare deltas to deltas: the card
-   swings 150 W on the board sensor and 155–160 W at the wall, so the wall
-   figure sits a few percent *above* the board figure, which is exactly what
-   PSU and delivery losses predict. First independent check this project has
-   had on the number every rel/J figure rests on, and it passes.
-
-   **The GPU never reaches zero.** It idles at 15 W in P8 and it drives this
-   box's displays (`Disp.A = On`), so there is no configuration of this machine
-   where the card is absent. That 15 W belongs in the host constant on *both*
-   sides of the item-0 comparison, which is the honest accounting anyway — the
-   CPU box needs display output too.
-
-   Cautions. **Read W, not VA** — VA is apparent power, ~4% high here. **Subtract
-   the monitors** once and for all. And **none of these is a sieve-only number**:
-   the ECM job is in all of them, and per finding 53 it is simultaneously
-   costing the sieve throughput, so both sides of rel/J are wrong here. These
-   are the *co-scheduled* data, worth having, but not the verdict data.
-
-   **Elastic background load is still a trap**, even though it did not bite
-   here. ECM expands to fill whatever cores are free, so stopping the GPU job
-   handed it the sieve's spinning core and it drew *more* CPU power — the 240 W
-   row therefore contains somewhat more CPU work than the 395–400 W row does,
-   which understates the GPU delta by roughly the draw of one core. The
-   agreement above survives that because the residual is ~10 W against a 150 W
-   signal. It would not survive it on a smaller difference. Pin the background
-   worker count across both readings, or stop it.
-
-   **The host constant is now measured, which was the term every projection in
-   this file was missing.** At ~105 W it is roughly a third of a sieving box,
-   not the 200 W+ the earlier ranges allowed for.
-
-   **The CPU side is measured too**, on the c183 at q=130M, 16 workers, all
-   monitors-off and steady-state (2026-08-07):
-
-   The box is a **9800X3D: 8 physical cores, 16 threads, 96 MB L3**, so "16
-   workers" is two per physical core and the per-worker column below is per
-   *thread*, not per core.
-
-   | load | whole box | per worker |
-   |---|---:|---:|
-   | idle | ~105 W | — |
-   | 14 `ecm` workers | 240 W | 9.6 W |
-   | 16 `gnfs-lasieve4I14e` | **225 W** | 7.5 W |
-   | 16 `gnfs-lasieve4I15e` | **220 W** | 7.2 W |
-   | GPU sieving alone (derived) | ~270 W | — |
-
-   **Power falls as the workload gets more memory-bound**, which is exactly why
-   ECM was a bad proxy: it is ALU-bound and drew 33% more per core than the
-   siever it was standing in for. The earlier ~260 W estimate scaled from ECM
-   was ~18% high. Use 220 W for the CPU side.
-
-   > **SUPERSEDED 2026-08-20 by finding 71, which metered both sides again.**
-   > The CPU row is **~236 W**, not 220 W, and the GPU row is **240 W**
-   > measured, not ~270 W derived. The CPU difference is not the cores: this
-   > box idles its GPU at **30 W**, not the ~16 W P8 figure assumed above, and
-   > that is 14 of the 16 W. The GPU row also moved because the card has been
-   > undervolted since (finding 61). Both new figures are UPS readings with the
-   > 45 W of monitors subtracted, taken in one session with the two workloads
-   > run separately. Use **240 W GPU / 236 W CPU**.
-
-   Throughput measured in the same session, so both sides of the CPU figure
-   come from one box on one day:
-
-   | siever | ms/q | rel/q | rel/s | J/q | rel/J |
-   |---|---:|---:|---:|---:|---:|
-   | I14e | 166.2 | 31.6 | 190.4 | **37.4** | 0.846 |
-   | I15e | 474.8 | 68.9 | 145.0 | **104.5** | 0.659 |
-
-   **I15e measures 475 ms/q here against finding 43's 295 ms/q** — same siever,
-   same 16 workers, same stated q, 1.6× apart. A worker sweep run to chase it
-   eliminated every mechanism except one:
-
-   | workers | finding 43 | measured 2026-08-07 |
-   |---:|---:|---:|
-   | 8 | 2.120 q/s | 1.140 q/s |
-   | 16 | 3.392 q/s | 2.106 q/s |
-   | SMT gain | 1.60× | **1.85×** |
-
-   Not cache capacity — 16 workers beat 8 by 1.85×, so SMT is working and the
-   96 MB L3 is not the binding constraint at I15e (a tempting hypothesis on an
-   X3D part, and wrong). Not thermal — cores held 4691 MHz under sustained
-   load. Not startup — these are steady-state windows. The slowdown is
-   *uniform across worker counts*, and contention or thermal effects would bite
-   harder at 16 than at 8, not equally. **That leaves configuration**: finding
-   43 does not record which `input.job` it swept, and this run used the c183
-   (`alim 134.2M, mfba 92, alambda 3.5, lpba 32`) at 68.9 rel/q. A job yielding
-   fewer relations per q would sieve faster per q and prove nothing.
-
-   So the two numbers are probably measuring different work, and **s/q is the
-   wrong axis to compare them on — rel/J is the right one**. Resolve by
-   recording the job file alongside any future N_eff sweep.
-7. **Why our survivor gate is looser than GGNFS's at matched lambda —
-   DOWNGRADED 2026-08-17: the surplus does not exist at shipping defaults
-   (finding 62).** At each siever's own gate our cofactor volume matches
-   GGNFS's within 0.4% (c183 I14e) and 0.03% (C194 15e), so the bound is
-   derived for a new job, not swept. Reopen only if a job is found where the
-   volumes diverge. Do not "fix" the matched-lambda asymmetry by tightening the
-   default: the gate finds every relation GGNFS finds.
-8. **A = 32 sieve areas and MFB widening**, for jobs like AS276. **Two of the
-   three blockers are gone**: `lpb` now goes to 64 (2026-08-17), so a C194's
-   `lpba 33 / mfba 95` runs today; and `mfb` now goes to 128 (2026-08-18) on a
-   per-side 3-or-4-limb dispatch, so a C208's 4/3 shape runs without a flag.
-   AS276 has since been sieved end to end and validated against its own GGNFS
-   corpus at 99.97% recall (finding 69), and the width measured at **×1.72 on
-   the widened queue, +8-9% of wall** (finding 70) — the 1.8-2× projection was
-   close.
-
-   **CORRECTED 2026-09-01 — the area blocker is gone; what is left is one
-   untested aspect ratio.** `--pipeline` applies no total-area cap at all:
-   `bench_main.cu`'s `I*J <= 2^31` refusal is guarded by `!cfg.pipeline`, the
-   non-pipeline
-   path, and the planner slabs any geometry through `logI 20`. **`A = 32` has
-   been sieved twice** — `I16 J65536` on the 5070 (finding 74's discriminating
-   run, 8 slabs of `2^29`) and `I=J=2^16` on the L40 (finding 72).
-
-   **CLOSED 2026-09-01 by finding 82: their shape is sieved, gated and
-   geometrically confirmed.** AS276 at `--logI 17 --J 32768 --maxbits 17`, 10 q
-   from 80000023, plans **8 slabs of 4096 rows** unaided and emits 1,322
-   relations; `--check-relations` rebuilds **1,322 of 1,322** norms exactly, and
-   `relgeom.py` recovers `i in [-65477, 65239]`, `j in [1, 32761]` — `2^17 x
-   2^15`, the same extent finding 69 recovered from GGNFS's own output for this
-   job. Setup allocation 2.71 GB (bucket array 1.18), so a 12 GB card runs it.
-   Finding 69's "their shape is `A = 32`, which we still refuse" is dated
-   2026-08-19, predates the slab merge, and is no longer true; the `2^17 x
-   2^14` runs in findings 69 and 77 are `2^31` sub-rectangles and finding 77's
-   "(A=32)" label on one was wrong. **The 14-16 GB figure applies only to the
-   monolithic allocation nothing makes now.**
-
-   **What is left of this item is a performance comparison, not a capability.**
-   A like-for-like run against NFS@Home at this geometry needs an idle card and
-   a matched q band; finding 82's run was on a card at 96-100% foreign load and
-   quotes no timing.
-
-   **The per-slab cost side of that footprint improved on 2026-08-26**
-   (finding 77): halving the slab now costs +1.7% rather than +3.4%, and on
-   AS276 itself the recording pass fell 9.234 -> 1.256 ms/q. That does not lift
-   either remaining blocker, but it is what makes trading slab size for VRAM
-   cheap enough to be worth doing. Item 18 is the next term in the same
-   direction.
-
-   **Neither remaining blocker binds a C195 at NFS@Home's geometry.** They
-   sieve `2^15 × 2^14` and would prefer `2^15 × 2^15` — `2^30`, half the
-   current area limit — so no A=32 work is required for that class of job at
-   all. The current design assessment, performance accounting, alternatives,
-   and work status are consolidated in **"Current size limits and j-slabbing"**
-   above; that section is canonical rather than duplicating a moving design
-   here.
+   than one job. **Low value at the geometry we deploy, and blocking nothing.**
+   The 1:1 anomaly that drove it was a geometry mismatch (finding 65:
+   `gnfs-lasieve4I15e -J 15` covers our `2^16 x 2^14`); at matched rectangles
+   our yield is 0.979-0.981 of GGNFS's, flat in aspect ratio, area and j, which
+   is the shape of a constant downstream residual (finding 62), not of a norm
+   approximation degrading with the rectangle. `sieve_allowance` and
+   `sieve_bound_checked` are exonerated by arithmetic. The payoff is job-shaped:
+   where the special-q side is degree 1 (snfs236) largest-term and
+   true-rectangle are the same number. What came out of it is the rule in
+   "Measured": buy area with I, not J.
+6. **Whole-box power — the meter exists** (the UPS reports real watts; read W,
+   not VA, which is ~4% high; subtract the monitors' ~45 W). The host constant
+   is **~105 W** (idle box including the GPU, ±7%, average it), and the GPU
+   idles at **30 W** on this box, not the ~16 W P8 figure first assumed. At the
+   verdict band (item 0, undervolted card): GPU sieving **240 W**, CPU sieving
+   at 16 workers **~236 W** (finding 71). The board sensor is trustworthy: the
+   card's swing at the wall sits a few percent above its swing on the board
+   sensor, as PSU losses predict. Two traps: elastic background load (ECM
+   expanded into the sieve's freed core and drew more), so pin or stop it; and
+   power falls as a workload gets more memory-bound, so an ALU-bound stand-in
+   overstates a siever's draw (ECM drew 33% more per core than GGNFS).
+   Ambient matters too: the same voltage curve drew 133.5 W board in August
+   and 147-153 W in September heat, so quote board draw beside any rel/J.
+7. **Our survivor gate against GGNFS's — CLOSED 2026-08-17 (finding 62).** At
+   each siever's own gate our cofactor volume matches GGNFS's within 0.4%
+   (c183 I14e) and 0.03% (C194 15e). Do not "fix" the matched-lambda asymmetry
+   by tightening the default: the gate finds every relation GGNFS finds.
+8. **A = 32 sieve areas and MFB widening — CLOSED 2026-09-01 (finding 82).**
+   `lpb` to 64, `mfb` to 127 per side, and `A = 32` slabbed: AS276 at
+   `--logI 17 --J 32768 --maxbits 17` plans 8 slabs of 4096 rows unaided, every
+   norm rebuilds, and the recovered rectangle is GGNFS's own `2^17 x 2^15`;
+   setup allocation 2.71 GB, so a 12 GB card runs it. Left: a like-for-like
+   timing against NFS@Home at that geometry on an idle card.
 9. **Dead factor-base parses under `--sq-side 0` -- CLOSED 2026-09-02,
    finding 86: both defects are stale, and startup on the client's job class
    is 1.9 s** (0.2% of a 900 s unit). Left, neither worth scheduling: runs
    without `--fb1` (GPU factor-base generation) were not timed, and c194's
    ~3.45 s is a bound rather than a measurement.
-
 10. **GPU power-limit sweep — MEASURED 2026-08-17 (finding 61); a floor, not
     a knee.** The sieve is not power-limited at stock. At the 175 W floor:
     +5.0% whole-box rel/J (the board sensor overstates it 1.8x). The undervolt
-    is the lever: ~2900 MHz at 950 mV, +14.6% whole-box rel/J for +6.7% time,
-    **applied to this box permanently**, so every timing after 2026-08-17 is
-    ~6.7% slower than findings 43-60. Left: where the knee is (900 mV untried).
-11. **Apply breakdown — ANSWERED 2026-08-17 (finding 60) as "no cheap win";
-    that conclusion is PARTLY WRONG, corrected 2026-08-25 (finding 75).** Apply
-    is issue-limited with a balanced mix, but the cheap win was occupancy:
-    `__launch_bounds__(512, 3)` gave apply −12.6%, wall −4.6%. **Check `Block
-    Limit Registers` against `Block Limit Shared Mem` before concluding a
-    kernel is out of cheap headroom.** `NORM_FAST_LOG2` and `NORM_CANCEL_TOL`
-    are build switches for re-pricing the norm's accurate `log2f` and
-    cancellation guard on another job.
+    (~2900 MHz at 950 mV) gave +14.6% whole-box rel/J for +6.7% time and was
+    removed 2026-09-11 ("Measured": power and the undervolt). Left: where the
+    knee is (900 mV untried).
+11. **Apply breakdown — CLOSED (findings 60, 75).** Apply is issue-limited with
+    a balanced mix, and the cheap win was occupancy: `__launch_bounds__(512, 3)`
+    gave apply −12.6%, wall −4.6%. **Check `Block Limit Registers` against
+    `Block Limit Shared Mem` before concluding a kernel is out of cheap
+    headroom.** `NORM_FAST_LOG2` and `NORM_CANCEL_TOL` are build switches for
+    re-pricing the norm's accurate `log2f` and cancellation guard on another
+    job.
 12. **Unattended operation — checkpoint, resume, clean stop, logging**
     *(added 2026-08-07, owner-stated requirement; scoped 2026-08-11)*. The GPU
     should not idle waiting on a human any more than it should idle waiting on
@@ -2734,700 +1460,88 @@ finding 92.
     rounds well and the last rounds not at all**, and a device that still trips
     its watchdog should be given fewer rounds or a smaller budget, not a
     smaller chunk.
+
 13. **Validate the BOINC GPU assignment — CLOSED 2026-08-17.** Greg Childers,
     who reported the original failure (every task on a multi-GPU host landing
     on device 0), reviewed and signed off on the assignment change, and a BOINC
-    queue is now running with it. Both things this item said could not be
-    checked here — that the client emits `<gpu_device_num>` for this app
-    version's plan class, and that concurrent tasks land on distinct cards —
-    are answered affirmatively by a live queue on a real multi-GPU host.
-
-    What is written below stayed open for one session and is kept only as the
-    recipe for re-checking the read path after a change to it, since a silent
-    regression still looks exactly like success on a single-card box:
-
-    Testable here, no second card and no client: `boinc_get_init_data()` reads
-    the `init_data.xml` in the working directory, so a `HAVE_BOINC=1` build run
-    in a directory holding a hand-written one exercises the whole read path.
-    Four cases worth pinning, each identified by its stderr line — (a) an
-    NVIDIA assignment is read and used; (b) an assignment overrides a
-    conflicting `--device`, with the notice printed; (c) a non-NVIDIA
-    `gpu_type` is refused rather than acted on; (d) no assignment falls through
-    to `--device` and then to CUDA's default. An assignment of 1 on a one-card
-    box should also produce the bounded "sees only 1 device" refusal rather
-    than an invalid-ordinal error.
-
-    Not testable here, and both are project-side rather than application-side:
-    that the client emits `<gpu_device_num>` at all for this app version's plan
-    class, and that concurrent tasks land on distinct cards. Those need a
-    multi-GPU host running the real client, i.e. the reporter who saw the
-    original failure.
+    queue runs with it. To re-check the read path after a change to it (a
+    silent regression looks exactly like success on a single-card box): a
+    `HAVE_BOINC=1` build run in a directory holding a hand-written
+    `init_data.xml` exercises the whole path. Pin (a) an NVIDIA assignment read
+    and used; (b) an assignment overriding a conflicting `--device`, with the
+    notice printed; (c) a non-NVIDIA `gpu_type` refused; (d) no assignment
+    falling through to `--device` and then CUDA's default; and an assignment of
+    1 on a one-card box giving the bounded "sees only 1 device" refusal.
 14. **Use the survivor cell's real resolution — MEASURED AND CLOSED 2026-08-18
     (finding 66): no win, do not build it.** Dropping the 10-13% of survivors
     admitted on `las_scale`'s 8-bit rounding changed nothing (112.44 against
     112.43 ms/q): the survivor list is nearly free downstream, so **survivor
     counts are a poor proxy for work** in any cross-siever comparison.
-15. **Older cards, and the shared-memory ceiling that blocks them — code
-    read 2026-08-20, NOT tested on any such card.** **Fixed 2026-08-21:** both
-    the production pipeline and standalone apply benchmark now query
-    `cudaDevAttrMaxSharedMemoryPerBlockOptin` from the selected device at runtime;
-    the default remains `--region 14`. `GPU_ARCH_all` started at sm_80 at the
-    time (sm_75 joined it later, 2026-09-09 -- see below, this item is now
-    stale on that specific point), but the apply path no longer assumes one
-    architecture family's opt-in limit regardless of which target sits at
-    the fat binary's floor.
+15. **Older cards.** Both the pipeline and the standalone apply benchmark read
+    `cudaDevAttrMaxSharedMemoryPerBlockOptin` from the selected device at run
+    time (2026-08-21); `--region 14` stays the default. **Qualified on sm_61
+    and sm_75, 2026-09-09:** a GTX 1080 and an RTX 2080 Ti (k8s pods, CUDA
+    12.8.93, `GPU_ARCH=61` / `75`) passed `--verify-only`, reproduced
+    `oracle/c183.fb1` with `fbgen_gpu` byte for byte, passed `cofcheck.sh`, and
+    gave a c183 `--pipeline --cofactor` band the same counts as the 3090/4090.
+    `GPU_ARCH_all` is sm_75/80/86/89/90/120 (`Makefile` and
+    `build_windows.bat`); `GPU_ARCH=full` adds sm_50/52/60/61/70 and needs CUDA
+    <= 12.8 (CUDA 13 rejects sm_61; both build paths refuse a >= 13 nvcc for it
+    with an explicit error). Only sm_61 and sm_75 are hardware-confirmed.
 
-    Before the fix, both `pipeline.cuh` and `bench_kernels.cu` hardcoded
-    `101376` bytes as "the opt-in limit". CUDA does not define one universal
-    value; representative limits are:
-
-    | target | max dynamic smem per block | old 101376-byte bound |
-    |---|---:|---|
-    | sm_70 Volta | 96 KB | too high |
-    | sm_75 Turing | 64 KB | **too high — the opt-in call fails** |
-    | sm_80 A100 | 163 KB | **too low** |
-    | sm_86 / sm_89 / sm_120 | 99 KB | matched |
-    | sm_90 Hopper | 227 KB | **too low** |
-
-    Apply sizes its shared memory at `(1 << log_region) * 2 + nslice_pow2 * 2`,
-    so `--region 15` needs roughly 66 KB and `--region 16` roughly 131 KB. The
-    old literal therefore prevented region 16 on A100/Hopper even though the
-    hardware permits it, while it would have admitted sizes that are illegal on
-    some older devices. The runtime query fixes both directions.
-
-    `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`
-    remains the opt-in mechanism; the requested value is checked against the
-    selected device's reported limit before that attribute is set or the apply
-    kernel is launched. This is capability detection only: `--region 14` is
-    still the default because larger regions have not been shown to be faster.
-
-    **QUALIFIED on sm_61 AND sm_75, 2026-09-09.** Real GTX 1080 (Pascal,
-    compute 6.1, 8 GB) and RTX 2080 Ti (Turing, compute 7.5, 11 GB), each via
-    a k8s pod (`nvidia/cuda:12.8.1-devel-ubuntu22.04`, toolkit 12.8.93), built
-    with `GPU_ARCH=61` / `GPU_ARCH=75` respectively. On both: `make bench`
-    compiled clean, `--verify-only` passed, `fbgen_gpu` reproduced
-    `oracle/c183.fb1` byte-for-byte identically (7,605,616 entries, matching
-    the RTX 4090's own generation of the same file), `cofcheck.sh` passed all
-    ~52 cases (including the 4-slab apply path this item is actually about),
-    and a real `--pipeline --cofactor` band against `oracle/c183` reproduced
-    the SAME candidate/relation counts on both cards as on the RTX 3090/4090
-    (44 relations from the sieve pass, 254 total after cofactorisation,
-    identical side-0/side-1 split/dead/stuck counts) -- correctness, not just
-    "it ran".
-
-    **The Turing warning: this item's 2026-09-09 note named the wrong kernel,
-    and the correction is the opposite of what it claimed. CORRECTED
-    2026-09-12.** `k_fill_l1`/`k_fill_l2` DO trip
-    `ptxas warning: ... .minnctapersm will be ignored` on sm_75, exactly as
-    this note originally predicted. The 2026-09-09 note then added that
-    `k_apply` does NOT trip it on either Pascal or Turing. **That is wrong on
-    Turing.** Compiling `bench_kernels.cu` for sm_75 alone emits TWELVE such
-    warnings, and NINE of them are `k_apply` template instantiations
-    (`k_apply<8,...>` and `k_apply<16,...>`); only three are fill kernels.
-    Reproduced identically under nvcc 13.4 and nvcc 12.8.93 -- 12.8.93 being
-    the very toolkit the original claim was measured under, so this is not a
-    toolchain difference and not a CUDA 13 regression.
-
-    **The Pascal half of the claim stands, and is stronger than stated:**
-    sm_61 emits NO `.minnctapersm` warning at all, not even on
-    `k_fill_l1`/`k_fill_l2`.
-
-    **The mechanism was already in this item, and it predicts the warning the
-    note said did not happen.** `__launch_bounds__(512, 3)` asks for 1536
-    resident threads/SM. Pascal allows 2048 -- clears it, hence silence on
-    sm_61. Turing allows 1024 -- cannot satisfy it, hence the warning on
-    sm_75. sm_86/89 permit exactly 1536, which is why the rest of
-    `GPU_ARCH_all` is silent. The superseded note reasoned that "Pascal's 2048
-    max resident threads/SM and Turing's 1024 are both apparently enough
-    headroom for `k_apply`'s three-block target"; 1024 < 1536, so that
-    sentence contradicted itself and should have been the tell. The likely
-    origin of the error is that the 2026-09-09 hardware runs confirmed sm_75
-    *ran correctly* and that was read as the warning not firing -- but this is
-    a compile-time ptxas diagnostic, so a runtime test cannot observe it
-    either way.
-
-    **What this does and does not change.** It does NOT touch the correctness
-    qualification above: the relation counts, the byte-identical `fb1`, and
-    the ~52 `cofcheck.sh` cases all still stand, and `.minnctapersm` is an
-    occupancy hint that ptxas discards while still generating correct code.
-    What it changes is the claim that "the tuning floor turned out not to bite
-    the kernel that is actually in the production pipeline" -- it does bite
-    it, on Turing. `k_apply` runs on sm_75 without its three-block occupancy
-    target, and **nobody has measured what that costs.** sm_75 is in the
-    default fat binary as a CORRECTNESS-qualified target, not a tuned one.
-    Measuring `k_apply` throughput on real Turing with and without the
-    annotation is the open question this leaves behind; `-Xptxas -v` on an
-    sm_75 build would at least report the occupancy ptxas settled on.
-
-    **THE UNFINISHED HALF OF THE "LET THE BLACKWELL VALUE FLOAT" ITEM.
-    DRAFTED 2026-09-12. NOT IMPLEMENTED, NOT MEASURED.** The shared-memory
-    opt-in limit was the half that got fixed (`c2c4104`, 2026-08-21, above):
-    it is queried per device at `bench_kernels.cu:69` and applied at
-    `pipeline.cuh:1824`, and no `101376` literal survives in code. The
-    OCCUPANCY TARGET is the half that did not. `__launch_bounds__(512, 3)`
-    is still written literally at three sites -- `k_apply`
-    (`bench_kernels.cu:453`), `k_fill_l1` (`:720`), `k_fill_l2` (`:831`) --
-    and asks for 3 x 512 = 1536 resident threads/SM, an Ampere-consumer
-    number. There is no `__CUDA_ARCH__` in that file today.
-
-    **Max threads/SM is a property of COMPUTE CAPABILITY, not of a product
-    line.** Derived 2026-09-12 by compiling a probe kernel at
-    `__launch_bounds__(512, N)` for N = 1..4 against each target and recording
-    which N ptxas rejects. Cross-checked on both toolchains: nvcc 13.4 gives
-    an identical verdict on all six archs it accepts (sm_75/80/86/89/90/120);
-    sm_61 is nvcc 12.8.93 only, since CUDA 13 rejects that arch outright:
-
-    | target | max N at 512 thr/blk | max threads/SM | trips the warning? |
-    |---|---:|---:|---|
-    | sm_61 Pascal | >= 4 | 2048 | no -- clears 1536 outright |
-    | **sm_75 Turing** | **2** | **1024** | **YES -- 12 warnings, 9 of them k_apply** |
-    | sm_80 A100 | >= 4 | 2048 | no |
-    | sm_86 / sm_89 / sm_120 | 3 | 1536 | no -- permits exactly 1536 |
-    | sm_90 Hopper | >= 4 | 2048 | no |
-
-    Note that "Ampere" is NOT a unit: sm_80 (2048) and sm_86 (1536) disagree
-    on this very number, and on the shared-memory side sm_86 (99 KB) and
-    sm_87 Orin (163 KB) disagree too. Only `sm_XX` can be keyed off. Within
-    one compute capability the value IS uniform, so every sm_86 part
-    (3090/3080/A10) is 1536 and every sm_75 part (2080 Ti/T4/Quadro RTX) is
-    1024.
-
-    **`GPU_ARCH=<CC>` DOES NOT SUBSTITUTE FOR THE FIX, and assuming it does
-    is the trap here.** `GPU_ARCH=75` is this project's equivalent of
-    msieve's `CUDA=75` (both emit a single
-    `-gencode arch=compute_75,code=sm_75`), but `__launch_bounds__` lives in
-    the SOURCE, not the build. A single-`-gencode` sm_75 compile was measured
-    2026-09-12 and emits the SAME 12 warnings, 9 of them `k_apply`, as the
-    fat build does. Narrowing the target list buys smaller binaries and
-    faster builds and nothing at all here.
-
-    **A Makefile `-D` cannot do it either, for the build that ships.** The
-    default fat binary compiles one source once per `-gencode`, and all of
-    those passes share one set of `-D` flags, so a define cannot differ per
-    target. It would work only for single-arch builds -- exactly the ones
-    that do not need it. `__CUDA_ARCH__` is the mechanism, because nvcc
-    defines it per device-compilation pass; it covers the fat and single-arch
-    builds with one lever and cannot fall out of step with the target the way
-    an operator-supplied `-D` would:
-
-        #if   __CUDA_ARCH__ == 750
-        #  define APPLY_MINBLK 2      /* Turing: 1024 thr/SM */
-        #elif __CUDA_ARCH__ >= 800
-        #  define APPLY_MINBLK 3      /* 1536 thr/SM */
-        #else
-        #  define APPLY_MINBLK 4      /* Pascal/Volta: 2048 thr/SM */
-        #endif
-
-    **BUT THE ANNOTATION ALONE BUYS NO OCCUPANCY ON TURING -- SHARED MEMORY
-    BINDS FIRST.** `k_apply` sizes shared memory as
-    `(1 << log_region) * 2 + nslice_pow2 * 2`, so at the shipping default
-    `--region 14` that is ~33 KB/block against Turing's 64 KB per SM:
-
-    | region | smem/block | blocks/SM by smem | by threads | actual | occupancy |
-    |---|---:|---:|---:|---:|---:|
-    | 13 | ~17 KB | 3 | 2 | **2** | **100%** |
-    | 14 (default) | ~33 KB | **1** | 2 | **1** | **50%** |
-    | 15 | ~65 KB | 0 | 2 | -- | will not launch |
-
-    So `__launch_bounds__(512, 2)` on sm_75 makes the hint HONEST -- ptxas
-    stops discarding `.minnctapersm` -- but does not make a second block
-    resident, because there is no 66 KB to put it in. The configuration that
-    actually reaches 100% on Turing is `APPLY_MINBLK 2` TOGETHER WITH
-    `--region 13`. That second half needs no build machinery at all: region
-    is already a runtime flag and the device's compute capability is already
-    read, so it is an arch-aware DEFAULT, not a portability change.
-
-    **MEASURED 2026-09-12, AND IT COLLAPSES THE EXPERIMENT: THE ANNOTATION
-    CHANGE IS COSMETIC.** `-Xptxas -v` was the free step and it answered the
-    question outright -- no card needed. Compiling `bench_kernels.cu` for
-    sm_75 twice, once as shipped (`minblk 3`, hint discarded) and once with
-    `k_apply` alone patched to `minblk 2` (hint honoured), gives BYTE-IDENTICAL
-    register allocation across all nine `k_apply` instantiations:
-
-    | instantiation | minblk 3 | minblk 2 | delta |
-    |---|---:|---:|---:|
-    | `<16,0,0,0>` / `<16,1,0,0>` / `<8,0,0,0>` / `<8,1,0,0>` | 26 | 26 | 0 |
-    | `<16,0,1,0>` / `<16,1,1,0>` / `<16,1,1,1>` | 35 | 35 | 0 |
-    | `<8,0,1,0>` / `<8,1,1,0>` | 36 | 36 | 0 |
-
-    `minblk 2` does silence all nine `k_apply` warnings (12 -> 3, the
-    remaining three being the fill kernels), but it changes no generated code
-    whatsoever. **So the `__CUDA_ARCH__` fix buys build hygiene and an honest
-    hint -- not throughput.** Anyone expecting a speedup from it should stop
-    here.
-
-    **WHY, and it is the register file that settles it.** The production
-    instantiation `k_apply<16,1,1,1>` uses 35 registers. At 512 threads/block
-    on Turing (65,536 registers, 1024 threads and 64 KB shared per SM):
-
-    | limiter | arithmetic | blocks/SM |
-    |---|---|---:|
-    | registers | 65536 / (512 x 35) = 3.66 | 3 |
-    | threads | 1024 / 512 | 2 |
-    | **shared memory @ region 14** | **64 KB / ~33 KB** | **1 <- BINDS** |
-
-    Registers were never the constraint -- ptxas settled on 35, slack enough
-    for three blocks, more than Turing's own thread cap allows. That is why
-    discarding `.minnctapersm` costs nothing in codegen, and why forcing it
-    back changes nothing. Note this also does not match the prediction at
-    `bench_kernels.cu:417` that ptxas "otherwise settles on 45-46 registers";
-    that figure is for dropping the annotation entirely, whereas `.maxntid`
-    (512) survives here even when `.minnctapersm` does not.
-
-    **THE ONLY REAL LEVER ON TURING IS `--region`, AND IT REMAINS
-    UNMEASURED.** Shared memory is the binding constraint at every region, so
-    region is the one axis that can move occupancy: region 13 (~17 KB) admits
-    3 blocks by smem, the thread cap takes it to 2, and 2 x 512 = 1024 is
-    100% of Turing. The open questions are now only two, and both need a
-    card:
-
-    1. Whether region 13's occupancy gain survives the extra passes per slab
-       it costs. Could easily be a wash.
-    2. Whether `k_apply` at 50% occupancy is occupancy-bound on Turing at
-       all. If it is latency- or bandwidth-bound, region 13 wins nothing
-       either.
-
-    The rental target is **Turing (20x0 / 2080 Ti / T4) ONLY**. Pascal (10x0,
-    sm_61) is NOT affected -- it clears 1536 outright and emits no warning at
-    all, so a 10x0 rental measures nothing for this item. sm_61 also cannot
-    join the default fat binary under CUDA 13 regardless (`GPU_ARCH=full`,
-    CUDA <= 12.8, above). The run is now a **1 x 2, not a 2 x 2**: `--region
-    14` vs `--region 13` on stock `minblk 3`, since the annotation axis is
-    measured inert. Use the c183 band from the 2026-09-09 qualification so
-    relation counts stay comparable, and report as % of apply-stage time AND
-    % of wall, since apply is only part of the band.
-
-    **The two halves now have different cases.** The `__CUDA_ARCH__`
-    annotation change is measured to be codegen-neutral, so it carries no
-    performance risk and no performance reward: it removes nine warnings from
-    every sm_75 build and makes the hint honest. Judge it as build hygiene.
-    Its one real cost is coupling -- it would be the first `__CUDA_ARCH__`
-    conditional in `bench_kernels.cu`, and `APPLY_THREADS_MAX`
-    (`bench.h:856`) is host-side validation of the same `512`, enforcing a
-    hard CLI ceiling on `--apply-threads`, so the two must stay in step.
-
-    The arch-aware `--region` default is the half that could actually pay,
-    and the half nobody has measured. It needs no build machinery at all
-    (region is already a runtime flag and the compute capability is already
-    read), but it is a real behaviour change on a target that is
-    correctness-qualified and in nobody's production fleet. A few percent
-    does not justify carrying an arch-special default; a large win on cards
-    volunteers actually still run might.
-
-    **`GPU_ARCH_all` UPDATED 2026-09-09: sm_75 added.** `sm_75` is now in the
-    default fat binary (both `Makefile` and `build_windows.bat`) alongside
-    sm_80/86/89/90/120 -- it is qualified above and compiles clean under this
-    project's CUDA 13.2/13.3 canonical toolchain. `sm_61` was NOT added to
-    `GPU_ARCH_all`: CUDA 13 hard-rejects it (`nvcc fatal: Unsupported gpu
-    architecture 'compute_61'`, confirmed the same day against real nvcc
-    13.0), so it cannot live in the same fat binary as sm_75/80/86/89/90/120
-    at all, qualified or not -- this is an nvcc floor, not a caution.
-
-    A second, opt-in target -- `GPU_ARCH=full` -- was added instead, covering
-    every `GPU_ARCH_all` target plus sm_50/52/60/61/70: sm_50 through sm_120
-    in one binary. It needs CUDA <= 12.8 (verified: nvcc 12.8.93 accepts the
-    whole span; nvcc 13.0 accepts only sm_75-and-later) and the Makefile/
-    batch script both detect and reject a >=13 nvcc with an explicit error
-    rather than failing with a bare "Unsupported gpu architecture". Same
-    qualification split as above: only sm_61/sm_75 are hardware-confirmed;
-    sm_50/52/60/70 are in the list because nvcc accepts them, not because a
-    card has.
-
-    (An intermediate design briefly split this into two opt-in targets --
-    `GPU_ARCH=legacy` for just sm_50-through-sm_75, and `GPU_ARCH=full` as
-    their union -- before `legacy` was dropped as redundant: `full` is a
-    strict superset, and item 16's -t 0 concurrency argument says adding a
-    target is free WHEN the build host has at least as many free threads as
-    targets. **Not re-measured for this 12-target case** -- item 16's table
-    was 6-7 targets on a 16-thread box, so "no real extra cost" here is
-    inference from that mechanism, not a fresh measurement; a host with
-    fewer than 12 free threads would see the extra legacy targets queue
-    rather than run concurrently.)
-
-    Both the Makefile and `build_windows.bat` paths for `GPU_ARCH=full` were
-    exercised directly (dry-run against real nvcc 13.0 and 12.8 in k8s pods
-    for the Makefile; fake `nvcc`/`cl` stubs under real cmd.exe for the
-    batch script) -- and that exercise caught a real bug in the first draft
-    of the batch script, back when it still had a separate `:arch_legacy`
-    target sharing this gate: `exit /b 1` inside a `call`ed subroutine only
-    returns to the caller with an errorlevel set, it does not stop the
-    calling script, so the version-gate error printed and the build
-    continued anyway. Fixed at the time by checking `if errorlevel 1 exit /b
-    1` after the `call`.
-
-    **A code review of this whole change (same day) found 14 more issues**
-    before it was committed -- most were documentation drift this entry
-    itself was causing (the sm_80-floor claim above, the six/seven-target
-    count, the repetition just edited out of the two paragraphs above), but
-    two were real: `bench/testsieve.sh`'s `gpu_arch_arg()` counted
-    `-gencode` entries in `.arch.stamp` to reconstruct which `GPU_ARCH` a
-    tree was built with, and its `>1 means the default all list` assumption
-    silently broke the moment `full` also became a multi-gencode option --
-    it would have told an operator to rebuild a `full` tree with a bare
-    `make fbgen_gpu`, quietly reverting it to `all` and invalidating every
-    object in it. Fixed by teaching it the two known counts (7 and 12)
-    instead of treating any count over 1 as "the default". Separately, the
-    batch script's `call`-based subroutine was inlined into `:arch_full`
-    (removing the `call`/`errorlevel` trap by construction, not just
-    documenting it), and `:arch_all`/`:arch_full` were changed to compose
-    their gencode lists from one shared SASS string instead of each
-    re-spelling it -- which, while re-verifying the composed lists against
-    real cmd.exe, surfaced a THIRD real bug: the shared string was
-    initialized after the `GPU_ARCH=all`/`full` dispatch `goto`s, so both
-    branches read it before it was ever set. Two deliberate exclusions from
-    that review, left as-is: `bench.h`'s `TD_RECORD_THREADS` comment still
-    enumerates sm_80/86/89/90 as the "512 threads may be fine" set without
-    sm_75 (a real gap, but out of scope for this entry), and the version
-    gate still checks only that nvcc isn't *too new* (>= 13) and not that
-    it's new enough for sm_90/sm_120 (CUDA >= 11.8 / >= 12.8) -- a real
-    asymmetry, deliberately deferred rather than fixed here.
-16. **Build wall time — MEASURED 2026-08-20, and the cause is `CF_LMAX=4`.**
-    The 4th limb takes sm_120's ptxas from 277 s to 754 s. Dropping targets
-    buys nothing, since `-t 0` builds them concurrently (the six-target fat
-    build measured 750 s against sm_120 alone at 754 s). **A zero exit from
-    `make` is not evidence a build happened** (the default-goal trap, fixed
-    2026-08-25, finding 75): check the binary's mtime before benchmarking
-    against it. For iteration, `make GPU_ARCH=120 CF_LMAX=3` (277 s) is a
-    shippable binary; cofcheck pins 3- and 4-limb output byte-identical. Not
-    yet investigated: why the 4th limb triples ptxas time on sm_120 (first
-    experiment: the cofactor kernels in their own `.cu`).
+    On Turing, `__launch_bounds__(512, 3)` asks for more threads than an SM
+    holds (1024), so ptxas ignores the min-blocks hint with twelve warnings,
+    nine of them `k_apply`'s. Making the bound depend on `__CUDA_ARCH__` is
+    cosmetic: shared memory binds first (`k_apply` at region 14 needs ~33 KB
+    against Turing's 64 KB, so one block per SM, 50% occupancy; region 13 gives
+    two). **The only real lever on Turing is `--region`, and it is unmeasured**;
+    a rental for it is Turing only (20x0 / 2080 Ti / T4). Deferred from the
+    2026-09-12 review: `bench.h`'s `TD_RECORD_THREADS` comment omits sm_75, and
+    the version gate checks only that nvcc is not too new, not that it is new
+    enough for sm_90/sm_120.
+16. **Build wall time — MEASURED 2026-08-20: the cause is `CF_LMAX=4`.** The
+    fourth limb took sm_120's ptxas from 277 s to 754 s; dropping targets buys
+    nothing, since `-t 0` builds them concurrently. Not re-measured since the
+    PTX arithmetic (findings 125, 153) or the degree copies (finding 144, sm_120
+    kernel compile +17%). **A zero exit from `make` is not evidence a build
+    happened** (finding 75): check the binary's mtime before benchmarking
+    against it. For iteration, `make GPU_ARCH=120 CF_LMAX=3` is a shippable
+    binary; cofcheck pins 3- and 4-limb output byte-identical.
 17. **`--mode twolevel` has a live race in `k_fill_l1` — FOUND 2026-08-24, NOT
-    fixed, benchmark-only.** `--mode atomic --verify` matches the CPU
-    per-region reference exactly (all 8192 regions). `--mode twolevel --verify`
-    does not, and **the answer changes every run**:
-
-    | binary | differing regions, three runs |
-    |---|---|
-    | merge commit `5e96cf0` (pre-slab-tuning) | 543 / 488 / 564 of 8192 |
-    | after the finding-73 walk change | 395 / 365 / 327 of 8192 |
-
-    The card was running an unrelated job at ~100% throughout, so these counts
-    are **scheduling-dependent and not reproducible figures** — the two columns
-    are not a before/after comparison and the gap between them means nothing.
-    What is robust is the shape: every run fails, no two runs agree, and the
-    total is always exact.
-
-    It is **pre-existing**: the unmodified merge commit fails it. Note that
-    `k_fill_l1` was converted by finding 73 and then **reverted** (it spilled
-    against its launch bound), so it is byte-identical to HEAD in the shipped
-    tree. The two columns below therefore measure *the same* `k_fill_l1` and
-    the gap between them is noise, not an effect — the table shows only that
-    every run fails and no two agree. `--mode atomic`, which does carry the
-    converted walk, is exact. **For bisecting: this race predates all of
-    finding 73's work; do not start from that range.** The record *total* is 77,382,815 every time, matching
-    the reference exactly; individual regions are wrong in **both** directions
-    (`gpu 9485 ref 9484` and `gpu 9529 ref 9530`). So records are conserved and
-    misfiled, which is why nothing downstream ever noticed.
-
-    **The mechanism, from code reading.** `k_fill_l1` reserves a whole run with
-    one `atomicAdd(&cnt[b], nrun)` and, when the run does not fit, gives the
-    space back with `atomicSub` — but the shared `buf` is never cleared and the
-    flush emits `buf[0 .. cnt[b])` unconditionally. A third thread can take a
-    slot *above* a failed thread's range after that thread subtracts, leaving a
-    **hole below the final count**:
-
-        cnt=58, L1_CAP=64
-        T_B add(8) -> slot 58, cnt 66   (66 > 64: will subtract)
-        T_A add(4) -> slot 66, cnt 70   (will subtract)
-        T_B sub(8) -> cnt 62
-        T_C add(2) -> slot 62, cnt 64   (fits: writes buf[62..64))
-        T_A sub(4) -> cnt 60
-        flush emits buf[0..60) -- slots [58,60) hold LAST cycle's records,
-        and T_C's real records at [62,64) are dropped after it advanced x.
-
-    Stale-but-valid positions are re-emitted while live ones are lost, one for
-    one. That reproduces the exact signature: conserved total, nondeterministic
-    per-region error, both directions. It needs three threads and a specific
-    interleaving, which is why it is a few hundred records in 77M.
-
-    `k_fill_l2` is immune and shows the shape of the fix: it reserves **one**
-    slot at a time and never subtracts, so slots fill densely from 0 and the
-    flush always writes a fully populated prefix. The fix for L1 is to write
-    the part of a run that fits and carry the remainder pending, rather than
-    reserving all-or-nothing — records within a run are independent, so
-    splitting one across two flushes is harmless.
-
-    **Priority is low and the reason is not "it is only a benchmark".** It is
-    that `k_fill_l1` is the two-level path, which finding 1 measured as losing
-    by 2.7x and which nothing in `--pipeline` reaches. But the verify gate is
-    not in `make check`, so this sat undetected; whoever revisits two-level
-    fan-out must fix this **before** trusting any number it produces.
-18. **Lanes-per-item for the DENSE trial-division pass — the per-slab tax that
-    replaced the recording one. NOT BUILT, opened 2026-08-26 by finding 77,
-    CEILING BOUNDED THE SAME DAY by finding 78 at ~3% of wall at the realistic
-    A=32 geometry. Gated on item 8: build it only if that measurement forces
-    slabs below 16.**
-
-    **DO NOT BUILD — the gate was measured 2026-09-01 and it does not fire
-    (finding 82).** A 12 GB card runs `A = 32` at NFS@Home's own shape in **8
-    slabs of `2^29`** — the sweep optimum itself, not a memory compromise —
-    with 2.71 GB of setup allocation. This item exists to make slabs *below*
-    `2^29` affordable, and nothing is asking for them: at 8 slabs the dense-TD
-    excess is +2.95 ms and the whole item is worth −0.8% of wall, against
-    rewriting the hot dense path. Reopen only if a card smaller than 12 GB, or
-    an area beyond `2^32`, actually forces the slab count past 16.
-
-    `k_td<1,0,0>` ("norms + trial division, both sides") gives one thread per
-    survivor and each thread marches the whole `nsm` list — and because that
-    march sits INSIDE the grid-stride loop, a launch costs
-    `iters = ceil(n/(blocks*threads))` of them. Measured on the warp binary,
-    c194 I16 J32768, default grid `288 x 256` = 73,728 threads, 237,256
-    two-sided survivors/q:
-
-    | slabs | survivors/launch | `iters` | total marches | TD |
-    |---:|---:|---:|---:|---:|
-    | 1 | 237,256 | 4 | 8 | 10.71 |
-    | 2 | 118,628 | 2 | 8 | 9.76 |
-    | 4 | 59,314 | **1** | 8 | 10.34 |
-    | 8 | 29,657 | 1 | **16** | 13.18 |
-    | 16 | 14,828 | 1 | **32** | 21.83 |
-
-    **Splitting the slab is free only while `iters` can absorb it.** It falls
-    4 -> 2 -> 1 across the first two halvings and the cost does not move; at 4
-    slabs it is pinned at 1 and every halving after that doubles the march
-    count. That is the entire column, and it is the same disease item 77
-    removed from the recording pass — ~0.96 ms per slab past the knee, against
-    the recording pass's 0.12. **It is now the larger of the two, by 8x.**
-
-    **The cheap version of this was tested first and does NOT work.** If the
-    knee is at `blocks*threads`, raising `--blocks` should move it — two runs
-    rather than a kernel rewrite. Three grids x five slab counts, idle card
-    (finding 77):
-
-    | slabs | TD b288 | b512 | b1024 |
-    |---:|---:|---:|---:|
-    | 1 | 10.85 | 9.56 | **9.15** |
-    | 4 | 10.49 | 10.38 | 10.43 |
-    | 8 | 13.39 | 13.31 | 13.38 |
-    | 16 | 21.82 | 21.96 | 22.36 |
-
-    **Where `iters` is already 1 — every slabbed geometry, which is this item's
-    entire case — a 3.5x grid range is worth 0.0 to 2.5%, i.e. nothing.** Only
-    the unslabbed row moves, and only by −15.6% of one stage (−0.4% of wall).
-    So `--blocks` is not a substitute: it is the kernel change or nothing.
-
-    **Taken further on 2026-08-26 (finding 78b): that unslabbed cell is not
-    worth taking as a default either.** Three reps, two jobs. On c194 forced to
-    1 slab the stage win reproduces exactly (−15.0% against −15.6%, arms
-    non-overlapping) but is −0.51% of wall against a 1.8–2.9% within-arm rep
-    spread, and the sign flips between reps. On c147 I14/J8192, natively
-    unslabbed, it **reverses**: b1024 is worst on every column, +5.6% TD and
-    +1.45% wall, because 1024x256 threads already exceeds the survivor count.
-    `--blocks` stays on auto. Third measurement pointing the same way, and it
-    strengthens this item: **threads are not the lever.** More threads help only
-    where `iters > 1` and hurt where `n` is already below the grid — which is
-    precisely the regime lanes-per-item exists to serve.
-
-    It also falsified half the model. Cutting the march count 4x at one slab
-    bought 15.6%, not 75%, so cost is NOT proportional to marches; the march
-    count predicts the shape and not the magnitude. What survives, and what
-    this item rests on, is the confirmed half: **at equal march count the grid
-    does not matter**, so threads are not the lever and lanes-per-item is.
-
-    **Duplication debt to settle first (code review, 2026-08-26).**
-    `k_td_record_warp` already copy-pastes ~90 lines of `k_td` -- the exact-norm
-    builder, the special-q/large-prime step, and the whole small-prime
-    congruence. Building this item as a third copy would make that three. The
-    review's suggestion is right and should be taken with the item rather than
-    after it: extract `td_small_hit()` and `td_build_norm()` as device helpers
-    and call them from both kernels, or go further and parameterise `k_td` by
-    lanes-per-item -- `template <int DIVIDE, int RECORD, int SELECT, int LANES,
-    bool SLABBED>` with LANES=1 collapsing to today's per-thread loop and
-    LANES=32 to the ballot form -- which covers both call sites with one body.
-    That is the shape this item wanted anyway.
-
-    **Do not just apply finding 77's fix again.** One warp per survivor would
-    lose wherever survivors exceed the thread count, which is the ordinary
-    case at large slabs and at 1 slab is every job. What this wants is
-    L lanes per item with L chosen on the host from `n` against the grid —
-    `L = clamp(nthreads/n, 1, 32)` rounded to a power of two — so the kernel
-    degenerates to today's behaviour at L=1 and spreads the march only when
-    there are idle threads to spread it over. `__ballot_sync` gives the hit
-    mask for a full warp; at L<32 it needs masking to the item's lane group,
-    and the divisions go to the group's first lane rather than lane 0.
-
-    **The ordering constraint that an earlier draft of this item inherited from
-    finding 77 does not exist** (corrected 2026-08-26 by code review).
-    `td_divide_out` consumes the whole power of a prime per call and distinct
-    primes commute, so the factor multiset is order-invariant; both emitters
-    sort before writing. This rewrite is therefore free to visit entries in
-    whatever order the lane grouping makes cheapest. The acceptance test is the
-    same as finding 77's — factor multiset and relation count against the
-    scalar path, at both slab shapes — but it is a multiset test, not an
-    ordering one.
-
-    **Value, stated honestly: nothing at the operating point.** At `2^29` this
-    pass is already near its floor (10.34 against 10.71 at one slab), so the
-    prize is entirely below `2^29` — about 2.8 ms at 8 slabs and 11.5 at 16.
-    Like item 77's, the reason to build it is that it decouples slab size from
-    cost for an A=32 job on a 12 GB card (item 8), not throughput. It is a
-    bigger and riskier change than the recording pass was, because this kernel
-    IS the hot dense path, so it should be measured against the unslabbed case
-    as carefully as against the slabbed one.
-
-    **The other term below `2^29` is `fill`, and MEASURING IT LOWERED THIS
-    ITEM'S CEILING -- finding 78, 2026-08-26.** The sweep now runs to 64 slabs
-    at fixed total area, and `fill` is a bandwidth floor: `k_fill_atomic` is
-    launched with `fb->n` every slab and streams 42 B per entry (`plat` 24,
-    `slice` 2, `walk_cur` 8, `walk_next` 8) x 22.1M entries = **929 MB per
-    slab** before it can know whether a prime hits. Slope **1.18 ms/slab**
-    asymptotically, against the 1.98 the old 4/8/16 window implied -- so the
-    floor is real but ~1.7x lower than this item was written against. Skipping
-    `plat`/`slice` for non-hitting entries was costed and **does not pay**: 1.1
-    ms of 16.1 at 16 slabs, because `p > xmax` still hits with probability
-    `xmax/p`.
-
-    The consequence is the column this item was missing:
-
-    | slabs | fill excess | dense TD excess | complete vs `2^29` | **this item's best case** |
-    |---:|---:|---:|---:|---:|
-    | 8 | +0.31 | +2.95 | +1.5% | −0.8% |
-    | 16 | +16.11 | +11.64 | +11.4% | **−2.9%** |
-    | 32 | +28.21 | +31.44 | +29.4% | −6.8% |
-    | 64 | +66.30 | +71.65 | +71.8% | −11.7% |
-
-    The TD projections above are confirmed (2.95 and 11.64 measured against 2.8
-    and 11.5 projected). What changed is that **at 16 slabs -- the worst case a
-    12 GB card actually reaches for an A=32 job -- fill's irreducible excess is
-    larger than this item's entire prize.** Ceiling at the realistic geometry is
-    about 3% of wall. That is not zero, but it is bounded, and it should be
-    weighed against the risk of rewriting the hot dense path before anyone
-    starts. **Build it only if item 8's geometry measurement forces slabs below
-    16.**
-19. **NOW THE TOP OPEN ITEM** -- item 1 closed, so nothing outranks it.
-
-    **GPU contention is NOT this item and must not be filed under it.** On
-    2026-09-10 the same box, binary and band gave 131.4 ms/q in the morning and
-    90.5 ms/q at night, and a draft of this note offered that 45% swing as
-    evidence the regression is bigger than 10%. It is not evidence of anything
-    here: the morning run had another process on the CARD, and **a sieve sharing
-    a GPU running slowly is expected behaviour, not an unexplained regression.**
-    The measurement is simply discarded. This item is about a slowdown with the
-    box to itself, which is a different question.
-
-    **CPU contention is the one worth minimising**, because it is the condition
-    real deployment runs in -- a BOINC host has other tasks -- and because the
-    sieve's host thread is on the critical path (item 4: identifiable host work
-    is 7% of an idle wall and **triples** under CPU contention, finding 53).
-    At the geometry we run it is a few percent, not tens: worth minimising,
-    but no longer a large lever (finding 96 holds the figures).
-
-    **`acc/wall` is the discriminator between the two, and it is already in every
-    runlog record and every band summary.** It falls when host time appears with
-    the GPU idle, so CPU contention drives it DOWN while GPU contention leaves it
-    flat. That is exactly what the two runs showed: `acc/wall` was **0.92 in
-    both**, which is what says the morning's loss was all device-side. Quote it
-    beside any timing taken on a shared box; a wall figure alone cannot tell the
-    two apart, and `rental5090.sh` (removed 2026-09-14; `e47f205`) printed `acc` and mean board draw beside
-    each arm group's spread for that reason.
-
-    *Original statement follows.* **An ENVIRONMENTAL ~10%-of-wall regression, cause still open -- MEASURED
-    2026-09-02 (finding 88). Worth more than every open item except 1.**
-
-    Rebuilding `4b581b33` -- the exact commit August was built from --
-    unchanged, today, reproduces `unaccounted` **0.50 -> 7.86 ms/q**:
-    **+7.36 ms/q of GPU idle** (band-length insensitive, so exact) and
-    **~10.6 ms/q of wall, +10.4%** at c183/I15e. **Our code is exonerated.**
-
-    **Ruled out by direct test:** the CUDA 13.2/13.3 toolkit line (HEAD built
-    against each gives unaccounted 7.87 and 7.96 -- worth ~1.4 ms of wall and
-    none of the idle), and the Windows driver / WSL passthrough (every real
-    binary in `/usr/lib/wsl/lib` is dated 2026-07-22, and the driver available
-    since 2026-08-26 is still not installed).
-
-    **Narrowed to the `apt upgrade` of 2026-08-27 17:51**, which installed
-    CUDA 13.3, bumped the 13.2 line (cudart 13.2.75 -> 13.2.86) *and* upgraded
-    59 non-CUDA packages. The toolkit test above compares two POST-upgrade
-    toolkits, which is why it came out flat.
-
-    It has been masking real work: at matched runtime our apply+fill
-    improvements are worth **9.44 ms/q**, which is why the two nearly cancelled
-    and why 130M and 190M disagreed in sign.
-
-    **What is NOT known: where inside the runtime it goes.** It is GPU idle
-    spread across the per-q launch sequence, so the candidates are launch
-    overhead and default-stream semantics. **The instrument is Nsight Systems**
-    -- gaps BETWEEN kernels -- not `ncu`, which profiles what happens inside
-    one and would show nine healthy kernels and no gap.
-
-    Steps, in order:
-
-    **DONE 2026-09-02, both negative on the cause but positive on a fix:**
-
-    - **CUDA fully eliminated.** HEAD linked against the August-era
-      `libcudart_static.a` (13.2.75-1, extracted from the .deb via a
-      symlink-farm shadow toolkit, nothing installed) gives `unaccounted`
-      **7.83** -- against 7.87 at 13.2.86 and 7.96 at 13.3.29. The exact
-      runtime August ran reproduces today's number, not August's.
-    - **`unaccounted` is NOT simply GPU idle.** An Nsight Systems trace puts
-      the GPU at **97.6% kernel-busy** with total inter-kernel gap
-      **3.44 ms/q**, well under the 7.83. Part of that quantity is device work
-      outside the event brackets. Read it as "wall not attributed to a
-      bracketed stage", and do not repeat the idle framing.
-
-    What remains, in order:
-
-    1. **DONE 2026-09-02 (finding 89): both serialisation points fixed,
-       -1.40 ms/q (-1.36%), relations unchanged.** The `ev[1]` transform sync
-       existed only to read a timer, so the transform end moved to a dedicated
-       `ev[4]` read after the slab loop. That exposed a second block behind it
-       -- four synchronous H2D `cudaMemcpy` calls that, once the GPU was no
-       longer drained, waited on the other side's in-flight transform -- now
-       `cudaMemcpyAsync` from the already-pinned staging buffers. Measured
-       interleaved, four paired reps, every pair favouring the fix.
-    2. **ANSWERED 2026-09-03 (finding 90): `unaccounted` is HOST time with the
-       GPU idle, not GPU inefficiency.** The whole-q event bracket was built as
-       **`--qspan`** (runtime flag, off by default, pipeline-only, does not
-       perturb: wall 95.94 off against 96.14 on). It reports the GPU-timeline
-       span of each q, and `unaccounted` **moves with** `wall - span` rep by rep
-       (3.37/2.93, 3.45/2.96, 4.14/3.42 -- including the rep where both rise),
-       which is what establishes the quantity is host-side.
-
-       **Do NOT quote `wall - span`'s magnitude.** Finding 91 records that it
-       cannot be reconciled with the region timers -- prologue 0.03 and tail
-       0.00 are the only host regions outside the bracket, so a 4.48 ms gap
-       should be impossible. The DIRECTION is established; the SIZE is not. The
-       trustworthy half is the region table, which sums to the host clock
-       within 0.01 ms/q.
-
-       **The residue is a host problem, but item 4.1 is not the fix** -- see
-       step 5. Finding 91 showed its prep is already hidden.
-
-    3. **The magnitude is NOT stable across days, which re-scopes this item.**
-       Identical commit, box and command: `unaccounted` was **6.67 ms/q on
-       09-02 afternoon and 2.83 on 09-03 morning**, with `sieve` unchanged at
-       63.2-63.7 throughout. A quantity that swings 2.4x overnight is not a
-       regression to bisect -- and that is why finding 88's bisect found every
-       commit equally bad; they shared one afternoon's host conditions.
-       **Do not close this item on finding 90**: 0.50 -> 2.83 is still 5.7x and
-       may exceed day-to-day variance, and the 08-27 upgrade remains a real
-       coincidence in time. What is needed now is to characterise the variance
-       (CPU frequency/thermal state, WSL scheduling, Windows host activity --
-       none measured) rather than to hunt a commit.
-    4. Only then chase the 08-27 trigger, if the attribution points at
-       something a package could plausibly have changed.
-    5. **Preparation-only overlap remains parked.** Finding 91 showed its prep
-       is already hidden under the asynchronous transform that finding 89
-       unblocked, leaving ~0.5 ms/q exposed. The earlier "1.166 ms fits in the
-       shadow" argument is superseded. The current [item 4](#low-cpu-plan)
-       addresses CPU consumption and handoffs as well as preparation.
-    6. **Per-launch overhead is real but UNQUANTIFIED.** The 1.56 ms/q figure
-       once here came from a slab-loop sub-split that code review found unsound
-       -- its window included the `k_intersect_compact` launch and a blocking
-       GPU wait -- and which has been removed; see finding 91. What survives is
-       finding 89's Nsight ranking putting the largest remaining gaps in the
-       fill/apply region. **Preparation-only overlap remains limited by
-       finding 91; the broader host work is reopened 2026-10-12 for CPU
-       consumption as well as throughput.** See [item 4](#low-cpu-plan) and
-       finding 106. CUDA graphs are a candidate after addressing host
-       readbacks and dynamic buffer management; no numeric gain is established.
-       The other candidate that used to sit here -- the mid-sequence transform sync --
-       was removed by finding 89 and is no longer available as a lever.
-
-    **The separate inefficiency found while chasing this is now FIXED**
-    (finding 89, above). `556a631` had split the per-q chain so that
-    `pipe_side_prepare_q` blocked on the transform purely to read a timer,
-    where the pre-slab code queued transform -> fill -> apply asynchronously
-    with one sync at `ev[3]`. It was never finding 88's regression -- commits
-    predating the split measure just as bad -- but it was ours and it is gone.
-
+    fixed, benchmark-only.** `--mode twolevel --verify` misfiles records in
+    300-560 of 8192 regions per run, differently every run, in both directions,
+    with the total of 77,382,815 exact (`--mode atomic --verify` is exact). Mechanism, from
+    code reading: `k_fill_l1` reserves a whole run with one
+    `atomicAdd(&cnt[b], nrun)` and gives it back with `atomicSub` when it does
+    not fit, but the shared `buf` is never cleared and the flush emits
+    `buf[0 .. cnt[b])`, so a third thread taking a slot above a failed thread's
+    range leaves a hole below the final count: stale records re-emitted, live
+    ones lost, one for one. `k_fill_l2` reserves one slot at a time and never
+    subtracts, and shows the fix: write the part of a run that fits and carry
+    the remainder. Low priority because the two-level path lost by 2.7x
+    (finding 1) and nothing in `--pipeline` reaches it, but the verify gate is
+    not in `make check`, so whoever revisits two-level fan-out must fix this
+    **before** trusting any number it produces. `k_fill_l1` also keeps the
+    32-bit walk (`pl_next`) and its own untuned 144 x 512 grid.
+18. **Lanes-per-item for the dense trial-division pass — DO NOT BUILD (finding
+    82).** It exists to make slabs below `2^29` affordable, and nothing asks
+    for them: a 12 GB card runs `A = 32` at NFS@Home's own shape in 8 slabs of
+    `2^29`, the sweep optimum. Its ceiling was ~3% of wall at that geometry
+    (finding 78). The recording pass's per-slab tax was already removed by the
+    warp recorder (finding 77, `k_td_record_warp`, 56.6 µs fixed + 55 ns per
+    candidate against a flat 653 µs).
+19. **The August -> September environmental slowdown — PARKED.** A rebuild of
+    the exact August commit reproduced `unaccounted` 0.50 -> 7.86 ms/q at c183
+    I15e on 2026-09-02 with no source change (finding 88); the CUDA toolkit
+    line and the Windows driver were ruled out, leaving the `apt upgrade` of
+    2026-08-27 as a coincidence in time. Then: `unaccounted` is host time with
+    the GPU idle, not GPU inefficiency (finding 90, `--qspan`), and its size
+    swung 6.67 -> 2.83 ms/q overnight on one commit, so it is day-to-day
+    variance to characterise (CPU frequency, WSL scheduling, Windows host
+    activity), not a commit to bisect. Finding 89 removed two serialisation
+    points it exposed (−1.36%). The idle work since (rows 19, 24-26, 33) took
+    c135's card idle to 3.6-5.0%. **GPU contention is not this item**: a sieve
+    sharing the card runs slowly by design, and `acc/wall` (flat under GPU
+    contention, falling under CPU contention) tells the two apart. Do not
+    quote `wall - span`'s magnitude: finding 91 could not reconcile it with the
+    region timers.

@@ -19014,3 +19014,238 @@ CUDA client off: fat's objects copied, the binary swapped by `mv`, then
 gates passed" (`tree.check.txt`), with `multest` at 0 of 34 failed.
 `bench/bench` is `5512830e`, copied to `work/xdbl/bench.installed.154`; the
 previous `e3cae1b4` is `work/eomul/bench.installed.153`.
+
+## Finding 155 — the transform's inverse in 2-bit windows, with `pl_redc`'s high word by `__umulhi` on the device: the inverse loop goes from 23 SASS instructions per exponent bit to 29 per two bits, and the transform + plattice stage is −8.3 to −10.5% (c143 −6.4%). Per-q wall is −1.0% at c135 (all 4 rounds) and −1.3% at C148 (2 of 4 rounds), noise elsewhere. Whole-process time by `/usr/bin/time` came out +0.5 to +4.6% the other way. That has the size and shape of the host's wall-clock steps (back ~2.5 s every ~32 s, so a run is ~2.5 s shorter when a step lands inside it), and is evidence neither way. Relations byte-identical. Installed 2026-11-11 (fat `2c590187`)
+
+STATUS row 47. The lead came from an outside review (Fable, relayed by Kyle
+2026-11-10); Kyle gave the go-ahead the same day. Kyle's `/code-review` of the
+change (2026-11-11) found no fault in the arithmetic. It did find weak spots in
+the evidence and errors in this write-up, corrected below (see "The review").
+**Installed 2026-11-11 09:54, Kyle's call**: fat `2c590187`. See "Install"
+below. Work, scripts and logs are in `work/twin/` (`NOTES.md`).
+
+### The change
+
+`pl_transform_fast_try` (`plattice.cuh`) computes d^(q-2) mod q by Montgomery
+exponentiation, then checks itself: `REDC(REDC(d*acc)) == 1`. Before, it was
+left-to-right square-and-multiply, with the multiply done on every bit and then
+selected: 2(nb-1) montmuls for q-2 of nb bits. Now it uses fixed 2-bit windows
+over {d, d^2, d^3}:
+
+- 2 montmuls of setup.
+- Two squares and one multiply per window. Window 00's multiply is computed
+  and dropped, so lanes stay converged.
+- The top window takes 1 or 2 bits, so the rest align to bit 0.
+
+That is 2 + 3(nb-2)/2 montmuls for even nb and 2 + 3(nb-1)/2 for odd: 44
+against 58 at nb = 30 (−24%), 47 against 60 at nb = 31 (−22%), 44 against 56
+at nb = 29 (−21%).
+
+Every montmul is a ring operation in Z/qZ for odd q, any addition chain to q−2
+reaches the same residue, and `pl_redc` returns [0, q) for T < q·2^32. So acc,
+the self-check and rt are the same bits for every input, prime q or not.
+
+Two codegen problems ate most of the first build's gain (43 instructions per
+2 bits against 46):
+
+- **The table lookup.** nvcc made the nested `?:` a divergent branch
+  (BSSY/BSYNC; every lane has its own q). It is now two plain selects, in one
+  helper, `pl_sel3`, for both uses.
+- **The montmul's compare.** `pl_redc`'s `(uint32_t)(((uint64_t)m*q)>>32)` led
+  nvcc to compare h and u as a 64-bit pair, 9 instructions a montmul where 6
+  do. It is now `PL_MULHI32(m, q)`, which is `__umulhi` on the device and the
+  64-bit shift on the host, defined beside `PL_CLZ32`.
+
+Probe SASS, instructions per exponent bit: base 20.75, `__umulhi` alone 16.5,
+windows alone 17, both 13.4.
+
+The same function runs on the host each special-q: the small-sieve tables
+(`pipe_side_prepare_q`, `td_fill_small`). So host prep changed too, and got
+faster (Timing).
+
+### Gates
+
+- **CPU, `work/twin/eqv/`.** The base header (HEAD eaba635) and the tree's,
+  compiled side by side, comparing `pl_transform_fast_try`'s (taken, rt) over
+  92,130,870 inputs:
+  - exhaustive over odd q < 600, every root and every d;
+  - 20M random odd moduli of every bit length, with coefficients inside, at
+    and past the 2^32 guard;
+  - the largest odd moduli.
+
+  **0 mismatches**, 25,950,727 taken by the fast path (`runs-eqv.final.txt`,
+  on the final header). 9 of 9 mutants were caught (`eqv/mutants.py`).
+- **fbtest.** Base and new are identical. The fast path's counts must not fall,
+  because a wrong inverse would fail the self-check and drop to the general
+  path silently: 43,487,736 of 45,765,270 taken in both.
+- **Device against host, `work/twin/devcheck.cu`.** 92,130,870 cases, 0
+  mismatches, 25,950,727 taken. These are exactly eqv's inputs. Both programs'
+  input streams hash to `2df0eb6a42565e86` (`eqv/ordprobe/`), so device ==
+  host == base holds on one input set. The first eqv run drew its coefficients
+  as function arguments, in unspecified order, so it saw other inputs (25,950,269
+  taken); the review caught that.
+- **SASS (sm_120 builds).** 107 of 109 function bodies are identical; the 2
+  that differ are `k_transform<0>` and `<1>`. The inverse loop goes from 23
+  instructions per bit to 29 per 2-bit window. The function is the same size
+  (1,029 -> 1,030 non-NOP at `<0>`), since the setup grew as the loop shrank.
+- **Resources.** sm_120: identical in the 107 functions outside `k_transform`;
+  `k_transform` is REG 26. The fat build (`gate.sh`, `CPU_ONLY=1`,
+  `gate.cpu.txt`) shows 642 of 654 bodies identical, the 12 that differ all
+  `k_transform`, and one register change: **sm_90 `k_transform<1>` REG 30 ->
+  34**. At 256 threads a block that is 40 registers allocated, so 6 blocks and
+  1,536 threads per SM instead of 2,048, on a latency-bound montmul chain. It
+  is untimed: there is no Hopper card here.
+- **On the card** (`work/twin/after_card.sh`, once the msieve-s sopt A/B had
+  left it, 11:27-11:54):
+  - `cofcheck.sh` on new: golden test passed.
+  - `abcheck.sh` base new, all four sets: 36 of 36 identical.
+  - The timed A/B below: 40 runs, 0 failed, every relation file
+    byte-identical.
+
+### Timing
+
+`work/twin/ab.sh 4`, interleaved, sm_120 builds (base `80c100ba`, new
+`bc44abd9`).
+
+Run conditions:
+- Host load was ~15 in round 1, fell from 13 to 2.7 through round 2, and was
+  2.2-2.6 in rounds 3-4.
+- No Windows 3D users before the timing; after it, two, at 1% and 2%.
+
+Means of all four rounds, ms/q:
+
+| job | transform + plattice | per round | wall per q | per round | host per-q |
+|---|---:|---|---:|---|---:|
+| C148 | 2.965 -> 2.720 (−8.3%) | −8 −9 −11 −6 | 9.35 -> 9.23 (−1.3%) | −2.8 −2.4 −0.3 +0.3 | 0.414 -> 0.409 |
+| c135 | 0.368 -> 0.336 (−8.7%) | −8 −10 −9 −7 | 2.58 -> 2.56 (−1.0%) | −1.1 −0.8 −0.8 −1.2 | 0.245 -> 0.230 |
+| c143 | 0.603 -> 0.565 (−6.4%) | −12 −3 −7 −4 | 4.35 -> 4.33 (−0.3%) | −0.5 +0.7 −0.5 −0.9 | 0.244 -> 0.229 |
+| I16 | 4.440 -> 4.053 (−8.7%) | −9 −10 −7 −9 | 128.84 -> 129.63 (+0.6%) | −0.1 −1.4 +3.3 +0.7 | 1.253 -> 1.143 |
+| c183 | 5.474 -> 4.897 (−10.5%) | −5 +5 −23 −22 | 34.59 -> 34.49 (−0.3%) | +0.3 −0.1 +0.2 −1.4 | 0.721 -> 0.664 |
+
+The stage times include sharing the card with the other q in flight, so they
+are not kernel times. The stage includes plattice, so the inverse itself fell
+by more than the column shows. "Host per-q" is the host's sieve-table and
+staging time, which runs the same new loop: −1 to −9%.
+
+Per-q wall:
+- **c135:** the one job where every round agrees.
+- **C148:** −1.3% over four rounds, but only rounds 1-2 show it; rounds 3-4
+  are ±0.3%. `k_transform` was 12.1% of kernel time there (finding 147), and
+  the stage fell 0.25 ms of a 9.3 ms q.
+- **I16 and c183:** the saving is below the run-to-run spread. At I16 the
+  transform is 2.4% of kernel time (finding 147), and its +0.6% is one +3.3%
+  round.
+
+**Whole-process time went the other way.** By `/usr/bin/time`, means of four,
+in seconds:
+
+| job | base | new |
+|---|---:|---:|
+| C148 | 20.31 | 20.85 (+2.6%) |
+| c135 | 16.85 | 17.32 (+2.8%) |
+| c143 | 10.13 | 10.22 (+0.9%) |
+| I16 | 49.08 | 49.30 (+0.5%) |
+| c183 | 22.88 | 23.92 (+4.6%) |
+
+Split into the per-q loop (q × wall per q) and the rest, the loop is faster
+for new on four jobs, and 0.6% slower on I16 (its one +3.3% round). The rest
+is startup and teardown: factor bases, card setup, the final flush. On C148,
+c135 and c183 it falls into two levels about 2.2-2.8 s apart, in both builds.
+c143 and I16 do not show the split.
+
+**The split has the size of the wall clock's steps.** `/usr/bin/time` takes elapsed
+time from the wall clock (CLOCK_REALTIME). On this host the wall clock is
+stepped back by about 2.48 s every ~32 s: `work/twin/mtime/clock.txt`
+recorded 9 steps in 300 s, at load ~18 on 2026-11-11. So a run comes out
+~2.5 s short whenever a step lands inside it, and a 10-50 s process time
+carries that quantum.
+
+The per-q figures read CLOCK_MONOTONIC_RAW (finding 134) and do not see the
+steps. The same steps also explain the two fat builds whose `make -q all`
+found an object 1.4-1.6 s newer than the link made from it.
+
+So the process-time column is evidence neither way. Nothing in the change runs
+outside the per-q loop, and a rerun would have to time the whole process on
+RAW. Checking against the Windows host clock reproduced finding 134 with
+Python's CLOCK_MONOTONIC: 8.4% fast over 120 s. That is why bench reads RAW.
+
+The cause was found the same day: the Windows clock was 4.07 s fast with its
+time service stopped. WSL's host sync slewed the guest towards it at +8.3%
+while `systemd-timesyncd` stepped it back to NTP. Kyle fixed it at ~07:52, by
+syncing Windows and disabling timesyncd. After that: 0 steps in 300 s, and
+CLOCK_MONOTONIC equal to RAW (STATUS, Performance accounting). A process-time
+A/B from here on reads true.
+
+### The review (Kyle's `/code-review`, 2026-11-11)
+
+It found no correctness fault. It found these weak spots, now fixed:
+
+- **No standing device check.** `__umulhi` is device-only, and a device-only
+  fault is silent in a run: the self-check fails, entries fall through,
+  relations stay identical. The only device test was `devcheck.cu`, which is
+  in the gitignored `work/`.
+  - Now `bench/xftest.cu`, run by `make xfcheck` inside `make check`, like
+    finding 153's `multest`. It checks `PL_MULHI32` and `pl_redc` on
+    structured words, and `pl_transform_fast_try` exhaustively over odd
+    q < 256 plus 4M random and edge moduli, device against host.
+  - `work/twin/xfmutants.py` holds 7 device-only mutants that it must catch:
+    signed `__mulhi`, `__clz` off by +1 or −2, and others. Both ran on the card
+    before the install, and both passed: see "Install".
+- **devcheck and eqv saw different inputs.** Fixed as above.
+- **Stale comments.**
+  - The header said host and device run "bit-identical code"; now it says the
+    same source, with the two per-platform primitives named.
+  - The fast-path block still described a bit at a time.
+  - `verify_cpu.c` said it ran "the device's own transform".
+- **Two copies of the codegen-sensitive select.** Now one, `pl_sel3`.
+- **This write-up.** The heading's numbers did not match its table; the run
+  conditions were misstated; "~24%" holds for even nb only. It left out the
+  sm_90 register change, the host-side change and the process-time result.
+  All are corrected above; the process-time result matches the wall clock's
+  steps.
+
+The review fixes change no instruction of the sieve: see `work/twin/NOTES.md`
+for the SASS of the rebuilt `new2` against the timed `new`.
+
+### Install
+
+The fat build of exactly the tree's source, `2c590187` (`eaba635f-dirty`;
+`work/twin/build.sh fat`). Kyle called it 2026-11-11, and the card was free
+from 09:34 (`work/twin/card_run.txt`).
+
+- **Card checks first** (`work/twin/review_card.sh`):
+  - `xftest` (the final tree, sm_120): `PL_MULHI32` and `pl_redc` each 0 of
+    1,048,576 differ; `pl_transform_fast_try` 0 of 9,723,390 differ, with the
+    fast path taken on 2,468,879 and refused on the rest. 0 of 4 checks
+    failed.
+  - `xfmutants.py`: the control passed, and all 7 device-only mutants were
+    caught. The `PL_MULHI32` check caught the three mulhi mutants; the
+    transform check caught `__clz` +1, `__clz` −2 and sel3 w3 -> d2; the
+    `pl_redc` check caught the missing final add of q.
+- **Gated** against the installed `5512830e` by `work/twin/gate.sh`
+  (09:36-09:51, `gate.txt`, `gate/gate.gate.txt`):
+  - **SASS, every arch:** 642 of 654 function bodies identical. The 12 that
+    differ are the two `k_transform` instantiations on each of the six
+    archs.
+  - **Resources:** all 642 functions outside `k_transform` identical. Inside
+    it, only sm_90 `k_transform<1>` changed (REG 30 -> 34).
+  - **The timed code:** fat's sm_120 `k_transform` SASS is identical to the
+    build timed above (1,845 instructions).
+  - **`work/emitw/gate.sh`**, installed against fat:
+    - `abcheck`: 36 of 36 identical.
+    - c135 20,000 q: identical to finding 138's reference (1,855,599
+      relations), and all of them rebuild both norms exactly.
+    - kill -9 at 20 s and at 45 s, then resume: both identical to the
+      reference.
+    - SIGINT, SIGTERM and a stop file: each drained and resumed to the
+      reference.
+    - SNFS-301 over 10 q: identical (669 relations).
+    - `make check` in fat: all gates passed.
+
+`work/twin/install.sh` then installed it the way finding 154's was, with the
+CUDA client off. Fat's objects were copied, the binary swapped by `mv`, then
+`make all` ran and `make -q all` came back clean. `make check` in the tree
+printed "all gates passed" (`tree.check.txt`): `multest` 0 of 34 failed,
+`xftest` 0 of 4. `bench/bench` is `2c590187`, copied to
+`work/twin/bench.installed.155`; the previous `5512830e` is
+`work/xdbl/bench.installed.154`.
