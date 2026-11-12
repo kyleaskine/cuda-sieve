@@ -250,7 +250,19 @@ template <int W> CF_HD uint32_t cf_top_over(uint32_t top)
  * The L = 3 product does not: it keeps one carry word h for position 4, so it
  * takes any odd n < 2^96, and mfb 96 -- the I16 NFS@Home job's mfba -- stays
  * on 3 limbs. h costs 6 instructions a product (40 without it), against
- * moving mfb 96 to the 4-limb kernel. */
+ * moving mfb 96 to the 4-limb kernel.
+ *
+ * OUTPUTS ARE "=r", NOT "=&r". Most blocks write an output before their last
+ * input is read, which under GCC's rules would want the early-clobber "&".
+ * nvcc 12.0 rejects it ("an asm operand may specify only one constraint
+ * letter", a forum report against ad05510), and NVIDIA's inline-PTX docs
+ * define only "=" and "+". Nor does nvcc need it: the asm's operands are PTX
+ * virtual registers and ptxas allocates after the block is spliced in. With
+ * and without "&", the PTX is byte-identical on 12.8 and 13.5, and
+ * work/earlyclobber/aliascheck.py finds no output sharing a register with
+ * another operand on 12.0, 12.8 or 13.5, every arch (its 20 mutants, one per
+ * block template, are all caught). Rerun it after adding or changing a block
+ * here. */
 #if defined(__CUDACC__)
 template <>
 CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
@@ -269,7 +281,7 @@ CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
             "mul.hi.u32 %3, %8, %9;\n\t"
             "mul.lo.u32 %4, %7, %9;\n\t"
             "mul.hi.u32 %5, %7, %9;"
-            : "=&r"(e0), "=&r"(e1), "=&r"(e2), "=&r"(e3), "=&r"(o0), "=&r"(o1)
+            : "=r"(e0), "=r"(e1), "=r"(e2), "=r"(e3), "=r"(o0), "=r"(o1)
             : "r"(a0), "r"(a1), "r"(a2), "r"(x));
     }
     m = e0 * n0inv;
@@ -282,7 +294,7 @@ CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
         "madc.hi.cc.u32 %5, %7, %9, %5;\n\t"
         "addc.cc.u32    %3, %3, 0;\n\t"
         "addc.u32       %6, %6, 0;"
-        : "+r"(e0), "+r"(e1), "+r"(e2), "+r"(e3), "+r"(o0), "+r"(o1), "=&r"(h)
+        : "+r"(e0), "+r"(e1), "+r"(e2), "+r"(e3), "+r"(o0), "+r"(o1), "=r"(h)
         : "r"(m), "r"(n0), "r"(n1), "r"(n2));
 
     #pragma unroll
@@ -298,7 +310,7 @@ CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
             "madc.lo.cc.u32 %2, %15, %16, %17;\n\t"
             "madc.hi.cc.u32 %3, %15, %16, %3;\n\t"
             "addc.u32       %6, 0, 0;"
-            : "=&r"(E0), "=&r"(E1), "=&r"(E2), "=&r"(E3), "=&r"(O0), "=&r"(O1), "=&r"(H)
+            : "=r"(E0), "=r"(E1), "=r"(E2), "=r"(E3), "=r"(O0), "=r"(O1), "=r"(H)
             : "r"(o0), "r"(o1), "r"(e1), "r"(e2), "r"(e3), "r"(h),
               "r"(a0), "r"(a1), "r"(a2), "r"(x), "r"(z));
         m = E0 * n0inv;
@@ -322,13 +334,13 @@ CF_FN void mz_mul<3>(mz<3> *r, const mz<3> *a, const mz<3> *b,
             "addc.cc.u32 %1, %5, %7;\n\t"
             "addc.cc.u32 %2, %8, 0;\n\t"
             "addc.u32    %3, %9, 0;"
-            : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3)
+            : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3)
             : "r"(o0), "r"(o1), "r"(e1), "r"(e2), "r"(e3), "r"(h));
         asm("sub.cc.u32  %0, %4, %7;\n\t"
             "subc.cc.u32 %1, %5, %8;\n\t"
             "subc.cc.u32 %2, %6, %9;\n\t"
             "subc.u32    %3, %10, 0;"               /* t3 is 0 or 1 */
-            : "=&r"(s0), "=&r"(s1), "=&r"(s2), "=&r"(bw)
+            : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(bw)
             : "r"(t0), "r"(t1), "r"(t2), "r"(n0), "r"(n1), "r"(n2), "r"(t3));
         const bool keep = bw != 0;
         r->v[0] = keep ? t0 : s0; r->v[1] = keep ? t1 : s1; r->v[2] = keep ? t2 : s2;
@@ -343,7 +355,7 @@ CF_FN void mz_sub_mod<3>(mz<3> *a, const mz<3> *b, const mz<3> *n)
         "subc.cc.u32 %1, %5, %8;\n\t"
         "subc.cc.u32 %2, %6, %9;\n\t"
         "subc.u32    %3, 0, 0;"            /* m = 0 or 0xffffffff (borrow) */
-        : "=&r"(d0), "=&r"(d1), "=&r"(d2), "=&r"(m)
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(m)
         : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
     asm("add.cc.u32  %0, %0, %3;\n\t"
         "addc.cc.u32 %1, %1, %4;\n\t"
@@ -361,13 +373,13 @@ CF_FN void mz_add_mod<3>(mz<3> *a, const mz<3> *b, const mz<3> *n)
         "addc.cc.u32 %1, %5, %8;\n\t"
         "addc.cc.u32 %2, %6, %9;\n\t"
         "addc.u32    %3, 0, 0;"
-        : "=&r"(s0), "=&r"(s1), "=&r"(s2), "=&r"(s3)
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3)
         : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
     asm("sub.cc.u32  %0, %4, %7;\n\t"
         "subc.cc.u32 %1, %5, %8;\n\t"
         "subc.cc.u32 %2, %6, %9;\n\t"
         "subc.u32    %3, %10, 0;"          /* borrow out of (s3:s) - n */
-        : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(bw)
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(bw)
         : "r"(s0), "r"(s1), "r"(s2), "r"(n->v[0]), "r"(n->v[1]), "r"(n->v[2]), "r"(s3));
     const bool keep = bw != 0;              /* s < n: keep the sum */
     a->v[0] = keep ? s0 : r0; a->v[1] = keep ? s1 : r1; a->v[2] = keep ? s2 : r2;
@@ -399,8 +411,8 @@ CF_FN void mz_mul<4>(mz<4> *r, const mz<4> *a, const mz<4> *b,
             "mul.hi.u32 %5, %9, %12;\n\t"
             "mul.lo.u32 %6, %11, %12;\n\t"
             "mul.hi.u32 %7, %11, %12;"
-            : "=&r"(e0), "=&r"(e1), "=&r"(e2), "=&r"(e3),
-              "=&r"(o0), "=&r"(o1), "=&r"(o2), "=&r"(o3)
+            : "=r"(e0), "=r"(e1), "=r"(e2), "=r"(e3),
+              "=r"(o0), "=r"(o1), "=r"(o2), "=r"(o3)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(x));
     }
     m = e0 * n0inv;
@@ -432,8 +444,8 @@ CF_FN void mz_mul<4>(mz<4> *r, const mz<4> *a, const mz<4> *b,
             "madc.lo.cc.u32 %2, %17, %19, %10;\n\t"
             "madc.hi.cc.u32 %3, %17, %19, %11;\n\t"
             "addc.u32       %7, %7, 0;"               /* even chain's carry, position 4 */
-            : "=&r"(E0), "=&r"(E1), "=&r"(E2), "=&r"(E3),
-              "=&r"(O0), "=&r"(O1), "=&r"(O2), "=&r"(O3)
+            : "=r"(E0), "=r"(E1), "=r"(E2), "=r"(E3),
+              "=r"(O0), "=r"(O1), "=r"(O2), "=r"(O3)
             : "r"(o0), "r"(o1), "r"(o2), "r"(o3), "r"(e1), "r"(e2), "r"(e3),
               "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(x), "r"(z));
         m = E0 * n0inv;
@@ -457,14 +469,14 @@ CF_FN void mz_mul<4>(mz<4> *r, const mz<4> *a, const mz<4> *b,
             "addc.cc.u32 %1, %5, %9;\n\t"
             "addc.cc.u32 %2, %6, %10;\n\t"
             "addc.u32    %3, %7, 0;"
-            : "=&r"(t0), "=&r"(t1), "=&r"(t2), "=&r"(t3)
+            : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3)
             : "r"(o0), "r"(o1), "r"(o2), "r"(o3), "r"(e1), "r"(e2), "r"(e3));
         asm("sub.cc.u32  %0, %5, %9;\n\t"
             "subc.cc.u32 %1, %6, %10;\n\t"
             "subc.cc.u32 %2, %7, %11;\n\t"
             "subc.cc.u32 %3, %8, %12;\n\t"
             "subc.u32    %4, 0, 0;"
-            : "=&r"(s0), "=&r"(s1), "=&r"(s2), "=&r"(s3), "=&r"(bw)
+            : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(bw)
             : "r"(t0), "r"(t1), "r"(t2), "r"(t3), "r"(n0), "r"(n1), "r"(n2), "r"(n3));
         const bool keep = bw != 0;
         r->v[0] = keep ? t0 : s0; r->v[1] = keep ? t1 : s1;
@@ -486,7 +498,7 @@ CF_FN void mz_sub_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
         "subc.cc.u32 %2, %7, %11;\n\t"
         "subc.cc.u32 %3, %8, %12;\n\t"
         "subc.u32    %4, 0, 0;"
-        : "=&r"(d0), "=&r"(d1), "=&r"(d2), "=&r"(d3), "=&r"(m)
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3), "=r"(m)
         : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
           "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
     asm("add.cc.u32  %0, %0, %4;\n\t"
@@ -507,7 +519,7 @@ CF_FN void mz_add_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
         "addc.cc.u32 %2, %7, %11;\n\t"
         "addc.cc.u32 %3, %8, %12;\n\t"
         "addc.u32    %4, 0, 0;"
-        : "=&r"(s0), "=&r"(s1), "=&r"(s2), "=&r"(s3), "=&r"(s4)
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(s4)
         : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
           "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
     asm("sub.cc.u32  %0, %5, %9;\n\t"
@@ -515,7 +527,7 @@ CF_FN void mz_add_mod<4>(mz<4> *a, const mz<4> *b, const mz<4> *n)
         "subc.cc.u32 %2, %7, %11;\n\t"
         "subc.cc.u32 %3, %8, %12;\n\t"
         "subc.u32    %4, %13, 0;"
-        : "=&r"(r0), "=&r"(r1), "=&r"(r2), "=&r"(r3), "=&r"(bw)
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(bw)
         : "r"(s0), "r"(s1), "r"(s2), "r"(s3),
           "r"(n->v[0]), "r"(n->v[1]), "r"(n->v[2]), "r"(n->v[3]), "r"(s4));
     const bool keep = bw != 0;

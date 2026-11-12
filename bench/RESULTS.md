@@ -18795,6 +18795,19 @@ instructions). `abcheck` is 7 of 7 again, and `cofcheck` is 95 of 95.
   125's add/sub, is now `"=&r"`: each block writes outputs before it has read
   all its inputs. NVVM's fresh registers made `"=r"` work; it was still the
   wrong constraint. The dead `e0` copies are gone.
+  **Reversed 2026-11-12: back to `"=r"`.** nvcc 12.0 rejects `&` (74 errors
+  per file, "an asm operand may specify only one constraint letter": a forum
+  user's report against `ad05510`, reproduced with nvcc 12.0.140), and
+  NVIDIA's inline-PTX docs define only `=` and `+`. It also never did
+  anything. With and without `&`, the PTX of `bench_kernels.cu` and
+  `multest.cu` is identical, less `.loc` lines, on 13.5 and 12.8 for every fat
+  arch. `work/earlyclobber/aliascheck.py` matches each PTX asm block to its
+  template in `cofac_arith.cuh`. It finds no output sharing a register with
+  another operand on 12.0, 12.8 or 13.5, and its 20 mutants (one per template)
+  are all caught. The tree (`44a0a43` plus the change) builds on 12.0 with
+  gcc 12 for sm_89 with no errors or warnings. Not run: the 12.0 build on a
+  card. Evidence: `work/earlyclobber/treecheck.sh`, `treecheck.txt` (45
+  checks, 0 failed).
 - **Docs and comments** that still said 128 (RUNBOOK's width table, README,
   STATUS's four-limb section, `--help`, `bench_main.cu`, `build_windows.bat`),
   the PTX header's stale evidence, a broken parenthesis in RUNBOOK, and this
