@@ -773,6 +773,13 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
  * them -- which is why this makes far fewer primality calls than a general
  * cofactorizer would. On this job that threshold is 2^54 on the algebraic side,
  * so only the middle part of a 3LP split is ever tested.
+ *
+ * "By construction" holds only if trial division saw EVERY factor-base prime
+ * dividing the norm. Row j = 0 broke that (finding 156): bucketed primes with
+ * a projective transformed root were never offered there, and the product of
+ * two of them went out as one large prime. k_intersect_compact now drops row
+ * 0. Any future path that skips a prime's hits must either drop the point or
+ * make this rule test primality; `--check-relations` catches the symptom.
  */
 /* METHOD 0 is Pollard-Brent rho and `budget` is an iteration count; METHOD 1 is
  * ECM and `budget` is a CURVE count. Both are bounded per launch and

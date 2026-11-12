@@ -86,8 +86,24 @@ static int cuda_optin_smem_limit(size_t *out)
  * What is still not expressible is g > 1: hits confined to every g-th row,
  * which is not a plat_t walk. Those emit an empty walk, and the kernel
  * accumulates the number of positions thereby dropped so the loss is a printed
- * number rather than a silence. With the default bkthresh = I >= J it is
- * exactly zero: g > 1 needs q | (rows), and every bucketed q exceeds J. */
+ * number rather than a silence -- printed by the single-side harness only;
+ * the pipeline clears it per q and never reads it back. With bkthresh >= J
+ * there is nothing on rows j >= 1 to lose: g > 1 needs g | j, and every
+ * bucketed q exceeds J. bkthresh >= I is enforced, J <= bkthresh is enforced
+ * for every run that writes relations or candidates (bench_main.cu, finding
+ * 156), and only a sieve-only run with J > I can lose positions there.
+ *
+ * ROW j = 0 IS THE EXCEPTION. J / g counts the multiples of g in [1, J], so
+ * the count leaves row 0 out (exactly, when g does not divide J; for a
+ * bucketed p > J it is 0). But g divides 0, so such an entry hits every
+ * position of row 0, and none of those hits is sieved or offered to trial
+ * division. That is not harmless where it lands.
+ * Row 0's one primitive point is (+-1, 0) = +-(a0, a1), and g = p there means
+ * exactly that p divides its norm. So TD at (+-1, 0) missed those primes, they
+ * stayed in the cofactor, and mz_split's "below lim^2 is prime" rule wrote the
+ * product of two of them as one large prime (finding 156: 3 relations in 38M
+ * at c135, which CADO's dup2 aborts on). k_intersect_compact now drops row 0,
+ * so nothing downstream sees a point whose trial division was incomplete. */
 template <bool SLABBED>
 __global__ void k_transform(const uint32_t *__restrict primes,
                             const uint32_t *__restrict roots,
@@ -1877,6 +1893,23 @@ static float time_kernel(cudaEvent_t a, cudaEvent_t b)
  * relations were non-primitive, and every one had q = 1 (mod 7) -- the
  * condition for that F to split completely.
  *
+ * ROW j = 0 IS DROPPED OUTRIGHT (finding 156). Its only primitive points are
+ * (+-1, 0), which give the same relation up to sign, so the row is worth at
+ * most one relation per special-q -- 12 in ~530K q at c135 -- and every one
+ * of them was emitted twice. Worse, a bucketed prime whose transformed root is
+ * projective hits only that row and gets no walk (k_transform), so trial
+ * division at (+-1, 0) never saw it and the cofactoriser could list two such
+ * primes as one composite "large prime". Dropping the row costs at most one
+ * relation per q and removes both faults; fixing its trial division instead
+ * would be more code for the same dozen relations.
+ *
+ * The drop comes after the gcd and q | b tests, and the points it drops are
+ * counted in *nrow0 rather than vanishing. Two readers need that count. The
+ * --other-bits print's "CADO-comparable" figure is the gcd-only population,
+ * which dumpcmp --and reproduces with (+-1, 0) in it. And the pipeline's
+ * "no survivors at this q" rule would otherwise turn a q whose only
+ * two-sided survivors were on row 0, which used to pass, into a fatal error.
+ *
  * The list carries BOTH the sieve index x and the pair (a,b). Emitting only
  * (a,b) would be the natural-looking choice and it is the wrong one: every
  * downstream stage -- resieve under either layout, trial division, the
@@ -1889,8 +1922,8 @@ static float time_kernel(cudaEvent_t a, cudaEvent_t b)
  */
 __device__ __forceinline__ uint32_t bgcd(uint32_t u, uint32_t v)
 {
-    /* gcd(u,0) = u, which is what makes j = 0 fall out correctly: only
-     * i = +-1 is primitive on that row. */
+    /* gcd(u,0) = u. k_intersect_compact drops row j = 0 before it gets here
+     * (finding 156), but the function stays a plain gcd. */
     if (!u) return v;
     if (!v) return u;
     int s = __ffs(u | v) - 1;
@@ -2149,7 +2182,8 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
                                     unsigned long long *__restrict npre,
                                     uint32_t *__restrict twosided,
                                     unsigned long long *__restrict nqb,
-                                    uint32_t j_base)
+                                    uint32_t j_base,
+                                    uint32_t *__restrict nrow0)
 {
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
@@ -2189,6 +2223,13 @@ __global__ void k_intersect_compact(const uint32_t *__restrict A,
              * modulo per two-sided survivor, which is ~1 position in 400. */
             if (q > 1 && ((int64_t)i * a1 + (int64_t)j * b1) % q == 0) {
                 qbrej++;
+                continue;
+            }
+            /* row 0, after both tests: see "ROW j = 0 IS DROPPED OUTRIGHT"
+             * above. What reaches here is (+-1, 0), at most 2 per q, so the
+             * atomic is all but free; it is counted, not emitted. */
+            if (j == 0) {
+                if (nrow0) atomicAdd(nrow0, 1u);
                 continue;
             }
             keep |= 1u << k;
@@ -3898,7 +3939,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         CK(cudaMalloc(&d_x, (size_t)icap * 4));
                         CK(cudaMalloc(&d_a, (size_t)icap * 8));
                         CK(cudaMalloc(&d_b, (size_t)icap * 8));
-                        CK(cudaMalloc(&d_n, 4));   CK(cudaMemset(d_n, 0, 4));
+                        /* d_n[1]: the row-0 points the kernel drops */
+                        CK(cudaMalloc(&d_n, 8));   CK(cudaMemset(d_n, 0, 8));
                         CK(cudaMalloc(&d_pre, 8)); CK(cudaMemset(d_pre, 0, 8));
                         CK(cudaMalloc(&d_qb, 8));  CK(cudaMemset(d_qb, 0, 8));
                         CK(cudaMalloc(&d_two, (size_t)nbitword * 4));
@@ -3909,14 +3951,15 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                          * steady-state per-q price. Report the best. */
                         t_isect = 1e30f;
                         for (int rep = 0; rep < 3; rep++) {
-                            CK(cudaMemset(d_n, 0, 4));
+                            CK(cudaMemset(d_n, 0, 8));
                             CK(cudaMemset(d_pre, 0, 8));
                             CK(cudaMemset(d_qb, 0, 8));
                             cudaEventRecord(e3);
                             k_intersect_compact<1, false><<<blocks, cfg->threads>>>(
                                 D.survbits, dother, nbitword, cfg->logI,
                                 L->a0, L->a1, L->b0, L->b1, (int64_t)L->q,
-                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb, 0u);
+                                d_x, d_a, d_b, icap, d_n, d_pre, d_two, d_qb, 0u,
+                                d_n + 1);
                             cudaEventRecord(e4);
                             CK(cudaEventSynchronize(e4));
                             CK(cudaGetLastError());
@@ -3928,21 +3971,28 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                         CK(cudaMemcpy(&hn, d_n, 4, cudaMemcpyDeviceToHost));
                         CK(cudaMemcpy(&hpre, d_pre, 8, cudaMemcpyDeviceToHost));
                         CK(cudaMemcpy(&hqb, d_qb, 8, cudaMemcpyDeviceToHost));
+                        uint32_t hr0 = 0;
+                        CK(cudaMemcpy(&hr0, d_n + 1, 4, cudaMemcpyDeviceToHost));
 
                         printf("\n  intersect+gcd+compact vs %s\n", cfg->other_bits);
                         printf("  %-26s %8llu\n", "two-sided, pre-gcd",
                                (unsigned long long)hpre);
                         /* THIS is the number to compare against dumpcmp --and
                          * and CADO's after_sieve: both apply the gcd(i,j) test
-                         * and nothing else. */
+                         * and nothing else. The q | b and row-0 drops come
+                         * after it, so both are added back. */
+                        const unsigned long long hprim =
+                            (unsigned long long)hn + hqb + hr0;
                         printf("  %-26s %8llu  (%.1f%% of pre-gcd survive)"
                                "  <- CADO-comparable\n",
-                               "primitive gcd(i,j)=1",
-                               (unsigned long long)hn + hqb,
-                               hpre ? 100.0 * (hn + hqb) / (double)hpre : 0.0);
+                               "primitive gcd(i,j)=1", hprim,
+                               hpre ? 100.0 * hprim / (double)hpre : 0.0);
                         printf("  %-26s %8llu  (q | b: (a,b) = q*(a',b'),"
                                " finding 68)\n",
                                "  of which dropped", (unsigned long long)hqb);
+                        printf("  %-26s %8u  (row j = 0, (+-1, 0):"
+                               " finding 156)\n",
+                               "  of which dropped", hr0);
                         printf("  %-26s %8u\n", "emitted", hn);
                         if (hn > icap)
                             printf("  ** OVERFLOW: %u > cap %u, list truncated\n", hn, icap);

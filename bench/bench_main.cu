@@ -1869,6 +1869,23 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 bkthresh, cfg.logI);
         return 1;
     }
+    /* And J <= bkthresh for anything that writes relations or candidates
+     * (finding 156). A bucketed prime whose transformed root is projective
+     * (row divisor g = p) hits only rows j = 0 (mod p) and gets no walk
+     * (k_transform). With p >= bkthresh >= J that is row 0 alone, which
+     * k_intersect_compact drops. With J > bkthresh it is also rows p, 2p, ...:
+     * trial division there never sees p, and mz_split's "below lim^2 is
+     * prime" rule can write two such primes as one large prime, which CADO's
+     * dup2 aborts on. A sieve-only run may go on: its survivor counts just
+     * miss those positions, as the single-side harness reports (finding 1). */
+    if (cfg.J > bkthresh && (cfg.relations || cfg.candidates || cfg.cofactor)) {
+        fprintf(stderr, "--J %u is above the bucket threshold %u (I = 2^%d"
+                        " unless --bkthresh): rows j >= %u can miss trial"
+                        " division by bucketed primes, so a relation-producing"
+                        " run needs J <= %u\n",
+                cfg.J, bkthresh, cfg.logI, bkthresh, bkthresh);
+        return 1;
+    }
     if (!fbbound && cfg.side == 1 && !cfg.pipeline)
         fbbound = (q > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)q;
 

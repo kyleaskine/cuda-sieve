@@ -23,6 +23,7 @@
 #include "runlog.h"
 #include "watchdog.h"
 #include <signal.h>
+#include <type_traits>  /* std::remove_pointer, for the h_rb layout check */
 
 /* The pipeline's apply cell width. One constant for the k_apply instances it
  * launches, their shared-memory size and the survbits-clear guard
@@ -1383,6 +1384,8 @@ typedef struct {
         uint32_t base, cnt;     /* last group's scan base and count */
         td_ctr_t ctr;           /* flags, accepted count, overflow word */
         uint32_t isect;         /* the intersection's survivor count */
+        uint32_t isect_row0;    /* and its dropped row-0 points; d_n[1],
+                                 * copied with isect, so keep it next */
         uint32_t rscan[2];      /* --resieve-scan: {pairs, index overflow} */
     } *h_rb;
     /* joint acceptance */
@@ -1422,6 +1425,11 @@ typedef struct {
      * (pipe_td_prepare_next). */
     int rec_pending, rec_swapped;
 } pipe_td_t;
+/* The intersection's readback copies d_n's two words into isect and isect_row0
+ * with one 8-byte copy, so they must stay adjacent. */
+typedef std::remove_pointer<decltype(pipe_td_t::h_rb)>::type pipe_rb_t;
+static_assert(offsetof(pipe_rb_t, isect_row0) == offsetof(pipe_rb_t, isect) + 4,
+              "one 8-byte copy fills h_rb->isect and h_rb->isect_row0");
 
 static void pipe_td_free(pipe_td_t *C)
 {
@@ -2838,7 +2846,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         PIPE_CK(cudaMalloc(&d_gate, (size_t)((nbitword_alloc +
                            (1u << cfg->fill_gate_shift) - 1) >>
                            cfg->fill_gate_shift) * 4));
-    PIPE_CK(cudaMalloc(&d_n, 4));
+    PIPE_CK(cudaMalloc(&d_n, 8));   /* {survivors, row-0 points dropped} */
     PIPE_CK(cudaMalloc(&d_pre, 8));
     /* Untimed warm-up, n = 0 so it touches nothing. Everything above this line
      * is cudaMalloc/cudaMemcpy, so without it k_transform is the first kernel
@@ -3548,6 +3556,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         double carry_td = 0, carry_rec = 0;
         if (cfg->qspan) { hspan0 = host_ms(); PIPE_CK(cudaEventRecord(qspan0)); }
         uint32_t hn = 0, nacc = 0, ncand = 0, nrel = 0;
+        uint32_t hrow0 = 0;    /* row-0 points k_intersect_compact dropped */
         uint64_t side_surv1 = 0, side_surv0 = 0;
         uint32_t cofgate_found[2] = {0, 0};
         int td_verified = 0;
@@ -4321,7 +4330,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             const cudaStream_t sis = qpipe ? st_sv : 0;
             if (qpipe && !pipe_event_done(etd))
                 PIPE_CK(cudaStreamWaitEvent(st_sv, etd, 0));
-            PIPE_CK(cudaMemsetAsync(d_n, 0, 4, sis));
+            PIPE_CK(cudaMemsetAsync(d_n, 0, 8, sis));
             PIPE_CK(cudaMemsetAsync(d_pre, 0, 8, sis));
             /* No clear of d_two: k_intersect_compact stores every one of its
              * nbitword words outright (256 MiB per q at I16/J32768). */
@@ -4329,7 +4338,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             k_intersect_compact<1, SLABBED><<<blocks, cfg->threads, 0, sis>>>(
                 S1.survbits, S0.survbits, nbitword, cfg->logI,
                 Lq.a0, Lq.a1, Lq.b0, Lq.b1, (int64_t)Lq.q,
-                NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL, j_base);
+                NULL, NULL, NULL, 0u, d_n, d_pre, d_two, NULL, j_base, d_n + 1);
             PIPE_CK(cudaEventRecord(eb, sis));
             /* --fill-ahead: the next q's side-1 apply, now. It needs only this
              * slab's intersection to be done with S1.survbits, which it
@@ -4399,7 +4408,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
              * timing excludes it) and one wait, on the stream where the
              * kernel and the copy run -- not a synchronous round trip after
              * the wait (finding 113). */
-            PIPE_CK(cudaMemcpyAsync(&C.h_rb->isect, d_n, 4,
+            /* both words of d_n: isect and isect_row0 (layout asserted at
+             * pipe_td_t) */
+            PIPE_CK(cudaMemcpyAsync(&C.h_rb->isect, d_n, 8,
                                     cudaMemcpyDeviceToHost, srs));
             /* --fill-ahead: this q's workspace is free once its records are
              * scanned; its applies were joined above */
@@ -4502,6 +4513,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             PIPE_CK(cudaGetLastError());
             tis += time_kernel(ea, eb);
             hn_s = C.h_rb->isect;
+            hrow0 += C.h_rb->isect_row0;
             /* Side 0 from the pairs only if every record found an index slot
              * and the list held every pair; otherwise this slab walks side 0
              * as before, and the list grows for the next. A list that cannot
@@ -4899,8 +4911,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         }
         /* This is the original pre-slabbing invariant: an entire special-q
          * with no two-sided survivors is suspicious and remains fatal. Empty
-         * individual slabs are allowed; only their sum is tested here. */
-        if (!hn) {
+         * individual slabs are allowed; only their sum is tested here.
+         * Row 0's (+-1, 0) count as survivors for this test although the
+         * intersection drops them (finding 156): a q whose only survivors
+         * were there sieved correctly and is an empty q, as it was before
+         * the drop, not a fault. */
+        if (!hn && (nslab_skipped_q || !hrow0)) {
             /* Still fatal when the sieve actually RAN: a fully-sieved q with
              * no two-sided survivor means something is wrong, and that
              * invariant predates slabbing. But if slabs were soft-skipped
@@ -5036,6 +5052,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * is the one somebody passes --verbose-q to read. Report what is
          * actually known per q rather than a variable that stayed at its
          * initialiser; the device counters are folded in after the band. */
+        if (cfg->verbose_q && hrow0)
+            printf("  q=%llu: %u row-0 point%s (+-1, 0) dropped by the"
+                   " intersection (finding 156)\n",
+                   (unsigned long long)cur->q, hrow0, hrow0 == 1 ? "" : "s");
         if (cfg->verbose_q) {
             if (want_host)
                 printf("  q=%llu: %u survivors, %u joint candidates,"

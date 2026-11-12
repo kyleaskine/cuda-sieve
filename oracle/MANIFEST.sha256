@@ -55,6 +55,11 @@ f6879ab6e21f989dc9b1875424ca4fffffb1a8b0aee69b0977c657c769a2cf03  c194.roots1.m1
 3ece01bde6f6c7b9b03e59370cbc89b73dccda4d5e8dde19ae8acd8bfd83d337  c143.job
 a50b860de9acc417068967650f5b9fac9ffb7b7ab10e72cb00883a393f10cd7a  c143.poly
 
+# --- c135 job, added 2026-11-11 ---
+# bench/cofcheck.sh's row-0 case (finding 156) runs it with the factor base
+# generated in-process, so no roots file is needed.
+33412ba162225654d4999b5d0aabce3bce0e77da500e1916b27693915b8059cf  c135.job
+
 # --- dated evidence folders, removed 2026-10-29 ---
 # The 23 oracle/*-202610DD/ folders (findings 105-131) and their 306 lines here
 # were dropped from the tree; commit cadcf3c holds them with this manifest's

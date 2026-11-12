@@ -782,4 +782,71 @@ else
     printf 'FAIL   %-34s --threads 33 accepted\n' "warp-multiple guard"; fail=1
 fi
 
+# Row j = 0 (finding 156), on ../oracle/c135.job with the factor base built
+# in-process. At q = 1866083 the q-lattice's point (-1, 0) is (a, b) =
+# (43551, 2), and the bucketed primes 13001 and 19289 hit only row 0, so they
+# got no walk and trial division never saw them. Binaries before the fix
+# emitted that relation twice (from i = +-1), listing 13001*19289 as one large
+# prime; CADO's dup2 aborts on it. Row 0 is now dropped, so: the relations
+# must pass --check-relations (every factor prime, both norms rebuilt),
+# (43551,2) must be absent, no line may repeat, and the count is pinned
+# (ROW0_WANT; the binary before the fix wrote ROW0_WANT + 2, with 2 composite
+# lines). Allowances pinned to what the policy derived at this q, for the same
+# reason as PIN above, and the cofactoriser pinned to the defaults it derived
+# (ECM both sides, 4 rounds of 8 curves, B1/B2 100/3000 on side 0 and
+# 140/4200 on side 1), so a change of default does not move ROW0_WANT.
+ROW0_WANT=365
+C135="--pipeline --cofactor --poly ../oracle/c135.job --logI 13 --J 4096 --region 13 --maxbits 13 --sq-side 1 --lambda0 1.89 --lambda1 1.94 --allowance 58.2 --allowance0 54.81 --cof-ecm --cof-rounds 4 --ecm-curves 8 --ecm-b1-0 100 --ecm-b2-0 3000 --ecm-b1-1 140 --ecm-b2-1 4200 --qrange 1866083:1866084"
+if ./bench $C135 --relations $TMP/row0.txt > $TMP/row0.out 2>&1; then
+    got=$(grep -vc '^#' $TMP/row0.txt || true)
+    nab=$(grep -c '^43551,2:' $TMP/row0.txt || true)
+    ndup=$(grep -v '^#' $TMP/row0.txt | sort | uniq -d | wc -l)
+    if ./bench --poly ../oracle/c135.job --check-relations $TMP/row0.txt > $TMP/row0.chk 2>&1; then chk=ok; else chk=FAIL; fi
+    if [ "$got" = "$ROW0_WANT" ] && [ "$nab" = 0 ] && [ "$ndup" = 0 ] && [ $chk = ok ]; then
+        printf 'PASS   %-34s %s relations, none on row 0, all prime\n' "row 0 dropped (c135, finding 156)" "$got"
+    else
+        printf 'FAIL   %-34s %s relations (want %s), (43551,2) x%s, %s repeated, check-relations %s\n' \
+            "row 0 dropped (c135, finding 156)" "$got" "$ROW0_WANT" "$nab" "$ndup" "$chk"
+        tail -1 $TMP/row0.chk | sed 's/^/       /'; fail=1
+    fi
+else
+    printf 'FAIL   %-34s bench exited nonzero\n' "row 0 dropped (c135, finding 156)"
+    tail -5 $TMP/row0.out | sed 's/^/       /'; fail=1
+fi
+
+# A q whose only two-sided survivors are row 0's (+-1, 0) is an empty q, not a
+# fault (finding 156). J = 1 sieves row 0 alone. At q = 8087413, first root,
+# (+-1, 0) survive both sides: the binary before the fix wrote them as two
+# copies of a relation with a composite factor, and the first build that
+# dropped row 0 died on "no survivors at this q". Required now: exit 0, the
+# two points reported dropped (--verbose-q), no relation. A q with no survivors
+# at all is still fatal (skipcheck.sh).
+C135J1="--pipeline --cofactor --poly ../oracle/c135.job --logI 13 --J 1 --region 13 --maxbits 13 --sq-side 1 --lambda0 1.89 --lambda1 1.94 --allowance 58.2 --allowance0 54.81 --verbose-q --qrange 8087413: --nq 1"
+rm -f $TMP/row0j1.txt $TMP/row0j1.txt.*
+if ./bench $C135J1 --relations $TMP/row0j1.txt > $TMP/row0j1.out 2>&1; then
+    got=$(grep -vc '^#' $TMP/row0j1.txt || true)
+    if [ "$got" = 0 ] && grep -qF 'q=8087413: 2 row-0 points (+-1, 0) dropped' $TMP/row0j1.out; then
+        printf 'PASS   %-34s exit 0, 2 dropped, no relation\n' "row-0-only q is empty, not fatal"
+    else
+        printf 'FAIL   %-34s %s relations, or the 2 dropped points not reported\n' "row-0-only q is empty, not fatal" "$got"
+        grep -E '^  q=' $TMP/row0j1.out | sed 's/^/       /'; fail=1
+    fi
+else
+    printf 'FAIL   %-34s bench exited nonzero\n' "row-0-only q is empty, not fatal"
+    tail -3 $TMP/row0j1.out | sed 's/^/       /'; fail=1
+fi
+
+# J above the bucket threshold is refused for anything that writes relations
+# (finding 156): bucketed primes with a projective root would miss trial
+# division on rows p, 2p, ... Refused for that reason, not another.
+if ./bench --pipeline --cofactor --poly ../oracle/c135.job --logI 13 --J 16384 --region 13 --maxbits 13 --sq-side 1 --qrange 1866083:1866084 \
+           --relations $TMP/jg.txt > $TMP/jg.out 2>&1; then
+    printf 'FAIL   %-34s accepted, should have been refused\n' "J above bkthresh, relations"; fail=1
+elif grep -q 'above the bucket threshold' $TMP/jg.out; then
+    printf 'PASS   %-34s refused\n' "J above bkthresh, relations"
+else
+    printf 'FAIL   %-34s refused, but not by the J guard\n' "J above bkthresh, relations"
+    tail -2 $TMP/jg.out | sed 's/^/       /'; fail=1
+fi
+
 [ $fail = 0 ] && echo "cofactor golden test passed" || { echo "cofactor golden test FAILED"; exit 1; }

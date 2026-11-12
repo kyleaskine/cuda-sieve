@@ -19015,7 +19015,7 @@ gates passed" (`tree.check.txt`), with `multest` at 0 of 34 failed.
 `bench/bench` is `5512830e`, copied to `work/xdbl/bench.installed.154`; the
 previous `e3cae1b4` is `work/eomul/bench.installed.153`.
 
-## Finding 155 — the transform's inverse in 2-bit windows, with `pl_redc`'s high word by `__umulhi` on the device: the inverse loop goes from 23 SASS instructions per exponent bit to 29 per two bits, and the transform + plattice stage is −8.3 to −10.5% (c143 −6.4%). Per-q wall is −1.0% at c135 (all 4 rounds) and −1.3% at C148 (2 of 4 rounds), noise elsewhere. Whole-process time by `/usr/bin/time` came out +0.5 to +4.6% the other way. That has the size and shape of the host's wall-clock steps (back ~2.5 s every ~32 s, so a run is ~2.5 s shorter when a step lands inside it), and is evidence neither way. Relations byte-identical. Installed 2026-11-11 (fat `2c590187`)
+## Finding 155 — the transform's inverse in 2-bit windows, with `pl_redc`'s high word by `__umulhi` on the device: the inverse loop goes from 23 SASS instructions per exponent bit to 29 per two bits, and the transform + plattice stage is −8.3 to −10.5% (c143 −6.4%). Per-q wall is −1.0% at c135 (all 4 rounds) and −1.3% at C148 (2 of 4 rounds), noise elsewhere. Whole-process time by `/usr/bin/time` first came out +0.5 to +4.6% the other way. That was the host's wall-clock steps: rerun on the fixed clock, process time follows the per-q wall (C148 −2.2%, c135 −1.4%, −0.5 to +0.1% elsewhere; per-q wall −2.4% and −1.5%, every round), and the time outside the band is the same in both builds to 0.03 s. Relations byte-identical. Installed 2026-11-11 (fat `2c590187`)
 
 STATUS row 47. The lead came from an outside review (Fable, relayed by Kyle
 2026-11-10); Kyle gave the go-ahead the same day. Kyle's `/code-review` of the
@@ -19176,6 +19176,39 @@ syncing Windows and disabling timesyncd. After that: 0 steps in 300 s, and
 CLOCK_MONOTONIC equal to RAW (STATUS, Performance accounting). A process-time
 A/B from here on reads true.
 
+### Process time, rechecked on the fixed clock (2026-11-11, after the install)
+
+The same two sm_120 binaries (`80c100ba`, `bc44abd9`), the same `ab.sh`, four
+interleaved rounds, into `work/twin/runs2/` (`runs-ab2.txt`). Host load was
+1.0-3.0 throughout. At the start, three Windows 3D users were at 0.3-2.7%; at
+the end, none was above 0.2%. All 40 runs passed, and every new relation file
+was byte-identical to base's.
+
+Means of four, with the per-round change, new against base:
+
+| job | process time, s | per round, % | wall per q, ms | per round, % |
+|---|---:|---|---:|---|
+| C148 | 20.80 -> 20.34 (−2.2%) | −1.5 −2.1 −2.0 −3.2 | 9.317 -> 9.092 (−2.4%) | −1.3 −2.5 −2.3 −3.7 |
+| c135 | 16.80 -> 16.56 (−1.4%) | −2.7 −2.2 −0.4 −0.4 | 2.510 -> 2.473 (−1.5%) | −2.7 −2.0 −0.4 −0.8 |
+| c143 | 9.36 -> 9.37 (+0.1%) | +2.9 −0.4 −0.8 −1.3 | 4.290 -> 4.290 (0.0%) | +2.8 −0.2 −0.9 −1.7 |
+| I16 | 48.83 -> 48.64 (−0.4%) | −0.7 −0.0 −0.3 −0.4 | 126.36 -> 126.03 (−0.3%) | −0.3 +0.1 −0.4 −0.4 |
+| c183 | 22.02 -> 21.91 (−0.5%) | −0.2 −0.4 −0.8 −0.6 | 33.27 -> 33.13 (−0.4%) | +0.3 −0.5 −0.9 −0.6 |
+
+Process time now moves with the per-q wall, round by round. The time outside
+the band (process time minus q × wall per q; `work/twin/remainder.py`) has a
+median that is equal in both builds to within 0.03 s on every job: C148 2.15,
+c135 0.60-0.61, c143 0.78, I16 7.17-7.20, c183 2.03 s. Across rounds it varies
+by at most 0.4 s. Before the fix, it varied by up to 3.3 s within a job
+(C148 1.16-4.43 s, c135 −0.49 to +2.00 s). So the earlier +0.5 to +4.6% was the clock, and nothing in
+the change costs time outside the band.
+
+Per-q wall reads a little better than the first A/B: C148 −2.4% and c135
+−1.5%, each in every round, at load ~2 where the first ran at up to 15. c143's
+one +2.8% round is round 1, and I16 and c183 stay within ±1%. The transform +
+plattice stage fell 8-10% again (c183 −21%, where it was −10.5%). Stage times
+include sharing the card with the other q in flight, though, so they move
+with load and are not kernel times; the wall column is the measure.
+
 ### The review (Kyle's `/code-review`, 2026-11-11)
 
 It found no correctness fault. It found these weak spots, now fixed:
@@ -19249,3 +19282,351 @@ printed "all gates passed" (`tree.check.txt`): `multest` 0 of 34 failed,
 `xftest` 0 of 4. `bench/bench` is `2c590187`, copied to
 `work/twin/bench.installed.155`; the previous `5512830e` is
 `work/xdbl/bench.installed.154`.
+
+## Finding 156 — row j = 0 can list a composite as a large prime. A bucketed prime whose transformed root is projective hits only row 0, `k_transform` gives it an empty walk, so trial division at (±1, 0) never sees it, and `mz_split`'s "prime by size" rule then writes the product of two such primes as one prime. 3 relations in 38.2M unique at c135 (q 1.5M-9.3M), each written twice; CADO's `dup2` aborts on the first. Fixed in the tree 2026-11-11 by dropping row 0 in `k_intersect_compact` and refusing J above the bucket threshold for relation-producing runs (Kyle's go-ahead); fat `bench/bench` `c23282d5` installed 2026-11-11 21:42, Kyle's call
+
+STATUS row 48. Found 2026-11-11 by the shorter-J test (finding 157), when
+CADO's `dup2` stopped on J=4096's unit 3:
+
+```
+Renumber table is corrupt: cannot find p=0xef28ae1, r=0x7799a80 on side 1 ;
+NOTE that this p is not prime, which is very unexpected. See bug #30048
+```
+
+Work and scripts are in `work/shortj/`. `primecheck.c` runs Miller-Rabin on
+every factor of every relation line (exit 1 if any is composite).
+
+### The relations
+
+`primecheck` over all 53.3M raw J=4096 lines (78 units, q 1.5M-9.3M) found
+three, each on two identical lines:
+
+| q | (a,b) | side | listed "prime" | really |
+|---|---|---|---|---|
+| 1,866,083 | (43551, 2) | 1 | 250,776,289 | 13,001 × 19,289 |
+| 3,701,267 | (−109669, 3) | 0 | 293,873,533 | 12,781 × 22,993 |
+| 8,087,413 | (−250744, 5) | 1 | 520,452,497 | 9,341 × 55,717 |
+
+J=3072 has the same three. J=2048, which went on to q 14.3M, has two more:
+(−109669, 3) again, from a second special-q, and (484415, 11) at side 1,
+218,620,477. Every factor in every product is between 8,192 and the side's
+lim. The gate's c135 reference (`work/ckpt30/gate/census.new.rel`, 1.86M
+relations) has none.
+
+Each one is the point (i, j) = (−1, 0) of its q-lattice: run through
+`qlat_build`'s reduction, (a, b) is ±(a0, a1), the shorter reduced vector. The
+second copy is (1, 0), which gives the same relation with the opposite sign.
+
+### How it happens
+
+1. At (1, 0) the point is (a, b) = (a0, a1). A factor-base prime p divides
+   that norm exactly when a0 ≡ r·a1 (mod p). That is the transform's D ≡ 0,
+   so its row divisor g is p: hits are confined to rows j ≡ 0 (mod p), and
+   for p > J that means row 0 only.
+2. Small-tier trial division handles this: `td_fill_small` keeps g, and
+   the trial-division kernel's row test (`td.cuh:1019`, `if (jglobal % g)
+   continue`, and its twin at `td.cuh:1236`) passes j = 0 because
+   0 % g == 0.
+3. Bucketed primes (p ≥ bkthresh = I, 8,192 here) do not. `k_transform`
+   emits an empty walk for g > 1 (its comment from `bench_kernels.cu:86`,
+   the branch at line 127; line numbers as of the fix). Its comment argues the loss is "exactly zero" because g > 1 "needs
+   q | (rows), and every bucketed q exceeds J". But q divides j = 0. The
+   counter has the same gap: it adds (J / g) × (I / m), which is 0 for
+   g > J. Rows j ≡ 0 (mod g) in [0, J) number (J − 1) / g + 1, one more.
+4. So the sieve never adds those primes' logs at (±1, 0), and the resieve
+   never offers them to trial division. Row 0's reduced-basis norm is small
+   enough that the point survives the threshold anyway.
+5. The primes stay in the cofactor, and two routes write a product of two
+   of them as one large prime:
+   - **No ECM at all.** If the cofactor is that product alone, at most lpb
+     bits, `cof_classify` accepts it (`prp.cuh:199`, CADO's case (a)) and
+     `mz_split` writes it at once. Two of the three went this way: q 3,701,267
+     on side 0 (293,873,533 alone, 29 bits) and q 8,087,413 on side 1
+     (520,452,497 alone).
+   - **After an ECM split.** `mz_split` (`cofac.cuh:771`) treats any piece
+     below lim² as "PRIME by construction -- trial division removed every
+     factor below lim". At q 1,866,083 the side-1 cofactor was
+     250,776,289 × 850,197,193 (58 bits), and ECM split it into those two.
+
+   If each piece holds one prime the relation is correct, only found the hard
+   way. The missed primes also cost yield: they stay in the cofactor's bit
+   count, so the point can fail mfb or the gap test it would otherwise
+   pass.
+
+Row 0 holds one primitive point per q, so it gives at most one relation per
+special-q. J=4096 had 12 in about 530K q: 12 pairs of identical lines in
+53.3M. Three of the 12 have a composite.
+
+### What it breaks, and what does not catch it
+
+- CADO's `dup2` aborts on the first one (above).
+- msieve: not checked. Its behaviour with a composite listed as a prime is
+  unknown here.
+- NFS@Home runs this binary. The rate at NFS@Home's larger jobs and q is not
+  measured.
+- `abcheck` compares a base build with a new one, so a fault both share
+  passes.
+- `--check-relations` does test every listed factor for primality: it
+  reports these as "carried a COMPOSITE factor" and exits 1. But the gates
+  ran it only on files that held none. The gate's c135 reference has two
+  row-0 relations, both with prime factors.
+
+### The fix (2026-11-11, Kyle's go-ahead; not installed)
+
+Of the options (drop row 0, or give (1, 0) a full trial division), dropping
+the row is the simpler one and costs at most one relation per q.
+
+- **`bench_kernels.cu`.** `k_intersect_compact` rejects j = 0 before the gcd
+  test. That one line is the functional change. `k_emit_ranked` reads the
+  two-sided bitmap this kernel writes, so it follows. The comments that
+  carried the wrong argument are corrected: `k_transform`'s "exactly zero",
+  the primitivity block and `bgcd`'s j = 0 note.
+- **`cofac.cuh`.** `mz_split`'s comment names its precondition: trial
+  division must have seen every factor-base prime.
+- **`cofcheck.sh`.** A new case runs c135 at q = 1866083 with the factor base
+  generated in-process and the allowances pinned (58.2/54.81). It requires
+  365 relations, no (43551, 2), no repeated line, and `--check-relations`
+  passing. The binary before the fix writes 367, including (43551, 2) twice
+  with a composite, and fails the check.
+- **`oracle/`.** `c135.job` added, with its manifest and README entries.
+
+A code review of that change (2026-11-11) found the drop complete only for
+J ≤ bkthresh, and two readers of the survivor count that lost the row-0
+points silently. The second pass, also with Kyle's go-ahead:
+
+- **J above the bucket threshold is refused** for any run that writes
+  relations or candidates (`bench_main.cu`, beside the bkthresh ≥ I guard).
+  With J > bkthresh, a bucketed prime with g = p also hits rows p, 2p, ...,
+  where trial division never sees it, which is the same fault away from row
+  0. A sieve-only run may still go on. No production shape is affected: I16
+  sieves J = 32768 = I/2 and c135 J = 4096 = I/2, and abcheck's J > I cases
+  are all single-side sieve runs. The build before this accepts
+  `--cofactor --logI 13 --J 16384` at q 1866083 and writes 521 relations
+  (none composite at that one q).
+- **The dropped points are counted.** `k_intersect_compact` now drops row 0
+  after the gcd and q | b tests and adds the points to a counter (`nrow0`,
+  the second word of the pipeline's `d_n`, read back in the same 8-byte
+  copy). Two readers needed it:
+  - the `--other-bits` print's "CADO-comparable" figure, which must equal
+    `dumpcmp --and`'s primitive count. At c135 q = 8087413 (ρ 4802299) both
+    are 6,564; the first pass printed 6,562;
+  - the pipeline's "no survivors at this q" rule, now
+    `!hn && (nslab_skipped_q || !hrow0)`. A q whose only two-sided survivors
+    are (±1, 0) is an empty q, not a fault. The first pass made it fatal.
+    `--verbose-q` reports the dropped points.
+- **`cofcheck.sh`.**
+  - The row-0 case pins the cofactoriser, so a change of default cannot
+    move 365: ECM on both sides, 4 rounds of 8 curves, B1/B2 100/3000 on
+    side 0 and 140/4200 on side 1.
+  - New case: J = 1 at q = 8087413, first root, where (±1, 0) are the only
+    survivors. It requires exit 0, the two points reported dropped, and no
+    relation. HEAD writes the composite relation twice; the first pass exits
+    255 on "no survivors at this q".
+  - New case: `--cofactor --J 16384` at logI 13 must be refused by the J
+    guard, not by another check.
+- **`work/row0/sasscheck.sh`** accepts the kernel's renamed symbol (its
+  signature gained the counter), provided every arch loses as many
+  `k_intersect_compact` bodies as it gains.
+
+Evidence for the first pass (`work/row0/`, NOTES.md):
+
+- **SASS, sm_120, same toolkit.** Only `k_intersect_compact<1,false/true>`
+  differs, 107 of 109 bodies identical, resources identical. Fat, all six
+  archs: 642 of 654 identical, and the 12 that differ are all that kernel.
+- **abcheck, base against new.** 34 of 36 cases identical. c143.i13 and
+  c143.i14's candidate files differ by exactly their row-0 lines, 2 each.
+  `row0cmp.py` checks that: new must be base with only lines deleted, each
+  one (±1, 0) of a special-q in the band, and none left.
+- **c135, 20,000 q.** New is finding 138's reference less its 2 row-0 lines,
+  (37807, 3) twice, and `--check-relations` passes. SNFS301 at 10 q is
+  identical, with no row-0 line.
+- **`make check`.** All gates pass, including the cofcheck case above.
+
+**The toolkit.** The installed `2c590187` was built with CUDA 13.4. apt's
+dist-upgrade on 2026-11-11 installed 13.5 and removed 13.4 (12:05), so any
+build now differs from the installed binary in every kernel. The source
+change is isolated against a 13.5 build of HEAD (above). Installing would
+also move the compiler, so a same-source A/B of installed 13.4 against HEAD
+built with 13.5 prices that.
+
+- **Setup.** `work/twin/ab.sh` ran 4 rounds, interleaved, on the fixed clock
+  (`work/row0/abtk.txt`). Host load was 2.1-2.7.
+- **Relations.** All 40 runs passed, and every relation file is
+  byte-identical between the two compilers.
+- **Speed.** Per-q wall moves by −1.9 to +1.6% per round, with the sign
+  changing within every job. The mean over rounds is:
+  - C148 +0.4%, c135 −0.6%, c143 +0.1%, c183 +0.1%;
+  - I16 +0.4%, the only job leaning one way (3 of 4 rounds slower).
+
+  That is noise, with at most a few tenths of a percent at I16.
+
+**The install gate passed (2026-11-11 17:15-17:29, `work/row0/gate.txt`).**
+It ran fat (`d4fdfe5a`, 13.5) against the installed `2c590187`:
+
+- **S0-S3.**
+  - S0 records the toolkits.
+  - S1/S2 against fatbase: only `k_intersect_compact`, 12 bodies.
+  - S3: fat's sm_120 kernel is the one `card.sh` tested.
+- **G.** This is `work/emitw/gate.sh`, adjusted for row 0.
+  - abcheck: 34 of 36 identical, and the 2 that differ are explained by
+    row 0.
+  - c135 20,000 q: identical to the row-0 reference (1,855,597 relations),
+    and `--check-relations` passes.
+  - kill -9 at 20 s and 45 s: both resume to the reference.
+  - SIGINT, SIGTERM and stop file: each drains and resumes to the
+    reference.
+  - SNFS301: identical.
+  - `make check` in fat: all gates passed.
+  - 0 failed.
+
+**The second pass's gates passed (2026-11-11 20:14-20:41,
+`work/row0/chain2.sh`).** The first pass's install gate is superseded.
+
+- **SASS.** Against HEAD on the same toolkit, only `k_intersect_compact`
+  differs: 24 of 666 bodies on six archs, its two instantiations under the
+  old and new mangled names. Resources are identical outside it; it goes from
+  36 to 38 and 38 to 40 registers on sm_120.
+- **card.sh, HEAD against the tree, sm_120 (`card2.txt`).**
+  - The row-0 case: HEAD writes 367 relations with the composite; the tree
+    writes 365, clean.
+  - cofcheck, with its three row-0 cases, passed.
+  - abcheck: 34 of 36 identical. c143.i13 and c143.i14's candidates differ
+    by their 2 row-0 lines each, as in the first pass.
+  - c135 20,000 q: the reference less its 2 row-0 lines, 1,855,597
+    relations. SNFS301: identical. make check: all gates passed.
+- **Install gate, fat `c23282d5` (13.5) against the installed `2c590187`
+  (13.4) (`gate.txt`).**
+  - abcheck: 34 of 36 identical, the other 2 explained by row 0.
+  - c135: identical to the first pass's output (1,855,597), and
+    `--check-relations` passes.
+  - kill -9 at 20 s and 45 s, SIGINT, SIGTERM and stop file: each resumes
+    to that output.
+  - SNFS301: identical. `make check` in fat: all gates passed, including the
+    two new cofcheck cases.
+  - 0 failed.
+
+Relations are unchanged from the first pass on every band gated; the second
+pass changes counts, refusals and the one fatal rule.
+
+**Installed 2026-11-11 21:42, Kyle's call**: `work/row0/install.sh` (CUDA
+client down, card empty) installed fat `c23282d5` the way finding 155's was
+installed. `make -q all` is clean after the relink, and `make check` in the
+tree passed (`work/row0/install.txt`, `tree.check.txt`). `2c590187` is kept as
+`work/twin/bench.installed.155`, `c23282d5` as `work/row0/bench.installed.156`.
+
+For the shorter-J test the flagged lines were repaired on the way into
+CADO's filter: each composite is written as its two primes, which is the
+true factorisation (`filter.py`).
+
+## Finding 157 — a shorter J loses at c135 when priced as time to a filterable matrix. Sieving each J until CADO's purge reaches the cado-gpu run's target (excess ≥ 3% of the columns after singleton removal), J=3072 takes +5.9% process time (+4.9% q-loop) and J=2048 +12.7% (+9.7%). They need about the same relations (+0.3%, +1.7%), but less of the sieve area per q means going to q 12.4M and 15.8M instead of 10.2M. J=4096 stays
+
+STATUS row 49, the question STATUS raises under "The final metric": "a shorter
+J ... needs more special-q for the same relations, at higher q where yield is
+lower and duplicates more common". Kyle gave the go-ahead 2026-11-11. Work,
+scripts and logs are in `work/shortj/`. This prices c135 only. NFS@Home's work
+units are sized on GGNFS yield, so this bears on Kyle's own jobs.
+
+### Method
+
+`run.py` sieved c135 the way the cado-gpu run did (`work/c135/c135.job`:
+I=13, lim 9M/12M, lpb 29/30, mfb 55/58, lambda 1.89/1.94). It used side-1
+special-q from q = 1.5M in work units of 100K, one `bench/bench` (`2c590187`)
+process per unit.
+
+- **Interleaving.** Each round ran the next unit of every J still going, in
+  an order rotated each round. Host drift therefore lands on all three Js.
+- **Stopping and timing.** A J stopped at a target count of unique (a, b).
+  Process time was measured on CLOCK_MONOTONIC_RAW. bench's own wall per q
+  gives the q-loop time.
+- **Watchdog.** bench ran with `--watchdog 20 --watchdog-kill 90` and a 300 s
+  outer timeout, retrying a frozen unit. There were no stalls. The first
+  attempt had frozen for 69 min on one unit (STATUS 12d), after a driver
+  update without a reboot; it was rerun from scratch after Kyle rebooted.
+- **Card sharing.** The card was shared once, for 3 min between two units.
+  run.py waits while anything else is on the card.
+
+The first target, 38M unique, was too few. J=4096's 38.2M leaves excess
+−338,212 (−3.9% of the columns) after singleton removal. run.py then resumed
+each J to 46M, rebuilding its seen set from its relation files to the
+recorded count. That took 105, 125 and 161 units for J = 4096, 3072, 2048,
+to q 12.0M, 14.0M and 17.6M; every result below is at the lower count L that
+purge needs.
+
+`filter.py` does the pricing:
+
+1. Each J's first-seen relations, in sieving order, are renumbered by CADO's
+   `dup2` with the cado-gpu run's renumber table. dup2 must find 0
+   duplicates and keep every line.
+   - The composite "primes" of finding 156 are repaired first: 6, 8 and 12
+     lines for J = 4096, 3072, 2048.
+2. CADO's `purge` runs with the cado-gpu run's flags and free relations
+   (`-keep 170 -required_excess 0.03`) on the first L relations.
+3. L is bisected to 25,000 relations. The verdict is excess ≥ 0.03 ×
+   ncols after singleton removal, which matched purge's own exit status at
+   all 39 probes.
+4. Time to L is the J's cumulative time to the unit where its unique count
+   reaches L, interpolated linearly inside that unit.
+
+### Result
+
+| J | units to L | unique needed (L) | q reached | process time | q-loop time |
+|---|---|---|---|---|---|
+| 4096 | 88 | 41.04M | 10.23M | 1514.2 s | 1432.5 s |
+| 3072 | 110 | 41.17M (+0.3%) | 12.43M | 1604.1 s (+5.9%) | 1502.3 s (+4.9%) |
+| 2048 | 143 | 41.72M (+1.7%) | 15.77M | 1706.0 s (+12.7%) | 1571.7 s (+9.7%) |
+
+"Units to L" counts the unit in which L is reached; the times are
+interpolated inside it.
+
+How the result comes about:
+
+- **At equal q, a shorter J is slightly more efficient.** Over units 0-77,
+  J=3072 gets 0.874 of J=4096's raw relations in 0.849 of its process time,
+  and J=2048 gets 0.708 in 0.689.
+- **But it has to reach higher q, where yield is lower.** That more than
+  cancels the gain.
+- **Duplicates do not decide it.** The cross-unit duplicate rate at 46M
+  unique falls slightly with J: 31.3%, 30.8%, 29.9%.
+- **Per-unit startup.** Outside the q loop each unit costs 0.94 s at every J.
+  The shorter Js run more units, which is the gap between the process and
+  q-loop columns.
+- **The watchdog's exit wait.** About 0.25 s of that 0.94 s is the
+  watchdog's exit. `wd_stop` (`watchdog.c:410-430`) clears the run flag,
+  then joins a thread that is partway through a 500 ms `nanosleep`
+  (`WD_POLL_MS`). So every process run with `--watchdog` ends 0-500 ms
+  late, and process times fall on a 0.5 s grid from start: 380 of 391
+  units end at x.19-x.20 or x.69-x.70 s.
+  - It costs J=2048's 55 extra units about 14 s, 0.8% of its total. The
+    q-loop column excludes it, and the verdict does not change.
+  - For a client work unit it is noise. A condition-variable wait in place
+    of the sleep would remove it (not done).
+- **Noise.** Apart from that quantum, unit times are stable: consecutive
+  units differ by 0.5 s (median) and at most 2.0 s. The differences are
+  well outside run noise, though each J was sieved once.
+
+### Side observations
+
+- **bench needs more unique relations than las did.** The cado-gpu run's
+  purge passed with 37.14M unique relations from las-glas (q 1.5M-12.9M), at
+  excess +402,221, 4.3% of the columns. bench at J=4096 needs 41.04M, 10.5%
+  more. That is a lower bound: bench's 41.04M is the bisected minimum for the
+  3% target, while las's 37.14M is a whole run that ended past it, so las
+  needed fewer. Bisecting las's set the same way would measure the gap. bench
+  also yields about 29% more raw relations
+  per q than las-glas at the same q:
+  - q 1.5M-1.6M: 1,015,642 against 789,185;
+  - q 9.2M-9.3M: 531,386 against 408,779.
+
+  At equal row counts bench's set has more distinct ideals: 45.49M columns
+  against 43.13M at the start of purge. So the extra relations evidently
+  carry more large primes, and the raw yield ratio overstates bench's lead.
+  This rests on one CADO run. Comparing ideals per relation in the two sets
+  would confirm it.
+- **The log scale depends on J.** bench takes its log scale and threshold
+  bound from the first q's maximum norm, which depends on J. When J=3072 and
+  J=4096 round to the same scale (units 0 and 3: 1.625, bound 95), J=3072's
+  relations are an exact subset of J=4096's. When they don't (unit 4: 1.575/92
+  against 1.600/94), J=3072 keeps relations J=4096's threshold drops: 1,675
+  in that unit. Over the shared 78 units, J=3072 found 49,327 relations
+  (0.11%) and J=2048 63,160 (0.17%) that J=4096 did not. That favours the
+  shorter Js slightly, and they still lose.

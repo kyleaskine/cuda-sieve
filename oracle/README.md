@@ -274,6 +274,16 @@ The launcher replaces `-t` with its host CPU allocation unless
 These are reproduction recipes, not new measurements. Compare fresh,
 interleaved runs and record host load and aggregate process CPU time.
 
+## c135 cado-gpu job (added 2026-11-11)
+
+[`c135.job`](c135.job) is the c135 from the owner's `~/cado-gpu/c136-934760359018`
+run: CADO I=13 (`--logI 13 --J 4096`), side-1 special-q, lambdas 1.89/1.94.
+Tracked in git (1.2 KB). `bench/cofcheck.sh` uses it for the row-0 regression
+case of [finding 156](../bench/RESULTS.md#finding-156): at q = 1,866,083 the
+binaries before the fix wrote the relation (43551, 2) with the composite
+250,776,289 = 13,001 x 19,289 listed as one prime. The factor base comes from
+bench's in-process generator, so no roots file is needed.
+
 ## Dated evidence folders
 
 Findings 105-131 kept their small evidence here, one folder per finding:
