@@ -135,14 +135,17 @@ echo "  build width: $LIMIT bits (BN_LIMBS*32)"
 # width covers it. What the width changes is whether such a job can be built and
 # SIEVED, and past 128 bits it cannot be sieved cheaply:
 #
-#   * pipeline.cuh's "no survivors at this q" check makes a special-q with no
-#     two-sided survivors FATAL, by design. That is still true for the jobs
-#     this gate builds, but it is no longer unconditional: since the per-slab
-#     soft-skip landed, a q whose slabs were ALL skipped (bucket overflow or a
-#     truncated factor list; norm overflow is fatal) is counted in nq_lost and
-#     passed over instead. Only an explained zero is tolerated; a q that actually
-#     sieved and found nothing still dies. So the generated job must actually
-#     yield relations, not merely overflow.
+#   * pipeline.cuh used to make a special-q with no two-sided survivors
+#     FATAL, by design; that is no longer unconditional in two ways. Since the
+#     per-slab soft-skip landed, a q whose slabs were ALL skipped (bucket
+#     overflow or a truncated factor list; norm overflow is fatal) is counted
+#     in nq_lost and passed over. And since the barren-q tolerance, a q that
+#     actually sieved and found nothing is counted in nq_barren and passed
+#     over too: two SNFS jobs produced legitimate barren q from degenerate
+#     special-q roots near a lattice boundary (rho ~= q/2, 2q/3), and a fatal
+#     q is one a checkpoint can never advance past. The generated job must
+#     still actually yield relations -- an all-barren band produces nothing,
+#     which the band summary's nq_barren line makes obvious.
 #   * A job that overflows 256 bits on one side has ~375 bits of norm across the
 #     two. At toy bounds (lim 2e6, lpb 26) that yields no survivors at all and
 #     the band dies; measured 2026-09-04 at BN_LIMBS=8. At bounds that would
