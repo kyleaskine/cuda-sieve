@@ -340,6 +340,16 @@ static void usage(void)
 "                   it is prepared, under this one's sieve and TD. Costs a\n"
 "                   second bucket array; off when it does not fit or the\n"
 "                   plan has several slabs per q   [on with --q-pipeline]\n"
+"  --slab-fill-ahead / --no-slab-fill-ahead  --q-pipeline, several slabs\n"
+"                   per q: each later slab's side-1 fill beside the previous\n"
+"                   slab's side-1 apply, at the greatest stream priority.\n"
+"                   Costs a second bucket array and a fourth side-1 cursor\n"
+"                   buffer; off when they do not fit or the plan has one\n"
+"                   slab per q. Output-identical.  [on with --q-pipeline\n"
+"                   and no row tier on sm_120 with " BENCH_STR(SLAB_FILL_DEFAULT_SMS) " SMs, the RTX 5070,\n"
+"                   where it was timed; off elsewhere: bench/tune.sh times it]\n"
+"  --slab-fill-blocks N  --slab-fill-ahead's fill grid, in blocks of " BENCH_STR(FILL_THREADS_DEFAULT) "\n"
+"                   threads   [" BENCH_STR(SLAB_FILL_BLOCKS_DEFAULT) " per " BENCH_STR(SLAB_FILL_DEFAULT_SMS) " SMs, scaled by the card's SMs]\n"
 "  --td-ahead / --no-td-ahead  --q-pipeline: queue trial division's record\n"
 "                   pass and cofactor enqueue before the host reads its\n"
 "                   counts, on a count the card gates as the host would.\n"
@@ -1118,6 +1128,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.row_cap = 1;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.fill_ahead = -1;   /* resolved with --q-pipeline */
+    cfg.slab_fill_ahead = -1;   /* this card's default, resolved at the device query */
+    cfg.slab_fill_default = 0; cfg.slab_fill_blocks = 0;
     cfg.td_ahead = -1;     /* resolved with --q-pipeline */
     cfg.q_prep = PIPE_QPREP_AUTO;
     cfg.qspan = 0;
@@ -1306,6 +1318,13 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         }
         else if (!strcmp(argv[i], "--fill-ahead")) { cfg.fill_ahead = 1; }
         else if (!strcmp(argv[i], "--no-fill-ahead")) { cfg.fill_ahead = 0; }
+        else if (!strcmp(argv[i], "--slab-fill-ahead")) { cfg.slab_fill_ahead = 1; }
+        else if (!strcmp(argv[i], "--no-slab-fill-ahead")) { cfg.slab_fill_ahead = 0; }
+        else if (!strcmp(argv[i], "--slab-fill-blocks") && i + 1 < argc) {
+            if (parse_int_range_arg("--slab-fill-blocks", argv[++i], 1,
+                                    BENCH_BLOCKS_MAX,
+                                    &cfg.slab_fill_blocks)) return 1;
+        }
         else if (!strcmp(argv[i], "--td-ahead")) { cfg.td_ahead = 1; }
         else if (!strcmp(argv[i], "--no-td-ahead")) { cfg.td_ahead = 0; }
         else if (!strcmp(argv[i], "--fill-gate-shift") && i + 1 < argc) {
@@ -1833,6 +1852,19 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 " --qspan)\n");
         return 1;
     }
+    /* an explicit request only: the default (-1) resolves off without the
+     * pipeline, at the device query below */
+    if (cfg.pipeline && cfg.slab_fill_ahead > 0 && !cfg.q_pipeline) {
+        fprintf(stderr, "--slab-fill-ahead fills the next slab under this one;"
+                " the pipeline is off (--no-q-pipeline, --fill-concurrent or"
+                " --qspan)\n");
+        return 1;
+    }
+    if (cfg.pipeline && cfg.slab_fill_blocks && !cfg.slab_fill_ahead) {
+        fprintf(stderr, "--slab-fill-blocks sets --slab-fill-ahead's grid;"
+                " add --slab-fill-ahead\n");
+        return 1;
+    }
     if (cfg.pipeline && cfg.td_ahead && !cfg.q_pipeline) {
         fprintf(stderr, "--td-ahead queues trial division's record pass under"
                 " --q-pipeline; the pipeline is off (--no-q-pipeline,"
@@ -2345,6 +2377,28 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         dev_ordinal = dev;
         dev_count = ndev;
 
+        /* --slab-fill-ahead's default, which needs the card: on only where it
+         * was timed -- sm_120 with SLAB_FILL_DEFAULT_SMS (48) SMs, the RTX
+         * 5070, -7.2% on the I16 NFS@Home job (finding 160) -- under
+         * --q-pipeline, and with no row tier (--fill-rows; 0 at I16), whose
+         * kernels the ahead fill does not confine. Its grid is a count of
+         * slots per SM and has been swept on that card only, and three times
+         * the right grid lost to off, so every other card keeps it off until
+         * it has been timed there (bench/tune.sh does that). Then the grid's
+         * refusal, which the default could not answer before. */
+        if (cfg.slab_fill_ahead < 0) {
+            cfg.slab_fill_default = 1;
+            cfg.slab_fill_ahead = cfg.pipeline && cfg.q_pipeline && !cfg.fill_rows &&
+                prop.major == 12 && prop.minor == 0 &&
+                prop.multiProcessorCount == SLAB_FILL_DEFAULT_SMS;
+        }
+        if (cfg.pipeline && cfg.slab_fill_blocks && !cfg.slab_fill_ahead) {
+            fprintf(stderr, "--slab-fill-blocks sets --slab-fill-ahead's grid, and"
+                    " it is off%s; add --slab-fill-ahead\n",
+                    cfg.slab_fill_default ? " by default on this card" : "");
+            return 1;
+        }
+
         /* Armed HERE, not later: everything above this point is argument
          * checking that cannot stall for two minutes, and everything below it
          * -- factor-base generation, the GPU root finder, resume, and the band
@@ -2491,6 +2545,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--fill-skip57", "--no-fill-skip57",
             "--no-fill-gate", "--no-resieve-rows", "--q-pipeline",
             "--no-q-pipeline", "--q-prep", "--fill-ahead", "--no-fill-ahead",
+            "--slab-fill-ahead", "--no-slab-fill-ahead", "--slab-fill-blocks",
             "--td-ahead", "--no-td-ahead",
             "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
             "--resieve-scan-cap", "--resieve-scan-pairs", "--no-row-cap",

@@ -27,6 +27,19 @@
 #   --fill-gate-shift 1 2 4              default 3
 #   --no-fill-merge                      default on with the row tier, at
 #                                        one slab per q; not timed elsewhere
+#   --slab-fill-ahead at --slab-fill-blocks 256 384 512 768 1024 1536 2048
+#     3072, and --no-slab-fill-ahead     on by default (512 blocks) only on
+#                                        sm_120 with 48 SMs and no row tier,
+#                                        the RTX 5070 it was timed on (finding
+#                                        160); elsewhere off, and its default
+#                                        grid there is 512 per 48 SMs
+#   The --slab-fill-ahead arms run only where it can: a plan of several slabs
+#   per q under --q-pipeline (bench's first run says which). Its right grid is
+#   a count of block slots per SM, so of that ladder only the grids of 6 to 24
+#   blocks per SM of this card are timed (512 is 10.7 on 48 SMs), and an arm
+#   equal to this card's default is not timed. A recommendation of
+#   --slab-fill-ahead here is worth reporting: the default is off on every
+#   card but one because no other card has been measured.
 #
 # Method (STATUS item 2, RESULTS findings 85, 145, 146 and 149). Every arm sieves the
 # same q, and the arms are interleaved within a round. The order is rotated
@@ -70,7 +83,11 @@ ARMS_GIVEN=$ARMS
 [ -n "$ARMS" ] || ARMS="B40=--ss-block-cut,40 B48=--ss-block-cut,48 B64=--ss-block-cut,64
   W128=--ss-warp-cut,128 W384=--ss-warp-cut,384 W512=--ss-warp-cut,512 W1024=--ss-warp-cut,1024
   F1152=--fill-blocks,1152 F2304=--fill-blocks,2304 F9216=--fill-blocks,9216 F18432=--fill-blocks,18432
-  F36864=--fill-blocks,36864 G1=--fill-gate-shift,1 G2=--fill-gate-shift,2 G4=--fill-gate-shift,4 M0=--no-fill-merge"
+  F36864=--fill-blocks,36864 G1=--fill-gate-shift,1 G2=--fill-gate-shift,2 G4=--fill-gate-shift,4 M0=--no-fill-merge
+  SFA0=--no-slab-fill-ahead SFA256=--slab-fill-ahead,--slab-fill-blocks,256 SFA384=--slab-fill-ahead,--slab-fill-blocks,384
+  SFA512=--slab-fill-ahead,--slab-fill-blocks,512 SFA768=--slab-fill-ahead,--slab-fill-blocks,768
+  SFA1024=--slab-fill-ahead,--slab-fill-blocks,1024 SFA1536=--slab-fill-ahead,--slab-fill-blocks,1536
+  SFA2048=--slab-fill-ahead,--slab-fill-blocks,2048 SFA3072=--slab-fill-ahead,--slab-fill-blocks,3072"
 ARMS=$(echo $ARMS)
 # Leave out of the grid whatever bench would refuse on this job line: one
 # refused arm fails in every round and voids the whole result.
@@ -81,6 +98,10 @@ if [ -z "$ARMS_GIVEN" ]; then
       *=--ss-*" --no-smallsieve "*) ;;
       *=--fill-gate-shift*" --no-fill-gate "*|*=--fill-gate-shift*" --fill-concurrent "*) ;;
       *=--no-fill-merge*" --fill-merge "*|*=--no-fill-merge*" --fill-merge-cut "*) ;;
+      # --slab-fill-ahead needs --q-pipeline, which these turn off (bench
+      # refuses it), and --pipeline itself
+      *slab-fill-ahead*" --no-q-pipeline "*|*slab-fill-ahead*" --fill-concurrent "*|*slab-fill-ahead*" --qspan "*) ;;
+      *slab-fill-ahead*) case " $* " in *" --pipeline "*) keep="$keep $a" ;; esac ;;
       *) keep="$keep $a" ;;
     esac
   done
@@ -167,16 +188,49 @@ run_stage() {
         [ -s "$ref" ] || { say "tune: the defaults' first run found no relations; pick a band that finds some"; exit 1; }
         say "   commit $(sed -n 's/^# commit *//p' "$o.log" | head -1)"
         say "   card $(sed -n 's/^# device *//p' "$o.log" | head -1)"
-        say "   one run takes about $((t1 - t0)) s; stage 1 is $(( (t1 - t0) * n * ROUNDS / 60 + 1 )) min"
         # --no-fill-merge on a plan with no merge would time the defaults
         # against themselves, and noise could adopt a flag that does nothing.
         if ! grep -q -- '--fill-merge: .*one launch' "$o.out"; then
-          for a in $ARMS; do [ "${a#*=}" = --no-fill-merge ] && NOOP="$NOOP ${a%%=*}"; done
-          [ -n "$NOOP" ] && say "   not timing$NOOP: this plan has no merge to turn off"
+          nm=; for a in $ARMS; do [ "${a#*=}" = --no-fill-merge ] && nm="$nm ${a%%=*}"; done
+          [ -n "$nm" ] && say "   not timing$nm: this plan has no merge to turn off"
+          NOOP="$NOOP$nm"
         fi
+        # --slab-fill-ahead: where it can run, this card's default (on at
+        # grid G, or off), and the ladder's grids of 6-24 blocks per SM
+        sms=$(sed -n 's/^grid: \([0-9][0-9]*\) SMs.*/\1/p; s/^grid: [0-9][0-9]* blocks on \([0-9][0-9]*\) SMs.*/\1/p' "$o.out" | head -1)
+        sg=$(sed -n "s/.*--slab-fill-ahead: each later slab.* \([0-9][0-9]*\) x [0-9][0-9]* at the greatest priority.*/\1/p" "$o.out" | head -1)
+        nm=; why=
+        if ! grep -q -- "--q-pipeline: each slab's sieve" "$o.out"; then why="it needs a plan of several slabs per q under --q-pipeline"; fi
+        for a in $ARMS; do
+          m=${a%%=*}; f=${a#*=}
+          case $f in
+            --no-slab-fill-ahead) [ -n "$why" ] || [ -z "$sg" ] && nm="$nm $m" ;;
+            --slab-fill-ahead,--slab-fill-blocks,*)
+              b=${f##*,}
+              if [ -n "$why" ] || [ "$b" = "$sg" ] || [ -z "$sms" ] ||
+                 [ "$b" -lt $((6 * sms)) ] || [ "$b" -gt $((24 * sms)) ]; then nm="$nm $m"; fi ;;
+          esac
+        done
+        if [ -n "$nm" ]; then
+          if [ -n "$why" ]; then say "   not timing$nm: $why"
+          else
+            if [ -n "$sg" ]; then st_sfa="on at $sg blocks"; else st_sfa=off; fi
+            say "   --slab-fill-ahead is $st_sfa in the defaults' run on this card${sms:+ ($sms SMs)}; not timing$nm (the defaults' own setting, or outside 6-24 blocks per SM)"
+          fi
+          NOOP="$NOOP$nm"
+        fi
+        nt=$n; for m in $NOOP; do nt=$((nt - 1)); done
+        say "   one run takes about $((t1 - t0)) s; stage 1 is $(( (t1 - t0) * nt * ROUNDS / 60 + 1 )) min ($nt arms timed)"
       else
         if [ $rc -ne 0 ] || [ -z "$w" ]; then
           say "   stage $st $arm round $rd: bench exited $rc (see $o.out)"; fails=$((fails+1)); continue
+        fi
+        # --slab-fill-ahead turns itself off when its memory does not fit:
+        # such an arm would time the defaults against themselves
+        if [ "$(flags_of $arm | grep -c -- '--slab-fill-ahead')" -gt 0 ] &&
+           grep -q -- '--slab-fill-ahead: off, because' "$o.out"; then
+          say "   not timing $arm further: $(grep -h -- '--slab-fill-ahead: off, because' "$o.out" | head -1 | sed 's/^ *//')"
+          NOOP="$NOOP $arm"; rm -f "$o.rel" "$o.rel".* "$o.log"; continue
         fi
         if cmp -s "$o.rel" "$ref"; then rm -f "$o.rel" "$o.rel".* "$o.log"
         else say "   stage $st $arm round $rd: RELATIONS DIFFER from the defaults' (a bug: keep $o.rel)"; echo "$st $arm DIFFERS" >> "$DIR/differs.txt"; fails=$((fails+1)); fi
@@ -227,7 +281,7 @@ summarise 1
 # if it sets no flag a larger winner sets (arms that share a flag are one knob,
 # and an -a arm may set several); BEST is the largest gain of all.
 WIN=$(awk '$3 == 1 { print }' "$DIR/s1.pick" 2>/dev/null | sort -k2,2gr | while read m g ok; do
-        printf '%s %s\n' "$m" "$(for f in $(flags_of $m); do case $f in --*) printf '%s ' $f ;; esac; done)"; done |
+        printf '%s %s\n' "$m" "$(for f in $(flags_of $m); do case $f in --no-*) printf '%s ' "--${f#--no-}" ;; --*) printf '%s ' $f ;; esac; done)"; done |
       awk '{ ok = 1; for (i = 2; i <= NF; i++) if ($i in used) ok = 0
              if (ok) { for (i = 2; i <= NF; i++) used[$i] = 1; print $1 } }')
 BEST=$(awk '$3 == 1 { print }' "$DIR/s1.pick" 2>/dev/null | sort -k2,2gr | awk 'NR == 1 { print $1 }')

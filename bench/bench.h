@@ -703,6 +703,22 @@ typedef struct {
      * Output-identical; finding 123. Default on wherever --q-pipeline is
      * (bench_main resolves -1). */
     int      fill_ahead;
+    /* --slab-fill-ahead: under --q-pipeline on a plan of several slabs per
+     * q, each slab's side-1 fill after the q's first runs beside the previous
+     * slab's side-1 apply, on a stream of the device's greatest priority,
+     * into a second bucket array and a fourth side-1 walk-cursor buffer
+     * (STATUS row 50, findings 158-160). Output-identical. -1 = this card's
+     * default, resolved by bench_main once the device is known: on only
+     * where it was timed (sm_120 with SLAB_FILL_DEFAULT_SMS SMs, the RTX
+     * 5070: -7.2% at I16, finding 160), under --q-pipeline and with no row
+     * tier, whose kernels it does not confine; off elsewhere.
+     * slab_fill_default says the value came from that default, not a flag.
+     * slab_fill_blocks is its grid, 0 = SLAB_FILL_BLOCKS_DEFAULT scaled by
+     * the SM count: confined, because the full fill grid takes every block
+     * slot the apply frees and the apply stops (findings 148, 158). */
+    int      slab_fill_ahead;
+    int      slab_fill_default;
+    int      slab_fill_blocks;
     /* --td-ahead: under --q-pipeline, TD's record pass and k_cof_enqueue are
      * queued ahead of its counter readback, on a count the device gates as
      * the host would. Output-identical; finding 135. Default on wherever
@@ -1000,6 +1016,21 @@ static inline uint32_t ss_warp_cut(const bench_cfg_t *cfg)
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* --slab-fill-ahead's grid, x FILL_THREADS_DEFAULT (the ahead fill launches
+ * that many threads whatever --fill-threads says: no other shape was timed,
+ * and wider blocks would undo the confinement). The fill is released at
+ * one slab's side-1 apply and needed at the next one's, about a slab later;
+ * from 384 blocks up it finishes with time to spare, and the wall follows the
+ * apply's total, which grows with the fill's share of each SM (65 ms/q at 384,
+ * 67 at 512, 70 at 768, 78 at 1536). At 256 the fill runs out the slab. So the
+ * rule is the narrowest grid whose fill still finishes inside a slab: 512 on
+ * the 5070's 48 SMs, 1.2-1.9 ms/q ahead of the probe's 768 in every round,
+ * 640 level (finding 160, the I16 NFS@Home job). That is a count of slots per
+ * SM, so the default is SLAB_FILL_BLOCKS_DEFAULT per SLAB_FILL_DEFAULT_SMS
+ * SMs, scaled by the card's count (512 on 48; at 1536 the option lost to
+ * off). Measured on 48 SMs only: bench/tune.sh times the grid on others. */
+#define SLAB_FILL_BLOCKS_DEFAULT 512
+#define SLAB_FILL_DEFAULT_SMS    48
 /* --fill-merge: the row tier's cut, and threads per block. 8 beat 4 and 16 on
  * C135, C143, C148 and C183; 64 and 128 threads were level and 32 lost, the
  * row tier needing warps the walk does not (findings 148, 150; sm_120 only).

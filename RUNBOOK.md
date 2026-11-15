@@ -1540,14 +1540,17 @@ which it supersedes on the geometry).
 
 **`bench/tune.sh` times the speed-only knobs on your card, for one job.** It
 tries the small-sieve tier cutoffs (`--ss-block-cut`, `--ss-warp-cut`),
-`--fill-blocks`, `--fill-gate-shift` and `--no-fill-merge`, one at a time away
+`--fill-blocks`, `--fill-gate-shift` and `--no-fill-merge`, and on a plan of
+several slabs per q `--slab-fill-ahead` with its grid, one at a time away
 from the defaults, on a short band of the job. The arms are interleaved on the same q over 6 rounds, the order
 rotated and reversed in alternate rounds, and every run's relations are
 compared byte for byte with the defaults'. A setting is adopted only if it
 was slower than the defaults in no round, and faster by more than 1% and by
 more than the defaults' own spread between rounds; if two knobs win, it
 times the combination too. Pick `--nq` so one run takes 10-60 s; the default
-grid of 17 arms is then 20-105 minutes. It refuses to start with anything on
+grid of 17 arms is then 20-105 minutes (up to 20 arms and 120 minutes on a
+plan of several slabs per q, where `--no-fill-merge` drops out and the
+`--slab-fill-ahead` grids of 6-24 blocks per SM of the card come in). It refuses to start with anything on
 any card or an NFS@Home CUDA client running (the CPU client is fine), and
 stops if either appears. On a host with several cards, all must be idle.
 Under WSL, `nvidia-smi` cannot see Windows programs, so close them first
@@ -1560,7 +1563,11 @@ sh bench/tune.sh -b bench/bench -- --pipeline --cofactor --poly JOB.job \
 ```
 
 Every default and the whole grid were measured on a 5070 (sm_120), so a
-report from another card is useful even when it keeps the defaults:
+report from another card is useful even when it keeps the defaults.
+`--slab-fill-ahead` (RESULTS.md finding 160, −6 to −7% at I16) is on by
+default only on that card, sm_120 with 48 SMs, because its grid is a count of
+slots per SM and no other card has been swept; a report recommending it on
+another card is the measurement that would turn it on there.
 `DIR/report.txt` names the card, driver, binary and job (RESULTS.md
 finding 146).
 

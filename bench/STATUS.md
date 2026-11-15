@@ -577,12 +577,18 @@ What binds each, on the 5070:
 
 - **`k_fill_atomic` is bound by L2 request rate, additive per request**
   (finding 148): side 1's time splits walk 16-21%, atomic 41-50%, store
-  29-43%; side 0's is 45-58% gate. More warps, cursor spacing and running fill
-  beside apply do not help (beside apply at greatest priority the two overlap
-  96% and apply slows from 9.5 to 17.0 ms: +28-30 ms/q of wall either way).
+  29-43%; side 0's is 45-58% gate. More warps and cursor spacing did not help.
+  Beside apply at greatest priority, with the full 4608-block grid, the two
+  overlap 96% but apply slows from 9.5 to 17.0 ms: +28-30 ms/q of wall. Finding 158 measured same-SM sharing
+  with 576/768 blocks: the extra fill costs +17–20 rather than +27–29 ms/q
+  at I16, and finding 159 the same with the placement controlled: the next
+  slab's side-1 fill beside this slab's side-1 apply would hide 6-7% of the
+  wall within a q, 8-9% with the q boundary too. Built within a q as
+  `--slab-fill-ahead` (finding 160): −7.2% at I16, −6.2 to −6.5% on C194 and
+  SNFS-301, at 512 blocks; on by default only on the 5070 (sm_120, 48 SMs);
+  the q boundary is not built (row 50).
   One launch for both tiers (`--fill-merge`) and the 5/7 gcd skip are what
-  landed (finding 150). No large fill win is left on this card; on the 3060
-  the fill grid is worth up to 19% (row 44).
+  landed (finding 150). On the 3060 the fill grid is worth up to 19% (row 44).
 - **`k_apply` is issue-bound** (~88%, findings 110-111), with the block
   tier's shared-memory atomics and the norm leading; occupancy was the cheap
   win there (finding 75, `__launch_bounds__(512, 3)`, three blocks per SM).
@@ -852,6 +858,8 @@ on 2026-11-10); the finding in `RESULTS.md` has the rest.
 | 47 | The transform's inverse in 2-bit windows | local GPU | **DONE 2026-11-10/11, finding 155; fat `bench/bench` `2c590187` installed 2026-11-11 09:54, Kyle's call** — `pl_transform_fast_try`'s exponentiation in fixed 2-bit windows over `{d, d^2, d^3}`, still branch-free (21-24% fewer montmuls per inverse by the parity of q's bit length), and `pl_redc`'s high word by `PL_MULHI32` (`__umulhi` on the device; nvcc's 64-bit compare made a montmul 9 instructions where 6 do). On the device only `k_transform` changes (inverse loop 23 SASS instructions per bit -> 29 per 2 bits; fat: sm_90 `k_transform<1>` REG 30 -> 34, untimed); on the host the per-q small-sieve tables run the same loop. Bit-identical by construction; eqv and devcheck on the same 92M inputs (hash-checked) 0 mismatches, 9 of 9 host mutants, abcheck 36 of 36, 40 timed runs byte-identical. Transform + plattice stage −8.3 to −10.5% (c143 −6.4%); per-q wall −1.0% c135 (every round), −1.3% C148, noise elsewhere; whole-process time by `/usr/bin/time` first read +0.5 to +4.6%, which was the host's wall-clock steps (CLOCK_REALTIME stepped back ~2.5 s every ~32 s until Kyle fixed the clock 2026-11-11). Rerun on the fixed clock, it follows the per-q wall: C148 −2.2% and c135 −1.4% (per-q wall −2.4% and −1.5%, every round), −0.5 to +0.1% elsewhere. The time outside the band is the same in both builds to 0.03 s. After Kyle's `/code-review`: `bench/xftest.cu` + `make xfcheck` (device == host, in `make check`), `pl_sel3`, stale comments fixed. On the card before the install: xfcheck 0 of 4 failed (9.7M transform inputs, device == host), and all 7 device-only mutants in `work/twin/xfmutants.py` caught. `work/twin/install_card.sh` then gated it: SASS and resources differ only in `k_transform`; abcheck 36/36; the c135 20000-q reference; kill -9 and clean-stop resumes; SNFS-301; make check. It installed it after those passed; `5512830e` is kept as `work/xdbl/bench.installed.154`. Work in `work/twin/` |
 | 48 | Row j = 0 can list a composite as a large prime | local GPU | **DONE 2026-11-11, finding 156; fat `bench/bench` `c23282d5` installed 2026-11-11 21:42, Kyle's call** — bucketed primes whose transformed root is projective (row divisor g = p > J) hit only row 0, and `k_transform` gives them an empty walk (its comment and its lost-positions counter both miss j = 0). Trial division at (±1, 0) never sees them, and `mz_split` writes the product of two of them as one prime because it is below lim². c135: 3 such relations in 38.2M unique (q 1.5M-9.3M), each written twice (row 0 gives at most 1 relation per q: 12 in ~530K q). CADO `dup2` aborts on them; msieve not checked. Fix: `k_intersect_compact` drops row 0 (≤ 1 relation per q); cofcheck's new row-0 case (`oracle/c135.job`, q 1866083) requires `--check-relations` to pass. Second pass after a code review: J > bkthresh refused for relation- or candidate-producing runs (rows p, 2p, ... have the same gap; no production shape uses it); the dropped points are counted, so the `--other-bits` CADO-comparable count matches dumpcmp again and a q whose only survivors are row 0 is empty rather than fatal; cofcheck pins the row-0 case's cofactoriser and adds a J = 1 case and the J guard. Gated in `work/row0/` (card2.txt, gate.txt). An install also moves the compiler (CUDA 13.4 → 13.5, apt 2026-11-11): same-source A/B byte-identical, per-q wall within noise (mean −0.6 to +0.4% by job). Install gate passed 2026-11-11 20:41 (second pass); installed 21:42, `2c590187` kept as `work/twin/bench.installed.155` |
 | 49 | A shorter J, priced as time to a filterable matrix (c135) | local GPU | **DONE 2026-11-11, finding 157; J=4096 stays** — each J sieved until CADO's purge reaches the cado-gpu run's target (excess ≥ 3% of columns after singletons): J=3072 +5.9% process time (+4.9% q-loop), J=2048 +12.7% (+9.7%), for about the same relations (+0.3%, +1.7%) taken to q 12.4M and 15.8M instead of 10.2M. Side result: bench needs at least ~10% more unique relations than las-glas for the same target (41.0M bisected, against las's 37.1M from a run that ended past the target) |
+| 50 | Co-residency: confine an L2-bound kernel to part of each SM, with apply beside it | local GPU, `nsys` | **TESTED 2026-11-13 and 14, findings 158 and 159: the pairing is worth 8-9% of the wall at I16, not the 10-20% proposed. BUILT 2026-11-14 within a q, Kyle's go-ahead, finding 160: `--slab-fill-ahead`, −7.2% on the NFS@Home I16 job (−9.2 ms/q), −6.5% C194, −6.2% SNFS-301, grid 512 x 32; relations byte-identical through every gate; +1.02 GB VRAM; `bench/bench` `0d2bce51` (sm_120 only, `GPU_ARCH=120`) installed 2026-11-15 09:00, Kyle's call (`work/fillahead-slab/`). On by default only on sm_120 with 48 SMs, the RTX 5070 (Kyle's call), off elsewhere; its grid scales with the SM count, and `bench/tune.sh` times it on other cards. Code review 2026-11-14: no fault, ten findings: six fixed, three in part (the row tier kept out of the default; a check and a note on the release, its own event left for the q boundary; the grid resolved once) and one, a helper shared with `--fill-ahead`, left for the q boundary (finding 160); the fixes and the default built and gated on the card 2026-11-15, every gate passed, the default -7.0% on the I16 job against the installed binary (finding 160, "Gates on the final tree"). Fable's review the same day: the grid's stated reason corrected, trial division's move recorded, a q/slab tag on the fill in flight and its own stage-table line added, gates rerun on the final tree (finding 160, "Review"). Next: one trace, then the q boundary (the note below)** — `work/coresid-20261113/`: same-SM sharing measured on all 48 SMs; sampled apply blocks sharing with fill rise from 3.1% at 4608 blocks to 35.3%/32.9% at 576/768. At I16 the extra production-copy fill costs +17–20 ms/q at the smaller grids against +27–29 at 4608, about 9 ms/q better; the proposed +8–12 is not reached with normal apply allocation. Shaping itself costs: serial extra fill +46.7/+38.7 at 576/768 against +29.8 at 4608. Corrected two-block control uses 36864 B (45056 leaves insufficient shared memory for 12/16 fill blocks); it hides more extra fill but its slower baseline loses on total wall time. Default priority gives back most of the gain. Old scratch kernel confirms the direction. Three main rounds plus two quiet-card confirmation rounds; a fourth main round affected by YouTube is retained but excluded. 91 relation comparisons identical, zero scratch overflows. No production code changed. Next candidate: side-1 resieve with one block per SM beside the next apply, using existing buffers; a second bucket array remains a separate design. The 10–20% wall estimate is unproved. **Finding 159, 2026-11-14 (`work/coresid2-20261113/`), supersedes the estimates in finding 158's review:** the extra side-1 fill beside side 1's apply hides 10.5-11.9 ms/q of fill (8.2-9.3% of the wall; ser4608 +29.1, the paired arms +17.1 to +19.0), about the same however it is placed, three sessions. A fill placed first keeps the apply off the card (pair 16.5 ms, serial), so the head start was the wrong order. In about two launches in three another kernel has the card when side 1's fill ends, and the priority fill takes its room two slots an SM as it leaves; no block shape prevents that. Holding the fill 1 ms gives one slot an SM in 24-26 launches of 31 and takes the median pair from 13.36 to 12.65 ms, but only 0.6-1.3 ms/q off the wall: pair spans overstate the wall gain. **The build this prices:** `--fill-ahead` for slabbed plans, the next slab's side-1 fill at 768 x 32 or 48 x 512 on a greatest-priority stream, released about 1 ms into this slab's side-1 apply, into a second bucket array (0.90 GB at I16). Within a q that is three slabs of four, 6-7% of the wall; 8-9% if the next q's first fill also runs beside this q's last side-1 apply. Not measured: the chain actually reordered, side 0, other jobs. The staggered chain with a second bitmap and the resieve pairing are unpriced; expect the same ceiling (two kernels on an SM ran at about 1.3x one, not 1.5x) |
+| 51 | The sieve region's shape: a J cap per special-q by lattice shape (CADO's `-adjust-strategy 0`), or cut corners | relation files only | **measured 2026-11-09 and 2026-11-13, small; closed** — `work/jshape/`. The J cap was first priced on 2026-11-09 (`jshape.txt`, before finding 157's runs): at c135 a cap by the reduced basis' length ratio keeps about 2 points more relations than a uniform J cut of the same area (88% of the area: 96.1% against 94.4%), and at the NFS@Home I16 job every basis ratio is 1.01-1.09, so a cap removes nothing. Added 2026-11-13 on finding 157's J=4096 relations (`c135.txt`, units at q 1.7M and 9.5M, which agree): relations crowd the origin in every lattice, the lowest eighth of rows by the central eighth of columns at 5.8-6.0x the mean density and the top eighth of rows at 0.43-0.51x; yet the best region of any shape, chosen per lattice shape from the measured density, also keeps only about 2 points more than the uniform cut (90% of the area: 97.1% against 95.2%; for 95% of the relations, 85% of the area against 89.5%). Finding 157 priced the uniform cut at +5.9% at 75% of the area, so no shape turns that into a gain worth building |
 
 **On (6).** The barrier keeps `k_cof_enqueue`'s device work inside the
 host-timed `tm.cofac` bucket. Removing it could overlap only the small enqueue
@@ -859,6 +867,150 @@ tail against later host preparation -- it cannot reclaim the 0.583 ms
 `k_cof_enqueue -> k_transform` gap, which *starts* after that kernel finishes
 and is the q boundary with the GPU already empty. Not worth disturbing the
 accounting.
+
+**On (50): the build finding 159 prices, for whoever writes it.** Fill ahead
+on plans of several slabs per q. Within a q, slab n+1's side-1 fill runs
+beside slab n's side-1 apply. Written from the probe and a read of
+`pipeline.cuh`, not from a prototype. Read against the code the same day
+before the build started: item 4, the launch rule on going first, the
+trial division and the 5/7 skip below are corrected or added then.
+
+*Built the same day, within a q (finding 160):* `--slab-fill-ahead`, opt-in.
+−7.2% on this job, above the 6-7% expected. Trial division did move (its
+wall 100 -> 84 ms/q, rank scan doubled, classify a third), but the gain
+was not lost to it. Three departures from the note: the grid is 512 x 32,
+not 768 (512 beat 768 by 1.2-1.9 ms/q in every round: from 384 up the fill
+finishes inside a slab and the wall follows the apply's total, which grows
+with the fill's share of each SM, so the right grid is a count of slots per
+SM and 512 is tuned for 48); there is no hold, so the fill is released
+~50 us after the apply starts; and the 5/7 skip stays on, worth 2 ms/q
+beside the option too. The q boundary (*Then the q boundary*, below) is the
+next stage, not built: take one trace first (finding 160, "Trial division
+moved"), and build it as one mechanism with the one-slab `--fill-ahead`,
+its release on a "workspace free" event of its own.
+
+*The chain.* Today `st_sv` carries, per slab, side 1's fill and apply, side
+0's fill and apply, then that slab's intersection and record scan, then the
+next slab (`issue_ahead`). In the build, at the point where slab n+1 is
+issued:
+
+- side 1's apply for slab n+1 goes on `st_sv`, waiting on its ahead fill's end
+  event, as `PIPE_PART_APPLY` waits on `fa_t1` now;
+- slab n+2's side-1 fill goes on the ahead stream into the other workspace
+  (`PIPE_PART_FILL`), released by an event recorded on `st_sv` immediately
+  ahead of that apply's launch;
+- side 0's fill and apply for slab n+1 follow on `st_sv` as now, into slab
+  n+1's workspace.
+
+A q's first slab fills serially as today and its last slab issues no ahead
+fill, until the q boundary is done (below).
+
+*What it needs.*
+
+1. **A second bucket workspace**, owned per slab where the one-slab
+   `--fill-ahead` owns one per q (`ws[2]`, `use_ws`, `ws_free`). The ahead
+   fill writes the workspace slab n used, so slab n's record scan must be
+   done with it. It is queued on `st_sv` ahead of slab n+1's apply, so a
+   release tied to that apply is behind it; state it with an event as
+   `ws_free` does. 0.90 GB at I16.
+2. **A fourth side-1 walk-cursor buffer.** Live at once: slab n's starting
+   cursors (its trial division's resieve), slab n+1's, slab n+2's (the ahead
+   fill's input) and the ahead fill's output. `pside_rotate_walk` turns
+   three. 8 B an entry, 0.13 GB at I16. Side 0's are unchanged.
+3. **Nothing else.** One survivor bitmap a side still (the apply for slab n+1
+   runs after slab n's intersection in `st_sv`'s order), side 0's record
+   index untouched, no transform set added within a q.
+4. **No row tier at I16.** `--fill-rows` defaults to 0 above logI 15
+   (`bench_main.cu`), so the slabbed plans this is for (the NFS@Home I16
+   job, C194, SNFS-301) launch only the walk, `k_fill_atomic`, which is what
+   the probe duplicated. Only an explicit `--fill-rows` on a slabbed plan
+   puts `k_fill_rows` and `k_rows_walk_next` into the ahead fill, unmeasured
+   beside the apply. (Corrected 2026-11-14; this item first said the row
+   tier went with every ahead fill.)
+
+*The ahead fill's launch.* Each of these is a measured way to lose:
+
+- **Greatest priority, on a stream of its own** (as `st_rs`). At default
+  priority it waits behind the apply's undispatched blocks: +38 to +40 ms/q
+  for the extra fill against +29 serial (finding 158).
+- **768 x 32 for the walk, not `fblocks`.** At 4608 blocks it holds every
+  block slot and the apply stops (finding 148). 576 is no better than 768.
+- **Not on the card before the apply.** Release it when the kernel ahead of
+  the apply on `st_sv` ends, not earlier. An event recorded on `st_sv` just
+  ahead of the apply does this by itself: the apply follows in stream order
+  (~3.5 us) and the fill's wait on another stream's event costs ~51 us
+  (finding 133), ovl768's order, which is the one the 10.5 ms/q was measured
+  on. The case against going first is weaker than this note first said. In
+  dly768's six launches with the fill placed first, the apply was kept off
+  for the fill's whole life, but finding 159 did not separate that from its
+  wait kernel overrunning. In head768 the fill went first in 19 launches; the
+  apply came on 0.4-0.8 ms later, and the arm timed as ovl768 did (+18.28
+  against +18.45 ms/q). Going first gains nothing either way.
+- Two knobs worth having, neither needed for the first measurement: a hold of
+  about 1 ms after that release (worth about 1 ms/q in the probe; there it is
+  a one-thread timed-wait kernel on the fill's stream, `k_probe_delay` in
+  `work/coresid2-20261113/src/`), and the 48 x 512 shape with 33,280 B of
+  dynamic shared memory a block.
+
+*What to expect, NFS@Home I16* (the command in
+`work/coresid2-20261113/run.py`: 60 q from 297000000, 127.6 ms/q installed,
+quiet card). Three pairs a q at 2.6-3.0 ms each: −8 to −9 ms/q, 6-7%. The
+probe could not see two things. The boundary ahead of the apply is no
+longer side 1's 4608-block fill, so the kernel that held the card there in
+two launches of three may be absent, or a different one may be present. And
+the probe added a fill where the build moves one, so the rest of the chain
+shifts.
+
+The likeliest of those is the previous slab's trial division. In finding
+158's base trace (`work/fillahead-slab/tdoverlap.py`, `tdoverlap.txt`; 40
+slabs), its kernels run 1.0 ms inside each side-1 fill and 1.5-1.9 ms inside
+each side-1 apply. The build takes that fill off the chain, and the host
+queues the trial division as the pair starts (it waits on `eisect`, the event
+ahead of the apply). So up to about 1 ms a slab of trial division lands
+beside the pair, against 2.6-3.0 ms hidden. If the build measures under about
+4%, look there and at the placement: `prepare_diag.py` there adds a block
+sampler to the fill and to `k_apply`, and `placement.py` and `early.py` say
+per launch whether the fill sat one slot an SM and whether the apply was at
+full rate when it arrived.
+
+Time it with and without `--no-fill-skip57` as well. The 5/7 skip is on by
+default at several slabs per q because the fill is on the sieve chain there
+(`pipe_fill_skip57`), and finding 148 measured it costing +0.8 to +1.0% on
+C135 and C143, where a fill already runs beside the chain. The build takes
+three of the four side-1 fills off the chain; side 0's stay on it, and the
+option is one setting for both.
+
+*Then the q boundary.* The next q's first side-1 fill beside this q's last
+side-1 apply: the last quarter, another 2.6-3.0 ms/q (8-9% in all). It needs
+the next q prepared a slab earlier and a third transform set a side, which
+one-slab fill ahead already has.
+
+*Gates.* Relations byte-identical, with finding 123's set: `abcheck.sh` with
+and without the option, `growfail.sh`, tdskip (a slab skipped for bucket
+overflow with an ahead fill already issued must drain as a
+prepared-but-not-issued q does), `degradecheck.sh`, `skipcheck.sh`,
+`fillcheck.sh`, `make check`, and kill -9 and clean-stop resumes with an
+ahead fill in flight. Off, not refused, when the second array and the fourth
+cursor buffer do not fit (+1.03 GB at I16).
+
+*Other jobs, guesses only; everything above is one job on the 5070.*
+
+- **C194 and SNFS-301 (I16, four slabs):** side 1's walk fill costs the same
+  28-29 ms/q there as here (finding 148's overlap arms) on walls of 142 and
+  148.5, so about the same milliseconds and 7-8% with the q boundary.
+- **More slabs per q** (larger J, I17): more of the pairs are within a q,
+  seven of eight at eight slabs, so the first build alone gets closer to the
+  full figure.
+- **One-slab plans (I15 and below)** already have fill ahead: c135 −6.3%,
+  C143 −7.0%, c183 −1.3% (finding 123). Its ahead fill is the full grid at
+  default priority, released without regard to the apply. At c135 and C143
+  it won by filling idle gaps, the kernels are about a millisecond, and I
+  expect little more. c183's −1.3% is the one to look at: its kernels are
+  long enough to need the SM sharing that a full-grid fill cannot do. The
+  launch rules above applied to the existing one-slab code are a change of
+  launch parameters, and the cheapest experiment in this note.
+- **Other cards:** not transferable without measuring. The 3060's best fill
+  grid is four times the 5070's (finding 149).
 
 **Provenance.** Items 1-4 and 6 came out of an outside review of this repo on
 2026-09-03 and two rounds of correction. The review was right about the three

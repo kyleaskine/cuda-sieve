@@ -207,6 +207,13 @@ typedef struct {
     plat_t   *plat_alt;
     uint32_t *rowrt_alt;
     uint64_t *walk_spare;
+    /* --slab-fill-ahead, side 1 only: the fourth walk-cursor buffer. The
+     * next slab's fill runs ahead, beside this slab's apply, so four are
+     * live: the previous slab's start (its TD), this slab's start (its TD,
+     * next), this slab's output (the ahead fill's input) and the ahead
+     * fill's output, which is walk_x. pside_rotate_walk turns four when it
+     * is set. NULL otherwise. */
+    uint64_t *walk_x;
     uint32_t *survbits;
     uint8_t  *logp;             /* each entry's log, which fill writes into its bucket records */
     uint32_t *sp, *srt, *sg;
@@ -281,6 +288,7 @@ static void pside_free(pside_t *S)
     cudaFree(S->walk_cur); cudaFree(S->walk_next);
     cudaFree(S->rowrt);
     cudaFree(S->plat_alt); cudaFree(S->rowrt_alt); cudaFree(S->walk_spare);
+    cudaFree(S->walk_x);
     cudaFree(S->survbits); cudaFree(S->logp);
     cudaFree(S->sp); cudaFree(S->srt); cudaFree(S->sg); cudaFree(S->slp);
     cudaFree(S->smag);
@@ -310,12 +318,26 @@ static void pside_swap_alt(pside_t *S)
  * next q's first) starts from this slab's output cursor and writes into the
  * spare, while the cursor this slab started from stays with its trial
  * division. The caller takes TD's view of the side BEFORE turning them. The
- * single-queued advance is the two-buffer swap in run_pipeline_impl. */
+ * single-queued advance is the two-buffer swap in run_pipeline_impl.
+ *
+ * Under --slab-fill-ahead (walk_x set) the next slab's fill has already run,
+ * from walk_next into walk_x, so four turn: (cur, next, x, spare) becomes
+ * (next, x, spare, cur). The new walk_cur is the next slab's start, walk_next
+ * its output (complete or being written by its ahead fill), walk_x the buffer
+ * the slab after it fills into (the previous slab's start, whose TD is done
+ * by every issue point), and walk_spare this slab's start, for its TD. At the
+ * q boundary the same turn leaves walk_cur, which the next q's k_transform
+ * writes, on this slab's output, which nothing reads once the q is over. */
 static void pside_rotate_walk(pside_t *S)
 {
     uint64_t *const started = S->walk_cur;
     S->walk_cur = S->walk_next;
-    S->walk_next = S->walk_spare;
+    if (S->walk_x) {
+        S->walk_next = S->walk_x;
+        S->walk_x = S->walk_spare;
+    } else {
+        S->walk_next = S->walk_spare;
+    }
     S->walk_spare = started;
 }
 
@@ -1177,6 +1199,21 @@ done:
  * every blocking stream, so join(1) used to wait for side 0 as well. Now each
  * join waits for its own side only; the callers join both sides before using
  * either, which is all they relied on. */
+/* TEST-ONLY (0 everywhere else): every Nth side-1 join of the process
+ * reports a one-record bucket overflow, so the slab-skip path runs on a real
+ * job at slabs of its choosing. No natural lever reaches it (degradecheck.sh
+ * says why). The count is in join order, which every arm of one binary shares,
+ * so arms of a test build compare against each other: under --slab-fill-ahead
+ * the skipped slab's apply has the next slab's fill beside it, still in
+ * flight. Set through DEFS, so a build that sets it is marked a pricing build
+ * and can be compared on --candidates only. */
+#ifndef PIPE_TEST_OVF_EVERY
+#define PIPE_TEST_OVF_EVERY 0
+#endif
+#if PIPE_TEST_OVF_EVERY
+static unsigned long long g_test_ovf_joins = 0;
+#endif
+
 static int pipe_side_sieve_join(int side, pside_t *S,
                                 float *t_fill, float *t_apply,
                                 int concurrent_join)
@@ -1196,7 +1233,12 @@ static int pipe_side_sieve_join(int side, pside_t *S,
     *t_apply = time_kernel(S->ev[2], S->ev[3]);
     S->nsurv = S->h_rb->nsurv;
     {
+#if PIPE_TEST_OVF_EVERY
+        const uint32_t hov = S->h_rb->overflow ? S->h_rb->overflow
+            : (side == 1 && ++g_test_ovf_joins % (PIPE_TEST_OVF_EVERY) == 0) ? 1u : 0u;
+#else
         const uint32_t hov = S->h_rb->overflow;
+#endif
         if (hov) {
             /* SOFT failure: rc = 1, not -1. Dropped bucket records can only
              * LOWER a position's log sum, so an overflow costs survivors it
@@ -2515,6 +2557,26 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * of it on st_sv: the device's greatest priority, so the scan's blocks
      * go ahead of the apply's undispatched ones instead of into its tail */
     cudaStream_t st_rs = 0;
+    /* --slab-fill-ahead (STATUS row 50), plans of several slabs per q: each
+     * slab's side-1 fill after the q's first runs on st_sfa, at the device's
+     * greatest priority, beside the previous slab's side-1 apply. The two
+     * workspaces are ws[] and the fill's events fa_t0/fa_t1, which
+     * --fill-ahead owns on one-slab plans and never has on these (both are
+     * never granted together). Slabs alternate between the workspaces in
+     * issue order: sv_ws is the slab last issued on st_sv; sfa_next the
+     * workspace the next slab's fill ran ahead into, while that slab is not
+     * yet issued (-1: none in flight); sv_sfa the same for the slab last
+     * issued, read at its join (-1: it filled on st_sv). A fill in flight
+     * carries the q and slab it was made for: sv_qseq counts side-1 issues
+     * of slab 0, so a fill left over from an abandoned q, or consumed by the
+     * wrong slab, is an internal error instead of the wrong buckets applied. */
+    int sfa = 0;                /* granted */
+    cudaStream_t st_sfa = 0;
+    int sv_ws = 1, sfa_next = -1, sv_sfa = -1;
+    unsigned long long sv_qseq = 0, sfa_qseq = 0;
+    uint32_t sfa_slab = 0;
+    int sfa_blocks = 0;         /* its grid, x FILL_THREADS_DEFAULT; resolved once */
+    unsigned long long n_slab_fill_ahead = 0;
     uint8_t  *d_bucket_fa = NULL;
     uint32_t *d_cursor_fa = NULL, *d_overflow_fa = NULL;
     pbkt_t ws[2];
@@ -2561,6 +2623,12 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * derived, not accumulated separately, so the printed total and its three
      * children cannot drift apart. */
     double acc_tr = 0, acc_fi = 0, acc_ap = 0;
+    /* --slab-fill-ahead's fills, which run beside the previous slab's side-1
+     * apply: their own line, outside "sieve, both sides", which would
+     * otherwise count the overlapped time in full (141 ms/q of sieve inside a
+     * 116 ms wall at I16). Banked per q from a per-q local (tsfa), so a q
+     * rolled back never reaches it. */
+    double acc_sfa = 0;
     /* --fill-concurrent only: fill and apply are still measured PER SIDE, and
      * under concurrency those two spans OVERLAP, so their sum exceeds the wall
      * time the pair actually took. Left uncorrected the band report showed
@@ -3177,6 +3245,117 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     } else {
         runlog_note("resieve-scan", "off");
     }
+    /* --slab-fill-ahead: a second bucket array, its cursors and overflow
+     * word, a fourth side-1 walk-cursor buffer, a stream of the greatest
+     * priority and two pairs of timing events. After --resieve-scan, so the
+     * options already measured keep their claim on the memory. Off, not
+     * refused, when it cannot run, like --fill-ahead. It asks for twice the
+     * usual margin: what is allocated after it (trial division's buffers grow
+     * at the first q, fatally if that fails) has only the margin left, and an
+     * optional claim should not be what takes it. That growth was 0.03 GB at
+     * I16 on the NFS@Home job, against 0.5 GB of margin.
+     *
+     * Its grid: SLAB_FILL_BLOCKS_DEFAULT per SLAB_FILL_DEFAULT_SMS SMs, scaled
+     * by this card's count, since it is a count of slots per SM (finding 160);
+     * --slab-fill-blocks overrides. */
+    if (cfg->slab_fill_ahead > 0) {
+        char why[160] = "";
+        const size_t extra = need + (size_t)nregion_alloc * 4 + 4 +
+                             (size_t)S1.nfb * sizeof(uint64_t);
+        int sdev = 0, nsm = 0;
+        if (!SLABBED) {
+            snprintf(why, sizeof why, "this plan has one slab per q (that is"
+                     " --fill-ahead's)");
+        } else if (!qpipe) {
+            snprintf(why, sizeof why, "the pipeline is single-queued");
+        } else if (fa) {
+            /* never: --fill-ahead is one slab's. Kept as a check, because
+             * issue_side1 and the record scan's stream assume it (below). */
+            snprintf(why, sizeof why, "--fill-ahead is on too (internal)");
+        } else if (cudaGetDevice(&sdev) != cudaSuccess ||
+                   cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount,
+                                          sdev) != cudaSuccess || nsm <= 0) {
+            cudaGetLastError();
+            snprintf(why, sizeof why, "the card's SM count could not be read");
+        } else {
+            size_t f5 = 0, t5 = 0;
+            PIPE_CK(cudaMemGetInfo(&f5, &t5));
+            if (extra + 2 * (size_t)PIPE_VRAM_MARGIN > f5)
+                snprintf(why, sizeof why, "it needs %.2f GB more, with twice the"
+                         " usual margin, and %.2f GB is free",
+                         extra / 1073741824.0, f5 / 1073741824.0);
+        }
+        if (!why[0]) {
+            /* as for --q-pipeline: a failure after the check passed falls
+             * back instead of failing the band */
+            cudaError_t e = cudaMalloc(&d_bucket_fa, need);
+            if (e == cudaSuccess) e = cudaMalloc(&d_cursor_fa, (size_t)nregion_alloc * 4);
+            if (e == cudaSuccess) e = cudaMalloc(&d_overflow_fa, 4);
+            if (e == cudaSuccess)
+                e = cudaMalloc(&S1.walk_x, (size_t)S1.nfb * sizeof(uint64_t));
+            if (e == cudaSuccess) {
+                int pri_least = 0, pri_greatest = 0;
+                e = cudaDeviceGetStreamPriorityRange(&pri_least, &pri_greatest);
+                if (e == cudaSuccess)
+                    e = cudaStreamCreateWithPriority(&st_sfa, cudaStreamNonBlocking,
+                                                     pri_greatest);
+            }
+            for (int w = 0; w < 2 && e == cudaSuccess; w++) {
+                e = cudaEventCreate(&fa_t0[w]);
+                if (e == cudaSuccess) e = cudaEventCreate(&fa_t1[w]);
+            }
+            if (e != cudaSuccess) {
+                cudaGetLastError();
+                cudaFree(d_bucket_fa);   d_bucket_fa = NULL;
+                cudaFree(d_cursor_fa);   d_cursor_fa = NULL;
+                cudaFree(d_overflow_fa); d_overflow_fa = NULL;
+                cudaFree(S1.walk_x);     S1.walk_x = NULL;
+                if (st_sfa) { cudaStreamDestroy(st_sfa); st_sfa = 0; }
+                for (int w = 0; w < 2; w++) {
+                    if (fa_t0[w]) { cudaEventDestroy(fa_t0[w]); fa_t0[w] = NULL; }
+                    if (fa_t1[w]) { cudaEventDestroy(fa_t1[w]); fa_t1[w] = NULL; }
+                }
+                snprintf(why, sizeof why, "allocating it failed (%s)",
+                         cudaGetErrorString(e));
+            }
+        }
+        if (why[0]) {
+            printf("  --slab-fill-ahead: off, because %s\n", why);
+            runlog_note("slab-fill-ahead", "off: %s", why);
+        } else {
+            sfa = 1;
+            sfa_blocks = cfg->slab_fill_blocks ? cfg->slab_fill_blocks
+                : (int)(((long long)SLAB_FILL_BLOCKS_DEFAULT * nsm +
+                         SLAB_FILL_DEFAULT_SMS / 2) / SLAB_FILL_DEFAULT_SMS);
+            if (sfa_blocks < 1) sfa_blocks = 1;
+            printf("  --slab-fill-ahead: each later slab's side-1 fill beside the"
+                   " previous slab's side-1 apply, %d x %d at the greatest"
+                   " priority%s; a second bucket array and a fourth side-1"
+                   " walk-cursor buffer (%.2f GB)%s\n", sfa_blocks,
+                   FILL_THREADS_DEFAULT,
+                   cfg->slab_fill_blocks ? " [--slab-fill-blocks]" : "",
+                   extra / 1073741824.0,
+                   cfg->slab_fill_default ? "; this card's default" : "");
+            if (cfg->fill_rows)
+                printf("  --slab-fill-ahead: the row tier (--fill-rows %d) runs at"
+                       " its own full grid in the ahead fill, not confined; not"
+                       " timed\n", cfg->fill_rows);
+            runlog_note("slab-fill-ahead", "on%s, %d x %d on %d SMs, +%.2f GB",
+                        cfg->slab_fill_default ? " (this card's default)" : "",
+                        sfa_blocks, FILL_THREADS_DEFAULT, nsm,
+                        extra / 1073741824.0);
+            VRAM_MARK("slab fill-ahead bucket array");
+        }
+    } else if (cfg->slab_fill_default && SLABBED && qpipe) {
+        /* where it could run: say why it does not, and how to try it */
+        printf("  --slab-fill-ahead: off, this card's default: on by default"
+               " only on sm_120 with %d SMs (the RTX 5070) and no row tier,"
+               " where it was timed; --slab-fill-ahead to use it, bench/tune.sh"
+               " to time it\n", SLAB_FILL_DEFAULT_SMS);
+        runlog_note("slab-fill-ahead", "off: this card's default");
+    } else {
+        runlog_note("slab-fill-ahead", "off");
+    }
 #undef VRAM_MARK
     /* Name the fill knobs in the banner: a knob the log does not show is one
      * a reader cannot prove was live. */
@@ -3459,6 +3638,73 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                                              cfg->fill_gate ? S1.survbits : NULL,
                                              d_gate);
     };
+    /* --slab-fill-ahead: slab sl's side-1 fill, on st_sfa into the workspace
+     * the slab just issued on st_sv is not using, released by S1.ev[2]. The
+     * issue just made recorded that on st_sv immediately ahead of its side-1
+     * apply, so this fill reaches the card ~50 us after the apply does (a
+     * wait on another stream's event, finding 133): the order finding 159
+     * measured, where a fill on the card first gained nothing. Everything
+     * that read the workspace before -- the slab two back, its side-1 apply,
+     * side-0 fill and apply and record scan -- is ahead of that event on
+     * st_sv. The fill reads the cursors the issued slab's fill wrote
+     * (walk_next) and writes walk_x, which the next issue point's turn makes
+     * sl's walk_next; a copy of the side carries the two pointers, since
+     * pipe_side_sieve_issue's fill reads them from it and writes nothing
+     * back. The grid is confined (sfa_blocks, resolved at the grant): at the
+     * full one it takes every block slot the apply frees (findings 148, 158).
+     * Its blocks are FILL_THREADS_DEFAULT wide whatever --fill-threads says,
+     * the only shape timed; wider ones would undo the confinement.
+     *
+     * The release on S1.ev[2] stands in for "the workspace is free". That
+     * holds because the workspace's last reader, slab s-1's record scan, is
+     * on st_sv ahead of it, which holds because the early side-1 apply that
+     * moves the scan to st_rs (early1) needs --fill-ahead, never granted with
+     * this. Building the q boundary means a workspace-free event of its own
+     * (as ws_free is for --fill-ahead), and one helper for both ahead fills
+     * (STATUS row 50; the code review of 2026-11-14). */
+    auto slab_fill_ahead = [&](uint32_t sl) -> int {
+        const int w = sv_ws ^ 1;
+        pbkt_t b = ws[w];
+        b.stream = st_sfa;
+        pside_t Sx = S1;
+        Sx.walk_cur = S1.walk_next;
+        Sx.walk_next = S1.walk_x;
+        const pipe_part_t p = { PIPE_PART_FILL, S1.ev[2], fa_t0[w], fa_t1[w] };
+        const int r = pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1,
+                I * slab_rows_at(slab_plan, cfg->J, sl), slab_jbase_at(slab_plan, sl),
+                &b, sfa_blocks, FILL_THREADS_DEFAULT, &Sx, NULL, NULL, &p);
+        if (!r) { sfa_next = w; sfa_qseq = sv_qseq; sfa_slab = sl; }
+        return r;
+    };
+    /* Side 1 of slab sl on st_sv. Under --slab-fill-ahead: into the next
+     * workspace in turn, only its apply when its fill ran ahead (waiting on
+     * that fill's end), and then the next slab's fill ahead beside it.
+     * Otherwise issue_side(1), with --fill-ahead's part as given. */
+    auto issue_side1 = [&](uint32_t sl, uint32_t xm, uint32_t jb,
+                           const pipe_part_t *part) -> int {
+        if (!sfa) return issue_side(1, xm, jb, part);
+        if (part) {
+            /* --fill-ahead's apply part: never granted with this (above) */
+            fprintf(stderr, "  internal error: slab %u's side 1 was issued with"
+                    " --fill-ahead's part under --slab-fill-ahead\n", sl);
+            return -1;
+        }
+        if (sl == 0) sv_qseq++;
+        sv_ws ^= 1;
+        use_ws(sv_ws);
+        sv_sfa = sfa_next;
+        sfa_next = -1;
+        if (sv_sfa >= 0 && (sv_sfa != sv_ws || sfa_qseq != sv_qseq || sfa_slab != sl)) {
+            fprintf(stderr, "  internal error: a side-1 fill ran ahead for q #%llu"
+                    " slab %u into workspace %d, and the issue is q #%llu slab %u"
+                    " in %d\n", sfa_qseq, sfa_slab, sv_sfa, sv_qseq, sl, sv_ws);
+            return -1;
+        }
+        const pipe_part_t ap = { PIPE_PART_APPLY, sv_sfa >= 0 ? fa_t1[sv_sfa] : NULL,
+                                 NULL, NULL };
+        if (issue_side(1, xm, jb, sv_sfa >= 0 ? &ap : NULL)) return -1;
+        return sl + 1 < slab_plan->nslab ? slab_fill_ahead(sl + 1) : 0;
+    };
     /* --fill-ahead: a just-prepared q's side-1 fill into workspace w, on
      * st_fa behind its transforms, once w's previous owner is done with it
      * (ws_free). S1 must point at that q's transform set. */
@@ -3493,10 +3739,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (fa) { use_ws(cur_ws ^ 1); use_set(spec_tset); }
         /* `sides`: 1 and 2 are side 1 and side 0 alone, for --fill-ahead's
          * early side-1 apply; 3 both */
-        if (((sides & 1) && issue_side(1, xm, jb, spec_fa >= 0 ? &ap : NULL)) ||
+        if (((sides & 1) && issue_side1(sl, xm, jb, spec_fa >= 0 ? &ap : NULL)) ||
             ((sides & 2) && issue_side(0, xm, jb))) {
             cudaStreamSynchronize(st_sv);
             if (st_fa) cudaStreamSynchronize(st_fa);
+            if (st_sfa) cudaStreamSynchronize(st_sfa);
             return -1;
         }
         if ((sides & 1) && spec_fa >= 0) n_fill_ahead++;
@@ -3507,6 +3754,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         const qsel_t *cur;
         qlat_t Lq;
         float ts1[3] = {0,0,0}, ts0[3] = {0,0,0}, tis = 0, trs = 0;
+        float tsfa = 0;   /* --slab-fill-ahead's fills this q, beside applies */
         double th1 = 0, th0 = 0, qwall = host_ms(), tv = 0;
         double hspan0 = 0, hreg = 0, prologue_q = 0;
         /* Per-q locals for the same reason prologue_q is one: the
@@ -3897,6 +4145,15 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     if (pipe_td_advance_small(&C, rows, blocks, cfg->threads))
                         return -1;
                     if (!rotated) {
+                        /* --slab-fill-ahead needs --q-pipeline, which turns
+                         * the cursors at every issue point; a swap here
+                         * would put the ahead fill's output out of turn */
+                        if (S1.walk_x) {
+                            fprintf(stderr, "  internal error: slab %u advanced"
+                                    " without its issue point's turn under"
+                                    " --slab-fill-ahead\n", sl);
+                            return -1;
+                        }
                         std::swap(S1.walk_cur, S1.walk_next);
                         std::swap(S0.walk_cur, S0.walk_next);
                     }
@@ -3913,6 +4170,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             const uint32_t xmax = I * J_here;
             const uint32_t nbitword = xmax >> 5;
             float sf1 = 0, sa1 = 0, sf0 = 0, sa0 = 0;
+            float sfa1 = 0;      /* --slab-fill-ahead: this slab's ahead fill */
+            int sfa_used = 0;
             uint32_t hn_s = 0, nacc_s = 0;
             double td_start, tv_before, cf_start, join_start;
 
@@ -4104,6 +4363,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                         const cudaError_t ef = cudaStreamSynchronize(st_fa);
                         if (e == cudaSuccess) e = ef;
                     }
+                    if (st_sfa) {
+                        const cudaError_t ef = cudaStreamSynchronize(st_sfa);
+                        if (e == cudaSuccess) e = ef;
+                    }
                     fprintf(stderr, "  q=%llu: the error above surfaced while"
                             " preparing the next q, with this q's last slab"
                             " still sieving (%s); either may be its source\n",
@@ -4149,6 +4412,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * and fills), so the unwind frees nothing still in use. */
                 cudaStreamSynchronize(st_sv);
                 if (st_fa) cudaStreamSynchronize(st_fa);
+                if (st_sfa) cudaStreamSynchronize(st_sfa);
                 const cudaError_t e = cudaStreamSynchronize(0);
                 fprintf(stderr, "  q=%llu slab %u: the error above surfaced while"
                         " preparing the next q under this slab's trial division"
@@ -4169,6 +4433,13 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * apply waited on its end, so both events are complete */
                 if (sv1 >= 0 && q_fa >= 0)
                     sf1 += (float)time_kernel(fa_t0[q_fa], fa_t1[q_fa]);
+                /* --slab-fill-ahead: on st_sfa beside the previous slab's
+                 * apply; read now, while its events are this slab's, and
+                 * banked apart (tsfa) with the slab's other times below */
+                if (sv1 >= 0 && sv_sfa >= 0) {
+                    sfa1 = (float)time_kernel(fa_t0[sv_sfa], fa_t1[sv_sfa]);
+                    sfa_used = 1;
+                }
                 /* Side 1 failing hard is not a reason to call into a sticky
                  * error again and have it blamed on side 0. Drain the stream
                  * so `done:` frees nothing a kernel is still writing. */
@@ -4217,9 +4488,14 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * is a real divergence that the relations-identity gate cannot
                  * see, so it is recorded rather than papered over. */
             } else {
-                sv1 = issue_side(1, xmax, j_base);
+                /* --slab-fill-ahead: and the next slab's fill beside its apply */
+                sv1 = issue_side1(slab, xmax, j_base, NULL);
                 if (!sv1)
                     sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, concurrent);
+                if (sv1 >= 0 && sv_sfa >= 0) {
+                    sfa1 = (float)time_kernel(fa_t0[sv_sfa], fa_t1[sv_sfa]);
+                    sfa_used = 1;
+                }
                 if (!sv1) {
                     /* --fill-gate: side 1 has been joined, so its bitmap for
                      * this slab is complete. Refused with --fill-concurrent,
@@ -4269,12 +4545,27 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * the repair would be right in one arm and wrong in the other.
                  * Abandoning the rest of the q is the cheap, obviously-correct
                  * repair in both; slabs already emitted keep their relations. */
+                /* --slab-fill-ahead: the next slab's fill, issued beside this
+                 * slab's apply, may still be writing a workspace and a cursor
+                 * buffer that the next q's preparation and fill reuse, on
+                 * other streams. Rare: wait it out. */
+                if (sfa_next >= 0) {
+                    const int w = sfa_next;
+                    sfa_next = -1;
+                    if (CUDA_CHECKED(cudaEventSynchronize(fa_t1[w]))) {
+                        rc = -1; break;
+                    }
+                }
                 nslab_skipped   += slab_plan->nslab - slab;
                 nslab_skipped_q += slab_plan->nslab - slab;
                 break;
             }
             ts1[1] += sf1; ts1[2] += sa1;
             ts0[1] += sf0; ts0[2] += sa0;
+            /* --slab-fill-ahead: a skipped slab's, like its fill and apply,
+             * is not counted; nor is a fill abandoned with its q */
+            tsfa += sfa1;
+            if (sfa_used) n_slab_fill_ahead++;
             if (concurrent) {
                 /* The overlap the two sides actually achieved, measured on one
                  * origin. Both side streams are released by the same
@@ -4468,6 +4759,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 if (early1) {               /* both, whatever the first said */
                     const cudaError_t er = cudaStreamSynchronize(st_rs);
                     if (e == cudaSuccess) e = er;
+                }
+                if (st_sfa) {               /* the ahead fill the issue made */
+                    const cudaError_t ef = cudaStreamSynchronize(st_sfa);
+                    if (e == cudaSuccess) e = ef;
                 }
                 fprintf(stderr, "  q=%llu slab %u: the error above surfaced"
                         " while issuing the next %s, with this slab's"
@@ -4961,6 +5256,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    ts1[0], ts1[1], ts1[2], ts1[0] + ts1[1] + ts1[2],
                    (unsigned long long)side_surv1, S1.BOUND,
                    SLABBED ? " [slabbed]" : "");
+            if (sfa)
+                printf("  side 1: and fill ahead %.3f ms, beside the previous"
+                       " slabs' applies\n", tsfa);
             /* Gated, side 0's own count is not its survivor population: its
              * fill skips every position side 1 rejected. */
             printf("  side 0: transform %.3f + fill %.3f + apply %.3f = %7.3f ms,"
@@ -4975,6 +5273,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         acc_tr += ts1[0] + ts0[0];
         acc_fi += ts1[1] + ts0[1];
         acc_ap += ts1[2] + ts0[2];
+        acc_sfa += tsfa;
         if (cfg->qspan) {
             /* Every readback in this q has already synchronised, so this is a
              * no-op drain; it is here so the elapsed read below cannot see a
@@ -5281,6 +5580,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * is still a fault, and must not vanish at `done:`. */
     if (st_sv && CUDA_CHECKED(cudaStreamSynchronize(st_sv)) && rc == 0)
         rc = -1;
+    /* --slab-fill-ahead: and that q's next slab's fill, issued beside it */
+    if (st_sfa && CUDA_CHECKED(cudaStreamSynchronize(st_sfa)) && rc == 0)
+        rc = -1;
     /* --q-pipeline: and the last slab's record pass, left owed (finding 135).
      * The final flush below would wait it out too, but tm.record wants its
      * time. */
@@ -5574,6 +5876,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  %-34s %8.3f ms\n", "  intersect + gcd", acc_isect / N);
         if (rs_granted)
             printf("  %-34s %8.3f ms\n", "  side-0 record scan", acc_rscan / N);
+        if (sfa)
+            printf("  %-34s %8.3f ms   <- beside side-1 apply, not in the sieve\n",
+                   "  side-1 fill ahead", acc_sfa / N);
         printf("  %-34s %8.3f ms\n", "  host per-q (sieve tables, staging)",
                acc_host / N);
         printf("  %-34s %8.2f ms   <- of which, on the device:\n",
@@ -5671,6 +5976,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 printf("  %-34s %llu q\n", "prepared two ahead (--fill-ahead)",
                        n_two_ahead);
             }
+            if (sfa)
+                printf("  %-34s %llu slab(s)\n", "side-1 fill ahead (--slab-fill-ahead)",
+                       n_slab_fill_ahead);
         }
         if (rs_granted)
             printf("  %-34s %llu slab(s); walked: %llu index full, %llu pair"
@@ -5908,6 +6216,7 @@ done:
     if (st_sv) cudaStreamSynchronize(st_sv);
     if (st_fa) cudaStreamSynchronize(st_fa);
     if (st_rs) cudaStreamSynchronize(st_rs);
+    if (st_sfa) cudaStreamSynchronize(st_sfa);
     cudaStreamSynchronize(0);
     pipe_td_free(&C);
     cofq_free(&Q, &QO);
@@ -5918,6 +6227,7 @@ done:
     cudaFree(d_bucket_fa); cudaFree(d_cursor_fa); cudaFree(d_overflow_fa);
     if (st_fa) cudaStreamDestroy(st_fa);
     if (st_rs) cudaStreamDestroy(st_rs);
+    if (st_sfa) cudaStreamDestroy(st_sfa);
     for (int w = 0; w < 2; w++) {
         if (fa_t0[w]) cudaEventDestroy(fa_t0[w]);
         if (fa_t1[w]) cudaEventDestroy(fa_t1[w]);

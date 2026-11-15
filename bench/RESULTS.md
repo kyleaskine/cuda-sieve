@@ -19643,3 +19643,775 @@ How the result comes about:
   in that unit. Over the shared 78 units, J=3072 found 49,327 relations
   (0.11%) and J=2048 63,160 (0.17%) that J=4096 did not. That favours the
   shorter Js slightly, and they still lose.
+
+## Finding 158 — a restricted fill grid really shares SMs with apply, but the extra fill still costs 17–20 ms/q at I16, against 27–29 at 4608 blocks. The proposed 8–12 ms/q is not reached at normal apply allocation; forcing two apply blocks loses on total wall time
+
+**Date:** 2026-11-13. RTX 5070, sm_120 private snapshot of `2a7618a4`.
+STATUS row 50's test; production code and `bench/bench` are unchanged.
+Scripts, source, full logs, relation files, nsys traces and sampled block
+residency: `work/coresid-20261113/`; detailed method and results in `NOTES.md`.
+
+### Test and controls
+
+I16 NFS job, logI 16, J 32768, q from 297000000, 60 q per timed run,
+pipeline and cofactorisation. The real fill stays 4608 x 32. An extra side-1
+fill writes private scratch, either serially before apply or on a nonblocking
+stream at greatest priority (-5). It joins after that same apply, earlier than
+finding 148's next-fill join, protecting inputs and bounding the test to the
+pair. The baseline allocates the same scratch before the q loop.
+
+The primary extra kernel wraps today's production walk, including the 5/7
+skip and a private continuation output. Finding 148's old `k_fill_lab` is a
+separate control. Resource usage: production copy 40 registers/thread, lab 37
+(allocated as 40), both 1 KiB fixed shared memory/block.
+
+**The old two-block control needed correction.** `PIPE_APPLY_SMEM=45056`
+plus the 1 KiB/block reserve leaves only 10 KiB after two apply blocks,
+insufficient for 12 or 16 fill blocks' reserves. This test uses 36864 B,
+which limits apply to two blocks and leaves room. Normal apply uses 32976 B.
+
+Four interleaved rounds were run. Round 4 is excluded: GPU memory rose about
+260 MiB mid-round, baseline slowed 6%, and the user confirmed watching YouTube.
+Two reversed confirmation rounds followed after YouTube closed. All raw data,
+including the affected round, are retained.
+
+### Result
+
+Main rounds 1–3, median paired extra COMPLETE wall cost in ms/q:
+
+| apply allocation | extra fill blocks | serial | overlapped |
+|---|---:|---:|---:|
+| normal | 4608 | 29.80 | 29.40 |
+| normal | 576 | 46.66 | 19.92 |
+| normal | 768 | 38.72 | 20.36 |
+| two-block control | 4608 | 31.15 | 29.94 |
+| two-block control | 576 | 45.23 | 14.56 |
+| two-block control | 768 | 38.31 | 14.64 |
+
+The two-block baseline is already 143.43 ms/q against normal's 129.10, so
+its smaller incremental cost still gives worse total time. Shaping fill has
+a substantial isolated cost at current I16 scale; finding 52's small-job
+flatness does not carry over.
+
+Quiet-card confirmation, two reversed rounds, normal apply allocation:
+
+| arm | total ms/q | extra ms/q |
+|---|---:|---:|
+| baseline | 129.020 | — |
+| production-copy overlap, 4608 | 155.560 | 26.540 |
+| production-copy overlap, 576 | 146.425 | 17.405 |
+| production-copy overlap, 768 | 147.080 | 18.060 |
+| old lab overlap, 4608 | 156.535 | 27.515 |
+| old lab overlap, 576 | 148.135 | 19.115 |
+| production copy, default priority, 576 | 168.890 | 39.870 |
+| production copy, default priority, 768 | 166.730 | 37.710 |
+
+The 576/768 high-priority production-copy runs repeat within 0.11/0.02 ms/q.
+Their improvement over 4608 is about 9 ms/q. Default priority gives back most
+of it. The old scratch kernel confirms the direction.
+
+### Same-SM residency, measured
+
+Separate diagnostic kernels record thread-0 start/end globaltimer and SM ID
+for every extra-fill block and every 32nd side-1 apply block. Positive overlap
+on the same SM occurred for 504/16384 sampled apply blocks at 4608 (3.1%),
+5778/16384 at 576 (35.3%), and 5388/16384 at 768 (32.9%), on all 48 SMs.
+These are sampled-block fractions, not elapsed-time fractions. Instrumented
+kernels retain 40 registers, zero stack and the same shared-memory allocation;
+their wall times are not used as performance measurements.
+
+Thus the proposal's absolute claim that the previous shape never shares an
+SM is false, but confining the fill makes sharing much more substantial.
+nsys separately shows why the win is limited: at 4608, extra fill is fully
+overlapped yet apply takes 16.02 ms per side-1 launch. At 576, the pair takes
+14.42 ms: fill 14.41 and apply 13.42, against serial-576's 13.47 and 8.06 ms.
+Baseline side-1 apply was 8.74 ms in its trace. Both the grid's isolated cost
+and the apply slowdown matter.
+
+### Validation and next
+
+96 successful runs, 91 byte-identical relation comparisons against fresh
+installed-binary references, zero scratch overflows and exact expected launch
+counts. Timings use CLOCK_MONOTONIC_RAW. No production overlap implementation
+was built or installed.
+
+The restricted-grid idea stays open, with a smaller measured upside than the
+proposal. This duplicate-work probe does not establish a 10–20% production
+wall gain. The no-extra-bucket side-1 resieve pairing remains a reasonable next
+experiment; its own slowdown and buffer dependencies still need measuring.
+
+### Review, same day: where the fill's blocks sat
+
+A reviewer's read of the block sampler's records, nothing run on the card:
+`work/coresid-20261113/review/` (`blocks2.py`, `blocks2.txt`). These are the
+instrumented build's 15 paired launches per arm, so they compare launches
+within that build and are not wall times.
+
+**The 576 and 768 arms did not place the fill 12 or 16 per SM on every SM.**
+The harness releases the extra fill on an event recorded after the real fill,
+and the probe stream runs a cursor memset before it; the apply is next on the
+sieve stream. The apply's first block starts 0-60 us ahead of the fill's, so
+the apply holds all 48 SMs (three blocks, every warp) and the fill enters as
+apply blocks end, one freed slot at a time: 16 blocks on an SM (one apply
+block's 16 warps), then 22-23 (the 24-block limit, which leaves that SM one
+apply block). The fill runs out of blocks before it reaches every SM. Launched
+alone (the first launch of each run) the same grids do sit 12 and 16 per SM on
+all 48.
+
+| arm | SMs holding 16 fill blocks at mid-fill | launches | pair span, ms |
+|---|---|---:|---:|
+| 4608 | none: 24 on all 48 | 15 | 15.4-17.6, median 16.35 |
+| 768 | 35-46 | 3 | 11.79-11.91 |
+| 768 | 8-15 | 5 | 12.80-13.11 |
+| 768 | at most 4 | 7 | 13.24-14.03 |
+| 576 | 30-36 | 2 | 12.34, 12.53 |
+| 576 | 10-22 | 8 | 13.21-14.55 |
+| 576 | at most 2 | 5 | 13.81-15.59 |
+
+In the 576 and 768 rows the other SMs that hold any fill hold 22-23 blocks
+(a few hold 17-21), and the rest hold none: 576 blocks reach 26-36 SMs and
+768 reach 34-48.
+
+Which mix a launch gets is a race, and the pair's span follows it. That is
+also why 576 and 768 time alike: they are the same arrangement with a
+different number of SMs left out.
+
+Sampled apply block time, by the fill blocks resident on the same SM while the
+fill runs (576 arm / 768 arm):
+
+| fill blocks on the SM | apply block, us | samples |
+|---|---:|---:|
+| none | 29.9 / 29.8 | 9,553 / 7,614 |
+| 16 | 34.9 / 35.7 | 2,758 / 2,165 |
+| 23 or more | 36.1 / 38.7 | 861 / 1,470 |
+
+Apply alone, before or after the fill, is 29.0-30.0 us. So an apply block on
+an SM with no fill block is not slowed by the fill running on the other SMs:
+the cost is local to the SM, not L2 or anything else card-wide. On a shared SM
+the apply loses mostly block slots (two beside 16 fill blocks, one beside 23,
+by the warp and block limits) and takes 17-30% longer per block. A fill block
+lives 9.41 ms at 16 per SM and 11.02 at 23 (576 arm; 7.90 and 9.26 at 768).
+
+What follows:
+
+- The grid was half the variable; placement is the other half, and these runs
+  did not control it. At 16 per SM nearly everywhere the pair is 11.8-11.9 ms
+  against 13.11 for the median 768 launch and 8.33 for apply alone in this
+  build: about +14 ms/q for the extra fill against +19 (the timed runs' +18 to
+  +20 agree with the latter). An inference from three launches, not a timing.
+- Row 50's +8 to +12 is refuted either way. The proposal took finding 52's
+  flat grid (a small job) and finding 80's +8.5% at 1152 as the cost of
+  shaping; at I16 it is +30% at 768 and +57% at 576.
+- Next arm, same harness: fix the placement, confirm it with the block
+  sampler, and time it. Two ways. (1) Give the fill the head start: make the
+  apply wait on an event recorded on the probe stream just ahead of the extra
+  fill, so both are released together and priority puts the fill's blocks down
+  first (alone, 768 blocks sit 16 per SM). (2) Make a second helping
+  impossible: the fill as 48 x 512 (the same 24,576 threads as 768 x 32; the
+  walk indexes by global thread) with its shared memory padded so that one
+  block fits beside two apply blocks and two do not fit beside one. By this
+  finding's accounting (102,400 B per SM, 1 KiB reserved per block, apply at
+  32,976 B) that window is about 200 B wide, near a 33.3 KB request, so (1) is
+  the safer first try.
+- The resieve pairing needs the same control. Its coarse block is 512 threads
+  and 32 KB, an apply block's footprint: at priority, with more than one block
+  per SM to place, it will take every slot the apply frees, as the 4608 fill
+  did.
+
+**Tested 2026-11-14, finding 159.** The +14 ms/q above did not survive, and
+the head start was the wrong way round: a fill placed first keeps the apply
+off the card, and the placement is set by another kernel at that boundary,
+not by which of the two starts first.
+
+## Finding 159 — the extra fill beside side 1's apply hides 10.5-11.9 ms/q of fill at I16, 8.2-9.3% of the wall, however it is placed. A fill placed first locks the apply out; the good placement needs the fill held about 1 ms, and that adds about 1 ms/q
+
+**Date:** 2026-11-14. RTX 5070, sm_120 private snapshots of `2a7618a4`;
+production code and `bench/bench` unchanged. Scripts, sources, logs, relation
+files and block records: `work/coresid2-20261113/`. Its `NOTES.md` has the
+predictions as written before each of the three passes; most of them failed,
+and they are listed at the end.
+
+### Test
+
+Finding 158's probe with the extra fill's release under control: a second
+side-1 fill of the slab just filled, into private scratch, beside that slab's
+side-1 apply, joined after it. Same job (I16, J 32768, q from 297000000,
+60 q a timed run, pipeline and cofactorisation). The real fill stays
+4608 x 32. An instrumented second build records where every fill block and
+every 32nd apply block ran, 31 paired launches an arm.
+
+| arm | the extra fill |
+|---|---|
+| ser4608 | 4608 x 32 on the sieve stream, ahead of the apply: the fill's own cost |
+| ovl768 | finding 158's arm: 768 x 32 at greatest priority, released when the real fill ends |
+| head576, head768 | the apply made to wait on an event recorded just ahead of the fill |
+| dly768 | head768 plus a 100 us wait ahead of the apply |
+| one512 | 48 x 512 with 33,280 B of shared memory a block, released as ovl768 |
+| late576, late768, late512 | the fill held 150 us by a wait on its own stream |
+| late768m, late512m | the fill held 1 ms |
+
+"Hidden" below is ser4608's extra cost less the arm's: the fill work the
+pairing took off the wall.
+
+### Timed
+
+Third pass, four rounds, a quiet card (base 126.85-127.80 ms/q); median of the
+per-round differences, range in brackets:
+
+| arm | wall ms/q | extra ms/q | hidden ms/q | of the wall |
+|---|---:|---:|---:|---:|
+| ser4608 | 156.68 | +29.08 (28.94-29.82) | | |
+| ovl768 | 146.16 | +18.97 (17.90-19.39) | 10.52 | 8.2% |
+| late768m | 145.09 | +17.94 (16.61-20.44) | 11.15 | 8.7% |
+| late512m | 144.44 | +17.11 (16.13-17.95) | 11.86 | 9.3% |
+
+First pass, round 2 (the round a host load spike did not touch; base 127.89):
+ser4608 +28.39, ovl768 +18.45, head576 +18.53, head768 +18.28, one512 +17.68,
+so hidden 9.9-10.7; dly768 +21.59 against its own control. The second pass's
+timed rounds are not used: the other session's `polyselect` ran in bursts
+between them and Firefox was on the card (base 126-137).
+
+### Placement
+
+Instrumented build, so these compare launches within it. "One slot an SM":
+at least 25 SMs holding exactly 16 fill blocks, or at least 30 holding exactly
+one 512-thread block. Pair is first start to last end of the two, median ms.
+
+| arm (pass) | fill's first block after the apply's | launches, one slot an SM | pair, those | pair, the rest | pair, all |
+|---|---|---:|---:|---:|---:|
+| ovl768 (1, 2, 3) | 1-7 us, or 36-65 us | 8, 7, 7 of 31 | 12.02, 12.22, 11.90 | 13.29, 14.00, 13.43 | 13.21, 13.71, 13.36 |
+| head768 (1) | 50 us in 12 launches; 0.4-0.8 ms BEFORE it in 19 | 12 | 12.02 | 13.70 | 13.38 |
+| one512 (1) | 4-107 us | 8 | 11.87 | 13.68 | 13.48 |
+| late768 (2) | 156 us or 211 us | 9 | 12.54 | 14.07 | 13.88 |
+| late512 (2) | 156 us or 211 us | 5 | 12.16 | 14.16 | 13.77 |
+| late768m (3) | 1.00-1.08 ms | 24 | 12.66 | 12.99 | 12.69 |
+| late512m (3) | 1.00-1.06 ms | 26 | 12.58 | 13.64 | 12.65 |
+| ser4608 (1) | serial | | | | 16.30 (fill 8.14, apply 8.01) |
+
+What the records show:
+
+- **A fill placed first keeps the apply off the card.** In dly768's six
+  launches where the fill sat 16 per SM on all 48, the apply's first block
+  started 7.83-7.88 ms after the fill's, as the first fill blocks ended, and
+  the pair ran 16.5 ms, the serial time. Finding 158's first launch of each
+  run looks the same (the fill alone and evenly placed, the apply 7.4-8.7 ms
+  later), though that launch is the first q's and may differ for other
+  reasons. I did not separate this from the wait kernel itself overrunning;
+  its control (the wait without the fill) cost nothing.
+- **In about two launches in three another kernel has the card when side 1's
+  fill ends.** The 150 us arms show it (`early2.txt`): where the fill then
+  gets one slot an SM, about 640 apply blocks have started before it arrives,
+  the full rate, and 90% of the fill's blocks start within 9-17 us. Where it
+  gets two slots, fewer than 100 apply blocks have started, at 41-46 us a
+  block against 30, and the fill's blocks come on over 130-360 us. That
+  kernel was waiting behind the real fill's undispatched blocks (finding
+  134's order); as its blocks end the greatest-priority fill takes the room
+  ahead of the apply's pending blocks, 22-23 blocks on about 33 SMs and none
+  on the rest. Not identified; the previous slab's trial division is on the
+  card then. Which of fill and apply starts first by microseconds, which I
+  took for the cause in finding 158's review, only marks which case it is.
+- **No block shape prevents it.** one512's shared memory stops a fill block
+  joining an SM that still holds an apply block, but two fit an SM that has
+  just been emptied, and then no apply block fits beside them: 13-24 SMs with
+  two fill blocks, as many with none. Half the card each ran 15.1-16.1 ms, no
+  better than serial, so the fill at I16 behaves as bound per SM, not by a
+  card-wide limit (with the apply on the other half; not isolated).
+- **Holding the fill 1 ms fixes the placement and buys little.** One slot an
+  SM in 24-26 of 31 launches, the median pair down from 13.36 to 12.65-12.69
+  ms; timed, 0.6-1.3 ms/q.
+
+**The pair's span overstates the wall.** From spans the pairing is worth
+(16.30 - 12.67) x 4 = 14.5 ms/q; timed it is 11.1-11.9. Fixing the placement
+took 2.8 ms/q off the spans and 0.6-1.3 off the wall. My reading, not
+measured: whatever else shares the card at that point gets less room and
+takes longer.
+
+### What it prices
+
+`--fill-ahead` for slabbed plans: the next slab's side-1 fill, at 768 x 32 or
+48 x 512 on a greatest-priority stream, released about 1 ms into this slab's
+side-1 apply, into a second bucket array (0.90 GB at I16; these runs had
+6.5 GB free). Its walk cursors exist once this slab's fill ends, and side 0
+follows on the array the apply has just read, so nothing else is new. Each
+pair hides 2.6-3.0 ms. Within a q that is three of the four slabs, 8-9 ms/q,
+6-7% of the wall. The fourth is the next q's first fill beside this q's last
+side-1 apply, which needs that q's transforms and cursors early, as
+`--fill-ahead` already arranges for one-slab plans: 8.2-9.3% with it.
+
+Not measured: the real chain reordered (the probe adds a fill, it does not
+move one, and in the build the boundary before the apply is side 0's apply,
+not side 1's fill); side 0's fill and apply; any other job.
+
+### Predictions that failed
+
+- A head start for the fill would cost +14 ms/q against finding 158's +17 to
+  +20: it cost +18.3, and the fill first is the losing order.
+- Releasing the fill 150 us after the apply would make the one-slot placement
+  reliable: 5-9 launches of 31, as without it.
+- With the placement fixed, 13-16 ms/q hidden: the placement was fixed and
+  the wall gave 11.1-11.9.
+
+### Validation
+
+93 runs over three passes. Every relation file is byte-identical to the
+installed binary's for the same q band in its suite; no scratch overflow;
+launch counts exact (240 a timed run). One run was repeated because
+`polyselect` came onto the card during it, and seven first-pass runs that a
+host load spike slowed (1-minute load 12-31 against 7) are left out of the
+figures above and kept in `timing/`. Timings are bench's COMPLETE ms/q.
+
+### Read against the code, same day, before the build
+
+Three corrections to the price, from `pipeline.cuh` and finding 158's base
+trace; nothing run on the card. Kyle then asked for the build
+(`work/fillahead-slab/`).
+
+- **No row tier at I16.** `--fill-rows` defaults to 0 above logI 15, so the
+  slabbed plans launch only `k_fill_atomic` for side 1, the kernel this probe
+  duplicated. STATUS's note had the row tier going with the ahead fill.
+- **The previous slab's trial division moves.** In finding 158's base trace
+  (`work/fillahead-slab/tdoverlap.py`, `tdoverlap.txt`; 40 slabs), the legacy
+  stream's kernels run 1.0 ms (median) inside each side-1 fill and 1.9 ms
+  (mean 1.5) inside each side-1 apply, out of 9.2 ms a slab with the
+  cofactoriser's rounds. In the build the serial fill is gone and the host
+  queues the trial division as the pair starts, so up to about 1 ms a slab of
+  it lands beside the pair, against 2.6-3.0 ms hidden. The probe kept it
+  under the real fill and could not see this.
+- **The 5/7 skip's default assumes the fill is on the chain.** It is on at
+  several slabs per q for that reason (`pipe_fill_skip57`); finding 148
+  measured it at +0.8 to +1.0% on C135 and C143, where a fill already runs
+  beside the chain. The build needs an arm without it.
+
+## Finding 160 — the next slab's side-1 fill beside this slab's side-1 apply (`--slab-fill-ahead`): −7.2% at I16 on the NFS@Home job (−9.2 ms/q at the 512-block default grid; −5.9% at the probe's 768), −6.5% on C194 and −6.2% on SNFS-301. Relations byte-identical through every gate. +1.02 GB of VRAM. The 5/7 skip still pays 2 ms/q beside it. Within a q only: the q boundary is not built. On by default only on sm_120 with 48 SMs (the RTX 5070 it was timed on), off elsewhere; installed 2026-11-15 as the sm_120-only build `0d2bce51`
+
+STATUS row 50; the price is findings 158-159, the note read against the code
+in finding 159's last section. Kyle's go-ahead 2026-11-14 ("start working on
+the change here in main"). RTX 5070, sm_120 snapshots of the working tree
+(`work/fillahead-slab/`: `sync.sh` builds `src/`, `builds.sh` the test
+builds); `bench/bench` was fat `c23282d5` (CUDA 13.5) throughout. **Installed
+2026-11-15 as `0d2bce51`, sm_120 only (below). On by default only on sm_120 with 48 SMs, the RTX 5070, off
+elsewhere (Kyle, 2026-11-14; "The default", below).** The card was shared with another
+session's polyselect tests and, for an hour, a CADO c141 run with a GPU
+siever; every timed run waited for 30 s with neither on the card (Timing).
+
+### The change
+
+On a plan of several slabs per q, under `--q-pipeline`, side 1's fill for
+slab s+1 runs beside slab s's side-1 apply instead of on the sieve stream
+after slab s's side 0 and record scan. Slab 0 of each q keeps its serial
+fill: the q boundary is not covered (row 50's note priced that at about 2%
+more).
+
+- **Release.** `issue_side1` (`pipeline.cuh`) issues slab s's side 1 on
+  `st_sv`, then `slab_fill_ahead(s+1)`: the fill on its own stream
+  `st_sfa`, of the device's greatest priority, waiting on `S1.ev[2]`, the
+  event recorded on `st_sv` immediately ahead of slab s's apply. A wait on
+  another stream's event reaches the card about 50 us after the apply does
+  (finding 133), so the apply always starts first, the order finding 159
+  measured as ovl768. No hold knob: the note's ~1 ms hold was not built.
+- **Grid.** `--slab-fill-blocks N` x 32 threads (`FILL_THREADS_DEFAULT`,
+  whatever `--fill-threads` says), default 512 per 48 SMs scaled by the
+  card's SM count (`bench.h` `SLAB_FILL_BLOCKS_DEFAULT`,
+  `SLAB_FILL_DEFAULT_SMS`; Timing, and the code review below). The fill is
+  `k_fill_atomic` alone at I16: the row tier is off above logI 15.
+- **Join.** Slab s+1's apply waits on the ahead fill's end event (`fa_t1`),
+  in place of its own fill. The fill's time is read from that event pair
+  and reported on its own line, `side-1 fill ahead`, outside `sieve, both
+  sides` (since the review: until then it was in side 1's fill, and the
+  sieve total counted the overlapped time in full, 141.00 ms/q inside a
+  115.74 ms wall).
+- **Workspaces.** Slabs take the two bucket arrays in turn (`sv_ws ^= 1`);
+  the ahead fill writes the one slab s is not using. Everything that read it
+  last (slab s-1's side-1 apply, side-0 fill and apply, record scan) is ahead
+  of `S1.ev[2]` on `st_sv`.
+- **Walk cursors.** Side 1 gets a fourth buffer (`walk_x`). The ahead fill
+  reads the cursors slab s's fill wrote (`walk_next`) and writes `walk_x`;
+  `pside_rotate_walk` turns (cur, next, x, spare) to (next, x, spare, cur)
+  at every issue point and q boundary. The non-rotating swap path refuses to
+  run with the fourth buffer (internal error).
+- **Skips and stops.** A bucket overflow abandons the rest of the q; if an
+  ahead fill is in flight it is waited out there, since the next q's
+  preparation reuses its workspace and cursors on other streams. Every drain
+  (error paths, the loop's exit, `done:`) also synchronises `st_sfa`. Since
+  the review, a fill in flight carries the q (counted at each slab 0's
+  side-1 issue) and slab it was made for, and one consumed by any other is
+  an internal error: no path does that today, but a missed exit would
+  otherwise apply the wrong buckets silently.
+- **Memory.** A second bucket array, its cursors and overflow word, and the
+  fourth cursor buffer: **+1.02 GB** at I16 (steady state 5.43 -> 6.45 GB of
+  11.91 on the NFS@Home job). Allocated after `--resieve-scan`, so the
+  options already measured keep their claim, and with twice the usual
+  margin free (code review); when it does not fit, or the plan has one slab
+  per q, or the pipeline is single-queued, the option is off with a banner
+  line and a runlog note, not refused.
+- **Options.** `--slab-fill-ahead` / `--no-slab-fill-ahead`,
+  `--slab-fill-blocks N` (1 to `BENCH_BLOCKS_MAX`; refused when the option
+  is off, by flag or by the card's default). An explicit
+  `--slab-fill-ahead` with the pipeline off (`--no-q-pipeline`,
+  `--fill-concurrent`, `--qspan`) is refused. The band summary counts the
+  slabs whose ahead fill was used and kept.
+- **Test hook.** `-DPIPE_TEST_OVF_EVERY=N` (default 0, compiled out) makes
+  every Nth side-1 join report a bucket overflow, so the skip path runs with
+  an ahead fill in flight.
+
+### Timing
+
+Bench's COMPLETE ms/q, 60 q, pipeline and cofactorisation, `--watchdog 20`;
+`work/fillahead-slab/timing.sh`, arm order rotated per round. Every
+relation file of every timed run is byte-identical to the installed
+binary's for the same q band.
+
+**The I16 NFS@Home job** (finding 159's command, q from 297000000), grid
+768, build `26fd1528` (before the compiled-out test hook), 16 runs an arm
+(`timing2/`). The script's watcher counted the run itself as another GPU
+user (WSL's `nvidia-smi` lists bench's own process; `diag/` logs only its
+PID), so it repeated every run four times; those are the 16. One of them,
+124.78, may have shared the card; the medians do not depend on it.
+
+| arm | median | mean | min-max |
+|---|---:|---:|---|
+| installed `c23282d5` | 126.89 | 127.17 | 126.64-129.19 |
+| tree, option off | 126.97 | 127.11 | 126.64-128.59 |
+| **option on** | **119.40** | 119.78 | 119.09-124.78 |
+| option on, `--no-fill-skip57` | 121.42 | 121.50 | 121.28-121.95 |
+| option off, `--no-fill-skip57` | 129.07 | 129.45 | 128.72-131.53 |
+
+- Off, the tree times as the installed binary (+0.08 ms, noise).
+- On: −7.5 ms/q, **−5.9%**. The note priced 6-7% within a q
+  (finding 159: 10.5-11.9 ms/q of fill hidden, less the trial division
+  that moves beside the pair, finding 159's last section).
+- The 5/7 skip still pays with the option on: 2.0 ms/q (1.7%), against
+  2.1 ms/q off. Its default stays.
+
+**The grid** (`grid/`, `grid2/`, two sweeps, 2 and 3 rounds):
+
+| blocks | sweep 1 | sweep 2 | median |
+|---:|---|---|---:|
+| 256 | | 120.32, 120.11, 120.63 | 120.32 |
+| 384 | | 118.73, 118.62, 119.01 | 118.73 |
+| 512 | 118.48, 118.90 | 118.23, 117.90, 119.22 | 118.48 |
+| 640 | | 118.33, 117.95, 119.08 | 118.33 |
+| 768 | 120.17, 120.41 | 119.46, 119.41, 120.46 | 120.17 |
+| 1024 | 124.36, 124.47 | | 124.42 |
+| 1536 | 128.31, 128.43 | | 128.37 |
+
+512 beat 768 in all five rounds, by 1.2-1.7 ms; 640 ties it. Why, from
+the same runs' stage tables (ms/q, one run each; fill and apply as the
+table then printed them, the ahead fills inside "fill"):
+
+| blocks | fill | apply | wall |
+|---:|---:|---:|---:|
+| off | 51.70 | 58.73 | 125.00 |
+| 256 | 106.50 | 64.56 | 118.46 |
+| 384 | 82.44 | 65.05 | 116.87 |
+| 512 | 69.12 | 67.35 | 115.74 |
+| 640 | 63.52 | 68.51 | 116.47 |
+| 768 | 60.18 | 69.89 | 117.69 |
+| 1024 | 56.76 | 74.61 | 122.50 |
+| 1536 | 54.87 | 78.22 | 126.44 |
+
+The ahead fill is released at slab s's side-1 apply and not needed until
+slab s+1's, about a slab (wall/4, 29-30 ms) later. Per slab, from the
+`side-1 fill ahead` line added after the review (`gate3/tab.*.out`, one run
+each), the ahead fill takes 25.0 ms at 256 blocks, 17.0 at 384 and 14.2 at
+512. From 384 up it finishes inside that gap with 12 ms or more to spare,
+and the wall follows the apply's total, which grows with the fill's share
+of each SM. At 256 it takes 25 of the 30 ms on average, and the apply's
+total is lower than at 384 while the wall is higher: the next apply waits
+on it, presumably in the larger slabs (not traced per slab). So the rule is the narrowest grid whose fill
+still finishes inside a slab. That is a count of slots per SM: the
+constant 512 is tuned for 48 SMs only, and at 1536 the option is slower
+than off. (The first write-up of this finding said 512 won because the
+next apply waits on the fill; the review corrected it, below.)
+The default is now 512. Confirmed on the build with that default
+(`fc333108`, `t512/`, 3 rounds, rotated):
+
+| arm | r1 | r2 | r3 |
+|---|---:|---:|---:|
+| installed `c23282d5` | 127.55 | 126.46 | 126.87 |
+| tree, option off | 126.86 | 126.92 | 126.79 |
+| **option on (512)** | **117.61** | **117.68** | **117.68** |
+| option on, `--slab-fill-blocks 768` | 119.54 | 119.50 | 119.45 |
+
+−9.2 ms/q against the installed binary's median, **−7.2%**; 512 against 768
+−1.8 to −1.9 ms in every round. The two sweeps put 512 at 117.9-119.2, so
+the spread between sessions is about 1 ms; the order of the arms held in
+every round of every session.
+
+**Other slabbed I16 jobs**, 3 rounds each, the grid at 512 (`fc333108`,
+`t194b/`, `t301b/`) and first at 768 (`a838fa8c`, `t194/`, `t301/`):
+
+| job | grid | installed | option on | per round |
+|---|---:|---|---|---:|
+| C194 (q from 80000023) | 512 | 134.96, 134.55, 135.08 | 126.24, 126.03, 126.17 | −8.5 to −8.9 ms, **−6.3 to −6.6%** |
+| | 768 | 135.69, 135.34, 135.07 | 129.06, 128.55 | −6.5 to −6.6 ms, −4.8 to −4.9% |
+| SNFS-301 (q from 200000000, special-q side 0) | 512 | 134.26, 134.13, 134.17 | 125.54, 125.83, 125.95 | −8.2 to −8.7 ms, **−6.1 to −6.5%** |
+| | 768 | 134.83, 134.24 | 127.66, 127.18 | −7.1 to −7.2 ms, −5.3% |
+
+At the medians, 512: C194 −8.8 ms (−6.5%), SNFS-301 −8.3 ms (−6.2%).
+From the 768 sessions, left out: C194 on r2 (175.48), SNFS-301 ref r2 (141.10) and on r2 (130.49).
+Their stage times match round 1's to under 0.4 ms; only the wall grew
+(C194 by 2.8 s over 60 q, SNFS-301 by 0.4 and 0.2 s), with no watchdog
+line, and one was the installed binary: a stall outside the GPU stages, not
+the option. Those sessions' deltas are per round, r1 and r3.
+
+### Trial division moved
+
+The stage tables also show trial division reshaped (ms/q, one run each,
+grid 512; stage times share the card under the pipeline, so they are not
+additive):
+
+| job | arm | wall | TD + classify, wall | rank scan | norms + TD | classify | device total |
+|---|---|---:|---:|---:|---:|---:|---:|
+| NFS@Home I16 | off | 125.00 | 99.95 | 12.28 | 30.19 | 27.97 | 90.89 |
+| | on | 115.74 | 83.90 | 23.32 | 20.52 | 8.00 | 68.21 |
+| C194 | installed | 132.85 | 104.70 | 8.44 | 34.35 | 33.01 | 95.54 |
+| | on | 124.12 | 93.23 | 23.04 | 27.45 | 10.48 | 78.95 |
+| SNFS-301 | installed | 129.53 | 97.58 | 21.46 | 25.27 | 33.15 | 99.95 |
+| | on | 120.83 | 84.79 | 28.68 | 20.65 | 9.13 | 75.12 |
+
+The rank scan doubles, classify falls to a third, and TD's wall drops more
+than the q's. Which kernels now share the card with which is not in these
+tables, nor whether the host waits on the sieve or on trial division in
+each slab. That decides whether further sieve-side savings, the q boundary
+among them, reach the wall: one trace first.
+
+### Gates
+
+`work/fillahead-slab/gates.sh` (`gates.txt`) and `gates2.sh`
+(`gates2.txt`), all on build `a838fa8c` (grid 768):
+
+1. **abcheck, option off**, against the installed binary: 36 of 36 cases
+   identical.
+2. **abcheck with the option**, every pipelined case: 13 of 13.
+3. **abcheck QUICK with the option and each of** `--q-prep td`,
+   `--q-prep join`, `--slab-fill-blocks 1`, `--slab-fill-blocks 4608`,
+   `--resieve-scan-pairs 1`, `--resieve-scan-cap 1`, `--no-resieve-scan`,
+   `--no-fill-skip57`: 12 of 12 each.
+4. **SNFS-301**, 10 q: 669 relations, identical; 30 slabs filled ahead.
+5. **Bucket overflow with an ahead fill in flight** (`PIPE_TEST_OVF_EVERY=7`,
+   candidates): c183 five slabs, c194 and nfs, the option and the option +
+   `--q-prep td` identical to off; 80, 16 and 24 slabs skipped, 120, 48 and
+   72 filled ahead.
+6. **growfail** (`-DPIPE_RS_TEST_GROW_FAIL=1`, the option added): 5 of 5
+   identical, each with the growth-failure warning; the three slabbed cases
+   filled ahead, the two one-slab ones report the option off. (First pass:
+   the wrapper's path was wrong, exit 127 in every case; a gate-script
+   fault, fixed and rerun.)
+7. **tdskip** (`PIPE_K=8`): c183 five slabs (150 q) and nfs (20 q), the
+   option and the option + `--q-prep td` identical to single-queued, with
+   9 and 2 slabs dropped and 600 and 60 filled ahead.
+8. **degradecheck** (pk8) and **skipcheck** (bn4), the option added: 16 and
+   21 PASS, 0 FAIL, 0 SKIP.
+9. **fillcheck**, the option on every pipelined arm: every arm
+   byte-identical; 38 of 38 slabbed runs filled ahead.
+10. **Crash, stop and resume**, nfs 600 q: the uninterrupted run with the
+    option is identical to the installed binary's (43,098 relations).
+    kill -9 at 20 s (seed only), kill -9 8 s after the first checkpoint
+    (gates2; at 64 s: `.part` 5,780,674 bytes, sidecar 5,264,578), SIGINT,
+    SIGTERM and the stop file at 30 s: each resumed byte for byte. (First
+    pass: a fixed 45 s kill came before the first checkpoint under CPU load
+    20, so it tested the seed case again; the gate now waits for the
+    checkpoint.)
+11. **make check**: 180 PASS, 0 FAIL.
+
+The default change to 512 was checked on build `fc333108`: abcheck QUICK
+with the option, 12 of 12 identical (`ab512.txt`), and the 11 relation
+files of `t512/` and 10 of `t194b/`, `t301b/` identical to the installed
+binary's. The grid cannot change the output: 1, 256 to 1536 and 4608 blocks
+all gave the same relations. The review's changes came after; their gates
+are under "Review".
+
+### Not done
+
+- **The q boundary.** Slab 0's fill of the next q still runs serially; the
+  note's 8-9% needs it beside the last slab's apply, across
+  `prepare_next_q`. Take the trace above first. Built, it should make this
+  and the one-slab `--fill-ahead` one mechanism, the q boundary on a
+  slabbed plan being the one-slab case with this build's launch rules;
+  the release then needs its own "workspace free" event, as `ws_free` is
+  for the one-slab path, not the apply's timing event `S1.ev[2]`.
+- **The one-slab path's launch rules.** `--fill-ahead` still launches its
+  fill at the full grid and default priority; this build's confined grid
+  and greatest priority there (finding 123: c183 −1.3%) is the cheapest
+  open experiment.
+- **A hold.** Finding 159's best placement held the fill about 1 ms; the
+  build releases it ~50 us after the apply starts. Not measured.
+- **Other cards.** The grid is a constant tuned on 48 SMs; NFS@Home's
+  cards have other SM counts.
+- **Fat build, install, default.** Kyle's call.
+
+### Review
+
+Fable read the diff, the code paths it relies on and the timing logs
+(relayed by Kyle 2026-11-14, before his code review); nothing run. It
+found the three ordering arguments sound: the bucket array reused two slabs
+back is last read by the side-0 record scan, ahead of the fill's release on
+`st_sv`, and trial division never reads it; the four-way cursor turn reuses
+a buffer at the same distance as the three-way one, at the q boundary and
+after an abandoned q too; and the overflow break is the only early exit
+from a q that does not fail the band, and it waits the fill out. Four
+points, and what came of them:
+
+1. **The grid's stated reason was wrong.** This finding, `bench.h` and
+   STATUS said 512 beat 768 because the next apply waits on the fill; the
+   stage tables say it does not from 384 up (Timing, corrected above).
+   Corrected in all three; the rule and its per-SM consequence are as
+   Fable put them.
+2. **Trial division moved, and the first write-up did not say so.** Added
+   ("Trial division moved"), with C194 and SNFS-301; the trace it asks for
+   before the q boundary is under "Not done".
+3. **One mechanism when the q boundary is built**, with its own
+   "workspace free" event; and the one-slab path under this build's launch
+   rules as the cheapest open experiment. Under "Not done"; not built.
+4. **For the code review.** Both done:
+   - A fill in flight now carries the q and slab it was made for (Change,
+     "Skips and stops"). A mutant with the overflow break's
+     `sfa_next = -1;` removed (`work/fillahead-slab/mut.sh`, with the
+     overflow hook) dies at once: `internal error: a side-1 fill ran ahead
+     for q #2 slab 2 into workspace 1, and the issue is q #3 slab 0 in 1`.
+     Both workspaces are 1: the workspace check alone would have passed it
+     and applied the abandoned q's buckets to the next q's first slab.
+   - The ahead fill has its own line, `side-1 fill ahead`, outside `sieve,
+     both sides` (Change, "Join"); `--verbose-q` prints it per q. At 512 the
+     sieve total is now 99.97 ms/q inside a 116.66 wall, where it was 141.00
+     inside 115.74. The one-slab `--fill-ahead` still counts its fill in
+     side 1's, as it always has; changing that would change the default
+     output, so it is left.
+
+Gates on the final tree (`src` `38225f31`; `work/fillahead-slab/gates3.sh`,
+`gates3.txt`): abcheck off QUICK 17 of 17, with the option 13 of 13, with
+it and `--q-prep join` 12 of 12; SNFS-301 identical (669); the overflow
+skip with a fill in flight identical on c183 five slabs, c194 and nfs, on
+and on + `--q-prep td`; tdskip identical to single-queued; fillcheck every
+arm byte-identical, 38 of 38 slabbed runs filled ahead; the mutant caught;
+the table runs at 256, 384 and 512 with relations equal to the installed
+binary's; `make check` 180 PASS. Not repeated: growfail, degradecheck,
+skipcheck and the resume set (the changes are a compare per slab and the
+report), and the timing.
+
+On shipping, Fable's view: correctness is not at risk on any card (every
+grid gave identical relations, and the option turns itself off when memory
+is short); speed is measured on the 5070 only, so on there and opt-in
+elsewhere until one other card has had a grid sweep. Kyle's call.
+
+### Code review (Kyle's `/code-review`, 2026-11-14)
+
+No correctness fault. It traced the four-way cursor turn across slabs, the
+q boundary, prepared-but-not-issued q and abandoned q; the workspace reuse
+against `S1.ev[2]`; and the events and teardown, and found them sound. Ten
+findings, all speed risks, fragile coupling, an accounting slip or cleanup.
+Fixed in the tree (2026-11-15; gated on the card the same day, below):
+
+1. **The ahead fill took `--fill-threads`**, so `--fill-threads 256` would
+   have lifted the confinement (512 x 256 is over an SM's 1536 threads).
+   It now launches `FILL_THREADS_DEFAULT` (32) wide always.
+2. **The grid was a fixed 512 on every card.** It is now 512 per 48 SMs,
+   scaled by the card's count (299 on 28 SMs, 1365 on 128), so the share
+   of each SM is the one measured; `--slab-fill-blocks` still overrides.
+   Unchanged on the 5070.
+3. **It claimed its 1.02 GB with only the 512 MB margin behind it**, and
+   trial division's buffers grow at the first q, fatally if that fails. It
+   now asks for twice the margin. (That growth was 0.03 GB here.)
+4. **An explicit `--fill-rows` runs the row tier's kernels at their full
+   grid in the ahead fill.** Not confined, and not timed; the default
+   below stays off when the row tier runs, and an explicit request says so
+   in a banner line.
+5. **The release stands in for "workspace free"** on the strength of the
+   record scan being on `st_sv`, which holds because `early1` needs
+   `--fill-ahead`. Now said at the release, with a check that
+   `--fill-ahead` is not granted too; the event of its own is for the q
+   boundary build, as the review of 2026-11-14 also has it.
+6. **The ahead fill's time and count were banked before the overflow
+   check**, so a skipped slab's fill was counted while its fill and apply
+   were not, and an abandoned fill was counted. Both now go in with the
+   slab's other times, after the check.
+7. **`issue_side1` dropped its `part` argument under the option.** Passing
+   one is now an internal error.
+8. and 9. **Two copies of the ahead-fill issue and of the second-workspace
+   allocation**, and the default grid resolved twice. The grid is now
+   resolved once, at the grant, for the banner and the launch alike; one
+   helper for both ahead fills belongs with the q boundary, which makes
+   them one mechanism (STATUS row 50).
+10. **`PIPE_TEST_OVF_EVERY` unparenthesised** in its modulus; parenthesised.
+
+### The default
+
+On by default only on sm_120 with 48 SMs (the RTX 5070, the one card timed),
+under `--q-pipeline` and with no row tier (Kyle, 2026-11-14: "only turn this
+on for now for the 5070"). It resolves after the device query, where the SM
+count is known (`bench_main.cu`); `--slab-fill-ahead` and
+`--no-slab-fill-ahead` override it. On any other card a slabbed run says
+the option is off by this default and names `--slab-fill-ahead` and
+`bench/tune.sh`. Keyed on the SM count, not the card's name: the right grid
+is a count of slots per SM, and at three times it the option lost to off.
+
+`bench/tune.sh` now times it: `--no-slab-fill-ahead` and `--slab-fill-ahead
+--slab-fill-blocks N` over 256-3072, of which it times the grids of 6-24
+blocks per SM of the card, on plans of several slabs per q under
+`--q-pipeline` only, and not the arm equal to the defaults' own setting
+(read from the defaults' first run); an arm whose option turns itself off
+for memory is dropped. `--no-X` and `--X` count as one knob, so the
+combination stage cannot pair off with a grid. Checked offline against
+real run outputs (`work/fillahead-slab/`, 5070 on and off, one slab, a
+28-SM card), and end to end on the card (gates4 step 14, below). RUNBOOK's
+tune.sh paragraph says the same.
+
+### Gates on the final tree (2026-11-15)
+
+`work/fillahead-slab/gates4.sh`, `gates4b.sh`, `gates4c.sh` (logs beside
+them), src 0d2bce51 against installed c23282d5, on a quiet card:
+
+- abcheck with the default, every case: 36 of 36 identical; with
+  `--no-slab-fill-ahead`, QUICK: 17 of 17. QUICK with each of
+  `--fill-threads 64`, `--q-prep td`, `--q-prep join`: 12 of 12 each.
+- The default resolves as meant: on at 512 x 32 on the NFS@Home I16 job
+  ("this card's default", 9 slabs filled ahead in 3 q); off with its banner
+  on c183 five slabs at logI 15 (the row tier); on there with the row-tier
+  note when asked; on by default at logI 15 five slabs with `--fill-rows 0`,
+  identical, 40 slabs (gates4c); `--no-q-pipeline` runs without it.
+- `--slab-fill-blocks 384` alone: accepted and run at 384 x 32 where the
+  default is on (c194, nfs, cand and cof, 4 of 4 identical; c183 five slabs
+  without the row tier, identical); refused with exit 1 where it is off
+  (c143 logI 13, c183 logI 15, nfs `--no-q-pipeline`), as
+  `--fill-row-bands` is without the row tier, so a job line carrying it
+  alone fails on jobs at logI 15 and below. On a plan of one slab per q it
+  is accepted and the option says "off, because this plan has one slab per
+  q", as an explicit request does. gates4's first run put it in the QUICK
+  list and expected it accepted everywhere; its 7 refusals there are this
+  rule, and the arm moved to gates4b.
+- SNFS-301 10 q: identical, 669 relations, 30 slabs filled ahead.
+- Bucket overflow with an ahead fill in flight (ovf build), c183 five
+  slabs, C194 and nfs, the default and `--q-prep td` against off: identical,
+  every run with skipped slabs and overflow lines. growfail 5 of 5, tdskip
+  4 of 4, degradecheck 16 of 16, skipcheck 21 of 21, fillcheck every arm
+  byte-identical (38 slabbed runs, all with ahead fills).
+- The mutant (the skip leaves its fill in flight uncleared) dies on the
+  tag: "a side-1 fill ran ahead for q #2 slab 2 into workspace 1, and the
+  issue is q #3 slab 0 in 1".
+- Crash, stop and resume, nfs 600 q, the default: uninterrupted identical
+  to the installed binary (43098 relations); kill at 20 s, kill after the
+  first checkpoint with relations (63 s), SIGINT, SIGTERM and the stop file
+  each resumed to the same relations. `make check`: 180 PASS.
+- Timing, nfs 60 q, 3 rounds, rotated (ms/q): installed 130.88 128.52
+  128.89, the default 119.89 118.57 121.07, `--no-slab-fill-ahead` 127.67
+  128.98 129.44; medians 128.89, 119.89, 128.98: the default -7.0%, off
+  +0.1%, the default fastest in every round; relations of all 9 runs
+  identical. (Absolute times sit about 2 ms above the 2026-11-14 runs, with
+  load 1.7-2.4 from other work on the host; the ratios match t512's -7.2%.)
+- tune.sh end to end, `-r 3`, nfs 20 q: it read 512 blocks and 48 SMs from
+  the defaults' run, skipped SFA256 (outside 6-24 per SM), timed SFA0
+  +8.04% (faster in 0 of 3), SFA384 -0.33% (2 of 3), SFA768 +0.26% (1 of 3)
+  with a 3.16% spread, and kept the defaults.
+
+### Installed
+
+Kyle's call 2026-11-15 09:00: `GPU_ARCH=120`, not the fat build ("I'm not
+shipping the executable anywhere"; the fat binary's sm_120 code is built by
+the same `-gencode`, so the 5070 runs the same code either way). Installed
+the gated `src/bench/bench` itself, `0d2bce51` (cuobjdump: sm_120 ELF only,
+no PTX), by copy and rename with the CUDA client down and the card empty;
+sources re-checked against the tree first. Smoke run, NFS@Home job 5 q from
+`bench/bench`: exit 0, 512 x 32, 15 slabs filled ahead, 329 relations. The
+previous `c23282d5` is `work/fillahead-slab/bench.installed.c23282d5`. This
+binary loads on sm_120 cards only.
