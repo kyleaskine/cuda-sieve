@@ -1,0 +1,91 @@
+name: CUDA tests (simulated H100)
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the bench with CUDA and runs the device-side golden tests on a simulated
+# NVIDIA H100 (https://github.com/pantheongpu/pantheonsim). A simulator cannot
+# reproduce hardware-specific behaviour or timing, so it complements real-GPU
+# testing and does not replace it. The run takes a while, so it is
+# started by hand.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-sim:
+    name: CUDA 13.0, simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@656f502ef4782d94d34d8ddd368e333960609639 # v0.1.8
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The simulator runs PTX only and needs a shared CUDA runtime, so the
+      # fat default arch list is replaced by compute_90 PTX and -cudart shared.
+      - name: Build
+        working-directory: bench
+        env:
+          ARCH: -gencode arch=compute_90,code=compute_90 -cudart shared
+        run: |
+          make -j3 NVCC=/usr/local/cuda-13.0/bin/nvcc NVCC_ARCH="$ARCH" \
+               CUDART_LINK=shared all multest xftest
+
+      - name: Generate the large factor base
+        run: |
+          ./bench/fbgen --poly oracle/c183.poly --lim 134200000 \
+              --maxbits 15 --threads 4 --out oracle/c183.fb1
+          cd oracle && grep ' c183.fb1$' MANIFEST.sha256 | sha256sum -c
+
+      # Each step must really run on the simulated device: the output has to
+      # show the virtual GPU and the test's own pass line, and no skips.
+      - name: Device arithmetic tests (multest, xftest)
+        working-directory: bench
+        run: |
+          set -o pipefail
+          vgpu run ./multest 2>&1 | tee multest.log
+          grep -q 'virtual GPU platform initialized' multest.log
+          grep -q '^0 of [0-9]* checks failed' multest.log
+          ! grep -q '^FAIL\|^SKIP' multest.log
+          vgpu run ./xftest 2>&1 | tee xftest.log
+          grep -q 'virtual GPU platform initialized' xftest.log
+          grep -q '^0 of [0-9]* checks failed' xftest.log
+
+      - name: Franke-Kleinjung walk check
+        working-directory: bench
+        run: |
+          set -o pipefail
+          vgpu run ./bench --verify-only 2>&1 | tee walk.log
+          grep -q 'virtual GPU platform initialized' walk.log
+          test "$(grep -c '^\[verify\] OK' walk.log)" -ge 3
+          ! grep -q 'FAILED' walk.log
+
+      # Two of the cases from bench/cofcheck.sh (same pinned arguments and
+      # the same expected count: 37 relations at q = 120000053). The full
+      # script takes hours on the simulator, so it is not run here.
+      - name: Cofactor pipeline, rho and ECM
+        working-directory: bench
+        run: |
+          set -o pipefail
+          run() {
+            vgpu run ./bench --pipeline --cadofb ../oracle/c183.fb1 \
+              --poly ../oracle/c183.poly --qrange 120000053:120000053 \
+              --allowance 101.6 --allowance0 68.1 --relations rel.txt "$@" 2>&1 | tee run.log
+            grep -q 'virtual GPU platform initialized' run.log
+            test "$(grep 'total relations' run.log | tail -1 | awk '{print $NF}')" = 37
+          }
+          run --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536
+          run --cofactor --cof-ecm --ecm-b1 2000 --ecm-curves 48
