@@ -20415,3 +20415,113 @@ sources re-checked against the tree first. Smoke run, NFS@Home job 5 q from
 `bench/bench`: exit 0, 512 x 32, 15 slabs filled ahead, 329 relations. The
 previous `c23282d5` is `work/fillahead-slab/bench.installed.c23282d5`. This
 binary loads on sm_120 cards only.
+
+## Finding 161 — on a rented RTX 3060 the NFS@Home I16 job takes finding 149's fill grid (−23.4% at `--fill-blocks 589824`), and `--slab-fill-ahead` loses beside it; `tune.sh`'s stage 2 now has to beat the best single setting too
+
+**Date:** 2026-11-15 to 16, Kyle, the same rented RTX 3060 as finding 149
+(sm_86, 28 SMs, 2 MB of L2 by bench's banner, 12 GB, Ryzen 9 5900X), commit
+`57e9d88d-dirty` (the dirt is `tune.sh`'s file mode), bench `f19dc9f0`, CUDA
+12.1, driver 13.3, 6 rounds. Evidence: `work/tune3060-20261116/tune3060/`
+(reports, per-run outputs and `host.txt`; relations not kept, every run's was
+compared with the defaults' by `tune.sh`). The fill-grid result itself is
+finding 149's; what is new is the I16 job and the ahead fill beside it.
+
+### The runs
+
+| run | job | load | notes |
+|---|---|---|---|
+| `tune.b0edd5e5adf0.20261115-201156` | C194 | 24 (CPU sievers) | contended; superseded by `tune.3060.c194` |
+| `tune.3060.nfs` | I16 | 0.6 (falling from 18 as the sievers stopped) | 10 arms: fill grids, ahead fill, both |
+| `tune.3060.c194` | C194 | 1.0 | the same 10 arms |
+| `tune.3060.nfs.fill` | I16 | 0.0 | 1179648 and 2359296 refused: `BENCH_BLOCKS_MAX` is 2^20 (12 runs, exit 1) |
+| `tune.3060.nfs.fill2` | I16 | 0.15 | 589824 to the cap |
+
+I16 is the NFS@Home job (`work/applyprof/nfs.job`, `--sq-side 1 --logI 16
+--J 32768 --qrange 296847000: --nq 40`, 4 slabs per q, default about 702 ms/q);
+C194 is `oracle/c194.job` (`--nq 40`, default about 683).
+
+### The fill grid: the I16 job follows finding 149's rule
+
+Wall against the defaults, all 6 of 6 rounds faster:
+
+| `--fill-blocks` | 36864 | 73728 | 147456 | 294912 | **589824** | 786432 | 1048576 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| I16 | −10.35% | −15.22% | −18.77% | −21.81 / −22.02% | **−23.67 / −23.41%** | −22.82% | −22.51% |
+| C194 | −8.75% | −13.19% | −16.77% | −18.52% | | | |
+
+(Two figures: two runs.) The I16 job buckets 16,250,718 entries on side 1 and
+11,072,395 on side 0; 589824 x 32 = 18.9M threads is the first grid above both,
+and the curve turns there, as finding 149 found on C194 and C183. C194
+reproduces finding 149 within 0.3 points (147456 −16.77 against −16.52,
+294912 −18.52 against −18.26). The fill falls from 488 to 301 ms/q.
+
+### `--slab-fill-ahead`: a gain on the default grid, a loss beside the big one
+
+| arm | I16 | C194 |
+|---|---:|---:|
+| ahead fill 256 blocks | −0.91% | −0.58% |
+| ahead fill **384** | **−3.12%** | **−2.51%** |
+| ahead fill 512 | −1.54% | −0.64% |
+| `--fill-blocks 36864`, then + ahead fill 384 | −10.35% → −8.32% | −8.75% → −8.03% |
+| 73728, then + ahead fill | −15.22% → −10.40% | −13.19% → −9.84% |
+| 147456, then + ahead fill | −18.77% → −12.44% | −16.77% → −11.89% |
+
+The larger the fill grid, the more the ahead fill costs: 2.0, 4.8 and 6.3
+points at I16. The stage means show why (I16, ms/q, 6 rounds; the stages
+overlap under `--q-pipeline`, so only wall adds; wall here is the band's
+`wall clock per q`, about 13 ms under the `COMPLETE` line `tune.sh` times):
+
+| arm | wall | main fill | ahead fill | apply |
+|---|---:|---:|---:|---:|
+| default | 688.8 | 488.5 | — | 182.6 |
+| ahead fill 256 | 682.2 | 417.3 | 346.1 | 225.0 |
+| ahead fill 384 | 666.6 | 338.7 | 270.5 | 288.6 |
+| ahead fill 512 | 678.1 | 276.0 | 242.8 | 362.4 |
+| `--fill-blocks 147456` | 556.9 | 331.4 | — | 140.0 |
+| 147456 + ahead fill 384 | 601.3 | 265.3 | 270.5 | 244.5 |
+| `--fill-blocks 589824` | 522.5 | 300.7 | — | 145.8 |
+
+The ahead fill takes side 1's fill of slabs 1-3. On the 147456 grid those
+fills cost about 66 ms/q (the main fill drops from 331 to 265 when they leave
+it); confined to 384 x 32 they take 270, about 90 ms per slab, where the
+defaults' whole apply is 46 ms per slab. So the ahead fill cannot hide under
+the apply it is paired with, and the apply beside it slows by about 105 ms/q.
+On the 5070 the same fill took 14.2 ms per slab at 512 blocks, inside a slab
+of 29-30 ms (finding 160). The 3060's fill wants a thread per entry (finding
+149); confinement to 13.7 blocks per SM is the opposite, and a larger ahead
+grid trades fill time for apply time (512: ahead fill 243, apply 362) without
+recovering. **`--slab-fill-ahead` stays off on this card, its default, and the
+5070-only default of finding 160 stands. A card that takes the big fill grid
+should not get it.** On the default fill grid the best ahead grid here was 384
+(13.7 per SM) on both jobs, not the 299 that finding 160's scaling of 512 per
+48 SMs gives; moot on this card.
+
+For this 3060: `--fill-blocks 589824`, the ahead fill off.
+
+### `tune.sh`'s stage 2 recommended the wrong thing
+
+Stage 1 adopted `--fill-blocks 294912` (the largest grid in those runs) and
+the ahead fill at 384 as two knobs' winners; stage 2 timed their combination
+against the defaults only, adopted it (−14.07% at I16, −12.71% at C194) and
+recommended it, while 294912 alone had given −21.81% and −18.52%. Stage 1's
+`FS` arms already showed the two undoing each other.
+
+Fixed (`bench/tune.sh`, 2026-11-16): stage 2 times the combination and stage
+1's best single setting beside the defaults in the same rounds, and recommends
+the combination only if, by the adoption rule (slower in no round, a median
+gain over 1% and over the defaults' spread), it beats the defaults and also
+that setting (`beats`); otherwise that setting stands. Stage 2 is now three
+arms a round, not two. Checked offline with a fake bench and a fake
+`nvidia-smi` (scratch, not kept): knobs that undo each other (−22% alone,
+−14% together) recommend `--fill-blocks` alone; additive (−10% and −5%,
+−14.4% together, −4.9% against the best) recommend the combination; and a
+combination 0.54% better than the best recommends the best. On these runs it
+would have recommended `--fill-blocks 294912`.
+
+### Not done
+
+- A per-card default for `--fill-blocks` (STATUS row 44, Kyle's call). The
+  I16 job adds the NFS@Home case to finding 149's: −23.4% on a 3060.
+- `tune.sh`'s grid stops at 36864, so on a small-L2 card it finds the
+  direction and not the peak; 147456 and 589824 arms would find it, at two
+  more arms on every card.

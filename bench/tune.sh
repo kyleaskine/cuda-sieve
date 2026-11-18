@@ -3,10 +3,11 @@
 # which settings beat the defaults. Every knob it tries changes no output, and
 # every run's relations are compared byte for byte with the defaults' run.
 #
-#   sh tune.sh [-b BENCH] [-r ROUNDS] [-o DIR] [-a "ARMS"] -- BENCH-ARGS...
+#   sh tune.sh [-b BENCH] [-r ROUNDS] [-o DIR] [-a "ARMS"] [-n] [-w FILE] -- BENCH-ARGS...
 #
 # BENCH-ARGS is a short band of the job to tune for, as bench takes it,
-# without --relations or --log (tune.sh adds its own), for example
+# without --relations, --log, --tuned or --no-tuned (tune.sh adds its own)
+# and without the knobs it tunes (they belong in -a arms), for example
 #   sh tune.sh -- --pipeline --cofactor --poly c148.job --logI 14 \
 #       --qrange 10000000: --nq 2000
 # Pick --nq so that one run takes 10-60 s. A much shorter run is mostly
@@ -18,6 +19,31 @@
 #   -a ARMS   arms to time against the defaults instead of the grid below:
 #             NAME=FLAGS, space-separated, commas for spaces in FLAGS,
 #             e.g. "B48=--ss-block-cut,48 F9216=--fill-blocks,9216"
+#   -n        report only; never write the saved-tuning file
+#   -w FILE   the saved-tuning file to compare against and write [bench's
+#             default, ~/.config/cuda-sieve/tuned.txt; bench --help, --tuned]
+#
+# SAVING (bench --help, --tuned; bench/tuned.h). bench applies the file's
+# entry for this card at this logI to every --pipeline run, so a result
+# saved here needs no flags afterwards. tune.sh times every arm with
+# --no-tuned, against the built-in defaults, and saves only after a final
+# confirmation stage that times the defaults, the entry already saved for
+# this card and logI (as bench itself would apply it: "saved") and the
+# recommendation ("cand") in the same rounds, judged by the adoption rule
+# below:
+#   - cand beats the defaults, and saved if there is one: cand is written;
+#   - else, if the defaults clearly beat the saved entry: an empty entry
+#     (the defaults won) replaces it;
+#   - else, with no saved entry: an empty entry records that the card was
+#     tuned and the defaults won;
+#   - else the file is left as it is.
+# saved is timed as bench runs it, so an entry whose --slab-fill-ahead turns
+# itself off on this job is timed as the defaults it then is.
+# Nothing is written when a run failed or its relations differed, when the
+# card got busy, when the job line carries flags outside bench's plain base
+# (its tuned-run line names them) or has no --pipeline (only pipeline runs
+# read the file), with -n, or for an -a experiment without -w. The write
+# replaces this card's entry at this logI and nothing else.
 #
 # The grid, one knob at a time away from the defaults (bench --help):
 #   --ss-block-cut 40 48 64              default 36; 33 is the floor, and
@@ -39,7 +65,8 @@
 #   blocks per SM of this card are timed (512 is 10.7 on 48 SMs), and an arm
 #   equal to this card's default is not timed. A recommendation of
 #   --slab-fill-ahead here is worth reporting: the default is off on every
-#   card but one because no other card has been measured.
+#   card but the 5070, and the one other card measured, an RTX 3060, loses
+#   with it beside its own best --fill-blocks (RESULTS finding 161).
 #
 # Method (STATUS item 2, RESULTS findings 85, 145, 146 and 149). Every arm sieves the
 # same q, and the arms are interleaved within a round. The order is rotated
@@ -53,30 +80,49 @@
 # both 1% and the defaults' own spread between rounds. Rankings between
 # nearby settings reproduce; their margins do not. For each knob the adopted
 # arm with the largest gain wins. If more than one knob has a winner, stage 2
-# times the combination against the defaults under the same rule; if the
-# combination does not hold up, the single winner with the largest gain is
-# recommended instead.
+# times the combination and the single winner with the largest gain beside
+# the defaults, in the same rounds. The combination is recommended only if,
+# under the same rule, it beats the defaults and also that single winner;
+# otherwise the single winner is. (Knobs can undo each other: finding 161.)
 #
 # The report goes to stdout and to DIR/report.txt, with the commit and the
 # card taken from the defaults' first run log (s1.default.1.log). Exits 0
 # when done, 1 if a run failed or its relations differed, 2 if it refused to
 # start, and 3 if the card became busy partway through.
-BIN=./bench; ROUNDS=6; DIR=; ARMS=
+BIN=./bench; ROUNDS=6; DIR=; ARMS=; NOWRITE=; TPATH=; WGIVEN=; NOSAVE=
 while [ $# -gt 0 ]; do
   case $1 in
     -b) BIN=$2; shift 2 ;;
     -r) ROUNDS=$2; shift 2 ;;
     -o) DIR=$2; shift 2 ;;
     -a) ARMS=$2; shift 2 ;;
+    -n) NOWRITE=1; shift ;;
+    -w) TPATH=$2; WGIVEN=1; [ -n "$TPATH" ] || { echo "tune: -w needs a file"; exit 2; }; shift 2 ;;
     --) shift; break ;;
     *) echo "tune: unknown option $1 (bench's arguments go after --)"; exit 2 ;;
   esac
 done
 [ $# -gt 0 ] || { echo "tune: no bench arguments after --"; exit 2; }
 for a in "$@"; do
-  case $a in --relations|--log) echo "tune: leave $a out; tune.sh sets it"; exit 2 ;; esac
+  case $a in
+    --relations|--log|--tuned|--no-tuned) echo "tune: leave $a out; tune.sh sets it"; exit 2 ;;
+    # the knobs it tunes: a base that sets one times every arm on top of it,
+    # and a saved entry would leave it out
+    --fill-blocks|--ss-block-cut|--ss-warp-cut|--fill-gate-shift|--no-fill-merge|--slab-fill-ahead|--no-slab-fill-ahead|--slab-fill-blocks)
+      echo "tune: $a is a knob tune.sh times; give it as an -a arm instead"; exit 2 ;;
+  esac
 done
 [ -x "$BIN" ] || { echo "tune: $BIN is not an executable"; exit 2; }
+# A bench older than saved tuning has no --no-tuned, and would refuse it.
+if "$BIN" --help 2>/dev/null | grep -q -- '--no-tuned'; then NOTUNED=--no-tuned
+else NOTUNED=; NOSAVE="this bench predates saved tuning (no --no-tuned in its --help)"; fi
+# Only --pipeline runs read saved tuning, and bench refuses --tuned and
+# --no-tuned on any other run, as a bench that predates them refuses both.
+case " $* " in
+  *" --pipeline "*) ;;
+  *) NOTUNED=; NOSAVE="the job line has no --pipeline, and only pipeline runs read saved tuning" ;;
+esac
+[ -n "$NOTUNED" ] || TPATH=
 case $ROUNDS in ''|*[!0-9]*) echo "tune: -r needs a number"; exit 2 ;; esac
 [ "$ROUNDS" -ge 3 ] || { echo "tune: -r must be at least 3"; exit 2; }
 ARMS_GIVEN=$ARMS
@@ -111,8 +157,14 @@ seen=" "
 for a in $ARMS; do
   case $a in *=--*) ;; *) echo "tune: arm '$a' is not NAME=FLAGS"; exit 2 ;; esac
   nm=${a%%=*}
-  case $nm in default|combined|*[!A-Za-z0-9_]*|'') echo "tune: arm name '$nm' must be letters, digits or _, and not 'default' or 'combined'"; exit 2 ;; esac
+  case $nm in default|combined|cand|saved|*[!A-Za-z0-9_]*|'') echo "tune: arm name '$nm' must be letters, digits or _, and not default, combined, cand or saved"; exit 2 ;; esac
   case $seen in *" $nm "*) echo "tune: arm name '$nm' is used twice"; exit 2 ;; esac
+  # what bench takes on its command line but the saved file would not
+  case ",${a#*=}," in *,--fill-blocks,0,*)
+    echo "tune: arm $nm: --fill-blocks 0 is bench's automatic grid, which a saved entry cannot hold; give a number"; exit 2 ;;
+  esac
+  dup=$(echo "${a#*=}" | tr , '\n' | grep -- '^--' | sort | uniq -d | head -1)
+  [ -z "$dup" ] || { echo "tune: arm $nm gives $dup twice"; exit 2; }
   seen="$seen$nm "
 done
 # The default DIR lands in the working directory; .gitignore has tune.*/ so
@@ -130,6 +182,9 @@ say() { echo "$*"; echo "$*" >> "$REP"; }
 # own process.
 BUSY_DEFAULT='run-cuda-client|ggnfs-sieve-client.*(engine=cuda|cuda-bench)'
 BUSY=${TUNE_BUSY-$BUSY_DEFAULT}
+# Seconds between checks on a running bench (busy every third). TUNE_POLL is
+# for tunecheck.sh's fake bench, whose runs take milliseconds.
+POLL=${TUNE_POLL:-1}
 busy() {
   if command -v nvidia-smi > /dev/null 2>&1; then
     nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null |
@@ -152,6 +207,30 @@ flags_of() {  # the flags of arm $1 (empty for default), commas to spaces
 }
 fails=0
 NOOP=
+# tuned_first OUT: from the defaults' first run, bench's own view of saved
+# tuning (bench_main.cu, tuned_step): the key and applicability record to
+# write, the incumbent (what bench would apply), the plan's slabs per q, any
+# flags outside bench's plain base, and the file's path when -w gave none.
+#   tuned-run: card|cc|SMs|logI|J|region|side|alim|rlim|policy|maxgrid|
+#              maxblocks|status|would|overrides|path
+TR=; TR_STATUS=; SAVED=; TR_OVER=; TR_NSLAB=; NOSAVE=${NOSAVE-}
+tuned_first() {
+  [ -n "$NOTUNED" ] || return 0
+  TR=$(sed -n 's/^tuned-run: //p' "$1" | head -1)
+  if [ -z "$TR" ]; then NOSAVE="bench printed no tuned-run line"; return 0; fi
+  TR_STATUS=$(printf '%s\n' "$TR" | awk -F'|' '{ print $13 }')
+  SAVED=$(printf '%s\n' "$TR" | awk -F'|' '{ print $14 }')
+  TR_OVER=$(printf '%s\n' "$TR" | awk -F'|' '{ print $15 }')
+  p=$(printf '%s\n' "$TR" | awk -F'|' '{ s = $16; for (i = 17; i <= NF; i++) s = s "|" $i; print s }')
+  TR_NSLAB=$(sed -n 's/^tuned-plan: \([0-9][0-9]*\) slab.*/\1/p' "$1" | head -1)
+  [ -n "$TPATH" ] || TPATH=$p
+  say "   saved tuning: $(sed -n 's/^tuned: //p' "$1" | head -1)"
+  [ -n "$TR_OVER" ] && NOSAVE="the job line sets $TR_OVER, outside the plain base saved entries are tuned on"
+  [ -n "$TPATH" ] || NOSAVE="bench names no saved-tuning file (no HOME?); give -w FILE"
+  [ "$TR_STATUS" = badfile ] && NOSAVE="bench cannot use $TPATH (see its tuned: line); fix or move it"
+  [ -n "$TR_NSLAB" ] || NOSAVE="bench printed no tuned-plan line"
+  return 0
+}
 # run_stage STAGE "NAMES": every arm in NAMES (default first) for ROUNDS
 # rounds, rotated every two rounds and reversed in the second; appends
 # "stage arm round wall" lines to DIR/walls.txt.
@@ -169,10 +248,10 @@ run_stage() {
       # make bench resume it and time only the rest of the band.
       rm -f "$o".*
       t0=$(date +%s)
-      "$BIN" "$@" $(flags_of $arm) --relations "$o.rel" --log "$o.log" > "$o.out" 2>&1 &
+      "$BIN" "$@" $(flags_of $arm) ${TPATH:+--tuned "$TPATH"} $NOTUNED --relations "$o.rel" --log "$o.log" > "$o.out" 2>&1 &
       pid=$!; i=0
       while kill -0 $pid 2>/dev/null; do
-        sleep 1; i=$((i + 1))
+        sleep "$POLL"; i=$((i + 1))
         if [ $((i % 3)) -eq 0 ] && kill -0 $pid 2>/dev/null && busy_now $pid; then
           kill $pid 2>/dev/null; wait $pid 2>/dev/null
           say "tune: another process came onto the card during stage $st $arm round $rd; stopping"; exit 3
@@ -188,6 +267,7 @@ run_stage() {
         [ -s "$ref" ] || { say "tune: the defaults' first run found no relations; pick a band that finds some"; exit 1; }
         say "   commit $(sed -n 's/^# commit *//p' "$o.log" | head -1)"
         say "   card $(sed -n 's/^# device *//p' "$o.log" | head -1)"
+        tuned_first "$o.out"
         # --no-fill-merge on a plan with no merge would time the defaults
         # against themselves, and noise could adopt a flag that does nothing.
         if ! grep -q -- '--fill-merge: .*one launch' "$o.out"; then
@@ -227,7 +307,9 @@ run_stage() {
         fi
         # --slab-fill-ahead turns itself off when its memory does not fit:
         # such an arm would time the defaults against themselves
-        if [ "$(flags_of $arm | grep -c -- '--slab-fill-ahead')" -gt 0 ] &&
+        # Not the saved entry: what bench does with it, off included, is what
+        # its runs would get, and what a re-tune has to beat.
+        if [ "$arm" != saved ] && [ "$(flags_of $arm | grep -c -- '--slab-fill-ahead')" -gt 0 ] &&
            grep -q -- '--slab-fill-ahead: off, because' "$o.out"; then
           say "   not timing $arm further: $(grep -h -- '--slab-fill-ahead: off, because' "$o.out" | head -1 | sed 's/^ *//')"
           NOOP="$NOOP $arm"; rm -f "$o.rel" "$o.rel".* "$o.log"; continue
@@ -265,6 +347,28 @@ summarise() {
         print m, g, ok > pick
       } }' "$DIR/walls.txt" | tee -a "$REP"
 }
+# beats STAGE A B: one report line for arm A against arm B over STAGE's rounds,
+# by the rule summarise applies against the defaults (slower in no round, a
+# median gain over 1% and over the defaults' spread), ending in ADOPTED if A
+# wins.
+beats() {
+  awk -v st=$1 -v A=$2 -v B=$3 -v R="$ROUNDS" '
+    function med(v, n,   i, j, t) { for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (v[j] < v[i]) { t = v[i]; v[i] = v[j]; v[j] = t }
+                                    return n % 2 ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2 }
+    $1 == st { w[$2, $3] = $4 }
+    END {
+      n = 0; for (r = 1; r <= R; r++) if (("default", r) in w) d[++n] = w["default", r]
+      if (n < 3) { printf "   %s against %s: too few default runs to judge\n", A, B; exit }
+      lo = d[1]; hi = d[1]; for (i = 1; i <= n; i++) { if (d[i] < lo) lo = d[i]; if (d[i] > hi) hi = d[i] }
+      spread = (hi - lo) / med(d, n) * 100
+      k = 0; f = 0; s = 0
+      for (r = 1; r <= R; r++) if ((A, r) in w && (B, r) in w) { x[++k] = w[A, r] / w[B, r]; f += (x[k] < 1); s += (x[k] > 1) }
+      if (!k) { printf "   %s against %s: no rounds with both\n", A, B; exit }
+      g = (1 - med(x, k)) * 100
+      ok = (k == n && s == 0 && g > 1 && g > spread)
+      printf "   %-8s %+8.2f%% wall against %s (median), faster in %d of %d rounds%s\n", A, g ? -g : 0, B, f, k, ok ? "  ADOPTED" : ""
+    }' "$DIR/walls.txt"
+}
 
 say "tune.sh on $(hostname 2>/dev/null), $(date '+%Y-%m-%d %H:%M')"
 say "   bench $BIN, sha256 $(sha256sum "$BIN" 2>/dev/null | cut -c1-8)"
@@ -289,15 +393,121 @@ COMBO=""; for m in $WIN; do COMBO="$COMBO $(flags_of $m)"; done; COMBO=$(echo $C
 nwin=$(echo $WIN | wc -w)
 if [ "$nwin" -ge 2 ]; then
   ARMS="$ARMS combined=$(echo $COMBO | tr ' ' ,)"
-  say "== stage 2: the defaults against the combination ($COMBO), $(date +%T)"
-  run_stage 2 "default combined" "$@"
+  # The combination must beat the defaults AND stage 1's best single setting,
+  # timed in the same rounds: knobs can undo each other (finding 161: on an RTX
+  # 3060, --fill-blocks 294912 alone -21.8%, with --slab-fill-ahead -14.1%).
+  say "== stage 2: the combination ($COMBO) against the defaults and $BEST, $(date +%T)"
+  run_stage 2 "default combined $BEST" "$@"
   summarise 2
-  if grep -q '^combined .* 1$' "$DIR/s2.pick" 2>/dev/null; then REC=$COMBO
+  if grep -q '^combined .* 1$' "$DIR/s2.pick" 2>/dev/null; then
+    vs=$(beats 2 combined "$BEST"); say "$vs"
+    case $vs in
+      *ADOPTED) REC=$COMBO ;;
+      *) REC=$(flags_of $BEST); say "   the combination did not beat $BEST clearly; $BEST stands" ;;
+    esac
   else REC=$(flags_of $BEST); say "   the combination did not hold up; stage 1's best single setting stands"; fi
 elif [ "$nwin" -eq 1 ]; then REC=$COMBO
 else REC=""; fi
+# --slab-fill-blocks alone ran with the slab fill ahead on by this card's
+# default (bench refuses it where that is off); a saved entry must say so
+case " $REC " in
+  *" --slab-fill-blocks "*) case " $REC " in *" --slab-fill-ahead "*) ;; *) REC="--slab-fill-ahead $REC" ;; esac ;;
+esac
 say "== result $(date +%T)"
 if [ $fails -ne 0 ]; then say "   $fails runs failed or had different relations; do not use this result (see above)"
 elif [ -n "$REC" ]; then say "   recommended for this card and job: $REC"
 else say "   keep the defaults: no setting beat them clearly on this card and job"; fi
+
+# Saving. Only knobs the file may carry (bench/tuned.h's allowlist) can be
+# written; an -a arm may set others.
+knobs_only() {
+  for f in $1; do
+    case $f in
+      --fill-blocks|--ss-block-cut|--ss-warp-cut|--fill-gate-shift|--slab-fill-blocks|--no-fill-merge|--slab-fill-ahead|--no-slab-fill-ahead) ;;
+      --*) return 1 ;;
+    esac
+  done
+}
+# canon FLAGS: flag/value pairs one per line, sorted, so two orders compare equal
+canon() { printf '%s\n' "$1" | awk '{ for (i = 1; i <= NF; i++) if (i < NF && $(i + 1) !~ /^--/) { print $i, $(i + 1); i++ } else print $i }' | sort | tr '\n' ' '; }
+# write_entry FLAGS NOTE: replace this card's entry at this logI in $TPATH,
+# atomically (a temp file beside it, then mv)
+write_entry() {
+  line="$(printf '%s\n' "$TR" | awk -F'|' -v ns="$TR_NSLAB" -v fl="$1" -v nt="$2" '{ printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6, ns, $7, $8, $9, $10, fl, nt }')"
+  d=$(dirname "$TPATH")
+  mkdir -p "$d" || return 1
+  tmp="$TPATH.tune.$$"
+  {
+    if [ -s "$TPATH" ]; then
+      # every line but this key's (fields 1-4, trimmed as bench trims them)
+      awk -F'|' -v key="$(printf '%s\n' "$TR" | awk -F'|' '{ print $1 "|" $2 "|" $3 "|" $4 }')" '
+        function t(s) { gsub(/^[ \t]+|[ \t\r]+$/, "", s); return s }
+        NF >= 13 && $0 !~ /^[ \t]*#/ && t($1) "|" t($2) "|" t($3) "|" t($4) == key { next }
+        { print }' "$TPATH"
+    else
+      echo "# cuda-sieve tuned v1"
+      echo "# Saved tuning, written by bench/tune.sh and read by bench (bench --help: --tuned)."
+      echo "# card|cc|SMs|logI|J|region|nslab|side|alim|rlim|policy|flags|note"
+    fi
+    printf '%s\n' "$line"
+  } > "$tmp" && mv "$tmp" "$TPATH" || { rm -f "$tmp"; return 1; }
+  say "   wrote to $TPATH:"
+  say "   $line"
+}
+REASON=
+if [ -n "$NOWRITE" ]; then REASON="-n"
+elif [ -n "$ARMS_GIVEN" ] && [ -z "$WGIVEN" ]; then REASON="an -a experiment saves only with -w FILE"
+elif [ $fails -ne 0 ]; then REASON="runs failed or differed"
+elif [ -n "$NOSAVE" ]; then REASON=$NOSAVE
+elif [ -n "$REC" ] && ! knobs_only "$REC"; then REASON="$REC sets a flag the saved-tuning file may not carry"
+fi
+if [ -n "$REASON" ]; then
+  say "== not saving: $REASON"
+else
+  # saved: bench applies an entry (TR_STATUS apply) for this card and logI;
+  # SAVED is what of it would apply, empty when that is the defaults.
+  HAVE_SAVED=; [ "$TR_STATUS" = apply ] && HAVE_SAVED=1
+  [ -n "$REC" ] && [ -n "$SAVED" ] && [ "$(canon "$REC")" = "$(canon "$SAVED")" ] && SAVED_IS_CAND=1 || SAVED_IS_CAND=
+  names="default"
+  [ -n "$REC" ] && { ARMS="$ARMS cand=$(echo $REC | tr ' ' ,)"; names="$names cand"; }
+  [ -n "$SAVED" ] && [ -z "$SAVED_IS_CAND" ] && { ARMS="$ARMS saved=$(echo $SAVED | tr ' ' ,)"; names="$names saved"; }
+  # the entry's note: date, commit (whole, as "57e9d88d-dirty"), job, band
+  band=$(printf '%s\n' "$*" | sed -n 's/.*--qrange \([^ ]*\).*/q \1/p')$(printf '%s\n' "$*" | sed -n 's/.*--nq \([^ ]*\).*/ nq \1/p')
+  note="tune.sh $(date +%Y-%m-%d) $(sed -n 's/^# commit *//p' "$DIR/s1.default.1.log" | head -1 | awk '{ print $1 }') $(basename "$(printf '%s\n' "$*" | sed -n 's/.*--poly \([^ ]*\).*/\1/p')") $band"
+  if [ "$names" = default ]; then
+    # nothing to time: no recommendation, and saved is the defaults or absent
+    if [ -z "$HAVE_SAVED" ]; then
+      write_entry "" "$note, the defaults won" || { say "   writing $TPATH failed"; exit 1; }
+    else say "== saving: nothing to change; the saved entry already says the defaults"; fi
+  else
+    say "== confirmation: $names, $(date +%T)"
+    run_stage 3 "$names" "$@"
+    [ $fails -eq 0 ] || { say "== not saving: the confirmation stage had failed runs"; exit 1; }
+    summarise 3
+    vc=; vs=; vd=
+    [ -n "$REC" ] && { vc=$(beats 3 cand default); say "$vc"; }
+    if [ -n "$REC" ] && [ -n "$SAVED" ] && [ -z "$SAVED_IS_CAND" ]; then vs=$(beats 3 cand saved); say "$vs"; fi
+    # the defaults against saved; where saved is cand, against cand
+    if [ -n "$SAVED" ]; then
+      if [ -n "$SAVED_IS_CAND" ]; then vd=$(beats 3 default cand); else vd=$(beats 3 default saved); fi
+      say "$vd"
+    fi
+    case $vc in
+      *ADOPTED)
+        case $vs in
+          ''|*ADOPTED) g=$(printf '%s\n' "$vc" | awk '{ print $2 }')
+                       write_entry "$REC" "$note $g against the defaults" || { say "   writing $TPATH failed"; exit 1; } ;;
+          *) vc=no ;;
+        esac ;;
+      *) vc=no ;;
+    esac
+    if [ "$vc" = no ]; then
+      case $vd in
+        *ADOPTED) write_entry "" "$note, the defaults beat the saved $SAVED" || { say "   writing $TPATH failed"; exit 1; } ;;
+        *) if [ -z "$HAVE_SAVED" ]; then write_entry "" "$note, the defaults won" || { say "   writing $TPATH failed"; exit 1; }
+           else say "== not saving: nothing beat both the defaults and the saved entry clearly; $TPATH is unchanged"; fi ;;
+      esac
+    fi
+  fi
+fi
 [ $fails -eq 0 ]

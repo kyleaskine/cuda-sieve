@@ -4,6 +4,7 @@
 #include "ckpt.h"
 #include "runlog.h"
 #include "watchdog.h"
+#include "tuned.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -359,6 +360,16 @@ static void usage(void)
 "                   blocks), else a multiple of 32 in\n"
 "                   [32,1024]. Independent of --threads: fill wants many\n"
 "                   narrow blocks, the other kernels do not.            [0]\n"
+"  --tuned PATH     saved tuning: bench/tune.sh writes the speed knobs that\n"
+"                   won on this card at this logI, and --pipeline runs apply\n"
+"                   them, all or none: none beside a speed knob given on the\n"
+"                   command line. Every one is output-identical, and the\n"
+"                   banner's tuned: line says what was applied and from where.\n"
+"                   [$XDG_CONFIG_HOME/cuda-sieve/tuned.txt, else\n"
+"                   ~/.config/cuda-sieve/tuned.txt; %%APPDATA%%\\cuda-sieve\\tuned.txt\n"
+"                   on Windows; a BOINC build reads only --tuned]\n"
+"  --no-tuned       apply none of it; the tuned: line still says what would\n"
+"                   apply (tune.sh times its arms this way)\n"
 "  --blocking-sync  yield the CPU while waiting on the GPU instead of spinning.\n"
 "                   CUDA busy-waits by default, so a host thread that is 90%%\n"
 "                   idle still pegs a core; this frees it, at the cost of a\n"
@@ -1044,6 +1055,166 @@ static int boinc_discard_bad_resume(const resume_recovery_t *r,
     return 1;
 }
 
+static_assert(TUNED_BLOCKS_MAX == BENCH_BLOCKS_MAX, "tuned.h mirrors bench.h");
+static_assert(TUNED_SS_BLOCK_MIN == SS_BLOCK_CUT_MIN, "tuned.h mirrors bench.h");
+static_assert(TUNED_SS_BLOCK_MAX == SS_BLOCK_CUT_MAX, "tuned.h mirrors bench.h");
+static_assert(TUNED_SS_WARP_MAX == SS_WARP_CUT_MAX, "tuned.h mirrors bench.h");
+
+/* What a saved entry can break that the judge (tuned_judge) is meant to have
+ * ruled out. NULL when the configuration is sound. Run after the merge as an
+ * assertion: a hit is a bug in tuned.c, and the run falls back to the
+ * defaults rather than refusing, since a saved value never refuses a run. */
+static const char *tuned_invalid(const bench_cfg_t *c, const cudaDeviceProp *prop)
+{
+    if (c->fill_blocks > prop->maxGridSize[0])
+        return "the fill grid is above this card's grid limit";
+    if (c->small_sieve && ss_warp_cut(c) <= ss_block_cut(c))
+        return "the warp cut is not above the block cut";
+    if (c->pipeline && c->fill_merge_cut && !c->fill_merge)
+        return "--fill-merge-cut without the merge";
+    if (c->pipeline && c->slab_fill_ahead > 0 && !c->q_pipeline)
+        return "the slab fill ahead without --q-pipeline";
+    if (c->slab_fill_blocks && c->slab_fill_ahead == 0)
+        return "a slab fill-ahead grid with the slab fill ahead off";
+    return NULL;
+}
+
+/* Saved tuning (tuned.h), at the device query: the first point that knows
+ * both the card and the resolved configuration, and before the
+ * --slab-fill-ahead default, which a saved entry overrides. Judges the entry
+ * for this card and logI, applies what fits unless --no-tuned, and prints
+ *   tuned: ...       what happened, in words (also into the run log)
+ *   tuned: note: ... skipped knobs and drift, when there are any
+ *   tuned-run: ...   the same for tune.sh, '|'-separated:
+ *     card|cc|SMs|logI|J|region|side|alim|rlim|policy|maxgrid|maxblocks|
+ *     status|would|overrides|path
+ * so that tune.sh takes its key, its incumbent and its path from bench's own
+ * rules instead of re-implementing them. *applied gets the TUNED_F_* of what
+ * was applied, for the banner's [tuned] tags. */
+static void tuned_step(bench_cfg_t *cfg, const cudaDeviceProp *prop,
+                       int argc, char **argv, const char *path_arg,
+                       int no_tuned, uint32_t alim, uint32_t rlim,
+                       unsigned *applied, char *line, size_t nline)
+{
+    static const char *const STATUS[] = { "nofile", "badfile", "none", "declined", "apply" };
+    char path[1024] = "", over[512], key[320], notes[1024];
+    tuned_run_t run;
+    tuned_verdict_t v;
+    const bench_cfg_t pre = *cfg;
+    *applied = 0;
+    memset(&run, 0, sizeof run);
+    memset(&v, 0, sizeof v);
+    run.card = prop->name;
+    run.cc_major = prop->major; run.cc_minor = prop->minor;
+    run.sms = prop->multiProcessorCount; run.logI = cfg->logI;
+    run.J = cfg->J; run.region = cfg->log_region; run.side = cfg->sq_side;
+    run.alim = alim; run.rlim = rlim;
+    run.pipeline = cfg->pipeline; run.q_pipeline = cfg->q_pipeline;
+    run.small_sieve = cfg->small_sieve; run.fill_gate = cfg->fill_gate;
+    run.fill_merge = cfg->fill_merge;
+    run.ss_block_cut = (int)ss_block_cut(cfg);
+    run.ss_warp_cut = (int)ss_warp_cut(cfg);
+    run.max_grid = prop->maxGridSize[0];
+    run.explicit_mask = tuned_explicit_mask(argc, argv);
+    tuned_overrides(argc, argv, over, sizeof over);
+    snprintf(key, sizeof key, "%s (sm_%d%d, %d SMs) at logI %d", prop->name,
+             prop->major, prop->minor, prop->multiProcessorCount, cfg->logI);
+
+    if (path_arg) snprintf(path, sizeof path, "%s", path_arg);
+#ifndef HAVE_BOINC
+    else if (tuned_default_path(path, sizeof path)) path[0] = 0;
+#endif
+    if (path[0]) tuned_lookup(path, &run, stderr, &v);
+    else v.status = TUNED_NOFILE;
+
+    notes[0] = 0;
+    switch (v.status) {
+    case TUNED_NOFILE:
+        if (path[0])
+            snprintf(line, nline, "tuned: none for %s (no file %s; bench/tune.sh"
+                     " writes it)", key, path);
+        else
+#ifdef HAVE_BOINC
+            snprintf(line, nline, "tuned: none (a BOINC build reads saved tuning"
+                     " only from --tuned PATH)");
+#else
+            snprintf(line, nline, "tuned: none (neither XDG_CONFIG_HOME nor HOME"
+                     " is set; --tuned PATH names a file)");
+#endif
+        break;
+    case TUNED_BADFILE:
+        snprintf(line, nline, "tuned: ignoring %s: %s", path, v.why);
+        fprintf(stderr, "bench: warning: saved tuning %s ignored: %s\n", path, v.why);
+        break;
+    case TUNED_NONE:
+        snprintf(line, nline, "tuned: none for %s in %s", key, path);
+        break;
+    case TUNED_DECLINED:
+        snprintf(line, nline, "tuned: not using %s line %u for %s: %s", path,
+                 v.e.line, key, v.why);
+        break;
+    default:
+        if (!v.e.flags[0])
+            snprintf(line, nline, "tuned: the defaults for %s: %s line %u found"
+                     " nothing faster [%s]", key, path, v.e.line, v.e.note);
+        else if (!v.applied[0])
+            snprintf(line, nline, "tuned: nothing of %s line %u (%s) fits this"
+                     " run [%s]", path, v.e.line, v.e.flags, v.e.note);
+        else
+            snprintf(line, nline, "tuned: %s %s for %s from %s line %u [%s]",
+                     no_tuned ? "would apply (but --no-tuned)" : "applied",
+                     v.applied, key, path, v.e.line, v.e.note);
+        snprintf(notes, sizeof notes, "%s", v.notes);
+        if (over[0]) {
+            size_t k = strlen(notes);
+            snprintf(notes + k, sizeof notes - k, "%sthis run also sets %s, which"
+                     " saved entries are not tuned with", k ? "; " : "", over);
+        }
+        break;
+    }
+    /* Apply, and check what that leaves, before saying anything, so the
+     * banner, the tuned-run line and the run log all describe the
+     * configuration that runs. */
+    if (v.status == TUNED_APPLY && !no_tuned && v.applied[0]) {
+        const tuned_knobs_t *a = &v.apply;
+        const char *bad;
+        if (a->fill_blocks) { cfg->fill_blocks = a->fill_blocks; *applied |= TUNED_F_FILL_BLOCKS; }
+        if (a->ss_block_cut) { cfg->ss_block_cut = (uint32_t)a->ss_block_cut; *applied |= TUNED_F_SS; }
+        if (a->ss_warp_cut) { cfg->ss_warp_cut = (uint32_t)a->ss_warp_cut; *applied |= TUNED_F_SS; }
+        if (a->fill_gate_shift >= 0) { cfg->fill_gate_shift = a->fill_gate_shift; *applied |= TUNED_F_GATE_SHIFT; }
+        if (a->no_fill_merge) { cfg->fill_merge = 0; *applied |= TUNED_F_MERGE; }
+        if (a->slab_fill_ahead >= 0) {
+            cfg->slab_fill_ahead = a->slab_fill_ahead;
+            cfg->slab_fill_blocks = a->slab_fill_blocks;
+            cfg->slab_fill_saved = 1;
+            *applied |= TUNED_F_SFA;
+        }
+        cfg->tuned_nslab = v.e.nslab;
+        if ((bad = tuned_invalid(cfg, prop)) != NULL) {
+            fprintf(stderr, "bench: internal error: saved tuning %s left %s;"
+                    " running on the defaults instead\n", v.applied, bad);
+            *cfg = pre;
+            *applied = 0;
+            snprintf(line, nline, "tuned: not using %s line %u for %s: applying"
+                     " %s left %s, an internal error; running on the defaults",
+                     path, v.e.line, key, v.applied, bad);
+            v.status = TUNED_DECLINED;
+        }
+    }
+    printf("%s\n", line);
+    if (notes[0]) printf("tuned: note: %s\n", notes);
+    printf("tuned-run: %s|%d.%d|%d|%d|%u|%d|%d|%u|%u|%d|%d|%d|%s|%s|%s|%s\n",
+           prop->name, prop->major, prop->minor, prop->multiProcessorCount,
+           cfg->logI, cfg->J, cfg->log_region, cfg->sq_side, alim, rlim,
+           TUNED_POLICY, prop->maxGridSize[0], prop->maxBlocksPerMultiProcessor,
+           STATUS[v.status], v.status == TUNED_APPLY ? v.applied : "", over,
+           path);
+    if (notes[0]) {
+        size_t k = strlen(line);
+        snprintf(line + k, nline - k, "; note: %s", notes);
+    }
+}
+
 /* `outcome` is an OUT-PARAMETER and not the return value, because the return
  * value is the process exit status and 1 and 2 are already spoken for there by
  * the argument checks. main() supplies the default -- OK on a zero status,
@@ -1130,6 +1301,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_ahead = -1;   /* resolved with --q-pipeline */
     cfg.slab_fill_ahead = -1;   /* this card's default, resolved at the device query */
     cfg.slab_fill_default = 0; cfg.slab_fill_blocks = 0;
+    cfg.slab_fill_saved = 0; cfg.tuned_nslab = 0;
     cfg.td_ahead = -1;     /* resolved with --q-pipeline */
     cfg.q_prep = PIPE_QPREP_AUTO;
     cfg.qspan = 0;
@@ -1202,6 +1374,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     const char *cofac_in = NULL;
     const char *check_rel = NULL;
     int blocking_sync = 0;
+    /* Saved tuning (tuned.h): --tuned PATH names the file, --no-tuned judges
+     * the entry and prints what would apply without applying it. */
+    const char *tuned_path_arg = NULL;
+    int no_tuned = 0;
+    char tuned_line[1024] = "";
+    unsigned tuned_applied = 0;
     int cuda_device = -1;       /* -1 = ask BOINC, else CUDA's default */
     /* Which values the COMMAND LINE supplied. Precedence is
      *      explicit flag  >  job file  >  derived  >  refuse
@@ -1497,6 +1675,10 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             fprintf(stderr, "note: --auto-params is the default now and is"
                             " ignored; drop it\n");
         else if (!strcmp(argv[i], "--blocking-sync")) blocking_sync = 1;
+        /* NOT through bench_boinc_resolve_path: the file is the host's, like
+         * --stop-file, not a workunit file with a logical name. */
+        else if (!strcmp(argv[i], "--tuned") && i + 1 < argc) tuned_path_arg = argv[++i];
+        else if (!strcmp(argv[i], "--no-tuned")) no_tuned = 1;
         else if (!strcmp(argv[i], "--lpb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > 64) { fprintf(stderr, "--lpb0 %ld out of range 1..64\n", v); return 1; } cfg.lpb0 = (uint32_t)v; lpb0_set = 1; }
         else if (!strcmp(argv[i], "--mfb0") && i + 1 < argc) { long v = strtol(argv[++i], 0, 10); if (v < 1 || v > (long)cf_width_bits(CF_LMAX)) { fprintf(stderr, "--mfb0 %ld out of range 1..%u\n", v, cf_width_bits(CF_LMAX)); return 1; } cfg.mfb0 = (uint32_t)v; mfb0_set = 1; }
         /* Cofactor width in 32-bit limbs, per side. Only useful FORCED UPWARD
@@ -2377,6 +2559,12 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         dev_ordinal = dev;
         dev_count = ndev;
 
+        /* Saved tuning: the pipeline only. The harness reproduces RESULTS
+         * numbers and must not pick up a machine's tuning. */
+        if (cfg.pipeline)
+            tuned_step(&cfg, &prop, argc, argv, tuned_path_arg, no_tuned,
+                       alim, rlim, &tuned_applied, tuned_line, sizeof tuned_line);
+
         /* --slab-fill-ahead's default, which needs the card: on only where it
          * was timed -- sm_120 with SLAB_FILL_DEFAULT_SMS (48) SMs, the RTX
          * 5070, -7.2% on the I16 NFS@Home job (finding 160) -- under
@@ -2489,14 +2677,15 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         printf("grid: %d x %d for fill (absolute, not per SM)%s%s%s\n",
                cfg.fill_blocks  ? cfg.fill_blocks  : FILL_BLOCKS_DEFAULT,
                cfg.fill_threads ? cfg.fill_threads : FILL_THREADS_DEFAULT,
-               cfg.fill_blocks  ? "  [--fill-blocks]"  : "",
+               !cfg.fill_blocks ? "" :
+               (tuned_applied & TUNED_F_FILL_BLOCKS) ? "  [tuned]" : "  [--fill-blocks]",
                cfg.fill_threads ? "  [--fill-threads]" : "",
                cfg.fill_merge ? "; on a one-slab plan, as --fill-merge reports" : "");
         if (cfg.small_sieve)
             printf("small sieve tiers: block m < %u, warp m < %u%s%s\n",
                    ss_block_cut(&cfg), ss_warp_cut(&cfg),
-                   cfg.ss_block_cut ? "  [--ss-block-cut]" : "",
-                   cfg.ss_warp_cut  ? "  [--ss-warp-cut]"  : "");
+                   !cfg.ss_block_cut ? "" : (tuned_applied & TUNED_F_SS) ? "  [tuned]" : "  [--ss-block-cut]",
+                   !cfg.ss_warp_cut  ? "" : (tuned_applied & TUNED_F_SS) ? "  [tuned]" : "  [--ss-warp-cut]");
         /* A knob the banner does not name is a knob a log cannot prove was
          * live -- the --fill-blocks lesson (bench_kernels.cu, twolevel note).
          * --fill-streams reaches k_fill_atomic only, so say so HERE rather
@@ -2549,7 +2738,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--td-ahead", "--no-td-ahead",
             "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
             "--resieve-scan-cap", "--resieve-scan-pairs", "--no-row-cap",
-            "--norm-gate", "--no-norm-gate", NULL
+            "--norm-gate", "--no-norm-gate", "--tuned", "--no-tuned", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -3555,6 +3744,8 @@ resume_artifacts_ready:
                         cfg.fill_threads ? cfg.fill_threads
                                          : FILL_THREADS_DEFAULT,
                         cfg.fill_merge ? " (or merged: # fill-merge)" : "");
+            /* what saved tuning did, since the geometry above includes it */
+            if (tuned_line[0]) runlog_note("tuned", "%s", tuned_line);
             /* The factor-base convention, spelled out rather than implied. The
              * pipeline runs the FULL base while GGNFS truncates at q, and the
              * ratio between the two is 2.54x at q=50M and 1.03x at 130M on the

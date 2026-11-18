@@ -392,7 +392,7 @@ CXXFLAGS   = -O3 $(HOST_TUNE) -Wall -Wextra -std=c++17 -MMD -MP \
              $(DEFS) $(CF_LMAX_DEF) $(BOINC_DEFS) $(BOINC_CPPFLAGS)
 
 CU_SRCS  = bench_main.cu bench_kernels.cu
-C_SRCS   = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c
+C_SRCS   = fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c tuned.c
 CPP_SRCS = boinc_support.cpp
 
 CU_OBJS  = $(CU_SRCS:.cu=.o)
@@ -554,6 +554,11 @@ ckpttest: ckpttest.c ckpt.h bench.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(
 stoptest: stoptest.c platform.h platform.o $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ stoptest.c platform.o -ldl -lm
 
+# Saved tuning's rules (tuned.c): the file format, the allowlist, the key, each
+# family's explicit-flag rule and the declines. CPU-only, like stoptest.
+tunedtest: tunedtest.c tuned.h tuned.o
+	$(CC) $(CFLAGS) -o $@ tunedtest.c tuned.o
+
 # joins the two per-side --emit-cof files into cofactorisation batch input
 mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -570,14 +575,14 @@ mkcofbatch: mkcofbatch.c $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE
 -include $(OBJS:.o=.d) $(TEST_OBJS:.o=.d) fbgen_gpu.d
 
 clean:
-	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest slabtest multest xftest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
+	rm -f bench fbtest fbgen fbgen_gpu sqgentest normscan dumpcmp mkcofbatch ckpttest stoptest tunedtest slabtest multest xftest *.o *.d $(ARCH_STAMP) $(BOINC_STAMP) $(LINK_STAMP) $(GIT_STAMP) $(DEFS_STAMP) $(CF_LMAX_STAMP) $(BN_LIMBS_STAMP) $(PIPE_K_STAMP)
 
-.PHONY: all clean check ckptcheck stopcheck mulcheck xfcheck cofcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
+.PHONY: all clean check ckptcheck stopcheck tunedcheck tunecheck mulcheck xfcheck cofcheck chunkcheck chunksimcheck fbgencheck fbgpucheck sqgencheck walkcheck slabcheck skipcheck degradecheck
 
 # `check` depended on fbtest alone, so the whole CUDA path -- kernels, the
 # cofactoriser, the pipeline -- could fail to compile while the gates reported
 # "all gates passed". Depend on `all`.
-check: all ckptcheck stopcheck mulcheck xfcheck cofcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
+check: all ckptcheck stopcheck tunedcheck tunecheck mulcheck xfcheck cofcheck chunksimcheck fbgencheck sqgencheck walkcheck slabcheck
 	./fbtest --fb1 ../oracle/c183.fb1
 
 # The cofactor products' gate (finding 153): cofac_arith.cuh's PTX mz_mul<3>
@@ -611,6 +616,14 @@ ckptcheck: ckpttest
 # whose regression is silent until an operator asks a real run to stop.
 stopcheck: stoptest
 	./stoptest
+
+# Saved tuning (tuned.h). A CPU gate: no card.
+tunedcheck: tunedtest
+	./tunedtest
+
+# tune.sh's saving rules against a fake bench (tunecheck.sh). No card.
+tunecheck:
+	sh ./tunecheck.sh
 
 # The lattice-walk gate, which nothing used to run. `--verify` is refused under
 # --pipeline (harness_only), and cofcheck/testsieve/every band run use

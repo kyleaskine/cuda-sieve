@@ -719,6 +719,12 @@ typedef struct {
     int      slab_fill_ahead;
     int      slab_fill_default;
     int      slab_fill_blocks;
+    /* Saved tuning (tuned.h): slab_fill_saved says slab_fill_ahead and its
+     * grid came from the file, so run_pipeline_impl's on/off line can say
+     * so; tuned_nslab is the applied entry's slabs per q (0 = no entry
+     * applied), for run_pipeline's check against the real plan. */
+    int      slab_fill_saved;
+    int      tuned_nslab;
     /* --td-ahead: under --q-pipeline, TD's record pass and k_cof_enqueue are
      * queued ahead of its counter readback, on a count the device gates as
      * the host would. Output-identical; finding 135. Default on wherever

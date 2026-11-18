@@ -38,6 +38,7 @@ bench/mkcofbatch
 bench/ckpttest
 bench/stoptest
 bench/slabtest
+bench/tunedtest
 bench/multest
 bench/xftest
 # wintest.bat outputs (cross-platform byte-comparison harness)

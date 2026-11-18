@@ -1547,7 +1547,9 @@ rotated and reversed in alternate rounds, and every run's relations are
 compared byte for byte with the defaults'. A setting is adopted only if it
 was slower than the defaults in no round, and faster by more than 1% and by
 more than the defaults' own spread between rounds; if two knobs win, it
-times the combination too. Pick `--nq` so one run takes 10-60 s; the default
+times their combination beside the defaults and the best single setting, and
+recommends the combination only if it beats both by the same rule (knobs can
+undo each other: RESULTS.md finding 161). Pick `--nq` so one run takes 10-60 s; the default
 grid of 17 arms is then 20-105 minutes (up to 20 arms and 120 minutes on a
 plan of several slabs per q, where `--no-fill-merge` drops out and the
 `--slab-fill-ahead` grids of 6-24 blocks per SM of the card come in). It refuses to start with anything on
@@ -1562,12 +1564,85 @@ sh bench/tune.sh -b bench/bench -- --pipeline --cofactor --poly JOB.job \
     --logI 14 --qrange Q0: --nq 2000
 ```
 
+**tune.sh saves what wins, and bench applies it from then on.** The file is
+`~/.config/cuda-sieve/tuned.txt` (`$XDG_CONFIG_HOME/cuda-sieve/tuned.txt` if
+that is set; `%APPDATA%\cuda-sieve\tuned.txt` on Windows). It holds one entry
+per card per logI, keyed on the card's name, compute capability and SM
+count. Every `--pipeline` run on that card at that logI applies the entry
+without being told: no `--fill-blocks` on the command line, and nothing to
+pass through a work client. The banner's `tuned:` line says what was
+applied and from where, and the run log records it. The grids it sets
+(`--fill-blocks`, the small-sieve cuts, `--slab-fill-blocks`) are also
+tagged `[tuned]` where the banner prints them. `--no-tuned` applies none of
+it, and `--tuned PATH` names another file. A BOINC build reads only
+`--tuned`.
+
+An entry applies whole or not at all. Its knobs were confirmed together, and
+they interact: on the 3060 a saved `--slab-fill-ahead` beside a hand-given
+`--fill-blocks 589824` was slower than either alone (finding 161). So a
+speed knob on the command line, or a flag of its family (`--fill-merge-cut`,
+`--no-fill-gate`, `--no-smallsieve`, `--fill-concurrent` and the like), sets
+the whole entry aside, and the `tuned:` line says so.
+
+Every knob in it is output-identical, so a stale entry costs speed, never
+relations. For that reason a saved value that does not fit a run is skipped
+with a note rather than refused. That covers:
+- the gate shift without the gate;
+- `--slab-fill-ahead` on a one-slab plan;
+- a grid above the card's limit.
+
+An entry is declined as a whole when it was tuned at another J or region,
+or under another tuning policy (`TUNED_POLICY`, bumped when a change makes
+old tuning untrustworthy). bench only notes a factor-base bound more than 2×
+from the tuned job's, another special-q side, or another slab-plan shape.
+
+tune.sh times every arm with `--no-tuned`, against the built-in defaults. It
+then runs a confirmation stage that times three things in the same rounds:
+- the defaults;
+- the entry already saved, as bench would apply it;
+- its recommendation.
+
+It writes the recommendation only if it beats both by the adoption rule.
+If it doesn't, and the defaults clearly beat the saved entry, it writes an
+empty entry (the defaults won). If there was no entry, it writes an empty
+one to record the tune. Otherwise the file is left alone. The saved entry is
+timed as bench runs it, so one whose `--slab-fill-ahead` turns itself off on
+this job is timed as the defaults it then is.
+
+It never writes:
+- after a failed or differing run;
+- with `-n`;
+- for an `-a` experiment unless `-w FILE` is given;
+- when the job line carries flags outside the plain base entries are tuned
+  on, which bench names on its `tuned-run:` line;
+- when the job line has no `--pipeline`, since only pipeline runs read the
+  file.
+
+`-w FILE` compares against and writes that file instead of the default.
+The format is plain text, and it is documented in `bench/tuned.h`.
+
+**Timing on a machine with an entry.** Every `--pipeline` run applies it, an
+A/B timing included. A binary from before saved tuning reads no file, so
+timing it against a new one would credit the saved knobs to the code
+change, and a "default against `--fill-blocks X`" A/B would time X against
+the saved grid. To time the built-in defaults, run every binary with
+`XDG_CONFIG_HOME=/nonexistent` in the environment: a new bench then finds
+no file, and an old one never looks. `--no-tuned` does the same on a new
+binary, but an old one refuses it. `abcheck.sh` compares output, not time,
+and is unaffected.
+
 Every default and the whole grid were measured on a 5070 (sm_120), so a
 report from another card is useful even when it keeps the defaults.
 `--slab-fill-ahead` (RESULTS.md finding 160, −6 to −7% at I16) is on by
-default only on that card, sm_120 with 48 SMs, because its grid is a count of
-slots per SM and no other card has been swept; a report recommending it on
-another card is the measurement that would turn it on there.
+default only on that card, sm_120 with 48 SMs. Its grid is a count of slots
+per SM, and the one other card swept, an RTX 3060, gains with it on the
+default fill grid but loses beside the much larger fill grid that card takes
+(`--fill-blocks 589824`, findings 149 and 161), so it stays off there. A
+report recommending it on another card, which now means beating that card's
+best single setting too (stage 2 checks), is the measurement that would turn
+it on there. Such a recommendation also becomes that card's saved entry, so
+the card uses `--slab-fill-ahead` from then on without any change to the
+built-in default.
 `DIR/report.txt` names the card, driver, binary and job (RESULTS.md
 finding 146).
 

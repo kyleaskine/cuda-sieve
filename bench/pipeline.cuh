@@ -3320,8 +3320,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             }
         }
         if (why[0]) {
-            printf("  --slab-fill-ahead: off, because %s\n", why);
-            runlog_note("slab-fill-ahead", "off: %s", why);
+            printf("  --slab-fill-ahead: off, because %s%s\n", why,
+                   cfg->slab_fill_saved ? "; saved setting" : "");
+            runlog_note("slab-fill-ahead", "off: %s%s", why,
+                        cfg->slab_fill_saved ? "; saved setting" : "");
         } else {
             sfa = 1;
             sfa_blocks = cfg->slab_fill_blocks ? cfg->slab_fill_blocks
@@ -3333,15 +3335,18 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    " priority%s; a second bucket array and a fourth side-1"
                    " walk-cursor buffer (%.2f GB)%s\n", sfa_blocks,
                    FILL_THREADS_DEFAULT,
-                   cfg->slab_fill_blocks ? " [--slab-fill-blocks]" : "",
+                   !cfg->slab_fill_blocks ? "" :
+                   cfg->slab_fill_saved ? " [tuned]" : " [--slab-fill-blocks]",
                    extra / 1073741824.0,
-                   cfg->slab_fill_default ? "; this card's default" : "");
+                   cfg->slab_fill_default ? "; this card's default" :
+                   cfg->slab_fill_saved ? "; saved setting" : "");
             if (cfg->fill_rows)
                 printf("  --slab-fill-ahead: the row tier (--fill-rows %d) runs at"
                        " its own full grid in the ahead fill, not confined; not"
                        " timed\n", cfg->fill_rows);
             runlog_note("slab-fill-ahead", "on%s, %d x %d on %d SMs, +%.2f GB",
-                        cfg->slab_fill_default ? " (this card's default)" : "",
+                        cfg->slab_fill_default ? " (this card's default)" :
+                        cfg->slab_fill_saved ? " (saved setting)" : "",
                         sfa_blocks, FILL_THREADS_DEFAULT, nsm,
                         extra / 1073741824.0);
             VRAM_MARK("slab fill-ahead bucket array");
@@ -3353,6 +3358,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                " where it was timed; --slab-fill-ahead to use it, bench/tune.sh"
                " to time it\n", SLAB_FILL_DEFAULT_SMS);
         runlog_note("slab-fill-ahead", "off: this card's default");
+    } else if (cfg->slab_fill_saved && SLABBED && qpipe) {
+        printf("  --slab-fill-ahead: off (saved setting)\n");
+        runlog_note("slab-fill-ahead", "off (saved setting)");
     } else {
         runlog_note("slab-fill-ahead", "off");
     }
@@ -6323,6 +6331,22 @@ extern "C" int run_pipeline(const fb_t *fb1, const fb_t *fbs1,
                 " (largest direct-test prime %u, requested --slab-j %u)\n",
                 cfg->logI, cfg->J, pmax, cfg->slab_j);
         return -1;
+    }
+    /* Saved tuning's slab check, here because this is the first point the
+     * real plan exists (it depends on the largest small-factor-base prime),
+     * and against the plan the run executes with, so the two cannot
+     * disagree. tune.sh records the plan's slab count from this line. */
+    {
+        const uint32_t nsl = plan.enabled ? plan.nslab : 1u;
+        printf("tuned-plan: %u slab%s per q\n", nsl, nsl == 1 ? "" : "s");
+        if (cfg->tuned_nslab > 0 && ((uint32_t)cfg->tuned_nslab > 1) != (nsl > 1)) {
+            printf("tuned: note: the saved entry was tuned on a plan of %d"
+                   " slab%s per q and this one has %u; a re-tune for this shape"
+                   " may find other settings\n", cfg->tuned_nslab,
+                   cfg->tuned_nslab == 1 ? "" : "s", nsl);
+            runlog_note("tuned-plan", "tuned on %d slabs per q, this plan %u",
+                        cfg->tuned_nslab, nsl);
+        }
     }
     /* The A/B record path leaves no other trace: the stage label is the same on
      * both branches and the checkpoint job text does not carry the flag, so a

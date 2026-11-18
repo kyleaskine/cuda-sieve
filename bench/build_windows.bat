@@ -191,7 +191,7 @@ set "CFLAGS=/nologo /O2 /W3 /MT -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
 set "CXXFLAGS=/nologo /O2 /W3 /MT /EHsc -D_CRT_SECURE_NO_WARNINGS %CF_LMAX_DEF% %DEFS%"
 
 echo Building host C objects with cl.exe... (GPU_ARCH=%GPU_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
-for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c) do (
+for %%F in (fb_load.c verify_cpu.c poly.c primes.c rfb.c fb_cado.c platform.c watchdog.c tuned.c) do (
     cl %CFLAGS% /std:c11 /c %%F || exit /b 1
 )
 
@@ -223,7 +223,7 @@ echo Linking bench.exe...
 nvcc %NVCC_ARCH% --cudart static -ccbin cl -Xlinker "/OPT:REF" -o bench.exe ^
     bench_main.obj bench_kernels.obj fbgen_gpu_lib.obj fb_load.obj verify_cpu.obj poly.obj ^
     primes.obj rfb.obj fb_cado.obj platform.obj runlog.obj watchdog.obj fbgen_lib.obj ^
-    boinc_support.obj || exit /b 1
+    tuned.obj boinc_support.obj || exit /b 1
 
 echo Built %CD%\bench.exe (GPU_ARCH=%GPU_ARCH% CF_LMAX=%CF_LMAX% build=%GIT_DESC%)
 
