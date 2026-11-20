@@ -1546,18 +1546,62 @@ from the defaults, on a short band of the job. The arms are interleaved on the s
 rotated and reversed in alternate rounds, and every run's relations are
 compared byte for byte with the defaults'. A setting is adopted only if it
 was slower than the defaults in no round, and faster by more than 1% and by
-more than the defaults' own spread between rounds; if two knobs win, it
-times their combination beside the defaults and the best single setting, and
-recommends the combination only if it beats both by the same rule (knobs can
-undo each other: RESULTS.md finding 161). Pick `--nq` so one run takes 10-60 s; the default
-grid of 17 arms is then 20-105 minutes (up to 20 arms and 120 minutes on a
-plan of several slabs per q, where `--no-fill-merge` drops out and the
-`--slab-fill-ahead` grids of 6-24 blocks per SM of the card come in). It refuses to start with anything on
-any card or an NFS@Home CUDA client running (the CPU client is fine), and
-stops if either appears. On a host with several cards, all must be idle.
-Under WSL, `nvidia-smi` cannot see Windows programs, so close them first
-(finding 137). Its output directory, `tune.HOST.DATE` in the working
-directory unless `-o` says otherwise, is gitignored.
+more than the defaults' own spread between rounds.
+
+It then searches past the grid in two ways:
+- **Ladders.** When the best `--fill-blocks`, `--ss-warp-cut`,
+  `--ss-block-cut` or `--slab-fill-blocks` is the grid's top or bottom arm,
+  it times the next two steps past it, with the defaults and that edge. It
+  keeps going until a step is clearly slower or the ladder reaches bench's
+  bound: 2^20 for `--fill-blocks`, 32768 and just above the block cut for
+  `--ss-warp-cut`, 128 for `--ss-block-cut`, and the card's resident blocks
+  per SM for `--slab-fill-blocks`. The 3060's `--fill-blocks 589824` is 16
+  times the grid's top (finding 161). Where steps are within noise of each
+  other, the one nearest the defaults wins. The ladders step only past the
+  built-in grid, not past `-a` arms.
+- **Stage 2.** The best single setting is the base. Every other knob's arms
+  are timed on top of it, and those that beat it are added one at a time,
+  each kept only if it beats the best so far. Knobs can undo each other:
+  on the 3060, `--slab-fill-ahead` beside the big fill grid was slower than
+  the grid alone (finding 161). Only the confirmation stage times the whole
+  combination against the defaults, so a tune that saves nothing (`-n`, an
+  `-a` experiment without `-w`) marks a combination as not confirmed.
+
+**Arms that lose a round are out early.** An arm slower than the defaults
+in any round can never be adopted, so in stage 1 it is not timed again
+after that round. Stage 2 does the same against the base. A stage whose arms
+are all out stops there. An arm with no real effect then costs about 2 runs
+whatever the round count, instead of one per round; re-scored from their
+recorded runs, the two 5070 tunes of 2026-11-18 (3 rounds) needed 29% and
+63% fewer. Every decision is the one timing every arm in every round would
+give from the same runs, except under `-t`: the time saved can let more of
+the search fit, and stage-2 knobs are left out in order of their stage-1
+gains, where an out arm's gain is over the rounds it ran. The ladder passes
+and the confirmation stage still time every arm in every round, since their
+rules compare two arms that may both lose to the defaults. `-f` turns early
+dropping off, for a table of every arm's median.
+
+Pick `--nq` so one run takes 10-60 s. The default grid of 17 arms is then at
+most 20-105 minutes for stage 1 alone, or up to 20 arms on a plan of several
+slabs per q, where `--no-fill-merge` drops out and the `--slab-fill-ahead`
+grids of 6 blocks per SM up to the card's resident limit come in. Stage 2
+re-times most of the grid on top of the base, so a whole tune can take up to
+twice that, plus about 4 arms' worth per ladder pass. Two options bound it:
+- `-t MINUTES` holds the confirmation stage's time back from the start
+  (none when the tune cannot save: `-n`, an `-a` experiment without `-w`),
+  and leaves out the ladder steps and stage-2 knobs that would eat into it,
+  smallest stage-1 gain first, naming them in the report. It counts every
+  arm in every round when it plans, so a tune usually ends well inside the
+  budget. It refuses to start if stage 1 and the confirmation cannot fit. If
+  the confirmation itself runs out of time, nothing is written (exit 4).
+- `-q` skips stage 2, so the best single setting is the recommendation.
+
+It refuses to start with anything on any card or an NFS@Home CUDA client
+running (the CPU client is fine), and stops if either appears. On a host
+with several cards, all must be idle. Under WSL, `nvidia-smi` cannot see
+Windows programs, so close them first (finding 137). Its output directory,
+`tune.HOST.DATE` in the working directory unless `-o` says otherwise, is
+gitignored.
 
 ```sh
 sh bench/tune.sh -b bench/bench -- --pipeline --cofactor --poly JOB.job \
