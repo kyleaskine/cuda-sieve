@@ -132,7 +132,7 @@ int main(int argc, char **argv)
     long J = 0, want = 100000;
     uint64_t qmin = 0, qmax = 0;
     poly_t P, P0;
-    double *v = NULL;
+    double *v = NULL, *v0 = NULL, *v1 = NULL;
     long n = 0;
     double nprime_tried = 0, nroot = 0;
     /* Which SIDE drives the width, tracked separately from v[] (which holds
@@ -180,7 +180,12 @@ int main(int argc, char **argv)
     for (int z = 2; z < BENCH_NCOEFF; z++) P0.c[z] = 0.0;
 
     v = (double *)malloc((size_t)want * sizeof(*v));
-    if (!v) { fprintf(stderr, "out of memory for %ld samples\n", want); return 1; }
+    v0 = (double *)malloc((size_t)want * sizeof(*v0));
+    v1 = (double *)malloc((size_t)want * sizeof(*v1));
+    if (!v || !v0 || !v1) {
+        fprintf(stderr, "out of memory for %ld samples\n", want);
+        return 1;
+    }
 
     for (int w = 0; w < windows && n < want; w++) {
         const long target = want * (w + 1) / windows;
@@ -193,7 +198,7 @@ int main(int argc, char **argv)
         uint64_t lastq = q0;
         qsel_t s;
         if (!G) { fprintf(stderr, "sqgen_create failed at q=%llu\n",
-                          (unsigned long long)q0); free(v); return 1; }
+                          (unsigned long long)q0); free(v0); free(v1); free(v); return 1; }
         while (n < target) {
             const int r = sqgen_next(G, &s);
             if (r <= 0) break;                  /* window ran to qmax */
@@ -211,7 +216,10 @@ int main(int argc, char **argv)
                 if (b0 > limit && b1 > limit) overboth++;
                 else if (b0 > limit) over0++;
                 else if (b1 > limit) over1++;
-                v[n++] = (b1 > b0) ? b1 : b0;
+                v0[n] = b0;
+                v1[n] = b1;
+                v[n] = (b1 > b0) ? b1 : b0;
+                n++;
                 nroot++;
             }
         }
@@ -220,11 +228,11 @@ int main(int argc, char **argv)
     }
     if (n < 2) { fprintf(stderr, "no special-q generated in [%llu,%llu]\n",
                          (unsigned long long)qmin, (unsigned long long)qmax);
-                 free(v); return 1; }
+                 free(v0); free(v1); free(v); return 1; }
 
     if (dump) {
         FILE *f = fopen(dump, "w");
-        if (!f) { perror(dump); free(v); return 1; }
+        if (!f) { perror(dump); free(v0); free(v1); free(v); return 1; }
         for (long i = 0; i < n; i++) fprintf(f, "%.4f\n", v[i]);
         fclose(f);
     }
@@ -256,6 +264,18 @@ int main(int argc, char **argv)
         printf("  per side: max side1 (deg %d) %.2f  max side0 (deg 1) %.2f"
                "  -- side 0 larger on %ld of %ld\n",
                P.deg, mx1, mx0, n0drv, n);
+        /* PER-SIDE QUANTILES, because the max above answers the width
+         * question (one outlier refuses the band) while the typical norm is
+         * what downstream per-side decisions want -- e.g. an LP-profile
+         * selector keys on the special-q side's MEDIAN cofactor, which the
+         * combined-max quantiles above cannot answer (one huge side hides
+         * the other's whole distribution). Sorted alongside v. */
+        qsort(v0, (size_t)n, sizeof(*v0), cmp_dbl);
+        qsort(v1, (size_t)n, sizeof(*v1), cmp_dbl);
+        printf("  per side quantiles: side1 med %.1f p99 %.1f p999 %.1f ; "
+               "side0 med %.1f p99 %.1f p999 %.1f\n",
+               v1[n / 2], v1[(long)(n * 0.99)], v1[(long)(n * 0.999)],
+               v0[n / 2], v0[(long)(n * 0.99)], v0[(long)(n * 0.999)]);
         if (over) {
             printf("  %ld of %ld sampled exceed %d bits  ->  ~%.0f of the band\n",
                    over, n, limit, (double)over / (double)n * N);
@@ -320,7 +340,7 @@ int main(int argc, char **argv)
                 if (need) printf("     Rebuild with `make BN_LIMBS=%d`.\n", need);
                 else      printf("     No supported BN_LIMBS is wide enough"
                                  " (the maximum is 16, i.e. 512 bits).\n");
-                free(v); return 2;
+                free(v0); free(v1); free(v); return 2;
             }
             if (worst + margin >= (double)limit) {
                 printf("  ** WARNING: %.1f bits of margin under the %d-bit limit,"
@@ -334,12 +354,12 @@ int main(int argc, char **argv)
                                  " committing the band.\n", need);
                 else      printf("     No supported BN_LIMBS is wide enough"
                                  " (the maximum is 16, i.e. 512 bits).\n");
-                free(v); return 3;
+                free(v0); free(v1); free(v); return 3;
             }
             printf("  OK: %.1f bits of margin under the %d-bit limit.\n",
                    (double)limit - worst, limit);
         }
     }
-    free(v);
+    free(v0); free(v1); free(v);
     return 0;
 }
