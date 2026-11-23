@@ -477,5 +477,16 @@ TUNE_FAKE_CLOCK="$T/clock" FAKE_F="--fill-blocks=294912:0.78 --ss-warp-cut=1024:
 check 'grep -q "not adding G2 to F294912+W1024, for the -t budget" "$R.txt" && grep -q "not searched, for the -t budget: --fill-gate-shift$" "$R.txt"' "G2 is named as --fill-gate-shift"
 check 'grep -q "|--fill-blocks 294912 --ss-warp-cut 1024|" "$W" && [ "$(cat "$T/clock")" -le 960 ]' "the pair is confirmed and written within 16 min ($(cat "$T/clock") s)"
 
+echo "== 46. the default busy pattern: the CUDA client sieving or benchmarking, not its tune subcommand or the CPU client"
+BD=$(sed -n "s/^BUSY_DEFAULT='\(.*\)'\$/\1/p" "$B/tune.sh")
+bm() { echo "$1" | grep -qE "$BD"; }
+check '[ -n "$BD" ]' "tune.sh's BUSY_DEFAULT is found"
+check 'bm "./ggnfs-sieve-client --server-url=http://h:8080 --engine=cuda --cuda-bench=/c/bench/bench --device=0"' "the CUDA client sieving matches"
+check 'bm "/bin/bash ./run-cuda-client.sh"' "run-cuda-client.sh before its exec matches"
+check 'bm "./ggnfs-sieve-client benchmark --engine=cuda --cuda-bench=/c/bench/bench"' "the GPU benchmark matches"
+check '! bm "./ggnfs-sieve-client tune --server-url=http://h:8080 --token=x --cuda-bench=/c/bench/bench --device=0"' "the client's tune subcommand does not match"
+check '! bm "./ggnfs-sieve-client --server-url=http://h:8080 --siever=/g/sievers --workers=12"' "the CPU client does not match"
+check '! bm "./ggnfs-sieve-client benchmark --siever=/g/sievers --workers=12"' "the CPU benchmark does not match"
+
 echo "tunecheck: $((checks - fails)) of $checks checks passed"
 [ $fails -eq 0 ]

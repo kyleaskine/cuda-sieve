@@ -1597,7 +1597,8 @@ twice that, plus about 4 arms' worth per ladder pass. Two options bound it:
 - `-q` skips stage 2, so the best single setting is the recommendation.
 
 It refuses to start with anything on any card or an NFS@Home CUDA client
-running (the CPU client is fine), and stops if either appears. On a host
+running (the CPU client is fine, and so is the client's own `tune`
+subcommand, which is what runs tune.sh), and stops if either appears. On a host
 with several cards, all must be idle. Under WSL, `nvidia-smi` cannot see
 Windows programs, so close them first (finding 137). Its output directory,
 `tune.HOST.DATE` in the working directory unless `-o` says otherwise, is

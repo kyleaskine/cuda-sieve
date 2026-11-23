@@ -244,9 +244,15 @@ say() { echo "$*"; echo "$*" >> "$REP"; }
 # bench will pick is not known before it starts, so on a host with several
 # cards all must be idle), or a local NFS@Home CUDA client (TUNE_BUSY, a
 # pattern for ps; empty to skip). The CPU client has the same name and never
-# touches the card, so only a CUDA one counts. busy PID leaves out bench's
-# own process.
-BUSY_DEFAULT='run-cuda-client|ggnfs-sieve-client.*(engine=cuda|cuda-bench)'
+# touches the card, so only a CUDA one counts. The default matches the
+# client sieving (a flag straight after its name, as run-cuda-client.sh
+# starts it) or running its GPU `benchmark`, but not its `tune` subcommand:
+# that is the client running this script, with --cuda-bench= on its own
+# command line, and matching it refused every tune the client started. A
+# new client subcommand that sieves on the card would need adding here.
+# tunecheck.sh tests this pattern against each form. busy PID leaves out
+# bench's own process.
+BUSY_DEFAULT='run-cuda-client|ggnfs-sieve-client +(--|benchmark ).*(engine=cuda|cuda-bench)'
 BUSY=${TUNE_BUSY-$BUSY_DEFAULT}
 # Seconds between checks on a running bench (busy every third). TUNE_POLL is
 # for tunecheck.sh's fake bench, whose runs take milliseconds.
