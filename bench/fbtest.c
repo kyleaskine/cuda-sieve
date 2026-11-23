@@ -585,14 +585,25 @@ static int verify_poly_parser_strict(void)
             strcmp(P.cs[1], "2"))
             return 0;
 
-    off = (size_t)snprintf(long_coeff, sizeof(long_coeff),
-                           "skew:1\nc0:-1\nc1:");
-    memset(long_coeff + off, '7', 100);
-    off += 100;
-    snprintf(long_coeff + off, sizeof(long_coeff) - off, "\nY0:0\nY1:1\n");
-    if (!poly_diag_case(long_coeff,
-                        ":3: c1 must be a decimal integer of at most 79 characters"))
-        return 0;
+    /* The exact-decimal cap rides on BN_DEC_MAX (bench.h), so both the
+     * over-long filler and the expected message derive from the struct
+     * instead of pinning 79: a `make BN_LIMBS=N` rebuild moves them
+     * together.  n >= cap rejects, so cap chars is enough to trigger. */
+    {
+        const size_t cap = sizeof(((poly_t *)0)->cs[0]);
+        char want[128];
+        off = (size_t)snprintf(long_coeff, sizeof(long_coeff),
+                               "skew:1\nc0:-1\nc1:");
+        memset(long_coeff + off, '7', cap + 10);
+        off += cap + 10;
+        snprintf(long_coeff + off, sizeof(long_coeff) - off,
+                 "\nY0:0\nY1:1\n");
+        snprintf(want, sizeof(want),
+                 ":3: c1 must be a decimal integer of at most %zu characters",
+                 cap - 1u);
+        if (!poly_diag_case(long_coeff, want))
+            return 0;
+    }
     return 1;
 }
 
