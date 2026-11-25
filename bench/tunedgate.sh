@@ -68,9 +68,14 @@ K=$(key c143.base); RC=$(rec c143.base)
 [ -n "$K" ] || { echo "tunedgate: no tuned-run line; is $BENCH older than saved tuning?"; exit 1; }
 echo "   key $K, record $RC"
 side=${RC%%|*}; rest=${RC#*|}
+# this binary's tuning policy (tuned.h's TUNED_POLICY), which every entry
+# below is written at but the one declined for another policy
+P=$(sed -n 's/^tuned-run: //p' "$O/c143.base.out" | awk -F'|' '{ print $10 }')
+case $P in ''|*[!0-9]*) echo "tunedgate: no policy in the tuned-run line"; exit 1 ;; esac
+[ "$P" -ge 1 ] || { echo "tunedgate: policy $P in the tuned-run line"; exit 1; }
 E() { echo "$K|$1|$side|$rest|$2|$3|tunedgate"; }   # nslab policy flags
 
-{ echo "$HDR"; E 1 1 "--fill-blocks 9216"; } > "$O/f.txt"
+{ echo "$HDR"; E 1 $P "--fill-blocks 9216"; } > "$O/f.txt"
 run c143.saved c143.base $C143 --tuned "$O/f.txt"
 has c143.saved "^tuned: applied --fill-blocks 9216 for " "applied"
 has c143.saved "^grid: 9216 x [0-9]+ for fill .*\[tuned\]" "tagged [tuned] in the banner"
@@ -90,7 +95,7 @@ has c143.nt "^tuned: would apply \(but --no-tuned\) --fill-blocks 9216" "--no-tu
 has c143.nt "^tuned-run: .*\|apply\|--fill-blocks 9216\|" "--no-tuned: tuned-run carries the incumbent"
 has c143.nt "^grid: 4608 x [0-9]+ for fill \(absolute, not per SM\)(;|$)" "--no-tuned: the default grid, untagged"
 
-{ echo "$HDR"; E 5 1 "--fill-gate-shift 2 --no-fill-merge --slab-fill-ahead --slab-fill-blocks 384"; } > "$O/g.txt"
+{ echo "$HDR"; E 5 $P "--fill-gate-shift 2 --no-fill-merge --slab-fill-ahead --slab-fill-blocks 384"; } > "$O/g.txt"
 run c143.gate c143.base $C143 --tuned "$O/g.txt" --no-fill-gate
 has c143.gate "^tuned: not using .*g.txt line 2 .*: the command line sets the fill gate, and a saved entry applies whole" "a family flag (--no-fill-gate) sets the entry aside"
 run c143.skip c143.base $C143 --tuned "$O/g.txt" --no-q-pipeline
@@ -101,12 +106,12 @@ has c143.sfa1 "^tuned: applied --fill-gate-shift 2 --no-fill-merge --slab-fill-a
 has c143.sfa1 "--slab-fill-ahead: off, because this plan has one slab per q.*; saved setting$" "slab fill ahead off on one slab, saying it was saved"
 has c143.sfa1 "^tuned: note: the saved entry was tuned on a plan of 5 slabs per q and this one has 1" "the plan's slab check"
 
-{ echo "$HDR"; E 1 0 "--fill-blocks 9216"; } > "$O/p.txt"
+{ echo "$HDR"; E 1 $((P - 1)) "--fill-blocks 9216"; } > "$O/p.txt"
 run c143.policy c143.base $C143 --tuned "$O/p.txt"
-has c143.policy "^tuned: not using .* policy 0 and this binary's is 1" "another policy declined"
+has c143.policy "^tuned: not using .* policy $((P - 1)) and this binary's is $P" "another policy declined"
 has c143.policy "^grid: 4608 x" "declined: the default grid"
 
-{ echo "# cuda-sieve tuned v9"; E 1 1 "--fill-blocks 9216"; } > "$O/v.txt"
+{ echo "# cuda-sieve tuned v9"; E 1 $P "--fill-blocks 9216"; } > "$O/v.txt"
 run c143.badfile c143.base $C143 --tuned "$O/v.txt"
 has c143.badfile "warning: saved tuning .*v.txt ignored: its first line is not" "a bad file: warned, and the run goes on"
 
@@ -114,7 +119,7 @@ has c143.badfile "warning: saved tuning .*v.txt ignored: its first line is not" 
 run c143.other c143.base $C143 --tuned "$O/o.txt"
 has c143.other "^tuned: none for .* in .*o.txt" "another card's entry: none"
 
-{ echo "$HDR"; echo "$K|1|garbage"; E 1 1 "--fill-blocks 9216"; } > "$O/m.txt"
+{ echo "$HDR"; echo "$K|1|garbage"; E 1 $P "--fill-blocks 9216"; } > "$O/m.txt"
 run c143.malformed c143.base $C143 --tuned "$O/m.txt"
 has c143.malformed "m.txt:2: .*skipped" "a malformed line warned about"
 has c143.malformed "^tuned: applied --fill-blocks 9216 for " "the good entry beside it still applies"
@@ -123,14 +128,30 @@ echo "== c183, five slabs per q"
 run c183.base - $C183 --tuned "$O/missing.txt"
 has c183.base "^tuned-plan: 5 slabs per q" "five slabs"
 K=$(key c183.base); RC=$(rec c183.base); side=${RC%%|*}; rest=${RC#*|}
-{ echo "$HDR"; E 5 1 "--slab-fill-ahead --slab-fill-blocks 384"; } > "$O/s.txt"
+{ echo "$HDR"; E 5 $P "--slab-fill-ahead --slab-fill-blocks 384"; } > "$O/s.txt"
 run c183.saved c183.base $C183 --tuned "$O/s.txt"
 has c183.saved "^tuned: applied --slab-fill-ahead --slab-fill-blocks 384 for " "applied"
 has c183.saved "--slab-fill-ahead: each later slab.* 384 x 32 at the greatest priority \[tuned\].*; saved setting" "the slab fill ahead runs at the saved grid, tagged"
 hasnt c183.saved "^tuned: note: the saved entry was tuned on a plan" "no slab-class note when the class matches"
 run c183.hand c183.base $C183 --tuned "$O/s.txt" --fill-blocks 9216
 has c183.hand "^tuned: not using .*s.txt line 2 .*: the command line sets --fill-blocks" "finding 161's pairing: a hand-given --fill-blocks sets the saved slab fill ahead aside"
-has c183.hand "--slab-fill-ahead: each later slab.* 512 x 32 .*; this card's default" "the slab fill ahead at this card's default grid, not the saved one"
+# This card's own ahead fill, as the base run (no entry) has it: on sm_120 at
+# bench.h's SLAB_FILL_BLOCKS_DEFAULT per SLAB_FILL_DEFAULT_SMS, scaled to the
+# card's SMs with pipeline.cuh's rounding; elsewhere off (no line).
+hdef() { sed -n "s/^#define $1 *\([0-9][0-9]*\)u* *\$/\1/p" bench.h | head -1; }
+sg=$(sed -n "s/.*--slab-fill-ahead: each later slab.* \([0-9][0-9]*\) x [0-9][0-9]* at the greatest priority.*; this card's default\$/\1/p" "$O/c183.base.out" | head -1)
+sms=$(sed -n 's/^grid: \([0-9][0-9]*\) SMs.*/\1/p' "$O/c183.base.out" | head -1)
+if [ -n "$sg" ]; then
+  sd=$(hdef SLAB_FILL_BLOCKS_DEFAULT); sp=$(hdef SLAB_FILL_DEFAULT_SMS)
+  want=$(( (${sd:-0} * ${sms:-0} + ${sp:-1} / 2) / ${sp:-1} ))
+  if [ -n "$sd" ] && [ -n "$sp" ] && [ -n "$sms" ] && [ "$sg" = "$want" ]; then
+    ok "c183.base: this card's ahead fill at $sg x 32, bench.h's $sd per $sp SMs on $sms SMs"
+  else bad "c183.base: this card's ahead fill at ${sg} x 32, not ${want} (bench.h's ${sd:-?} per ${sp:-?} SMs on ${sms:-?} SMs)"; fi
+  has c183.hand "--slab-fill-ahead: each later slab.* $sg x 32 .*; this card's default\$" "the slab fill ahead at this card's default grid ($sg), not the saved one"
+else
+  hasnt c183.base "--slab-fill-ahead: each later slab" "this card's ahead fill: off"
+  hasnt c183.hand "--slab-fill-ahead: each later slab" "the slab fill ahead off, as this card's default has it, not the saved one"
+fi
 
 echo "tunedgate: $((checks - fails)) of $checks checks passed"
 [ $fails -eq 0 ]

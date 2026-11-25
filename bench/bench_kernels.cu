@@ -3419,7 +3419,7 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
 
     int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
     /* Fill's grid is absolute, not per-SM -- see FILL_BLOCKS_DEFAULT. */
-    const int fblocks = cfg->fill_blocks ? cfg->fill_blocks : FILL_BLOCKS_DEFAULT;
+    const int fblocks = fill_blocks_auto(cfg);
     const int fthreads = cfg->fill_threads ? cfg->fill_threads : FILL_THREADS_DEFAULT;
     float t_trans = 0, t_fill = 0, t_l1 = 0, t_l2 = 0;
 

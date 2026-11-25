@@ -43,8 +43,14 @@ extern "C" {
 
 /* Bump when a change to a default or a kernel makes entries tuned before it
  * untrustworthy. Entries must match it EXACTLY: a newer binary declines an
- * older policy's entry, and a downgraded binary a newer one's. */
-#define TUNED_POLICY 1
+ * older policy's entry, and a downgraded binary a newer one's.
+ *   1  2026-11-17, saved tuning's start
+ *   2  2026-11-24, the per-card defaults below (finding 162): an entry holds
+ *      only the flags that differ from the defaults, so on sm_86, sm_89 and
+ *      sm_120 a policy-1 entry would sit on top of defaults it was never
+ *      timed beside, and a policy-2 entry under an older binary on its old
+ *      ones. tunedtest.c's POL follows this. */
+#define TUNED_POLICY 2
 
 /* The knobs' ranges, mirrored from bench.h (which this header must not
  * include: tuned.c is plain C) and static_asserted equal in bench_main.cu. */
@@ -52,6 +58,41 @@ extern "C" {
 #define TUNED_SS_BLOCK_MIN   33          /* SS_BLOCK_CUT_MIN */
 #define TUNED_SS_BLOCK_MAX   128         /* SS_BLOCK_CUT_MAX */
 #define TUNED_SS_WARP_MAX    32768       /* SS_WARP_CUT_MAX */
+
+/* Built-in defaults by card. Not saved tuning, but the same per-card
+ * question, kept here (plain C) so tunedtest can check the rule on every
+ * compute capability without the cards (STATUS row 44, 2026-11-24). Each is
+ * what tune.sh found on every card of that architecture it timed, and every
+ * knob is output-identical, so on a card not yet timed the worst case is
+ * speed, which tune.sh wins back. bench applies them to --pipeline runs only,
+ * like saved tuning (the harness reproduces RESULTS numbers), and a flag or
+ * an applied saved entry still wins.
+ *   sm_89 (Ada): --ss-warp-cut 1024. Never slower than 256 on six jobs on
+ *     two cards (4070 SUPER: C143 -0.95% to C194 -6.7%; 4060 Ti: the
+ *     NFS@Home I16 job -4.4%, C194 -5.8%), and the 4080 SUPER -4.2% on the
+ *     I16 job, where 2048 was best (-5.3%); the 3060 and three Blackwell
+ *     cards keep 256.
+ *   sm_86 and sm_89 at logI 16: --fill-blocks 589824. The 3060 -18.5 to
+ *     -23.4% on three logI 16 jobs; Ada -4.2 to -9.6% on four runs (three
+ *     cards; the 4080 SUPER -7.9%).
+ *     The one Ada loss was C183 at logI 15 (+2.08%), hence logI 16 only;
+ *     three Blackwell cards lose with it.
+ *   sm_120 (Blackwell), any SM count: --slab-fill-ahead on, at bench.h's
+ *     SLAB_FILL_BLOCKS_DEFAULT per SLAB_FILL_DEFAULT_SMS SMs: the 5070 -7.2%
+ *     (finding 160), the 5060 -4.44% at 384 on 30 SMs, the 5070 Ti -3.86%
+ *     at 512 and 768 on 70 SMs held at 1.58 GHz by its host (1024 -2.61%;
+ *     896 untimed); Ada and the 3060 lose with it beside their best fill grid.
+ * 0 means bench.h's constant, as everywhere else. */
+#define TUNED_CARD_SS_WARP_CUT_SM89  1024
+#define TUNED_CARD_FILL_BLOCKS       589824
+#define TUNED_CARD_FILL_LOGI         16
+typedef struct {
+    int ss_warp_cut;       /* 0 = SS_WARP_CUT_DEFAULT */
+    int fill_blocks;       /* 0 = FILL_BLOCKS_DEFAULT (k_fill_atomic's grid) */
+    int slab_fill_ahead;   /* 1 = on by default; bench_main adds the run's conditions */
+} tuned_card_defaults_t;
+void tuned_card_defaults(int cc_major, int cc_minor, int logI,
+                         tuned_card_defaults_t *d);
 
 /* Families of knobs, with the flags that ask for a setting of one: a
  * --fill-merge-cut asks for the merge as surely as --fill-merge does. A

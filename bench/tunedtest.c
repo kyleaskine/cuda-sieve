@@ -44,9 +44,18 @@ static int count_lines(FILE *f)
 
 #define CARD "NVIDIA GeForce RTX 3060"
 #define HDR  TUNED_FORMAT_LINE "\n"
+/* The policy these entries are written at (this binary's, as tune.sh writes
+ * it) and one either side, for the declines. */
+#define POL     2
+#define POL_OLD 1
+#define POL_NEW 3
+_Static_assert(POL == TUNED_POLICY && POL_OLD == POL - 1 && POL_NEW == POL + 1,
+               "tunedtest's policy literals follow TUNED_POLICY");
+#define STR_(x) #x
+#define STR(x)  STR_(x)
 /* a valid entry for the run below, with FLAGS and POLICY substituted */
 #define ENTRY(J, REGION, POLICY, FLAGS) \
-    CARD "|8.6|28|16|" #J "|" #REGION "|4|1|300000000|200000000|" #POLICY "|" FLAGS "|tune.sh 2026-11-16 57e9d88 nfs.job -23.4%\n"
+    CARD "|8.6|28|16|" #J "|" #REGION "|4|1|300000000|200000000|" STR(POLICY) "|" FLAGS "|tune.sh 2026-11-16 57e9d88 nfs.job -23.4%\n"
 
 static tuned_run_t base_run(void)
 {
@@ -101,32 +110,32 @@ static void line_tests(void)
     tuned_entry_t e;
     char err[200];
     char line[600];
-    snprintf(line, sizeof line, "%s", ENTRY(32768, 14, 1, "--fill-blocks 589824"));
+    snprintf(line, sizeof line, "%s", ENTRY(32768, 14, POL, "--fill-blocks 589824"));
     line[strlen(line) - 1] = 0;
     CHECK(!tuned_parse_line(line, &e, err, sizeof err), "valid line: %s", err);
     CHECK(!strcmp(e.card, CARD) && e.cc_major == 8 && e.cc_minor == 6 && e.sms == 28 &&
           e.logI == 16 && e.J == 32768 && e.region == 14 && e.nslab == 4 && e.side == 1 &&
-          e.alim == 300000000u && e.rlim == 200000000u && e.policy == 1 &&
+          e.alim == 300000000u && e.rlim == 200000000u && e.policy == POL &&
           e.k.fill_blocks == 589824 && !strcmp(e.flags, "--fill-blocks 589824") &&
           !strcmp(e.note, "tune.sh 2026-11-16 57e9d88 nfs.job -23.4%"), "fields");
-    CHECK(!tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|1||a|b|c",
+    CHECK(!tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "||a|b|c",
                             &e, err, sizeof err) && !strcmp(e.note, "a|b|c") && !e.flags[0],
           "empty flags, a note with bars: %s", err);
-    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|1|--fill-blocks 9216",
+    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-blocks 9216",
                            &e, err, sizeof err) == -1, "12 fields refused");
-    CHECK(tuned_parse_line("|8.6|28|16|32768|14|4|1|300000000|200000000|1||n", &e, err, sizeof err) == -1,
+    CHECK(tuned_parse_line("|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "||n", &e, err, sizeof err) == -1,
           "empty card refused");
-    CHECK(tuned_parse_line(CARD "|86|28|16|32768|14|4|1|300000000|200000000|1||n", &e, err, sizeof err) == -1,
+    CHECK(tuned_parse_line(CARD "|86|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "||n", &e, err, sizeof err) == -1,
           "cc without a dot refused");
-    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|2|300000000|200000000|1||n", &e, err, sizeof err) == -1,
+    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|2|300000000|200000000|" STR(POL) "||n", &e, err, sizeof err) == -1,
           "side 2 refused");
-    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|3e8|200000000|1||n", &e, err, sizeof err) == -1,
+    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|3e8|200000000|" STR(POL) "||n", &e, err, sizeof err) == -1,
           "alim 3e8 refused");
-    CHECK(!tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|4294967295|3000000000|1||n", &e, err, sizeof err) &&
+    CHECK(!tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|4294967295|3000000000|" STR(POL) "||n", &e, err, sizeof err) &&
           e.alim == 4294967295u && e.rlim == 3000000000u, "alim and rlim up to 2^32-1, as bench takes them: %s", err);
-    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|4294967296|200000000|1||n", &e, err, sizeof err) == -1,
+    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|4294967296|200000000|" STR(POL) "||n", &e, err, sizeof err) == -1,
           "alim 2^32 refused");
-    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|1|--fill-threads 64|n",
+    CHECK(tuned_parse_line(CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-threads 64|n",
                            &e, err, sizeof err) == -1, "a knob outside the allowlist voids the line");
 }
 
@@ -169,48 +178,49 @@ static void judge_tests(void)
             printf("FAIL setup: %s\n", err); fails++; return; } } while (0)
 
     r = base_run();
-    LOAD(32768, 14, 1, "--fill-blocks 589824");
+    LOAD(32768, 14, POL, "--fill-blocks 589824");
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_APPLY && v.apply.fill_blocks == 589824 &&
           !strcmp(v.applied, "--fill-blocks 589824") && !v.notes[0], "applies: '%s'", v.notes);
 
-    LOAD(32768, 14, 0, "--fill-blocks 589824");
+    LOAD(32768, 14, POL_OLD, "--fill-blocks 589824");
     tuned_judge(&e, &r, &v);
-    CHECK(v.status == TUNED_DECLINED && strstr(v.why, "policy 0"), "an older policy declined");
-    LOAD(32768, 14, 2, "--fill-blocks 589824");
+    CHECK(v.status == TUNED_DECLINED && strstr(v.why, "policy " STR(POL_OLD) " and this binary's is " STR(POL)),
+          "an older policy declined");
+    LOAD(32768, 14, POL_NEW, "--fill-blocks 589824");
     tuned_judge(&e, &r, &v);
-    CHECK(v.status == TUNED_DECLINED && strstr(v.why, "policy 2"), "a newer policy declined");
-    LOAD(16384, 14, 1, "--fill-blocks 589824");
+    CHECK(v.status == TUNED_DECLINED && strstr(v.why, "policy " STR(POL_NEW)), "a newer policy declined");
+    LOAD(16384, 14, POL, "--fill-blocks 589824");
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_DECLINED && strstr(v.why, "J 16384"), "another J declined");
-    LOAD(32768, 13, 1, "--fill-blocks 589824");
+    LOAD(32768, 13, POL, "--fill-blocks 589824");
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_DECLINED && strstr(v.why, "region 13"), "another region declined");
 
     /* A knob given by hand sets the whole entry aside (finding 161: a saved
      * --slab-fill-ahead beside a hand-given --fill-blocks 589824 lost). */
-    LOAD(32768, 14, 1, "--fill-blocks 589824");
+    LOAD(32768, 14, POL, "--fill-blocks 589824");
     r.explicit_mask = TUNED_F_FILL_BLOCKS;
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_DECLINED && !v.applied[0] && strstr(v.why, "sets --fill-blocks") &&
           strstr(v.why, "whole"), "an explicit --fill-blocks sets the entry aside: '%s'", v.why);
-    LOAD(32768, 14, 1, "--slab-fill-ahead --slab-fill-blocks 384");
+    LOAD(32768, 14, POL, "--slab-fill-ahead --slab-fill-blocks 384");
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_DECLINED && v.apply.slab_fill_ahead == -1,
           "an explicit --fill-blocks sets aside a saved slab fill ahead too");
     r.explicit_mask = TUNED_F_FILL_BLOCKS | TUNED_F_SS;
     tuned_judge(&e, &r, &v);
     CHECK(strstr(v.why, "sets --fill-blocks, the small-sieve cuts,"), "every family given is named: '%s'", v.why);
-    LOAD(32768, 14, 1, "");
+    LOAD(32768, 14, POL, "");
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_APPLY && !v.applied[0], "an empty entry is not set aside");
-    LOAD(32768, 14, 1, "--fill-blocks 589824");
+    LOAD(32768, 14, POL, "--fill-blocks 589824");
     r = base_run(); r.max_grid = 65535;
     tuned_judge(&e, &r, &v);
     CHECK(!v.apply.fill_blocks && strstr(v.notes, "grid limit"), "a grid above the card's limit is skipped");
 
     r = base_run(); r.fill_merge = 1;
-    LOAD(32768, 14, 1, "--no-fill-merge");
+    LOAD(32768, 14, POL, "--no-fill-merge");
     tuned_judge(&e, &r, &v);
     CHECK(v.apply.no_fill_merge == 1, "--no-fill-merge applies where the merge runs");
     r.explicit_mask = TUNED_F_MERGE;          /* e.g. --fill-merge-cut 32 */
@@ -222,7 +232,7 @@ static void judge_tests(void)
     CHECK(!v.apply.no_fill_merge && strstr(v.notes, "no merge"), "no merge, nothing to turn off");
 
     r = base_run();
-    LOAD(32768, 14, 1, "--fill-gate-shift 2");
+    LOAD(32768, 14, POL, "--fill-gate-shift 2");
     tuned_judge(&e, &r, &v);
     CHECK(v.apply.fill_gate_shift == 2, "gate shift applies with the gate");
     r.fill_gate = 0;
@@ -230,7 +240,7 @@ static void judge_tests(void)
     CHECK(v.apply.fill_gate_shift == -1 && strstr(v.notes, "gate is off"), "no gate, no shift");
 
     r = base_run();
-    LOAD(32768, 14, 1, "--slab-fill-ahead --slab-fill-blocks 384");
+    LOAD(32768, 14, POL, "--slab-fill-ahead --slab-fill-blocks 384");
     tuned_judge(&e, &r, &v);
     CHECK(v.apply.slab_fill_ahead == 1 && v.apply.slab_fill_blocks == 384, "slab fill ahead applies");
     r.q_pipeline = 0;
@@ -241,7 +251,7 @@ static void judge_tests(void)
     CHECK(v.status == TUNED_DECLINED && v.apply.slab_fill_ahead == -1, "an explicit --slab-fill-blocks wins");
 
     r = base_run();
-    LOAD(32768, 14, 1, "--ss-block-cut 48");
+    LOAD(32768, 14, POL, "--ss-block-cut 48");
     r.ss_warp_cut = 40;                        /* an effective warp cut of 40 */
     tuned_judge(&e, &r, &v);
     CHECK(!v.apply.ss_block_cut && strstr(v.notes, "warp 40"), "a pair that would fail warp > block is skipped");
@@ -253,7 +263,7 @@ static void judge_tests(void)
     CHECK(v.apply.ss_block_cut == 48 && !v.apply.ss_warp_cut, "the block cut alone applies");
 
     r = base_run(); r.alim = 60000000u; r.side = 0;
-    LOAD(32768, 14, 1, "--fill-blocks 589824");
+    LOAD(32768, 14, POL, "--fill-blocks 589824");
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_APPLY && v.apply.fill_blocks == 589824 &&
           strstr(v.notes, "alim 300000000") && strstr(v.notes, "side 1"),
@@ -268,7 +278,7 @@ static void judge_tests(void)
     tuned_judge(&e, &r, &v);
     CHECK(!v.notes[0], "exactly 2x away: no note: '%s'", v.notes);
 
-    LOAD(32768, 14, 1, "");
+    LOAD(32768, 14, POL, "");
     r = base_run();
     tuned_judge(&e, &r, &v);
     CHECK(v.status == TUNED_APPLY && !v.applied[0], "an empty entry keeps the defaults");
@@ -286,30 +296,66 @@ static void lookup_tests(void)
     CHECK(tuned_lookup("/nonexistent/tuned.txt", &r, w, &v) == TUNED_NOFILE, "no file");
     p = write_file("empty.txt", "");
     CHECK(tuned_lookup(p, &r, w, &v) == TUNED_BADFILE && strstr(v.why, "empty"), "empty file");
-    p = write_file("v2.txt", "# cuda-sieve tuned v2\n" ENTRY(32768, 14, 1, "--fill-blocks 9216"));
+    p = write_file("v2.txt", "# cuda-sieve tuned v2\n" ENTRY(32768, 14, POL, "--fill-blocks 9216"));
     CHECK(tuned_lookup(p, &r, w, &v) == TUNED_BADFILE && strstr(v.why, "first line"),
           "another format version");
-    p = write_file("noheader.txt", ENTRY(32768, 14, 1, "--fill-blocks 9216"));
+    p = write_file("noheader.txt", ENTRY(32768, 14, POL, "--fill-blocks 9216"));
     CHECK(tuned_lookup(p, &r, w, &v) == TUNED_BADFILE, "no version line");
 
     p = write_file("other.txt", HDR "# a comment\n\n"
-        "NVIDIA GeForce RTX 3060 Ti|8.6|38|16|32768|14|4|1|300000000|200000000|1|--fill-blocks 1|n\n"
-        CARD "|8.9|28|16|32768|14|4|1|300000000|200000000|1|--fill-blocks 2|n\n"
-        CARD "|8.6|30|16|32768|14|4|1|300000000|200000000|1|--fill-blocks 3|n\n"
-        CARD "|8.6|28|15|16384|14|1|1|300000000|200000000|1|--fill-blocks 4|n\n");
+        "NVIDIA GeForce RTX 3060 Ti|8.6|38|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-blocks 1|n\n"
+        CARD "|8.9|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-blocks 2|n\n"
+        CARD "|8.6|30|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-blocks 3|n\n"
+        CARD "|8.6|28|15|16384|14|1|1|300000000|200000000|" STR(POL) "|--fill-blocks 4|n\n");
     CHECK(tuned_lookup(p, &r, w, &v) == TUNED_NONE, "the key is card, cc, SMs and logI");
 
     rewind(w);
     if (ftruncate(fileno(w), 0)) {}
     p = write_file("mixed.txt", "\n" HDR "# comment\r\n"
         "garbage line\n"
-        CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|1|--fill-threads 64|bad knob\n"
-        CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|1|--fill-blocks 294912|first\r\n"
-        CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|1|--fill-blocks 589824|second\n");
+        CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-threads 64|bad knob\n"
+        CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-blocks 294912|first\r\n"
+        CARD "|8.6|28|16|32768|14|4|1|300000000|200000000|" STR(POL) "|--fill-blocks 589824|second\n");
     CHECK(tuned_lookup(p, &r, w, &v) == TUNED_APPLY && v.apply.fill_blocks == 589824 &&
           !strcmp(v.e.note, "second") && v.e.line == 7, "the last entry for a key wins, CRLF ok");
     CHECK(count_lines(w) == 3, "two malformed lines and one duplicate warned about (%d)", count_lines(w));
     fclose(w);
+}
+
+/* The built-in defaults by card: exactly the architectures timed, and the
+ * fill grid at logI 16 only. */
+static void card_tests(void)
+{
+    static const struct { int maj, min, logI, warp, fill, sfa; } t[] = {
+        {  8, 9, 16, 1024, 589824, 0 },   /* Ada at the NFS@Home shape */
+        {  8, 9, 15, 1024,      0, 0 },   /* C183 at logI 15 lost the grid */
+        {  8, 9, 17, 1024,      0, 0 },
+        {  8, 9, 14, 1024,      0, 0 },
+        {  8, 6, 16,    0, 589824, 0 },   /* the 3060 */
+        {  8, 6, 15,    0,      0, 0 },
+        { 12, 0, 16,    0,      0, 1 },   /* Blackwell: 5070, 5060 */
+        { 12, 0, 13,    0,      0, 1 },   /* bench adds the plan's conditions */
+        { 12, 1, 16,    0,      0, 0 },   /* untimed: sm_121 */
+        {  8, 0, 16,    0,      0, 0 },   /* untimed: A100 */
+        {  8, 7, 16,    0,      0, 0 },   /* untimed: Orin */
+        {  9, 0, 16,    0,      0, 0 },   /* untimed: Hopper */
+        {  7, 5, 16,    0,      0, 0 },   /* untimed: Turing */
+        { 10, 0, 16,    0,      0, 0 },   /* untimed: B200 */
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        tuned_card_defaults_t d;
+        memset(&d, 0x5a, sizeof d);   /* every field must be written */
+        tuned_card_defaults(t[i].maj, t[i].min, t[i].logI, &d);
+        CHECK(d.ss_warp_cut == t[i].warp && d.fill_blocks == t[i].fill &&
+              d.slab_fill_ahead == t[i].sfa,
+              "card defaults sm_%d%d logI %d: warp %d fill %d sfa %d, want %d %d %d",
+              t[i].maj, t[i].min, t[i].logI, d.ss_warp_cut, d.fill_blocks,
+              d.slab_fill_ahead, t[i].warp, t[i].fill, t[i].sfa);
+    }
+    CHECK(TUNED_CARD_SS_WARP_CUT_SM89 > TUNED_SS_BLOCK_MAX &&
+          TUNED_CARD_SS_WARP_CUT_SM89 <= TUNED_SS_WARP_MAX,
+          "the sm_89 warp cut is above every block cut and within bounds");
+    CHECK(TUNED_CARD_FILL_BLOCKS <= TUNED_BLOCKS_MAX, "the fill grid is within bounds");
 }
 
 static void path_tests(void)
@@ -345,6 +391,7 @@ int main(void)
     judge_tests();
     lookup_tests();
     path_tests();
+    card_tests();
     {
         char cmd[700];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", DIR_);

@@ -288,7 +288,8 @@ static void usage(void)
 #endif
 "  --threads N      threads per block, multiple of 32  [256]\n"
 "  --blocks N       0 = auto (6 per SM)        [0]\n"
-"  --fill-blocks N  fill only; 0 = auto (4608, absolute -- NOT per SM) [0]\n"
+"  --fill-blocks N  fill only; 0 = auto (4608, absolute -- NOT per SM; under\n"
+"                   --pipeline at logI " BENCH_STR(TUNED_CARD_FILL_LOGI) " on sm_86 and sm_89, " BENCH_STR(TUNED_CARD_FILL_BLOCKS) ") [0]\n"
 "  --fill-streams N fill only; N independent workspaces on N streams, timed\n"
 "                   against the same N issued serially and against 1 kernel\n"
 "                   at N x the blocks. 0/1 = off [0]. Costs a bucket array\n"
@@ -347,8 +348,8 @@ static void usage(void)
 "                   Costs a second bucket array and a fourth side-1 cursor\n"
 "                   buffer; off when they do not fit or the plan has one\n"
 "                   slab per q. Output-identical.  [on with --q-pipeline\n"
-"                   and no row tier on sm_120 with " BENCH_STR(SLAB_FILL_DEFAULT_SMS) " SMs, the RTX 5070,\n"
-"                   where it was timed; off elsewhere: bench/tune.sh times it]\n"
+"                   and no row tier on sm_120 (Blackwell), where it was\n"
+"                   timed; off elsewhere: bench/tune.sh times it]\n"
 "  --slab-fill-blocks N  --slab-fill-ahead's fill grid, in blocks of " BENCH_STR(FILL_THREADS_DEFAULT) "\n"
 "                   threads   [" BENCH_STR(SLAB_FILL_BLOCKS_DEFAULT) " per " BENCH_STR(SLAB_FILL_DEFAULT_SMS) " SMs, scaled by the card's SMs]\n"
 "  --td-ahead / --no-td-ahead  --q-pipeline: queue trial division's record\n"
@@ -397,7 +398,8 @@ static void usage(void)
 "  --ss-block-cut N small-sieve moduli m < N are walked by the whole block\n"
 "                   [36], 33..128; changes no output, only the speed\n"
 "  --ss-warp-cut N  the rest below N by one warp each, above them by one\n"
-"                   thread each [256], above the block cut, <= 32768\n"
+"                   thread each [256; " BENCH_STR(TUNED_CARD_SS_WARP_CUT_SM89) " under --pipeline on sm_89],\n"
+"                   above the block cut, <= 32768\n"
 "  --not-both-even  apply las's filter: i,j both even can never survive\n"
 "  --sieve-skip N   pipeline: skip sieve work gcd(i,j) rules out [2]\n"
 "                   0 = off, 1 = both-even positions, 2 = also 3|i and 3|j\n"
@@ -1059,6 +1061,10 @@ static_assert(TUNED_BLOCKS_MAX == BENCH_BLOCKS_MAX, "tuned.h mirrors bench.h");
 static_assert(TUNED_SS_BLOCK_MIN == SS_BLOCK_CUT_MIN, "tuned.h mirrors bench.h");
 static_assert(TUNED_SS_BLOCK_MAX == SS_BLOCK_CUT_MAX, "tuned.h mirrors bench.h");
 static_assert(TUNED_SS_WARP_MAX == SS_WARP_CUT_MAX, "tuned.h mirrors bench.h");
+static_assert(TUNED_CARD_SS_WARP_CUT_SM89 > SS_BLOCK_CUT_MAX &&
+              TUNED_CARD_SS_WARP_CUT_SM89 <= SS_WARP_CUT_MAX,
+              "the sm_89 warp cut is above every block cut and within bounds");
+static_assert(TUNED_CARD_FILL_BLOCKS <= BENCH_BLOCKS_MAX, "the card fill grid is within bounds");
 
 /* What a saved entry can break that the judge (tuned_judge) is meant to have
  * ruled out. NULL when the configuration is sound. Run after the merge as an
@@ -1306,6 +1312,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.q_prep = PIPE_QPREP_AUTO;
     cfg.qspan = 0;
     cfg.threads = 256; cfg.blocks = 0; cfg.fill_blocks = 0; cfg.fill_threads = 0;
+    /* this card's defaults (tuned_card_defaults), resolved at the device
+     * query under --pipeline only; 0 = bench.h's */
+    cfg.fill_blocks_card = 0; cfg.ss_warp_cut_card = 0;
 
     cfg.reps = 3; cfg.verify = 0;
     cfg.stage = STAGE_BOTH; cfg.cell_bits = 16; cfg.norm_mode = NORM_HORNER;
@@ -2559,26 +2568,40 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         dev_ordinal = dev;
         dev_count = ndev;
 
+        /* Built-in defaults by card (tuned_card_defaults, tuned.h; STATUS row
+         * 44): the pipeline only, like saved tuning, so harness numbers stay
+         * reproducible. Resolved BEFORE saved tuning so its checks see the
+         * warp cut this run would use. A flag or an applied entry still wins:
+         * they set cfg.ss_warp_cut / cfg.fill_blocks, which ss_warp_cut() and
+         * fill_blocks_auto() read first. */
+        tuned_card_defaults_t card_def;
+        tuned_card_defaults(prop.major, prop.minor, cfg.logI, &card_def);
+        if (cfg.pipeline) {
+            cfg.ss_warp_cut_card = (uint32_t)card_def.ss_warp_cut;
+            cfg.fill_blocks_card = card_def.fill_blocks;
+        }
+
         /* Saved tuning: the pipeline only. The harness reproduces RESULTS
          * numbers and must not pick up a machine's tuning. */
         if (cfg.pipeline)
             tuned_step(&cfg, &prop, argc, argv, tuned_path_arg, no_tuned,
                        alim, rlim, &tuned_applied, tuned_line, sizeof tuned_line);
 
-        /* --slab-fill-ahead's default, which needs the card: on only where it
-         * was timed -- sm_120 with SLAB_FILL_DEFAULT_SMS (48) SMs, the RTX
-         * 5070, -7.2% on the I16 NFS@Home job (finding 160) -- under
-         * --q-pipeline, and with no row tier (--fill-rows; 0 at I16), whose
-         * kernels the ahead fill does not confine. Its grid is a count of
-         * slots per SM and has been swept on that card only, and three times
-         * the right grid lost to off, so every other card keeps it off until
-         * it has been timed there (bench/tune.sh does that). Then the grid's
-         * refusal, which the default could not answer before. */
+        /* --slab-fill-ahead's default, which needs the card: on only on the
+         * architecture where it won, sm_120 (tuned_card_defaults: the RTX
+         * 5070 -7.2% on the I16 NFS@Home job, finding 160; the 5060 -4.44%,
+         * STATUS row 44), under --q-pipeline, and with no row tier
+         * (--fill-rows; 0 at I16), whose kernels the ahead fill does not
+         * confine. Its grid is a count of slots per SM (SLAB_FILL_BLOCKS_DEFAULT
+         * per SLAB_FILL_DEFAULT_SMS, scaled), and at three times the right
+         * grid it lost to off. Ada and the 3060 lost with it beside their best
+         * fill grid, so other cards keep it off until timed there (bench/tune.sh
+         * does that). Then the grid's refusal, which the default could not
+         * answer before. */
         if (cfg.slab_fill_ahead < 0) {
             cfg.slab_fill_default = 1;
             cfg.slab_fill_ahead = cfg.pipeline && cfg.q_pipeline && !cfg.fill_rows &&
-                prop.major == 12 && prop.minor == 0 &&
-                prop.multiProcessorCount == SLAB_FILL_DEFAULT_SMS;
+                card_def.slab_fill_ahead;
         }
         if (cfg.pipeline && cfg.slab_fill_blocks && !cfg.slab_fill_ahead) {
             fprintf(stderr, "--slab-fill-blocks sets --slab-fill-ahead's grid, and"
@@ -2636,8 +2659,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                     cfg.blocks, prop.maxGridSize[0]);
             return 1;
         }
-        effective_fill_blocks = cfg.fill_blocks ? cfg.fill_blocks
-                                                : FILL_BLOCKS_DEFAULT;
+        effective_fill_blocks = fill_blocks_auto(&cfg);
         if (effective_fill_blocks > prop.maxGridSize[0]) {
             fprintf(stderr, "fill grid %d exceeds this device's grid-x limit %d\n",
                     effective_fill_blocks, prop.maxGridSize[0]);
@@ -2675,9 +2697,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
          * fallback -- and there is exactly one place per kernel that knows its
          * own default. */
         printf("grid: %d x %d for fill (absolute, not per SM)%s%s%s\n",
-               cfg.fill_blocks  ? cfg.fill_blocks  : FILL_BLOCKS_DEFAULT,
+               fill_blocks_auto(&cfg),
                cfg.fill_threads ? cfg.fill_threads : FILL_THREADS_DEFAULT,
-               !cfg.fill_blocks ? "" :
+               !cfg.fill_blocks ? (cfg.fill_blocks_card ? "  [this card's default]" : "") :
                (tuned_applied & TUNED_F_FILL_BLOCKS) ? "  [tuned]" : "  [--fill-blocks]",
                cfg.fill_threads ? "  [--fill-threads]" : "",
                cfg.fill_merge ? "; on a one-slab plan, as --fill-merge reports" : "");
@@ -2685,7 +2707,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             printf("small sieve tiers: block m < %u, warp m < %u%s%s\n",
                    ss_block_cut(&cfg), ss_warp_cut(&cfg),
                    !cfg.ss_block_cut ? "" : (tuned_applied & TUNED_F_SS) ? "  [tuned]" : "  [--ss-block-cut]",
-                   !cfg.ss_warp_cut  ? "" : (tuned_applied & TUNED_F_SS) ? "  [tuned]" : "  [--ss-warp-cut]");
+                   !cfg.ss_warp_cut  ? (cfg.ss_warp_cut_card ? "  [this card's default]" : "")
+                                     : (tuned_applied & TUNED_F_SS) ? "  [tuned]" : "  [--ss-warp-cut]");
         /* A knob the banner does not name is a knob a log cannot prove was
          * live -- the --fill-blocks lesson (bench_kernels.cu, twolevel note).
          * --fill-streams reaches k_fill_atomic only, so say so HERE rather
@@ -3740,10 +3763,23 @@ resume_artifacts_ready:
                         cfg.logI, cfg.J, cfg.logI,
                         (double)(1u << cfg.logI) * cfg.J, cfg.log_region,
                         maxbits, cfg.blocks, cfg.threads,
-                        cfg.fill_blocks ? cfg.fill_blocks : FILL_BLOCKS_DEFAULT,
+                        fill_blocks_auto(&cfg),
                         cfg.fill_threads ? cfg.fill_threads
                                          : FILL_THREADS_DEFAULT,
                         cfg.fill_merge ? " (or merged: # fill-merge)" : "");
+            /* The small-sieve cuts and where each came from. A card's own
+             * warp cut (Ada's 1024) is in no flag and no saved entry, so
+             * without this the log could not show which one ran. */
+            if (cfg.small_sieve)
+                runlog_note("small-sieve", "block m < %u (%s), warp m < %u (%s)",
+                            ss_block_cut(&cfg),
+                            !cfg.ss_block_cut ? "bench.h"
+                            : (tuned_applied & TUNED_F_SS) ? "tuned" : "--ss-block-cut",
+                            ss_warp_cut(&cfg),
+                            cfg.ss_warp_cut ? ((tuned_applied & TUNED_F_SS) ? "tuned" : "--ss-warp-cut")
+                            : cfg.ss_warp_cut_card ? "this card's default" : "bench.h");
+            else
+                runlog_note("small-sieve", "off");
             /* what saved tuning did, since the geometry above includes it */
             if (tuned_line[0]) runlog_note("tuned", "%s", tuned_line);
             /* The factor-base convention, spelled out rather than implied. The

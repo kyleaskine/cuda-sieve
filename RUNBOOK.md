@@ -1550,10 +1550,13 @@ more than the defaults' own spread between rounds.
 
 It then searches past the grid in two ways:
 - **Ladders.** When the best `--fill-blocks`, `--ss-warp-cut`,
-  `--ss-block-cut` or `--slab-fill-blocks` is the grid's top or bottom arm,
-  it times the next two steps past it, with the defaults and that edge. It
-  keeps going until a step is clearly slower or the ladder reaches bench's
-  bound: 2^20 for `--fill-blocks`, 32768 and just above the block cut for
+  `--ss-block-cut` or `--slab-fill-blocks` has an untimed next step on its
+  ladder, it times the next two steps that way, with the defaults and that
+  arm. That means past the grid's top or bottom, or into a gap the grid
+  leaves, such as 36864 to 294912 on a card whose fill default is 589824. It
+  keeps going until a step is clearly slower, the ladder reaches bench's
+  bound, or the next step is one stage 1 timed or this card's default. The
+  bounds are 2^20 for `--fill-blocks`, 32768 and just above the block cut for
   `--ss-warp-cut`, 128 for `--ss-block-cut`, and the card's resident blocks
   per SM for `--slab-fill-blocks`. The 3060's `--fill-blocks 589824` is 16
   times the grid's top (finding 161). Where steps are within noise of each
@@ -1581,7 +1584,9 @@ and the confirmation stage still time every arm in every round, since their
 rules compare two arms that may both lose to the defaults. `-f` turns early
 dropping off, for a table of every arm's median.
 
-Pick `--nq` so one run takes 10-60 s. The default grid of 17 arms is then at
+Pick `--nq` so one run takes 10-60 s. The default grid of 17 arms (up to 21 on a
+card whose own defaults bring in W256, F4608 and the steps either side of
+them) is then at
 most 20-105 minutes for stage 1 alone, or up to 20 arms on a plan of several
 slabs per q, where `--no-fill-merge` drops out and the `--slab-fill-ahead`
 grids of 6 blocks per SM up to the card's resident limit come in. Stage 2
@@ -1638,7 +1643,9 @@ with a note rather than refused. That covers:
 
 An entry is declined as a whole when it was tuned at another J or region,
 or under another tuning policy (`TUNED_POLICY`, bumped when a change makes
-old tuning untrustworthy). bench only notes a factor-base bound more than 2×
+old tuning untrustworthy). Policy 2 (finding 162, 2026-11-24) gave cards
+their own built-in defaults, so an entry tuned under policy 1 is declined
+until the card is re-tuned. bench only notes a factor-base bound more than 2×
 from the tuned job's, another special-q side, or another slab-plan shape.
 
 tune.sh times every arm with `--no-tuned`, against the built-in defaults. It
@@ -1676,18 +1683,25 @@ no file, and an old one never looks. `--no-tuned` does the same on a new
 binary, but an old one refuses it. `abcheck.sh` compares output, not time,
 and is unaffected.
 
-Every default and the whole grid were measured on a 5070 (sm_120), so a
-report from another card is useful even when it keeps the defaults.
-`--slab-fill-ahead` (RESULTS.md finding 160, −6 to −7% at I16) is on by
-default only on that card, sm_120 with 48 SMs. Its grid is a count of slots
-per SM, and the one other card swept, an RTX 3060, gains with it on the
-default fill grid but loses beside the much larger fill grid that card takes
-(`--fill-blocks 589824`, findings 149 and 161), so it stays off there. A
-report recommending it on another card, which now means beating that card's
-best single setting too (stage 2 checks), is the measurement that would turn
-it on there. Such a recommendation also becomes that card's saved entry, so
-the card uses `--slab-fill-ahead` from then on without any change to the
-built-in default.
+**Defaults by card (RESULTS.md finding 162).** bench.h's defaults were
+measured on a 5070 (sm_120). Since 2026-11-24, `--pipeline` runs on three
+architectures use their own, from the tunes of finding 162 (`tuned_card_defaults`
+in `bench/tuned.h`):
+- sm_89 (Ada): `--ss-warp-cut 1024`.
+- sm_86 and sm_89 at logI 16: `--fill-blocks 589824`.
+- sm_120 (Blackwell), any SM count: `--slab-fill-ahead` on, at 384 blocks per
+  30 SMs scaled to the card (614 on the 5070's 48, 384 on the 5060's 30).
+
+A flag or a saved entry still wins over them, and the banner marks a card
+default `[this card's default]`. tune.sh reads them from the defaults' first
+run, so it times the arms around this card's default and leaves out the arm
+equal to it. W256 and F4608 are timed where those are not the defaults, and
+W2048, F294912 and F1048576 where they are the next steps either side of the
+card's default, so the search sees both sides of it. Every knob is
+output-identical, so on a card no one has timed the worst case is speed. A
+report from any other card is still useful, even one that keeps the defaults.
+A recommendation becomes that card's saved entry, so the card uses it from
+then on without a change to the built-in defaults.
 `DIR/report.txt` names the card, driver, binary and job (RESULTS.md
 finding 146).
 

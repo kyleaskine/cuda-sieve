@@ -60,26 +60,35 @@
 # The grid, one knob at a time away from the defaults (bench --help):
 #   --ss-block-cut 40 48 64              default 36; 33 is the floor, and
 #                                        33-35 split as 36 does
-#   --ss-warp-cut 128 384 512 1024       default 256
-#   --fill-blocks 1152 2304 9216 18432 36864   default 4608
+#   --ss-warp-cut 128 256 384 512 1024 2048   default 256; 1024 on sm_89
+#                                        (Ada)
+#   --fill-blocks 1152 2304 4608 9216 18432 36864 294912 1048576   default
+#                                        4608; 589824 on sm_86 and sm_89 at
+#                                        logI 16
 #   --fill-gate-shift 1 2 4              default 3
 #   --no-fill-merge                      default on with the row tier, at
 #                                        one slab per q; not timed elsewhere
 #   --slab-fill-ahead at --slab-fill-blocks 256 384 512 768 1024 1536 2048
-#     3072, and --no-slab-fill-ahead     on by default (512 blocks) only on
-#                                        sm_120 with 48 SMs and no row tier,
-#                                        the RTX 5070 it was timed on (finding
-#                                        160); elsewhere off, and its default
-#                                        grid there is 512 per 48 SMs
+#     3072, and --no-slab-fill-ahead     on by default only on sm_120
+#                                        (Blackwell) with no row tier, at 384
+#                                        blocks per 30 SMs scaled to the card
+#                                        (614 on the 5070's 48); elsewhere off
+#   The per-card defaults are bench's (tuned.h, tuned_card_defaults; STATUS
+#   row 44), read from the defaults' first run, and an arm equal to one is the
+#   defaults' own setting and not timed: W256 and F4608 are timed only on a
+#   card whose default is not 256 or 4608, and there W1024 or no F arm is not.
+#   W2048, F294912 and F1048576 (BRACKET_ARMS) are the ladder steps on either
+#   side of those card defaults, timed only on a card whose default they are
+#   next to.
 #   The --slab-fill-ahead arms run only where it can: a plan of several slabs
 #   per q under --q-pipeline (bench's first run says which). Its right grid is
 #   a count of block slots per SM, so of that ladder only the grids of 6
 #   blocks per SM up to the most this card holds resident (bench's tuned-run
-#   line; 24 if it prints none) are timed (512 is 10.7 on 48 SMs), and an arm
+#   line; 24 if it prints none) are timed (384 is 12.8 on 30 SMs), and an arm
 #   equal to this card's default is not timed. A recommendation of
-#   --slab-fill-ahead here is worth reporting: the default is off on every
-#   card but the 5070, and the one other card measured, an RTX 3060, loses
-#   with it beside its own best --fill-blocks (RESULTS finding 161).
+#   --slab-fill-ahead off sm_120 is worth reporting: Ada and the one Ampere
+#   card measured, an RTX 3060, lose with it beside their best --fill-blocks
+#   (RESULTS finding 161, STATUS row 44).
 #
 # Method (STATUS item 2, RESULTS findings 85, 145, 146 and 149). Every arm sieves the
 # same q, and the arms are interleaved within a round. The order is rotated
@@ -108,15 +117,22 @@
 #
 # Ladders (the grid's four numeric knobs; finding 161's 3060 wanted
 # --fill-blocks 589824, 16 times the grid's top). When a ladder knob's best
-# adopted arm is the grid's top or bottom one, a ladder pass times the next
-# two steps past it, with the defaults and that edge, and the next pass goes
-# on from the farther step, until the newest step is clearly slower than the
-# edge (the adoption rule) or the ladder reaches its bound:
+# adopted arm has an untimed next step on its ladder (past the grid's top or
+# bottom, or into a gap the grid leaves), a ladder pass times the next two
+# steps that way, with the defaults and that arm, and the next pass goes on
+# from the farther step, until the newest step is clearly slower than the
+# edge (the adoption rule), the ladder reaches its bound, or the next step
+# would reach a value stage 1 timed or this card's default:
 #   --fill-blocks        doubling, within [SMs, min(2^20, the card's grid limit)]
 #   --ss-warp-cut        doubling, above the block cut (36), up to 32768
-#   --ss-block-cut       40 48 64 96 128, below the warp cut (256)
+#   --ss-block-cut       40 48 64 96 128, below the warp cut (this card's)
 #   --slab-fill-blocks   x1.5 and x4/3 in turn (256 384 512 768 ...), within 6
 #                        to the most resident blocks per SM
+#   A card's own default has its ladder neighbours in the grid (W2048,
+#   F294912 and F1048576 for sm_89's warp cut 1024 and the fill grid 589824
+#   of sm_86 and sm_89 at logI 16), timed only on a card whose default they
+#   are next to, so the search sees both sides of it; the ladders then fill
+#   the gap between 36864 and 294912 from whichever side won (finding 162).
 # A doubling past a bound is clamped to it (bench refuses a value past
 # bench.h's bound, and tunecheck.sh checks the copies below against bench.h).
 #
@@ -188,14 +204,23 @@ SS_WARP_MAX=32768    # SS_WARP_CUT_MAX
 SS_BLOCK_DEF=36      # SS_BLOCK_CUT_DEFAULT
 SS_WARP_DEF=256      # SS_WARP_CUT_DEFAULT
 FILL_DEF=4608        # FILL_BLOCKS_DEFAULT, --fill-blocks 0's automatic grid
-SFA_BLOCKS_DEF=512   # SLAB_FILL_BLOCKS_DEFAULT, the slab fill ahead's grid
-SFA_DEF_SMS=48       # SLAB_FILL_DEFAULT_SMS, ... per this many SMs
+SFA_BLOCKS_DEF=384   # SLAB_FILL_BLOCKS_DEFAULT, the slab fill ahead's grid
+SFA_DEF_SMS=30       # SLAB_FILL_DEFAULT_SMS, ... per this many SMs
+# Those are bench.h's constants. A card can have its own defaults (sm_89's
+# warp cut, the fill grid on sm_86 and sm_89 at logI 16: tuned.h's
+# tuned_card_defaults), so the defaults' first run says what this card's are
+# (WDEF, FDEF, SFA_DEF below), and knob_def uses those. BRACKET_ARMS are the
+# ladder neighbours of tuned.h's card defaults that the grid lacks: timed only
+# where they are next to this card's default (tunecheck.sh section 47 checks
+# them against tuned.h).
 BLOCK_LADDER="40 48 64 96 128"
+BRACKET_ARMS="W2048 F294912 F1048576"
 ARMS_GIVEN=$ARMS
+[ -z "$ARMS_GIVEN" ] || BRACKET_ARMS=
 [ -n "$ARMS" ] || ARMS="B40=--ss-block-cut,40 B48=--ss-block-cut,48 B64=--ss-block-cut,64
-  W128=--ss-warp-cut,128 W384=--ss-warp-cut,384 W512=--ss-warp-cut,512 W1024=--ss-warp-cut,1024
-  F1152=--fill-blocks,1152 F2304=--fill-blocks,2304 F9216=--fill-blocks,9216 F18432=--fill-blocks,18432
-  F36864=--fill-blocks,36864 G1=--fill-gate-shift,1 G2=--fill-gate-shift,2 G4=--fill-gate-shift,4 M0=--no-fill-merge
+  W128=--ss-warp-cut,128 W256=--ss-warp-cut,256 W384=--ss-warp-cut,384 W512=--ss-warp-cut,512 W1024=--ss-warp-cut,1024
+  W2048=--ss-warp-cut,2048 F1152=--fill-blocks,1152 F2304=--fill-blocks,2304 F4608=--fill-blocks,4608 F9216=--fill-blocks,9216
+  F18432=--fill-blocks,18432 F36864=--fill-blocks,36864 F294912=--fill-blocks,294912 F1048576=--fill-blocks,1048576 G1=--fill-gate-shift,1 G2=--fill-gate-shift,2 G4=--fill-gate-shift,4 M0=--no-fill-merge
   SFA0=--no-slab-fill-ahead SFA256=--slab-fill-ahead,--slab-fill-blocks,256 SFA384=--slab-fill-ahead,--slab-fill-blocks,384
   SFA512=--slab-fill-ahead,--slab-fill-blocks,512 SFA768=--slab-fill-ahead,--slab-fill-blocks,768
   SFA1024=--slab-fill-ahead,--slab-fill-blocks,1024 SFA1536=--slab-fill-ahead,--slab-fill-blocks,1536
@@ -251,7 +276,12 @@ say() { echo "$*"; echo "$*" >> "$REP"; }
 # command line, and matching it refused every tune the client started. A
 # new client subcommand that sieves on the card would need adding here.
 # tunecheck.sh tests this pattern against each form. busy PID leaves out
-# bench's own process.
+# bench's own process. In a container (vast.ai and the like) nvidia-smi can
+# list processes by the host's PIDs, where bench's own run shows under a
+# number this shell never sees; that stopped every tune on a rented 3080 Ti
+# in its first run (2026-11-24). So during a run, when PID is not listed, one
+# listed process this shell cannot see in /proc is taken to be bench itself;
+# a process it can see, or a second it cannot, is still another.
 BUSY_DEFAULT='run-cuda-client|ggnfs-sieve-client +(--|benchmark ).*(engine=cuda|cuda-bench)'
 BUSY=${TUNE_BUSY-$BUSY_DEFAULT}
 # Seconds between checks on a running bench (busy every third). TUNE_POLL is
@@ -259,8 +289,14 @@ BUSY=${TUNE_BUSY-$BUSY_DEFAULT}
 POLL=${TUNE_POLL:-1}
 busy() {
   if command -v nvidia-smi > /dev/null 2>&1; then
-    nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null |
-      tr -d ' ' | grep -v -x -e '' -e "${1:-none}" | grep -q . && return 0
+    _mine=; _seen=; _unseen=
+    for _x in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' '); do
+      if [ "$_x" = "${1:-none}" ]; then _mine=1
+      elif [ -d "/proc/$_x" ]; then _seen="$_seen $_x"
+      else _unseen="$_unseen $_x"; fi
+    done
+    [ -n "${1:-}" ] && [ -z "$_mine" ] && _unseen=$(echo $_unseen | cut -s -d' ' -f2-)
+    [ -n "$_seen$_unseen" ] && return 0
   fi
   [ -n "$BUSY" ] && ps -eo args | grep -v grep | grep -qE "$BUSY"
 }
@@ -311,7 +347,10 @@ flags_of() {  # the flags of arm $1 (empty for default), commas to spaces
   for a in $ARMS; do [ "${a%%=*}" = "$1" ] && echo "${a#*=}" | tr , ' '; done
 }
 fails=0
-NOOP=
+# NOOP: arms that would time the defaults against themselves, never timed.
+# S1SKIP: BRACKET_ARMS this card's defaults leave out, in stage 1 only (a
+# ladder may still reach one).
+NOOP=; S1SKIP=
 # tuned_first OUT: from the defaults' first run, bench's own view of saved
 # tuning (bench_main.cu, tuned_step): the key and applicability record to
 # write, the incumbent (what bench would apply), the plan's slabs per q, any
@@ -351,10 +390,13 @@ run_stage() {
   dref=; [ -n "$FULL" ] || dref=${DROP:-}
   for rd in $(seq 1 "$ROUNDS"); do
     k=$(( ((rd + 1) / 2 - 1) % n ))
-    order="$(echo $names | tr ' ' '\n' | tail -n +$((k + 1)) | tr '\n' ' ')$(echo $names | tr ' ' '\n' | head -n $k | tr '\n' ' ')"
+    # Rotated left by k in one awk: the pipe through `head -n $k` this
+    # replaced broke at k = 0 (head exits unread), and under an ignored
+    # SIGPIPE (ggnfs-sieve-client's `tune`) tr printed a write error.
+    order=$(echo $names | awk -v k=$k '{ for (i = 1; i <= NF; i++) printf "%s ", $((i + k - 1) % NF + 1) }')
     [ $((rd % 2)) -eq 0 ] && order=$(echo $order | awk '{ for (i = NF; i > 0; i--) printf "%s ", $i }')
     for arm in $order; do
-      case " $NOOP $OUT " in *" $arm "*) continue ;; esac
+      case " $NOOP $S1SKIP $OUT " in *" $arm "*) continue ;; esac
       if [ -n "$BUDGET" ]; then
         lim=$BUDGET; [ "$st" = 3 ] || lim=$((BUDGET - $(reserve)))
         if [ $(( $(now) - START + $(avg_run) )) -gt $lim ]; then CUT=$st; return 0; fi
@@ -402,10 +444,39 @@ run_stage() {
         case $sms in *[!0-9]*) sms= ;; esac
         # the ladders' card limits: SMs, the grid limit, resident blocks per SM
         CARD_SMS=$sms; SFA_DEF=$sg
+        # This card's warp cut and fill grid, from the banner (bench before
+        # per-card defaults prints bench.h's there). An arm that equals one
+        # is the defaults against themselves: not timed. W256 and F4608 are
+        # in the grid for cards whose defaults are not bench.h's, and on the
+        # rest they are such arms; say so only where the card's differ.
         mb=$TR_MAXBLK; case $mb in ''|*[!0-9]*|0) mb=24 ;; esac; MAXBLK=$mb
         FILL_HI=$BLOCKS_MAX
         case $TR_MAXGRID in ''|*[!0-9]*) ;; *) [ "$TR_MAXGRID" -lt $FILL_HI ] && FILL_HI=$TR_MAXGRID ;; esac
         FILL_LO=${sms:-1}
+        WDEF=$(sed -n 's/^small sieve tiers: block m < [0-9]*, warp m < \([0-9][0-9]*\).*/\1/p' "$o.out" | head -1)
+        FDEF=$(sed -n 's/^grid: \([0-9][0-9]*\) x [0-9][0-9]* for fill.*/\1/p' "$o.out" | head -1)
+        case $WDEF in ''|*[!0-9]*) WDEF=$SS_WARP_DEF ;; esac
+        case $FDEF in ''|*[!0-9]*) FDEF=$FILL_DEF ;; esac
+        nm=; cd_=
+        [ "$WDEF" = "$SS_WARP_DEF" ] || cd_="$cd_, --ss-warp-cut $WDEF (bench.h's $SS_WARP_DEF)"
+        [ "$FDEF" = "$FILL_DEF" ] || cd_="$cd_, --fill-blocks $FDEF (bench.h's $FILL_DEF)"
+        for a in $ARMS; do
+          case ${a#*=} in "--ss-warp-cut,$WDEF"|"--fill-blocks,$FDEF") nm="$nm ${a%%=*}" ;; esac
+        done
+        # the bracket arms next to this card's defaults on the ladders: timed
+        bt=; fn=" $(ladder_next fill $FDEF up) $(ladder_next fill $FDEF down) "
+        wn=" $(ladder_next warp $WDEF up) $(ladder_next warp $WDEF down) "
+        for m in $BRACKET_ARMS; do
+          kv=$(ladder_of $m); [ -n "$kv" ] || continue
+          case ${kv%% *} in fill) nb=$fn ;; warp) nb=$wn ;; *) nb= ;; esac
+          case $nb in *" ${kv#* } "*) bt="$bt $m" ;; *) S1SKIP="$S1SKIP $m" ;; esac
+        done
+        if [ -n "$cd_" ]; then
+          say "   this card's defaults: ${cd_#, }${nm:+; not timing$nm (the defaults' own setting)}${bt:+; also timing$bt, next to them on the ladders}"
+        elif [ -n "$nm" ] && [ -n "$ARMS_GIVEN" ]; then
+          say "   not timing$nm: the defaults' own setting on this card"
+        fi
+        NOOP="$NOOP$nm"
         nm=; why=
         if ! grep -q -- "--q-pipeline: each slab's sieve" "$o.out"; then why="it needs a plan of several slabs per q under --q-pipeline"; fi
         for a in $ARMS; do
@@ -426,7 +497,7 @@ run_stage() {
           fi
           NOOP="$NOOP$nm"
         fi
-        nt=$n; for m in $NOOP; do nt=$((nt - 1)); done
+        nt=$n; for m in $NOOP $S1SKIP; do nt=$((nt - 1)); done
         say "   one run takes about $((t1 - t0)) s; stage 1 is $([ -n "$FULL" ] || echo 'at most ')$(( ((t1 - t0) * nt * ROUNDS + 59) / 60 )) min ($nt arms timed)"
         if [ -n "$BUDGET" ]; then
           s1t=$(( (t1 - t0) * nt * ROUNDS )); rst=$(reserve)
@@ -461,7 +532,7 @@ run_stage() {
     # needs it slower in no round), so it is not timed again
     left=
     for arm in $names; do
-      case " default $dref $NOOP $OUT " in *" $arm "*) continue ;; esac
+      case " default $dref $NOOP $S1SKIP $OUT " in *" $arm "*) continue ;; esac
       if awk -v st="$st" -v a="$arm" -v b="$dref" -v r=$rd '$1 == st && $3 == r { w[$2] = $4 }
            END { exit !((a in w) && (b in w) && w[a] + 0 > w[b] + 0) }' "$DIR/walls.txt"; then
         OUT="$OUT $arm"; echo "$st $arm $rd" >> "$DIR/out.txt"
@@ -540,32 +611,8 @@ say "   job: $*"
 say "   $ROUNDS rounds; load $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
 [ -n "$WSL_DISTRO_NAME" ] && say "   NOTE: under WSL nvidia-smi does not show Windows programs using the card; close them (a browser tab cost 6-8%)"
 : > "$DIR/walls.txt"; : > "$DIR/differs.txt"; : > "$DIR/out.txt"; rm -f "$DIR"/s*.pick
-NAMES="default $(for a in $ARMS; do printf '%s ' "${a%%=*}"; done)"
-say "== stage 1: $(echo $NAMES | wc -w) arms, $(date +%T)"
-DROP=default; run_stage 1 "$NAMES" "$@"
-if [ "$CUT" = 1 ]; then say "== stopping: the -t budget ran out in stage 1; nothing is judged or written"; exit 4; fi
-summarise 1
-
-# knobs_of FLAGS: the knobs FLAGS set, each once, values dropped and --no-X
-# as --X (arms that share one are one knob, and an -a arm may set several).
-# --slab-fill-blocks is --slab-fill-ahead's: bench refuses its grid with the
-# slab fill ahead off, so it never pairs with --no-slab-fill-ahead.
-knobs_of() {
-  for _f in $1; do
-    case $_f in --slab-fill-blocks) echo --slab-fill-ahead ;; --no-*) echo "--${_f#--no-}" ;; --*) echo "$_f" ;; esac
-  done | awk '!s[$0]++ { printf "%s ", $0 }'
-}
-shares() { for _x in $(knobs_of "$1"); do case " $(knobs_of "$2") " in *" $_x "*) return 0 ;; esac; done; return 1; }
-# valid_flags FLAGS: what bench would accept of the knobs' bounds and pairing
-valid_flags() {
-  _fb=; _bc=$SS_BLOCK_DEF; _wc=$SS_WARP_DEF; _prev=
-  for _f in $1; do
-    case $_prev in --fill-blocks) _fb=$_f ;; --ss-block-cut) _bc=$_f ;; --ss-warp-cut) _wc=$_f ;; esac
-    _prev=$_f
-  done
-  [ "$_wc" -gt "$_bc" ] && [ "$_bc" -ge $SS_BLOCK_MIN ] && [ "$_bc" -le $SS_BLOCK_MAX ] &&
-    [ "$_wc" -le $SS_WARP_MAX ] && { [ -z "$_fb" ] || [ "$_fb" -le "$FILL_HI" ]; }
-}
+# The ladders' arithmetic, before stage 1: the defaults' first run uses it
+# to pick the bracket arms next to this card's defaults.
 # ladder_of NAME: "KNOB VALUE" when the arm sets one ladder knob alone
 ladder_of() {
   _l=$(flags_of "$1")
@@ -579,8 +626,10 @@ ladder_of() {
 knob_flag() { case $1 in fill) echo --fill-blocks ;; warp) echo --ss-warp-cut ;; block) echo --ss-block-cut ;; sfa) echo --slab-fill-blocks ;; esac; }
 knob_def() {
   case $1 in
-    fill) echo $FILL_DEF ;; warp) echo $SS_WARP_DEF ;; block) echo $SS_BLOCK_DEF ;;
-    sfa) if [ -n "$SFA_DEF" ]; then echo "$SFA_DEF"; elif [ -n "$CARD_SMS" ]; then echo $((SFA_BLOCKS_DEF * CARD_SMS / SFA_DEF_SMS)); else echo $SFA_BLOCKS_DEF; fi ;;
+    fill) echo ${FDEF:-$FILL_DEF} ;; warp) echo ${WDEF:-$SS_WARP_DEF} ;; block) echo $SS_BLOCK_DEF ;;
+    # off in the defaults' run: the grid bench would scale for this card
+    # (pipeline.cuh's rounding)
+    sfa) if [ -n "$SFA_DEF" ]; then echo "$SFA_DEF"; elif [ -n "$CARD_SMS" ]; then echo $(( (SFA_BLOCKS_DEF * CARD_SMS + SFA_DEF_SMS / 2) / SFA_DEF_SMS )); else echo $SFA_BLOCKS_DEF; fi ;;
   esac
 }
 # ladder_next KNOB VALUE up|down: the ladder's next step, clamped to its
@@ -598,7 +647,7 @@ ladder_next() {
     block)
       if [ $3 = up ]; then _n=$(for _x in $BLOCK_LADDER; do [ $_x -gt $_v ] && echo $_x; done | head -1)
       else _n=$(for _x in $BLOCK_LADDER; do [ $_x -lt $_v ] && echo $_x; done | tail -1); fi
-      [ -n "$_n" ] && { [ $_n -lt $SS_BLOCK_MIN ] || [ $_n -gt $SS_BLOCK_MAX ] || [ $_n -ge $SS_WARP_DEF ] || [ $_n -eq $SS_BLOCK_DEF ]; } && _n= ;;
+      [ -n "$_n" ] && { [ $_n -lt $SS_BLOCK_MIN ] || [ $_n -gt $SS_BLOCK_MAX ] || [ $_n -ge "$(knob_def warp)" ] || [ $_n -eq $SS_BLOCK_DEF ]; } && _n= ;;
     sfa)
       [ -n "$CARD_SMS" ] || return 0
       _n=$_v
@@ -614,6 +663,65 @@ ladder_next() {
   esac
   echo $_n
 }
+# ladder_covered KNOB VALUE DIR STEP: the value nearest VALUE, past it that
+# way and no farther than STEP, that stage 1 timed on KNOB or (fill and warp)
+# that is this card's default, as "U timed" or "U default"; nothing if none
+ladder_covered() {
+  _cd=; case $1 in fill|warp) _cd=$(knob_def $1) ;; esac
+  awk -v k=$1 -v v=$2 -v d=$3 -v s=$4 -v def="$_cd" '
+    function within(u) { return d == "up" ? (u > v && u <= s) : (u < v && u >= s) }
+    function nearer(u) { return b == "" || (d == "up" ? u < b : u > b) }
+    BEGIN { b = ""; if (def != "" && within(def + 0)) { b = def + 0; w = "default" } }
+    $2 == k && within($3 + 0) && nearer($3 + 0) { b = $3 + 0; w = "timed" }
+    END { if (b != "") print b, w }' "$DIR/s1.ladder"
+}
+# ladder_open KNOB VALUE DIR: the ladder's next step from VALUE that way,
+# unless that is past the bound or reaches a value stage 1 timed or this
+# card's default: a ladder times only what the grid left untimed
+ladder_open() {
+  _s=$(ladder_next $1 $2 $3); [ -n "$_s" ] || return 0
+  [ -n "$(ladder_covered $1 $2 $3 $_s)" ] || echo $_s
+}
+# ladder_stop KNOB NAME VALUE DIR: the report line for a ladder that goes no
+# further from arm NAME (VALUE) that way
+ladder_stop() {
+  _s=$(ladder_next $1 $3 $4)
+  if [ -z "$_s" ]; then say "   $(knob_flag $1): $2 is the ladder's bound; it stops there"; return 0; fi
+  _c=$(ladder_covered $1 $3 $4 $_s); _u=${_c% *}
+  case $_c in
+    *default) if [ "$_u" = "$_s" ]; then say "   $(knob_flag $1): the next step past $2 is this card's default, $_u; the ladder stops"
+              else say "   $(knob_flag $1): this card's default, $_u, lies within the next step past $2; the ladder stops"; fi ;;
+    *timed) if [ "$_u" = "$_s" ]; then say "   $(knob_flag $1): the next step past $2, $_u, was timed in stage 1; the ladder stops"
+            else say "   $(knob_flag $1): stage 1 timed $_u, within the next step past $2; the ladder stops"; fi ;;
+  esac
+}
+NAMES="default $(for a in $ARMS; do printf '%s ' "${a%%=*}"; done)"
+say "== stage 1: $(echo $NAMES | wc -w) arms, $(date +%T)"
+DROP=default; run_stage 1 "$NAMES" "$@"
+S1SKIP=
+if [ "$CUT" = 1 ]; then say "== stopping: the -t budget ran out in stage 1; nothing is judged or written"; exit 4; fi
+summarise 1
+
+# knobs_of FLAGS: the knobs FLAGS set, each once, values dropped and --no-X
+# as --X (arms that share one are one knob, and an -a arm may set several).
+# --slab-fill-blocks is --slab-fill-ahead's: bench refuses its grid with the
+# slab fill ahead off, so it never pairs with --no-slab-fill-ahead.
+knobs_of() {
+  for _f in $1; do
+    case $_f in --slab-fill-blocks) echo --slab-fill-ahead ;; --no-*) echo "--${_f#--no-}" ;; --*) echo "$_f" ;; esac
+  done | awk '!s[$0]++ { printf "%s ", $0 }'
+}
+shares() { for _x in $(knobs_of "$1"); do case " $(knobs_of "$2") " in *" $_x "*) return 0 ;; esac; done; return 1; }
+# valid_flags FLAGS: what bench would accept of the knobs' bounds and pairing
+valid_flags() {
+  _fb=; _bc=$SS_BLOCK_DEF; _wc=$(knob_def warp); _prev=
+  for _f in $1; do
+    case $_prev in --fill-blocks) _fb=$_f ;; --ss-block-cut) _bc=$_f ;; --ss-warp-cut) _wc=$_f ;; esac
+    _prev=$_f
+  done
+  [ "$_wc" -gt "$_bc" ] && [ "$_bc" -ge $SS_BLOCK_MIN ] && [ "$_bc" -le $SS_BLOCK_MAX ] &&
+    [ "$_wc" -le $SS_WARP_MAX ] && { [ -z "$_fb" ] || [ "$_fb" -le "$FILL_HI" ]; }
+}
 # ladder_arm KNOB VALUE: the arm for that step (named as the grid names its
 # arms), added to ARMS if new; its name in LA. Not in $(...): it sets ARMS.
 ladder_arm() {
@@ -628,7 +736,7 @@ ladder_arm() {
 # among those within max(1%, the defaults' spread) of the knob's best gain
 winners() {
   while read -r _m _g _ok _sp; do echo "$_m $(ladder_of "$_m")"; done < "$1" > "$DIR/ladder.kv"
-  awk -v fd=$FILL_DEF -v wdf=$SS_WARP_DEF -v bd=$SS_BLOCK_DEF -v sd="$(knob_def sfa)" '
+  awk -v fd="$(knob_def fill)" -v wdf="$(knob_def warp)" -v bd=$SS_BLOCK_DEF -v sd="$(knob_def sfa)" '
     NR == FNR { if (NF == 3) { kn[$1] = $2; val[$1] = $3 }; next }
     { n++; arm[n] = $1; g[n] = $2; ok[n] = $3; sp[n] = $4 }
     END {
@@ -653,8 +761,10 @@ pick_wins() {
 gain_of() { awk -v a="$2" '$1 == a { printf "%.2f", $2 }' "$1"; }
 SKIPPED=
 
-# Ladders: each ladder knob whose best adopted arm is the grid's top or
-# bottom one steps on past it. Not for -a arms, which are an experiment.
+# Ladders: each ladder knob whose best adopted arm has an untimed next step
+# (past the grid's top or bottom, or into a gap such as 36864 to 294912 on a
+# card whose fill default is 589824) steps on that way; both untimed, away
+# from the default. Not for -a arms, which are an experiment.
 XPASS=0; EXTS=
 if [ -z "$ARMS_GIVEN" ] && [ $fails -eq 0 ]; then
   while read -r _m _g _ok _sp; do
@@ -665,10 +775,19 @@ if [ -z "$ARMS_GIVEN" ] && [ $fails -eq 0 ]; then
     [ -n "$e" ] || continue
     v=${e#* }; lo=$(awk -v k=$k '$2 == k { print $3 }' "$DIR/s1.ladder" | sort -n | head -1)
     hi=$(awk -v k=$k '$2 == k { print $3 }' "$DIR/s1.ladder" | sort -n | tail -1)
-    if [ "$lo" = "$hi" ]; then if [ "$v" -lt "$(knob_def $k)" ]; then dir=down; else dir=up; fi
-    elif [ "$v" = "$hi" ]; then dir=up
-    elif [ "$v" = "$lo" ]; then dir=down
-    else continue; fi
+    up=$(ladder_open $k $v up); dn=$(ladder_open $k $v down)
+    if [ -n "$up" ] && [ -n "$dn" ]; then if [ "$v" -lt "$(knob_def $k)" ]; then dir=down; else dir=up; fi
+    elif [ -n "$up" ]; then dir=up
+    elif [ -n "$dn" ]; then dir=down
+    else
+      # nowhere to go: said for the grid's top or bottom (outward), as before
+      od=
+      if [ "$lo" = "$hi" ]; then if [ "$v" -lt "$(knob_def $k)" ]; then od=down; else od=up; fi
+      elif [ "$v" = "$hi" ]; then od=up
+      elif [ "$v" = "$lo" ]; then od=down; fi
+      [ -n "$od" ] && ladder_stop $k "${e%% *}" $v $od
+      continue
+    fi
     EXTS="$EXTS $k:$dir:${e%% *}"
   done
 fi
@@ -677,9 +796,9 @@ while [ -n "$EXTS" ]; do
   for e in $EXTS; do
     k=${e%%:*}; r=${e#*:}; dir=${r%%:*}; edge=${r#*:}
     ev=$(ladder_of "$edge"); ev=${ev#* }
-    n1=$(ladder_next $k $ev $dir); n2=
-    if [ -z "$n1" ]; then say "   $(knob_flag $k): $edge is the ladder's bound; it stops there"; continue; fi
-    n2=$(ladder_next $k $n1 $dir)
+    n1=$(ladder_open $k $ev $dir); n2=
+    if [ -z "$n1" ]; then ladder_stop $k "$edge" $ev $dir; continue; fi
+    n2=$(ladder_open $k $n1 $dir)
     c=2; [ -n "$n2" ] && c=3
     echo "$(awk -v k=$k '$2 == k && $5 == 1 { print $4 }' "$DIR/s1.ladder" | sort -gr | head -1) $c $k:$dir:$edge:$n1:$n2" >> "$DIR/x.items"
   done
@@ -715,7 +834,7 @@ while [ -n "$EXTS" ]; do
     vs=$(beats x$XPASS "$edge" "$newest"); say "$vs"
     case $vs in *ADOPTED) say "   $(knob_flag $k): $newest is clearly slower than $edge; the ladder stops"; continue ;; esac
     nv=$(ladder_of "$newest"); nv=${nv#* }
-    if [ -z "$(ladder_next $k $nv $dir)" ]; then say "   $(knob_flag $k): $newest is the ladder's bound; it stops there"; continue; fi
+    if [ -z "$(ladder_open $k $nv $dir)" ]; then ladder_stop $k "$newest" $nv $dir; continue; fi
     EXTS="$EXTS $k:$dir:$newest"
   done
 done

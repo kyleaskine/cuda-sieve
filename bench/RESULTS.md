@@ -20524,4 +20524,223 @@ would have recommended `--fill-blocks 294912`.
   I16 job adds the NFS@Home case to finding 149's: −23.4% on a 3060.
 - `tune.sh`'s grid stops at 36864, so on a small-L2 card it finds the
   direction and not the peak; 147456 and 589824 arms would find it, at two
-  more arms on every card.
+  more arms on every card. **Done 2026-11-20 (`f9f61fe`) by ladders instead:**
+  a winning edge arm is doubled past the grid, up to 2^20. On 2026-11-23 they
+  took the 3060 from 36864 to 589824 in three passes on the NFS@Home job
+  (STATUS row 44).
+
+## Finding 162 — built-in defaults by card: sm_89 takes `--ss-warp-cut 1024`, sm_86 and sm_89 at logI 16 take `--fill-blocks 589824`, and every sm_120 card takes `--slab-fill-ahead` at 12.8 blocks per SM; tune.sh reads a card's defaults from its first run
+
+2026-11-24, Kyle's call ("you can build the defaults"; cc 8.6 added at his
+question). Until now bench.h's defaults were the 5070's, and only machines that
+ran `tune.sh` got anything else (saved tuning, findings 161 and STATUS row 44).
+These defaults reach fresh installs and BOINC volunteers. Every one of them is
+output-identical, so on a card no one has timed the worst case is speed, which
+`tune.sh` wins back.
+
+### The evidence: five cards, three architectures
+
+Wall against bench.h's defaults, every adopted figure faster in every round
+(STATUS row 44 has each run; `work/tune3060-20261123/`,
+`work/tune4060ti-20261123/`, `work/tune5060-20261124/`, `work/tune4070s/`,
+`work/sfagrid-20261124/`):
+
+| knob | sm_86: 3060 | sm_89: 4070 SUPER | sm_89: 4060 Ti (100 W) | sm_120: 5070 | sm_120: 5060 |
+|---|---|---|---|---|---|
+| `--ss-warp-cut 1024` | +0.32% (de222b73) | C143 −0.95, C147 −2.94, C183 −3.52, C194 −6.64% | de222b73 −4.36, C194 −5.81% | bottoms at 256-384 (finding 145) | +0.79% (de222b73) |
+| `--fill-blocks 589824` | C183 −6.30 (logI 15), C194 −19.02, I16 −23.4, de222b73 −18.53% | C194 −4.17%; **C183 +2.08% (logI 15)** | de222b73 −9.52, C194 −5.78% | C194 +5.83%; de222b73 36864 +0.41% | 9216-36864 +0.6 to +0.8% |
+| `--slab-fill-ahead` | loses beside the big grid (+6.3 points) | — | +0.4 to +7.1% alone, +3.9 to +6.2% beside it | −7.2% at 512 (finding 160) | −4.44% at 384 (256 −1.05, 512 −3.03%) |
+
+So:
+- **sm_89: warp cut 1024.** Never slower than 256 on six jobs on two cards,
+  one stock and one held to 100 W. Ampere and Blackwell keep 256.
+- **sm_86 and sm_89 at logI 16: fill grid 589824.** Ada's one loss is C183 at
+  logI 15, hence logI 16 only. The region count cannot separate them: C183 has
+  32768 regions too. The open-line footprint rule of finding 149 fails on Ada
+  (32 and 48 MB of L2 against 4 MB of open lines, and still gains), and
+  Blackwell loses on both cards. sm_86 is one card, the thinnest of the three.
+  But its gains are large, so even a much weaker effect on other Ampere cards
+  is still a gain.
+- **sm_120, any SM count: the ahead fill on, at 384 per 30 SMs** (12.8 per
+  SM; 614 on 48). On the 5070 at de222b73, 614 against its old 512 was
+  −0.63, −0.23, −0.10 and −0.15% in the four of six rounds clear of a Firefox
+  burst, and +2.24 and +3.69% in the two beside it. Finding 160 had 640 tie
+  512 at J 32768. Ada and Ampere lose with it beside their best grid.
+- **Not made a default: `--fill-gate-shift`.** On de222b73, 2 won on the 5070,
+  the 3060 and (beside the big grid) the 4060 Ti, but lost on the 5060
+  (+3.07%). It depends on the card as well as the job, so it stays with
+  tuning.
+
+**Since the build: an RTX 5070 Ti** (2026-11-24, rented; sm_120, 70 SMs; the
+committed c2d8d9f4 binary, so bench.h's defaults with the ahead fill off;
+de222b73 at 40000000:40000999; `work/tune5070ti-20261124/`). It agrees with
+the rule on all three sm_120 knobs:
+- No warp cut helped: 384 +0.06%, 1024 +0.80%.
+- The big grids lost: 9216 −0.15% and out after round 3, 18432 and 36864
+  +0.6%.
+- The ahead fill won: 512 and 768 −3.86% each, 1024 −2.61%, 1536 +0.52%.
+
+The rule's 896 (12.8 per SM) was not timed. Between its neighbours it would
+be about −3.2%, about 0.6% short of the card's best: still most of the gain,
+but the first card where the per-SM count overshoots (its best is 7.3 to 11
+per SM). The card also ran slow for its size: 114.78 ms/q at the defaults,
+where the 5070 runs this range in about 84 with the ahead fill on (gate A).
+Nothing shared it (spread 0.18-0.32%, load 1.07): the host held its clock
+down. In a sample during a follow-up run its SM clock read 1582 MHz of a
+3090 MHz maximum, at 109 W of a 250 W limit (the host's; the default is
+300 W), with no power or thermal cap active, only "Reliability". The 5070
+runs at 2932 MHz under load. 70 SMs at 1582 MHz are about 79% of the 5070's
+48 at 2932, which predicts about 107 ms/q with the ahead fill on, against
+about 110 measured. The CPU (Ryzen 7 5800X) is not the limit; PCIe ran Gen4
+x8 of x16. A core at half clock shifts the balance between the fill and the
+rest of the slab, so this card's best block count and gate shift do not carry
+over to a stock 5070 Ti. The 5080, a stock card at home, can settle the block
+count. Gate shift 1 won here (−4.54%; 2 −3.32%),
+where the 5060 lost 21.5% at 1, so the gate shift stays with tuning. Saved:
+`--fill-gate-shift 1 --slab-fill-ahead --slab-fill-blocks 512`, −8.41%.
+
+**And an RTX 4080 SUPER** (2026-11-24, rented; sm_89, 80 SMs, 64 MB of L2;
+a healthy card, 2670 of 3105 MHz at 289 of 320 W; the committed binary; the
+same job and range; `work/tune4080s-20261125/`). It is the third Ada card and
+the largest:
+- **The big fill grid won again**, most at 589824: 147456 −6.76%, 294912
+  −7.66%, 589824 −7.86% and −8.02%, 1048576 −7.11%. With 64 MB of L2
+  against 4 MB of open lines, the footprint rule fails on Ada a third time.
+- **The warp cut won again, but its best was 2048, not 1024**: 1024 −4.17%,
+  2048 −5.32%, 4096 −5.13%, 8192 −0.50%, 16384 +7.20%. Beside 294912, 1024
+  gave −4.18% and 2048 −5.41%, so the default leaves about 1.2% on this
+  card. On the 4060 Ti (34 SMs) 2048 was 0.3% behind 1024 on this job; on
+  the 4070 SUPER (56 SMs) it tied 1024 at C194 and was 1.0-1.2% behind at
+  C147 and C183. The best cut may grow with the SM count, but one 80-SM card
+  on one job does not move the default. 1024 stays, and tune.sh's W2048
+  bracket arm finds the rest.
+- **The ahead fill lost beside the big grid** (+2.4 to +4.9%; −1.48% alone
+  at 1024), so it stays on Blackwell only.
+- **The gate shift won beside the big grid**: 1 −4.84%, 2 −3.57% (alone, 2
+  −3.00% and 1 −0.77%). On this job 2 now wins beside the big grid on all
+  three non-Blackwell cards (the 3060 −2.80%, the 4060 Ti −3.13%). On the
+  4070 SUPER's small jobs (C143 and C147, without the big grid) 1 and 2 lost
+  or tied, so the gate shift stays with tuning.
+
+Saved: `--fill-blocks 294912 --ss-warp-cut 2048 --fill-gate-shift 1`,
+−17.15%, about 76 ms/q against the 5070's about 84 at its defaults. Finding
+162's defaults for this card (589824 and 1024) give about −12% of that, by
+stage 2 (294912 −7.79%, then 1024 −4.18% on top); the gate shift and the
+higher warp cut make up the rest. At the old defaults the card ran at
+91.98 ms/q, slower than the 5070. An Ada SM issues 64 INT32 operations per
+clock and a Blackwell SM 128, so its 80 SMs at 2.67 GHz have about 76% of the
+5070's integer rate (48 at 2.93 GHz), and the 5070-sized fill grid held its
+fill to 44.9 ms of an 81.3 ms sieve chain (the 5070: 24.6 on the chain).
+
+### What changed
+
+- `tuned.h`/`tuned.c`: `tuned_card_defaults(cc, logI)`, the whole rule, in
+  plain C so `tunedtest` checks it on every compute capability without the
+  cards. Exact capabilities only: sm_80, 87, 90, 100, 121 and Turing keep
+  bench.h's constants.
+- `bench.h`: `ss_warp_cut_card` and `fill_blocks_card` in the config, read
+  by `ss_warp_cut()` and a new `fill_blocks_auto()` after the flag. Kept
+  apart from `fill_blocks` so 0 there still means "auto" at the launch sites
+  (k_fill_l1 has its own default). `SLAB_FILL_BLOCKS_DEFAULT` /
+  `SLAB_FILL_DEFAULT_SMS` are now 384 / 30.
+- `bench_main.cu`: the card defaults resolve under `--pipeline` only, like
+  saved tuning, so the harness keeps reproducing RESULTS numbers. They
+  resolve before saved tuning, so its checks see the warp cut the run would
+  use, and a flag or an applied entry still wins. The ahead fill's default
+  condition drops "48 SMs". The banner marks a card default
+  `[this card's default]`, and `--help` says which cards differ. Every run
+  log gains a `# small-sieve` line with both cuts and where each came from
+  (bench.h, the flag, saved tuning or this card's default). Ada's warp cut is
+  in no flag and no saved entry, so without that line a log could not show
+  which cut ran.
+- `tune.sh`: reads the card's warp cut and fill grid from the defaults' first
+  run (it already read the ahead fill's). It leaves out an arm equal to one,
+  with a line naming the card's defaults where they differ from bench.h's
+  (and for an `-a` arm on any card). The grid gains W256 and F4608, timed
+  only where they are not the defaults. It also gains W2048, F294912 and
+  F1048576, the ladder steps on either side of the new card defaults, timed
+  only on a card whose default they are next to; tunecheck checks them
+  against tuned.h. Without them nothing above 1024 or 589824 would be timed
+  on Ada, and nothing between 36864 and 589824 unless 36864 first beat the
+  default.
+- A ladder now starts from the best arm toward any untimed next step, not
+  only past the grid's top or bottom. So it fills the gap between 36864 and
+  294912 from whichever side won. It stops at a value stage 1 timed or at
+  this card's default, instead of stepping over the default. Ties go to the
+  arm nearest this card's default, and `knob_def` scales the ahead fill's
+  grid with pipeline.cuh's rounding.
+- tune.sh's busy check, a fix found the same day. On a rented 3080 Ti
+  (vast.ai) every tune stopped in its first run with "another process came
+  onto the card". There, nvidia-smi inside the container lists processes by
+  the host's PIDs, so bench's own run never matched its PID. During a run,
+  one listed PID that the shell cannot see in /proc is now taken to be bench.
+  A visible one, or a second unseen one, still stops the tune. The fix alone,
+  against the committed tune.sh, is `work/carddefaults/review/busyfix.patch`.
+
+Saved entries store only the flags that differ from the defaults. So on a
+card whose defaults changed, an older entry would sit on top of defaults it
+was never timed beside, and an older binary would read a new entry against
+its old defaults. `TUNED_POLICY` is therefore 2 (Kyle's call, after review),
+and every policy-1 entry is declined with "re-tune". That includes the
+5070's `--fill-gate-shift 2`. Once the new binary is installed, either
+re-tune the 5070, or set the entry's policy field to 2 by hand: its only
+change is the ahead fill's grid, 512 to 614, a tie on this job. tunedtest's
+entries follow the policy through `POL` (a static assert), and tunedgate
+reads it from the binary's `tuned-run:` line: 96 of 96 and 48 of 48 at
+policy 2.
+
+### Gates (build `work/carddefaults/src/`, sm_120 only, 2026-11-24)
+
+- `tunedtest`: 96 of 96, 16 of them the rule's. Five mutants of the rule are
+  each caught: no logI condition (4 fail), sm_86 dropped (1), any sm_12x (1),
+  the warp cut on all of sm_8x (4), logI >= 16 (1).
+- `tunecheck.sh`: 142 of 142. Section 56 covers the busy check: a run is
+  stopped by neither its own PID nor one unseen host PID, and is stopped by
+  a visible PID or two unseen ones. The old check fails its first case, as
+  the 3080 Ti did. Sections 47-55 use an Ada-like fake card:
+  - It times W256 and F4608 but not W1024, and times the bracket arms on both
+    sides of tuned.h's defaults. They are read from tuned.h, so changing a
+    default there without its brackets in tune.sh fails.
+  - It names its defaults and saves a winning 256.
+  - With 36864 best, the fill ladder times 73728 and 147456 and stops at
+    294912, which stage 1 timed. With 294912 best, it runs down into the gap.
+  - With 512 best against the 1024 default there is no warp ladder.
+  - A default inside the gap (147456) stops the ladder there.
+  - An `-a` arm equal to the default is named, not dropped silently.
+  - Ties go to the arm nearest the card's default.
+
+  On bench.h's defaults no bracket arm is timed in stage 1, but a ladder still
+  reaches one (section 22).
+
+  Of nine tune.sh mutants of these rules, eight are caught
+  (`work/carddefaults/review/mut.sh`). They break: the stop at a timed value
+  or at the default; the start into a gap; the bracket arms, never or always
+  timed; clearing their skip after stage 1; the `-a` line; the default's
+  stop; and the second step's check. The ninth drops the check where a
+  ladder decides to go on. It is equivalent: the next pass's own check
+  stops the same step with the same line, as the bound check already did.
+- `tunedgate.sh` on the 5070: 48 of 48 (`work/carddefaults/review/`). Its
+  five-slab check had the 5070's old 512 written in, so it failed against this
+  build. It now computes the ahead fill's grid from bench.h and the card's SM
+  count (614 here), or expects it off on a card where it is off by default.
+- On the 5070, de222b73 (`work/carddefaults/gateA/`, saved tuning off): the
+  new binary's relations are byte-identical to the installed `4b3b2cfb`'s
+  (6679, sha256 f4cebcfd…), and its banner differs only in the ahead fill's
+  614 x 32. It is identical again with Ada's and Ampere's settings forced
+  (`--ss-warp-cut 1024 --fill-blocks 589824 --no-slab-fill-ahead`), and with
+  the machine's saved entry applied. Rerun after the run log's new
+  `# small-sieve` line (`work/carddefaults/review/`): identical again, with and
+  without Ada's settings forced, and the banner's knob lines unchanged.
+- `abcheck.sh` against the installed `4b3b2cfb` (saved tuning off): 36 cases, 36
+  identical, none skipped (the NFS@Home I16 job included), no overflow
+  warnings (`work/carddefaults/abcheck.log`).
+- `make check` on the fat build (every shipped architecture, so the change
+  compiles for sm_86 and sm_89 too): exit 0, all gates passed, 6 min
+  (`work/carddefaults/check.log`); again after the review's changes, 4.5 min
+  (`work/carddefaults/review/check.log`); and after the policy bump and the
+  busy fix, exit 0 with tunedtest 96/96 and tunecheck 142/142, 5.9 min beside
+  msieve's 8-thread filtering (`work/carddefaults/review/check2.log`).
+
+Not measured: any card not in the table above. On sm_86 the rule rests on
+one card. The ahead fill's grid at other SM counts is checked by the 5080's
+tune (84 SMs, where the rule gives 1075; tune.sh times 1024 beside it).

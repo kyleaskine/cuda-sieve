@@ -38,8 +38,14 @@ ok()   { checks=$((checks + 1)); echo "PASS $*"; }
 bad()  { checks=$((checks + 1)); fails=$((fails + 1)); echo "FAIL $*"; }
 check() { if eval "$1"; then ok "$2"; else bad "$2 [$1]"; fi; }
 
+# The fake nvidia-smi lists nothing, or under FAKE_SMI the PIDs in that file
+# while FAKE_SMI.on exists: the fake bench makes it for its run (its own PID
+# first under FAKE_SMI_SELF) for FAKE_SMI_SECS (0.3), longer than busy_now's
+# 3 s recheck where a listing must outlast it, and FAKE_SMI_STICKY leaves it
+# after.
 cat > "$T/bin/nvidia-smi" <<'EOF'
 #!/bin/sh
+[ -n "${FAKE_SMI:-}" ] && [ -e "$FAKE_SMI.on" ] && cat "$FAKE_SMI" "$FAKE_SMI.on"
 exit 0
 EOF
 cat > "$T/bin/bench" <<'EOF'
@@ -61,8 +67,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 case " ${FAKE_FAIL:-} " in *" $(basename "$rel" .rel) "*) echo "fake failure"; exit 1 ;; esac
+if [ -n "${FAKE_SMI:-}" ] && [ -n "$rel" ]; then
+  if [ -n "${FAKE_SMI_SELF:-}" ]; then echo $$ > "$FAKE_SMI.on"; else : > "$FAKE_SMI.on"; fi
+  sleep ${FAKE_SMI_SECS:-0.3}; [ -n "${FAKE_SMI_STICKY:-}" ] || rm -f "$FAKE_SMI.on"
+fi
 # bench's own refusals of the knobs' values (bench.h's bounds, the pair rule)
-bc=36; wc=256; fb=
+bc=36; wc=${FAKE_WDEF:-256}; fb=
 for x in $flags; do case $x in --ss-block-cut=*) bc=${x#*=} ;; --ss-warp-cut=*) wc=${x#*=} ;; --fill-blocks=*) fb=${x#*=} ;; esac; done
 [ "$bc" -ge 33 ] && [ "$bc" -le 128 ] || { echo "--ss-block-cut: $bc is outside 33..128"; exit 1; }
 [ "$wc" -ge 34 ] && [ "$wc" -le 32768 ] || { echo "--ss-warp-cut: $wc is outside 34..32768"; exit 1; }
@@ -97,6 +107,8 @@ printf '1,2:3:4\n5,6:7:8\n' > "$rel"
 printf '# commit fake0123-dirty\n# device fake 3060\n' > "$log"
 echo "args:$flags"
 echo "grid: 28 SMs x 6 = 168 blocks (dev 0: FAKE RTX 3060, 2 MB L2)"
+echo "grid: ${fb:-${FAKE_FDEF:-4608}} x 32 for fill (absolute, not per SM)"
+echo "small sieve tiers: block m < $bc, warp m < $wc"
 if [ -z "${FAKE_OLD:-}" ] && [ -n "$pipe" ]; then
   echo "tuned: fake verdict $st ($would)"
   echo "tuned-run: FAKE RTX 3060|8.6|28|16|32768|14|1|300000000|200000000|1|2147483647|16|$st|$would|$(echo $over)|$tp"
@@ -144,7 +156,8 @@ JOB="--pipeline --cofactor --poly x.job --logI 16 --qrange 50000000: --nq 10"
 GRIDLOSE="--ss-block-cut=40:1.01 --ss-block-cut=48:1.01 --ss-block-cut=64:1.01 --ss-warp-cut=128:1.01
   --ss-warp-cut=384:1.01 --ss-warp-cut=512:1.01 --ss-warp-cut=1024:1.01 --fill-blocks=1152:1.01
   --fill-blocks=2304:1.01 --fill-blocks=9216:1.01 --fill-blocks=18432:1.01 --fill-gate-shift=1:1.01
-  --fill-gate-shift=2:1.01 --fill-gate-shift=4:1.01 --slab-fill-blocks=256:1.01 --slab-fill-blocks=384:1.01"
+  --fill-gate-shift=2:1.01 --fill-gate-shift=4:1.01 --slab-fill-blocks=256:1.01 --slab-fill-blocks=384:1.01
+  --ss-warp-cut=2048:1.01 --fill-blocks=294912:1.01 --fill-blocks=1048576:1.01"
 # flags_in FILE: the flags field of the fake card's entry
 flags_in() { grep '^FAKE' "$1" | cut -d'|' -f12; }
 W=$T/w.txt
@@ -289,6 +302,7 @@ check '[ $(grep -c "^== ladder pass" "$R.txt") = 3 ]' "three ladder passes"
 check 'grep -q "F1048576 is clearly slower than F589824" "$R.txt"' "it stops on the loss at 2^20, the clamped last step"
 check 'grep -q "|--fill-blocks 589824|" "$W"' "589824 written: the grid's top, 36864, times 16"
 check '! ls "$R" | grep -q "F2097152"' "nothing past bench's bound, 2^20"
+check '! ls "$R" | grep -q "^s1[.]F294912[.]" && ls "$R" | grep -q "^sx2[.]F294912[.]1[.]out$"' "F294912, a bracket arm left out of stage 1 here, is timed when the ladder reaches it"
 check '! ls "$R" | grep -q "SFA512" && ls "$R" | grep -q "^s1.SFA384.1.out$"' "the slab fill ahead's grid stops at 16 resident blocks per SM (448 on 28 SMs)"
 f22=$(flags_in "$W"); rm -f "$W"
 FAKE_F="--fill-blocks=36864:0.92 --fill-blocks=73728:0.88 --fill-blocks=147456:0.84 --fill-blocks=294912:0.80 --fill-blocks=589824:0.76 --fill-blocks=1048576:0.84" \
@@ -487,6 +501,78 @@ check 'bm "./ggnfs-sieve-client benchmark --engine=cuda --cuda-bench=/c/bench/be
 check '! bm "./ggnfs-sieve-client tune --server-url=http://h:8080 --token=x --cuda-bench=/c/bench/bench --device=0"' "the client's tune subcommand does not match"
 check '! bm "./ggnfs-sieve-client --server-url=http://h:8080 --siever=/g/sievers --workers=12"' "the CPU client does not match"
 check '! bm "./ggnfs-sieve-client benchmark --siever=/g/sievers --workers=12"' "the CPU benchmark does not match"
+
+echo "== 47. a card with its own defaults (sm_89 at logI 16, tuned.h's): its own arm is not timed, W256 and F4608 are, so are the next steps on both sides of it, and the report says why"
+tw=$(sed -n 's/^#define TUNED_CARD_SS_WARP_CUT_SM89 *\([0-9][0-9]*\).*/\1/p' "$B/tuned.h")
+tf=$(sed -n 's/^#define TUNED_CARD_FILL_BLOCKS *\([0-9][0-9]*\).*/\1/p' "$B/tuned.h")
+tf2=$((tf * 2)); [ $tf2 -le 1048576 ] || tf2=1048576
+FAKE_WDEF=$tw FAKE_FDEF=$tf FAKE_F="$GRIDLOSE --ss-warp-cut=256:1.01 --fill-blocks=4608:1.01" tunerun 0 -q -n -- $JOB
+check 'grep -q "this card.s defaults: --ss-warp-cut $tw (bench.h.s 256), --fill-blocks $tf (bench.h.s 4608); not timing W$tw (the defaults. own setting); also timing .*, next to them on the ladders" "$R.txt"' "the report names the card's defaults ($tw, $tf), the arm left out and the bracket arms"
+check '! ls "$R" | grep -q "^s1[.]W$tw[.]" && ls "$R" | grep -q "^s1[.]W256[.]1[.]out$" && ls "$R" | grep -q "^s1[.]F4608[.]1[.]out$"' "W$tw not timed; W256 and F4608 timed"
+for a in W$((tw / 2)) W$((tw * 2)) F$((tf / 2)) F$tf2; do
+  check 'ls "$R" | grep -q "^s1[.]$a[.]1[.]out$"' "$a, next to the card's default on its ladder, timed in stage 1 (tune.sh's BRACKET_ARMS against tuned.h)"
+done
+
+echo "== 48. bench.h's defaults: W256 and F4608 are the defaults' own setting, not timed and not mentioned"
+FAKE_F="$GRIDLOSE" tunerun 0 -q -n -- $JOB
+check '! ls "$R" | grep -q -e "^s1[.]W256[.]" -e "^s1[.]F4608[.]" && ! grep -q "this card.s defaults" "$R.txt"' "neither timed, and no defaults line"
+check '! ls "$R" | grep -q -e "^s1[.]W2048[.]" -e "^s1[.]F294912[.]" -e "^s1[.]F1048576[.]" && ! grep -q -e W2048 -e F294912 -e F1048576 "$R.txt"' "the bracket arms (W2048 F294912 F1048576): not timed, not mentioned"
+check 'ls "$R" | grep -q "^s1[.]W1024[.]1[.]out$"' "W1024 is timed"
+
+echo "== 49. on such a card a winning 256 warp cut is recommended and saved"
+rm -f "$W"
+FAKE_WDEF=1024 FAKE_FDEF=589824 FAKE_F="$GRIDLOSE --ss-warp-cut=256:0.95 --fill-blocks=4608:1.01" tunerun 0 -q -w "$W" -- $JOB
+check 'grep -q "recommended for this card and job: --ss-warp-cut 256$" "$R.txt" && [ "$(flags_in "$W")" = "--ss-warp-cut 256" ]' "--ss-warp-cut 256 recommended and written"
+
+echo "== 50. fill default 589824, 36864 best: the ladder fills the gap up to 294912, which stage 1 timed, and stops there"
+FAKE_FDEF=589824 FAKE_NONOISE=1 FAKE_F="$GRIDLOSE --fill-blocks=4608:1.01 --fill-blocks=36864:0.9 --fill-blocks=73728:0.85 --fill-blocks=147456:0.8" \
+  tunerun 0 -q -n -- $JOB
+check 'ls "$R" | grep -q "^s1[.]F294912[.]1[.]out$" && ls "$R" | grep -q "^s1[.]F1048576[.]1[.]out$"' "both sides of the default timed in stage 1"
+check 'grep -q "^== ladder pass 1: --fill-blocks 73728 and 147456 past F36864" "$R.txt" && ! grep -q "^== ladder pass 2" "$R.txt"' "one pass, 73728 and 147456"
+check 'grep -q -- "--fill-blocks: the next step past F147456, 294912, was timed in stage 1; the ladder stops" "$R.txt"' "it stops before 294912, saying why"
+check '! ls "$R" | grep -q "[.]F589824[.]"' "589824, the default, never timed"
+check 'grep -q "recommended for this card and job: --fill-blocks 147456$" "$R.txt"' "147456 recommended"
+
+echo "== 51. a tie on a ladder knob goes to the arm nearest THIS card's default"
+FAKE_NONOISE=1 FAKE_F="$GRIDLOSE --ss-warp-cut=384:0.95 --ss-warp-cut=512:0.951" tunerun 0 -q -n -- $JOB
+check 'grep -q "each knob.s winner: W384 " "$R.txt"' "default 256: W384, the nearer"
+FAKE_WDEF=1024 FAKE_NONOISE=1 FAKE_F="$GRIDLOSE --ss-warp-cut=256:1.01 --ss-warp-cut=384:0.95 --ss-warp-cut=512:0.951" tunerun 0 -q -n -- $JOB
+check 'grep -q "each knob.s winner: W512 " "$R.txt"' "default 1024: W512, the nearer"
+
+echo "== 52. fill default 589824, 294912 best: the ladder runs down from it into the gap, not up onto the default"
+FAKE_FDEF=589824 FAKE_NONOISE=1 FAKE_F="$GRIDLOSE --fill-blocks=4608:1.01 --fill-blocks=294912:0.8 --fill-blocks=147456:0.78 --fill-blocks=73728:0.9" \
+  tunerun 0 -q -n -- $JOB
+check 'grep -q "^== ladder pass 1: --fill-blocks 147456 and 73728 past F294912" "$R.txt" && grep -q "F73728 is clearly slower than F294912; the ladder stops" "$R.txt"' "one pass down, 147456 and 73728, stopped on the loss"
+check '! ls "$R" | grep -q "[.]F589824[.]" && grep -q "recommended for this card and job: --fill-blocks 147456$" "$R.txt"' "589824 never timed; 147456 recommended"
+
+echo "== 53. warp default 1024, 512 best: no ladder past the default (stage 1 timed 2048 beyond it)"
+FAKE_WDEF=1024 FAKE_FDEF=589824 FAKE_NONOISE=1 FAKE_F="$GRIDLOSE --ss-warp-cut=256:1.01 --fill-blocks=4608:1.01 --ss-warp-cut=512:0.95" tunerun 0 -q -n -- $JOB
+check '! grep -q "^== ladder pass" "$R.txt" && ! ls "$R" | grep -q -e "[.]W4096[.]" -e "[.]W1024[.]"' "no ladder pass: W512's next steps are the default and 256, timed"
+check 'grep -q "recommended for this card and job: --ss-warp-cut 512$" "$R.txt"' "512 recommended"
+
+echo "== 54. -a: an arm that is the defaults' own setting is left out, and the report says so"
+FAKE_F="--ss-warp-cut=384:0.95" tunerun 0 -n -a "W256=--ss-warp-cut,256 W384=--ss-warp-cut,384" -- $JOB
+check 'grep -q "not timing W256: the defaults. own setting on this card" "$R.txt" && ! ls "$R" | grep -q "^s1[.]W256[.]"' "W256 named, not timed"
+
+echo "== 55. a card default one step past the ladder's first (fill 147456, 36864 best): the pass times 73728 alone and stops at the default"
+FAKE_FDEF=147456 FAKE_NONOISE=1 FAKE_F="$GRIDLOSE --fill-blocks=4608:1.01 --fill-blocks=36864:0.9 --fill-blocks=73728:0.85" tunerun 0 -q -n -- $JOB
+check 'grep -q "^== ladder pass 1: --fill-blocks 73728 past F36864" "$R.txt" && ! ls "$R" | grep -q "[.]F147456[.]"' "one step, 73728; the default 147456 never timed"
+check 'grep -q -- "--fill-blocks: the next step past F73728 is this card.s default, 147456; the ladder stops" "$R.txt"' "it stops at the default, saying so"
+
+echo "== 56. the card's process list during a run: bench's own (by its PID, or one unseen host PID in a container) is not another; a visible one or a second unseen one is"
+echo 999999999 > "$T/smi"
+FAKE_SMI="$T/smi" FAKE_SMI_SECS=3.5 FAKE_F="--ss-warp-cut=384:0.95" tunerun 0 -n -a "W384=--ss-warp-cut,384" -- $JOB
+check 'grep -q "recommended for this card and job: --ss-warp-cut 384$" "$R.txt"' "one PID this shell cannot see (bench seen from the host): the tune runs"
+: > "$T/smi"
+FAKE_SMI="$T/smi" FAKE_SMI_SELF=1 FAKE_SMI_SECS=3.5 FAKE_F="--ss-warp-cut=384:0.95" tunerun 0 -n -a "W384=--ss-warp-cut,384" -- $JOB
+check 'grep -q "recommended for this card and job: --ss-warp-cut 384$" "$R.txt"' "bench's own PID listed: the tune runs"
+printf '999999998\n999999999\n' > "$T/smi"
+FAKE_SMI="$T/smi" FAKE_SMI_STICKY=1 FAKE_F="--ss-warp-cut=384:0.95" tunerun 3 -n -a "W384=--ss-warp-cut,384" -- $JOB
+check 'grep -q "another process came onto the card during stage 1 default round 1" "$R.txt"' "two unseen PIDs: one is another process, and the tune stops"
+rm -f "$T/smi.on"; echo 1 > "$T/smi"
+FAKE_SMI="$T/smi" FAKE_SMI_STICKY=1 FAKE_F="--ss-warp-cut=384:0.95" tunerun 3 -n -a "W384=--ss-warp-cut,384" -- $JOB
+check 'grep -q "another process came onto the card during stage 1 default round 1" "$R.txt"' "a PID this shell can see (not bench's): the tune stops"
+rm -f "$T/smi.on"
 
 echo "tunecheck: $((checks - fails)) of $checks checks passed"
 [ $fails -eq 0 ]

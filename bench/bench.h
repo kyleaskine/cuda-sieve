@@ -607,7 +607,12 @@ typedef struct {
      * knee it is flat (<=1.7% to 9216 blocks on two of three cards), so
      * overshooting is cheap and undershooting is not. See RESULTS.md
      * finding 52. */
-    int      fill_blocks;   /* 0 = auto (FILL_BLOCKS_DEFAULT) */
+    int      fill_blocks;   /* 0 = auto (fill_blocks_auto()) */
+    /* This card's automatic grid for k_fill_atomic (tuned_card_defaults,
+     * --pipeline only; 0 = FILL_BLOCKS_DEFAULT). Kept apart from fill_blocks
+     * so 0 there still means "auto" at every launch site: k_fill_l1 has its
+     * own default and must not inherit this one. */
+    int      fill_blocks_card;
     int      fill_threads;  /* 0 = auto (FILL_THREADS_DEFAULT) */
     /* Item 1's decisive test, benchmark-only: run N independent fill
      * workspaces concurrently on N streams and compare against the same N
@@ -708,10 +713,11 @@ typedef struct {
      * slab's side-1 apply, on a stream of the device's greatest priority,
      * into a second bucket array and a fourth side-1 walk-cursor buffer
      * (STATUS row 50, findings 158-160). Output-identical. -1 = this card's
-     * default, resolved by bench_main once the device is known: on only
-     * where it was timed (sm_120 with SLAB_FILL_DEFAULT_SMS SMs, the RTX
-     * 5070: -7.2% at I16, finding 160), under --q-pipeline and with no row
-     * tier, whose kernels it does not confine; off elsewhere.
+     * default, resolved by bench_main once the device is known: on only on
+     * the architecture where it won, sm_120 (the RTX 5070 -7.2% at I16,
+     * finding 160; the 5060 -4.44%, STATUS row 44; tuned_card_defaults),
+     * under --q-pipeline and with no row tier, whose kernels it does not
+     * confine; off elsewhere.
      * slab_fill_default says the value came from that default, not a flag.
      * slab_fill_blocks is its grid, 0 = SLAB_FILL_BLOCKS_DEFAULT scaled by
      * the SM count: confined, because the full fill grid takes every block
@@ -753,6 +759,8 @@ typedef struct {
     int      tiny_table;    /* 1 = moduli 3, 5, 7, 9 from per-region tables      */
     uint32_t ss_block_cut;  /* small-sieve tier cuts (ss_block_cut()); 0 = the  */
     uint32_t ss_warp_cut;   /* defaults                                         */
+    uint32_t ss_warp_cut_card; /* this card's default warp cut (tuned_card_defaults,
+                                * --pipeline only); 0 = SS_WARP_CUT_DEFAULT  */
     int      side;          /* 1 = algebraic (special-q side), 0 = rational     */
     double   allowance;     /* bits of cofactor tolerated (lambda*lpb)         */
     double   scale;         /* las byte scale for this side; 1.0 = raw bits    */
@@ -885,7 +893,8 @@ typedef struct {
  * are the packing's: the block tier packs c0 and the step (< 2m) in 8 bits,
  * the warp tier in 16, and --tiny-fold's moduli (<= SS_FOLD_MAX, 32) and
  * --tiny-table's (<= 9) must sit in the block tier. The defaults were measured
- * on an RTX 5070 only, which is why they are flags. */
+ * on an RTX 5070, which is why they are flags; Ada's pipeline runs take a warp
+ * cut of 1024 instead (ss_warp_cut_card, tuned_card_defaults in tuned.h). */
 #define SS_BLOCK_CUT_DEFAULT  36u
 #define SS_WARP_CUT_DEFAULT  256u
 #define SS_BLOCK_CUT_MIN      33u
@@ -897,7 +906,8 @@ static inline uint32_t ss_block_cut(const bench_cfg_t *cfg)
 }
 static inline uint32_t ss_warp_cut(const bench_cfg_t *cfg)
 {
-    return cfg->ss_warp_cut ? cfg->ss_warp_cut : SS_WARP_CUT_DEFAULT;
+    return cfg->ss_warp_cut ? cfg->ss_warp_cut
+         : cfg->ss_warp_cut_card ? cfg->ss_warp_cut_card : SS_WARP_CUT_DEFAULT;
 }
 
 #define FILL_ATOMIC   0     /* (a) direct global atomicAdd per record   */
@@ -1022,6 +1032,14 @@ static inline uint32_t ss_warp_cut(const bench_cfg_t *cfg)
  * data-driven (one block per super-bucket) and has no grid to tune. */
 #define FILL_BLOCKS_DEFAULT  4608
 #define FILL_THREADS_DEFAULT 32
+/* k_fill_atomic's grid: --fill-blocks, else this card's default (sm_86 and
+ * sm_89 at logI 16 under --pipeline take 589824: tuned_card_defaults in
+ * tuned.h, STATUS row 44), else FILL_BLOCKS_DEFAULT. */
+static inline int fill_blocks_auto(const bench_cfg_t *cfg)
+{
+    return cfg->fill_blocks ? cfg->fill_blocks
+         : cfg->fill_blocks_card ? cfg->fill_blocks_card : FILL_BLOCKS_DEFAULT;
+}
 /* --slab-fill-ahead's grid, x FILL_THREADS_DEFAULT (the ahead fill launches
  * that many threads whatever --fill-threads says: no other shape was timed,
  * and wider blocks would undo the confinement). The fill is released at
@@ -1033,10 +1051,14 @@ static inline uint32_t ss_warp_cut(const bench_cfg_t *cfg)
  * the 5070's 48 SMs, 1.2-1.9 ms/q ahead of the probe's 768 in every round,
  * 640 level (finding 160, the I16 NFS@Home job). That is a count of slots per
  * SM, so the default is SLAB_FILL_BLOCKS_DEFAULT per SLAB_FILL_DEFAULT_SMS
- * SMs, scaled by the card's count (512 on 48; at 1536 the option lost to
- * off). Measured on 48 SMs only: bench/tune.sh times the grid on others. */
-#define SLAB_FILL_BLOCKS_DEFAULT 512
-#define SLAB_FILL_DEFAULT_SMS    48
+ * SMs, scaled by the card's count (at 1536 the option lost to off). Since
+ * 2026-11-24 the pair is the RTX 5060's best, 384 on its 30 SMs (12.8 per SM;
+ * 256 lost most of the gain, 512 a third of it), which gives 614 on the 5070's
+ * 48: level with 512 there on the NFS@Home job at J 16384, as 640 was at
+ * J 32768 (work/sfagrid-20261124/, STATUS row 44). On by default on every
+ * sm_120 card (tuned_card_defaults); bench/tune.sh times the grid on others. */
+#define SLAB_FILL_BLOCKS_DEFAULT 384
+#define SLAB_FILL_DEFAULT_SMS    30
 /* --fill-merge: the row tier's cut, and threads per block. 8 beat 4 and 16 on
  * C135, C143, C148 and C183; 64 and 128 threads were level and 32 lost, the
  * row tier needing warps the walk does not (findings 148, 150; sm_120 only).

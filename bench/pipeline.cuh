@@ -2484,7 +2484,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     const uint32_t nbitword_alloc = xmax_alloc >> 5;
     const int blocks = cfg->blocks ? cfg->blocks : 48 * 6;
     /* Fill's grid is absolute, not per-SM -- see FILL_BLOCKS_DEFAULT. */
-    const int fblocks = cfg->fill_blocks ? cfg->fill_blocks : FILL_BLOCKS_DEFAULT;
+    const int fblocks = fill_blocks_auto(cfg);
     const int fthreads = cfg->fill_threads ? cfg->fill_threads : FILL_THREADS_DEFAULT;
 
     pside_t S1, S0;
@@ -3354,9 +3354,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     } else if (cfg->slab_fill_default && SLABBED && qpipe) {
         /* where it could run: say why it does not, and how to try it */
         printf("  --slab-fill-ahead: off, this card's default: on by default"
-               " only on sm_120 with %d SMs (the RTX 5070) and no row tier,"
-               " where it was timed; --slab-fill-ahead to use it, bench/tune.sh"
-               " to time it\n", SLAB_FILL_DEFAULT_SMS);
+               " only on sm_120 (Blackwell) with no row tier, where it was"
+               " timed; --slab-fill-ahead to use it, bench/tune.sh to time"
+               " it\n");
         runlog_note("slab-fill-ahead", "off: this card's default");
     } else if (cfg->slab_fill_saved && SLABBED && qpipe) {
         printf("  --slab-fill-ahead: off (saved setting)\n");
