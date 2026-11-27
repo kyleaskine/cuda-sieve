@@ -326,31 +326,31 @@ static void lookup_tests(void)
  * fill grid at logI 16 only. */
 static void card_tests(void)
 {
-    static const struct { int maj, min, logI, warp, fill, sfa; } t[] = {
-        {  8, 9, 16, 1024, 589824, 0 },   /* Ada at the NFS@Home shape */
-        {  8, 9, 15, 1024,      0, 0 },   /* C183 at logI 15 lost the grid */
-        {  8, 9, 17, 1024,      0, 0 },
-        {  8, 9, 14, 1024,      0, 0 },
-        {  8, 6, 16,    0, 589824, 0 },   /* the 3060 */
-        {  8, 6, 15,    0,      0, 0 },
-        { 12, 0, 16,    0,      0, 1 },   /* Blackwell: 5070, 5060 */
-        { 12, 0, 13,    0,      0, 1 },   /* bench adds the plan's conditions */
-        { 12, 1, 16,    0,      0, 0 },   /* untimed: sm_121 */
-        {  8, 0, 16,    0,      0, 0 },   /* untimed: A100 */
-        {  8, 7, 16,    0,      0, 0 },   /* untimed: Orin */
-        {  9, 0, 16,    0,      0, 0 },   /* untimed: Hopper */
-        {  7, 5, 16,    0,      0, 0 },   /* untimed: Turing */
-        { 10, 0, 16,    0,      0, 0 },   /* untimed: B200 */
+    static const struct { int maj, min, logI, warp, fill, sfa, sp; } t[] = {
+        {  8, 9, 16, 1024, 589824, 0, 0 },   /* Ada at the NFS@Home shape */
+        {  8, 9, 15, 1024,      0, 0, 0 },   /* C183 at logI 15 lost the grid */
+        {  8, 9, 17, 1024,      0, 0, 0 },
+        {  8, 9, 14, 1024,      0, 0, 0 },
+        {  8, 6, 16,    0, 589824, 0, 0 },   /* the 3060 */
+        {  8, 6, 15,    0,      0, 0, 0 },
+        { 12, 0, 16,    0,      0, 1, 1 },   /* Blackwell: 5070, 5060 */
+        { 12, 0, 13,    0,      0, 1, 1 },   /* bench adds the plan's conditions */
+        { 12, 1, 16,    0,      0, 0, 0 },   /* untimed: sm_121 */
+        {  8, 0, 16,    0,      0, 0, 0 },   /* untimed: A100 */
+        {  8, 7, 16,    0,      0, 0, 0 },   /* untimed: Orin */
+        {  9, 0, 16,    0,      0, 0, 0 },   /* untimed: Hopper */
+        {  7, 5, 16,    0,      0, 0, 0 },   /* untimed: Turing */
+        { 10, 0, 16,    0,      0, 0, 0 },   /* untimed: B200 */
     };
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
         tuned_card_defaults_t d;
         memset(&d, 0x5a, sizeof d);   /* every field must be written */
         tuned_card_defaults(t[i].maj, t[i].min, t[i].logI, &d);
         CHECK(d.ss_warp_cut == t[i].warp && d.fill_blocks == t[i].fill &&
-              d.slab_fill_ahead == t[i].sfa,
-              "card defaults sm_%d%d logI %d: warp %d fill %d sfa %d, want %d %d %d",
+              d.slab_fill_ahead == t[i].sfa && d.sparse_apply == t[i].sp,
+              "card defaults sm_%d%d logI %d: warp %d fill %d sfa %d sp %d, want %d %d %d %d",
               t[i].maj, t[i].min, t[i].logI, d.ss_warp_cut, d.fill_blocks,
-              d.slab_fill_ahead, t[i].warp, t[i].fill, t[i].sfa);
+              d.slab_fill_ahead, d.sparse_apply, t[i].warp, t[i].fill, t[i].sfa, t[i].sp);
     }
     CHECK(TUNED_CARD_SS_WARP_CUT_SM89 > TUNED_SS_BLOCK_MAX &&
           TUNED_CARD_SS_WARP_CUT_SM89 <= TUNED_SS_WARP_MAX,

@@ -4,11 +4,15 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 JOB_FILE [OUTPUT_DIR]" >&2
-    echo "       writes msieve.fb and worktodo.ini" >&2
+    echo "Usage: $0 [--force] JOB_FILE [OUTPUT_DIR]" >&2
+    echo "       writes msieve.fb and worktodo.ini, and copies msieve.dat" >&2
+    echo "       from the job file's directory when present. An existing" >&2
+    echo "       OUTPUT_DIR/msieve.dat is kept unless --force is given." >&2
     exit 2
 }
 
+force=0
+if [[ ${1:-} == --force ]]; then force=1; shift; fi
 [[ $# -ge 1 && $# -le 2 ]] || usage
 
 job=$1
@@ -113,3 +117,22 @@ mv "$ini_tmp" "$out_dir/worktodo.ini"
 trap - EXIT
 echo "wrote $out_dir/msieve.fb"
 echo "wrote $out_dir/worktodo.ini"
+
+# Relations live next to the job file. Skip when the output directory is
+# the same place, since cp refuses to copy a file onto itself.
+dat_src="$job_dir/msieve.dat"
+if [[ "$job_dir" == "$out_dir" ]]; then
+    :
+elif [[ -e "$out_dir/msieve.dat" && $force -eq 0 ]]; then
+    echo "warning: $out_dir/msieve.dat exists; not overwritten (use --force)" >&2
+elif [[ -f "$dat_src" ]]; then
+    echo "copying $(du -h "$dat_src" | cut -f1) $dat_src ..."
+    dat_tmp=$(mktemp "$out_dir/.msieve.dat.XXXXXX")
+    trap 'rm -f "$dat_tmp"' EXIT
+    cp "$dat_src" "$dat_tmp"
+    mv "$dat_tmp" "$out_dir/msieve.dat"
+    trap - EXIT
+    echo "copied $out_dir/msieve.dat"
+else
+    echo "warning: $dat_src not found; msieve.dat not copied" >&2
+fi

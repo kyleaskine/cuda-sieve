@@ -221,6 +221,9 @@ typedef struct {
     uint16_t *slp;
     uint32_t  nsmall, nblk, nwrp, nsplit, nfold, ntab, nfb;
     unsigned long long tab_q, prep_q;   /* --tiny-table: q it was used for, of q prepared */
+    unsigned long long sp_slabs[3];     /* --sparse-apply: joined slabs [0]=dense, [1]=1-row, [2]=2-row */
+    unsigned long long sp_ovf_blocks;   /* --sparse-apply: joined blocks that overflowed to dense */
+    int       last_sp_mode;             /* --sparse-apply: mode of in-flight side-0 slab, or -1 */
     size_t    apply_smem;
     norm_t    N;
     uint32_t  CINIT, BOUND, tconst, nsurv;
@@ -228,12 +231,13 @@ typedef struct {
     uint32_t *hsp, *hsrt, *hsg; uint16_t *hslp;
     uint32_t *hsmag;
     uint32_t *d_nsurv, *d_nproj;
+    uint32_t *d_novf, *d_ovf_rows;      /* --sparse-apply overflow row queue */
     unsigned long long *d_nlost;
     /* PINNED readback slot, filled by async copies queued right behind each
      * slab's k_apply. The join reads it after ev[5] instead of making two
      * synchronous cudaMemcpy round trips per side, which cost 35-70 us each
      * under WSL2 and sat on the critical path between q (finding 113). */
-    struct { uint32_t nsurv, overflow; } *h_rb;
+    struct { uint32_t nsurv, overflow, sp_ovf; } *h_rb;
     /* ev[0..3] are the transform/fill/apply boundaries. ev[4] is the
      * transform END, kept separate because pipe_side_sieve_issue re-records
      * ev[1] once per slab and would clobber it. ev[5] follows the h_rb
@@ -294,6 +298,7 @@ static void pside_free(pside_t *S)
     cudaFree(S->smag);
     cudaFree(S->d_nsurv);
     cudaFree(S->d_nproj); cudaFree(S->d_nlost);
+    cudaFree(S->d_novf); cudaFree(S->d_ovf_rows);
     if (S->hsp)  cudaFreeHost(S->hsp);
     if (S->hsrt) cudaFreeHost(S->hsrt);
     if (S->hsg)  cudaFreeHost(S->hsg);
@@ -563,6 +568,12 @@ static int pipe_side_init(const fb_t *fb, const fb_t *fbs,
     SIDE_INIT_CK(cudaMalloc(&S->d_nsurv, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nproj, 4));
     SIDE_INIT_CK(cudaMalloc(&S->d_nlost, 8));
+    S->last_sp_mode = -1;
+    if (cfg->sparse_apply) {
+        const uint32_t max_rows = (xmax_alloc >> cfg->logI) ? (xmax_alloc >> cfg->logI) : 1u;
+        SIDE_INIT_CK(cudaMalloc(&S->d_novf, 4));
+        SIDE_INIT_CK(cudaMalloc(&S->d_ovf_rows, (size_t)max_rows * 4));
+    }
     for (int k = 0; k < 5; k++) SIDE_INIT_CK(cudaEventCreate(&S->ev[k]));
     SIDE_INIT_CK(cudaEventCreateWithFlags(&S->ev[5], cudaEventDisableTiming));
     SIDE_INIT_CK(cudaEventCreateWithFlags(&S->ev_up, cudaEventDisableTiming));
@@ -1025,13 +1036,34 @@ static auto pipe_apply_kern(int ngate, int tail)
                 : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false, false>);
 }
 
+/* Row 53 sparse side-0 apply kernels and their dense overflow fallback.
+ * All instances share the same helper-dispatch pattern as pipe_apply_kern so
+ * MaxDynamicSharedMemorySize registration stays in sync with launches. */
+template <bool SLABBED>
+static auto pipe_apply_ovf_kern(int tail)
+{
+    return tail ? k_apply_ovf_dense<SLABBED, true>
+                : k_apply_ovf_dense<SLABBED, false>;
+}
+
+template <bool SLABBED>
+static auto pipe_apply_sparse_kern(int nrows, int tail)
+{
+    return (nrows == 2)
+        ? (tail ? k_apply_sparse<2, 3072, SLABBED, true>
+                : k_apply_sparse<2, 3072, SLABBED, false>)
+        : (tail ? k_apply_sparse<1, 5632, SLABBED, true>
+                : k_apply_sparse<1, 5632, SLABBED, false>);
+}
+
 template <bool SLABBED>
 static int pipe_side_sieve_issue(const fb_t *fb, const bench_cfg_t *cfg,
                                  int side, uint32_t xmax, uint32_t j_base,
                                  const pbkt_t *bk, int fblocks, int fthreads,
                                  pside_t *S, const uint32_t *gate_bits = NULL,
                                  uint32_t *gate_fold = NULL,
-                                 const pipe_part_t *part = NULL)
+                                 const pipe_part_t *part = NULL,
+                                 double s1_mean_row = -1.0)
 {
     const int log_region = cfg->log_region;
     const uint32_t nregion = xmax >> log_region;
@@ -1162,24 +1194,86 @@ apply:
          * every other launch is the ungated instance (NGATE, finding 141).
          * Both choices go through pipe_apply_kern. */
         const uint32_t *const ngate = cfg->norm_gate ? gate_bits : NULL;
-        auto *const apply_kern = pipe_apply_kern<SLABBED>(
-            ngate != NULL, ss_needs_tail(S->nsplit, S->nsmall));
-        apply_kern<<<nregion, athr, S->apply_smem, st>>>(
-            (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
-            S->N, S->CINIT, S->CINIT - S->BOUND,
-            S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
-            S->sp, S->srt, S->sg, S->slp, S->smag,
-            S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold, S->ntab,
-            0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
-            j_base, ngate);
+        const int tail = ss_needs_tail(S->nsplit, S->nsmall);
+        const uint32_t rows = xmax >> cfg->logI;
+        const int can_sparse = (side == 0 && ngate != NULL && cfg->sparse_apply &&
+                                S->d_novf && S->d_ovf_rows &&
+                                PIPE_CELLBITS == 16 && athr == 512 &&
+                                cfg->logI >= SPARSE_APPLY_LOGI_MIN &&
+                                cfg->logI <= SPARSE_APPLY_LOGI_MAX &&
+                                log_region >= SPARSE_APPLY_REGION_MIN &&
+                                log_region <= cfg->logI &&
+                                ((uint64_t)nregion << log_region) == xmax &&
+                                apply_scan_stores<PIPE_CELLBITS>(cfg->logI, log_region,
+                                                                 (uint32_t)athr));
+        int sp_mode = 0; /* 0 = dense k_apply, 1 = 1-row sparse, 2 = 2-row sparse */
+        if (can_sparse) {
+            if (cfg->sparse_apply_rows == 1) {
+                sp_mode = 1;
+            } else if (cfg->sparse_apply_rows == 2) {
+                sp_mode = ((rows & 1u) == 0u) ? 2 : 1;
+            } else {
+                /* Auto per-slab selection from side 1's per-row survivor mean:
+                 *   <= SPARSE_APPLY_AUTO_2ROW (750)  -> 2-row (MAX_NS=3072)
+                 *   <= SPARSE_APPLY_AUTO_1ROW (4200) -> 1-row (MAX_NS=5632)
+                 *   >  SPARSE_APPLY_AUTO_1ROW (4200) -> dense k_apply
+                 * Cold start (s1_mean_row < 0) uses 1-row, safe everywhere. */
+                if (s1_mean_row < 0.0)
+                    sp_mode = 1;
+                else if (s1_mean_row <= SPARSE_APPLY_AUTO_2ROW && (rows & 1u) == 0u)
+                    sp_mode = 2;
+                else if (s1_mean_row <= SPARSE_APPLY_AUTO_1ROW)
+                    sp_mode = 1;
+                else
+                    sp_mode = 0;
+            }
+        }
+        S->last_sp_mode = (side == 0 && cfg->sparse_apply) ? sp_mode : -1;
+        if (sp_mode) {
+            const uint32_t nrows = (uint32_t)sp_mode;
+            SLAB_CK(cudaMemsetAsync(S->d_novf, 0, 4, st));
+            auto *const sp_kern = pipe_apply_sparse_kern<SLABBED>(sp_mode, tail);
+            sp_kern<<<rows / nrows, 512, 0, st>>>(
+                (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
+                S->N, S->CINIT, S->CINIT - S->BOUND,
+                S->d_nsurv,
+                S->sp, S->srt, S->sg, S->slp, S->smag,
+                S->nsmall, S->nblk, S->nwrp, S->nsplit,
+                S->survbits, cfg->not_both_even, cfg->sieve_skip,
+                j_base, ngate, S->d_novf, S->d_ovf_rows);
+            const uint32_t ovf_grid = (nregion < 1024u) ? nregion : 1024u;
+            auto *const ovf_kern = pipe_apply_ovf_kern<SLABBED>(tail);
+            ovf_kern<<<ovf_grid, 512, S->apply_smem, st>>>(
+                S->d_novf, S->d_ovf_rows, nrows,
+                (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
+                S->N, S->CINIT, S->CINIT - S->BOUND, S->tconst,
+                S->d_nsurv,
+                S->sp, S->srt, S->sg, S->slp, S->smag,
+                S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold, S->ntab,
+                S->survbits, cfg->not_both_even, cfg->sieve_skip,
+                j_base, ngate);
+        } else {
+            auto *const apply_kern = pipe_apply_kern<SLABBED>(ngate != NULL, tail);
+            apply_kern<<<nregion, athr, S->apply_smem, st>>>(
+                (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
+                S->N, S->CINIT, S->CINIT - S->BOUND,
+                S->tconst, NULL, S->d_nsurv, NULL, 0xFFFFFFFFu,
+                S->sp, S->srt, S->sg, S->slp, S->smag,
+                S->nsmall, S->nblk, S->nwrp, S->nsplit, S->nfold, S->ntab,
+                0xFFFFFFFFu, NULL, S->survbits, cfg->not_both_even, cfg->sieve_skip,
+                j_base, ngate);
+        }
     }
     SLAB_CK(cudaEventRecord(S->ev[3], st));
-    /* The join's two counts, queued behind apply on the same stream: the
+    /* The join's counts, queued behind apply on the same stream: the
      * join then waits once (ev[5]) and reads host memory. */
     SLAB_CK(cudaMemcpyAsync(&S->h_rb->nsurv, S->d_nsurv, 4,
                             cudaMemcpyDeviceToHost, st));
     SLAB_CK(cudaMemcpyAsync(&S->h_rb->overflow, bk->overflow, 4,
                             cudaMemcpyDeviceToHost, st));
+    if (S->last_sp_mode > 0)
+        SLAB_CK(cudaMemcpyAsync(&S->h_rb->sp_ovf, S->d_novf, 4,
+                                cudaMemcpyDeviceToHost, st));
     SLAB_CK(cudaEventRecord(S->ev[5], st));
     rc = 0;
 done:
@@ -1267,9 +1361,15 @@ static int pipe_side_sieve_join(int side, pside_t *S,
                                   " at end of band)" : "");
             else
                 g_warned_bucket_ovf++;
+            S->last_sp_mode = -1;
             rc = 1;
             goto done;
         }
+    }
+    if (side == 0 && S->last_sp_mode >= 0) {
+        S->sp_slabs[S->last_sp_mode]++;
+        if (S->last_sp_mode > 0) S->sp_ovf_blocks += S->h_rb->sp_ovf;
+        S->last_sp_mode = -1;
     }
     rc = 0;
 
@@ -2877,6 +2977,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             for (int t = 0; t < 2; t++)
                 PIPE_CK(cudaFuncSetAttribute(pipe_apply_kern<SLABBED>(g, t),
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+        for (int t = 0; t < 2; t++)
+            PIPE_CK(cudaFuncSetAttribute(pipe_apply_ovf_kern<SLABBED>(t),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
         /* Apply's blocks per SM, and whether shared memory is what limits
          * them. Losing the third block used to be silent: finding 128's
          * 2,1147+ ran apply 16-18% slower with clean output, and the k_apply
@@ -2900,12 +3003,41 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     if (n > nb_hi) nb_hi = n;
                     smem_limits |= n < n_nosmem;
                 }
+            if (cfg->sparse_apply) {
+                for (int t = 0; t < 2; t++) {
+                    int n = 0, n_nosmem = 0;
+                    PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,
+                        pipe_apply_ovf_kern<SLABBED>(t), apply_thr, apply_smem));
+                    PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n_nosmem,
+                        pipe_apply_ovf_kern<SLABBED>(t), apply_thr, 0));
+                    if (nb < 0 || n < nb) nb = n;
+                    if (n > nb_hi) nb_hi = n;
+                    smem_limits |= n < n_nosmem;
+                }
+            }
             printf("  apply: %d block%s of %d threads per SM, %zu B shared memory"
                    " each%s", nb, nb == 1 ? "" : "s", apply_thr, apply_smem,
                    smem_limits ? " -- shared memory is the limit" : "");
             if (nb < nb_hi)
                 printf(" -- the fewest of its instances; another runs %d", nb_hi);
             printf("\n");
+            if (cfg->sparse_apply) {
+                int sp_nb = -1, sp_hi = 0;
+                for (int r = 1; r <= 2; r++)
+                    for (int t = 0; t < 2; t++) {
+                        int n = 0;
+                        PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,
+                            pipe_apply_sparse_kern<SLABBED>(r, t), 512, 0));
+                        if (sp_nb < 0 || n < sp_nb) sp_nb = n;
+                        if (n > sp_hi) sp_hi = n;
+                    }
+                printf("  sparse apply: %d block%s of 512 threads per SM"
+                       " (32160 / 31456 B static shared memory)",
+                       sp_nb, sp_nb == 1 ? "" : "s");
+                if (sp_nb < sp_hi)
+                    printf(" -- the fewest of its instances; another runs %d", sp_hi);
+                printf("\n");
+            }
         }
     }
     VRAM_MARK("factor bases + bitmaps");
@@ -3410,6 +3542,27 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     if (cfg->norm_gate)
         printf("  --norm-gate: side 0's apply computes the log norm only under"
                " side 1's survivors\n");
+    if (cfg->sparse_apply)
+        printf("  --sparse-apply: side 0's apply compacts side 1's survivors"
+               " row-wide (%s%s)\n",
+               cfg->sparse_apply_rows == 1 ? "1 row/block"
+               : cfg->sparse_apply_rows == 2 ? "2 rows/block"
+               : "auto 2-row/1-row/dense",
+               cfg->sparse_apply_default ? "; this card's default" : "");
+    else if (cfg->sparse_apply_default && cfg->norm_gate) {
+        const int athr = cfg->apply_threads ? cfg->apply_threads : 512;
+        if (cfg->logI < SPARSE_APPLY_LOGI_MIN || cfg->logI > SPARSE_APPLY_LOGI_MAX ||
+            cfg->log_region < SPARSE_APPLY_REGION_MIN || cfg->log_region > cfg->logI ||
+            athr != 512)
+            printf("  --sparse-apply: off (needs logI in %d..%d, --region in"
+                   " %d..logI, and --apply-threads 512)\n",
+                   SPARSE_APPLY_LOGI_MIN, SPARSE_APPLY_LOGI_MAX,
+                   SPARSE_APPLY_REGION_MIN);
+        else
+            printf("  --sparse-apply: off, this card's default: on by default"
+                   " only on sm_120 (Blackwell), where it was timed;"
+                   " --sparse-apply to use it\n");
+    }
     if (cfg->small_sieve) {
         printf("  --tiny-fold: %s\n", cfg->tiny_fold
                ? "small-sieve moduli that are powers of two <= 32 are added at"
@@ -3590,6 +3743,24 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
     int spec_have = 0, spec_issued = 0, spec_qr = 0;
     qsel_t spec_raw = {};
     double spec_th1 = 0, spec_th0 = 0;
+    /* Row 53: per-slab-index side-1 survivor density (survivors/row) for
+     * --sparse-apply's auto mode selector. Indexed by slab because early
+     * slabs (small j) have higher survivor density than later slabs. */
+    double s1_mean_slab[64];
+    for (int i = 0; i < 64; i++) s1_mean_slab[i] = -1.0;
+    auto s1_mean_for_slab = [&](uint32_t sl) -> double {
+        const uint32_t idx = sl < 64u ? sl : 63u;
+        if (s1_mean_slab[idx] >= 0.0) return s1_mean_slab[idx];
+        /* First pass over slab sl > 0 under --q-pipeline: inherit slab sl - 1,
+         * which has smaller j and therefore equal or higher density (safe). */
+        if (idx > 0u && s1_mean_slab[idx - 1u] >= 0.0) return s1_mean_slab[idx - 1u];
+        return -1.0;
+    };
+    auto s1_mean_record = [&](uint32_t sl, uint32_t nsurv, uint32_t rows_here) {
+        if (!rows_here) return;
+        const uint32_t idx = sl < 64u ? sl : 63u;
+        s1_mean_slab[idx] = (double)nsurv / (double)rows_here;
+    };
     /* One step of the special-q source: 1 = a q, 0 = none left, -1 = failure.
      * qlist first, then the streaming generator. The loop top and the
      * --q-pipeline issue point both pull through this, and both ask
@@ -3636,7 +3807,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
      * when the gate is on, which it never is under --fill-concurrent. `part`
      * is --fill-ahead's: side 1 split into a fill and an apply. */
     auto issue_side = [&](int side, uint32_t xmax, uint32_t j_base,
-                          const pipe_part_t *part = NULL) -> int {
+                          const pipe_part_t *part = NULL,
+                          uint32_t slab_idx = 0u) -> int {
         return side
             ? pipe_side_sieve_issue<SLABBED>(fb1, cfg, 1, xmax, j_base, &bk1,
                                              fblocks, fthreads, &S1, NULL, NULL,
@@ -3644,7 +3816,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             : pipe_side_sieve_issue<SLABBED>(fb0, cfg, 0, xmax, j_base, &bk0,
                                              fblocks, fthreads, &S0,
                                              cfg->fill_gate ? S1.survbits : NULL,
-                                             d_gate);
+                                             d_gate, NULL,
+                                             s1_mean_for_slab(slab_idx));
     };
     /* --slab-fill-ahead: slab sl's side-1 fill, on st_sfa into the workspace
      * the slab just issued on st_sv is not using, released by S1.ev[2]. The
@@ -3748,7 +3921,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         /* `sides`: 1 and 2 are side 1 and side 0 alone, for --fill-ahead's
          * early side-1 apply; 3 both */
         if (((sides & 1) && issue_side1(sl, xm, jb, spec_fa >= 0 ? &ap : NULL)) ||
-            ((sides & 2) && issue_side(0, xm, jb))) {
+            ((sides & 2) && issue_side(0, xm, jb, NULL, sl))) {
             cudaStreamSynchronize(st_sv);
             if (st_fa) cudaStreamSynchronize(st_fa);
             if (st_sfa) cudaStreamSynchronize(st_sfa);
@@ -4437,6 +4610,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * On a soft skip this behaves like the concurrent arm: side 0
                  * ran anyway, and the q is abandoned below either way. */
                 sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, 1);
+                if (!sv1) s1_mean_record(slab, S1.nsurv, J_here);
                 /* --fill-ahead: side 1's fill ran on st_fa, timed there; the
                  * apply waited on its end, so both events are complete */
                 if (sv1 >= 0 && q_fa >= 0)
@@ -4470,7 +4644,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                  * HERE and wrong in the serial arm, which is exactly the kind
                  * of divergence output identity cannot catch. */
                 int i1 = issue_side(1, xmax, j_base);
-                int i0 = i1 ? -1 : issue_side(0, xmax, j_base);
+                int i0 = i1 ? -1 : issue_side(0, xmax, j_base, NULL, slab);
                 /* A failed ISSUE leaves launches in flight with nobody to
                  * await them, and `done:` below frees the bucket array they
                  * are writing into. Drain before unwinding. */
@@ -4478,6 +4652,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 /* qpipe is never granted with --fill-concurrent: views only. */
                 if (views_and_prep()) { rc = -1; break; }
                 sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, concurrent);
+                if (!sv1) s1_mean_record(slab, S1.nsurv, J_here);
                 sv0 = pipe_side_sieve_join(0, &S0, &sf0, &sa0, concurrent);
                 /* NOTHING collapses sv0 into sv1 here, and an earlier
                  * `if (sv1 > 0 && sv0 > 0) sv0 = 0;` was dead code: below,
@@ -4498,8 +4673,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
             } else {
                 /* --slab-fill-ahead: and the next slab's fill beside its apply */
                 sv1 = issue_side1(slab, xmax, j_base, NULL);
-                if (!sv1)
+                if (!sv1) {
                     sv1 = pipe_side_sieve_join(1, &S1, &sf1, &sa1, concurrent);
+                    if (!sv1) s1_mean_record(slab, S1.nsurv, J_here);
+                }
                 if (sv1 >= 0 && sv_sfa >= 0) {
                     sfa1 = (float)time_kernel(fa_t0[sv_sfa], fa_t1[sv_sfa]);
                     sfa_used = 1;
@@ -4508,7 +4685,7 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     /* --fill-gate: side 1 has been joined, so its bitmap for
                      * this slab is complete. Refused with --fill-concurrent,
                      * whose side 0 is issued before side 1 finishes. */
-                    sv0 = issue_side(0, xmax, j_base);
+                    sv0 = issue_side(0, xmax, j_base, NULL, slab);
                     if (!sv0 && views_and_prep()) {
                         cudaDeviceSynchronize();
                         rc = -1; break;
@@ -5999,6 +6176,11 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         if (cfg->small_sieve && cfg->tiny_table)
             printf("  %-34s side 1 in %llu of %llu q, side 0 in %llu of %llu q\n",
                    "--tiny-table used", S1.tab_q, S1.prep_q, S0.tab_q, S0.prep_q);
+        if (cfg->sparse_apply)
+            printf("  %-34s 2-row %llu, 1-row %llu, dense %llu slab(s)"
+                   " (dense fallback: %llu block(s))\n",
+                   "--sparse-apply used", S0.sp_slabs[2], S0.sp_slabs[1],
+                   S0.sp_slabs[0], S0.sp_ovf_blocks);
         printf("  %-34s %8.1f\n", "two-sided primitive survivors/q",
                (double)acc_surv / N);
         printf("  %-34s %8.2f\n", "cofactorisation candidates/q",

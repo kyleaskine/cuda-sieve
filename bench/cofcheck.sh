@@ -681,6 +681,94 @@ for off in --no-fill-gate --fill-concurrent; do
         printf 'FAIL   %-34s %s refused, but not for the gate\n' "norm-gate without the fill gate" "$off"; fail=1
     fi
 done
+# --sparse-apply (row 53, finding 164): row-wide sparse side-0 apply + dense
+# overflow fallback, output-identical to dense --norm-gate across unslabbed,
+# odd slab row counts, and an odd slab start with an even row count (so 2-row
+# runs at an odd global j0). Explicit --sparse-apply on every sparse arm so the
+# gate exercises it on non-sm_120 cards too, and asserts the joined slab counts
+# in `--sparse-apply used` rather than only the startup banner.
+for shape_spec in \
+    "unslabbed||37|2-row 1, 1-row 0, dense 0|2-row 0, 1-row 1, dense 0|2-row 1, 1-row 0, dense 0" \
+    "odd slab rows|--slab-j 4095|37|2-row 1, 1-row 4, dense 0|2-row 0, 1-row 5, dense 0|2-row 1, 1-row 4, dense 0" \
+    "odd start 2-row|--J 4097 --slab-j 2049|any|2-row 0, 1-row 2, dense 0|2-row 0, 1-row 2, dense 0|2-row 1, 1-row 1, dense 0"; do
+    IFS='|' read -r shape sjarg want want_a want_1 want_2 <<EOF
+$shape_spec
+EOF
+    run --cofactor $sjarg --no-sparse-apply                     --relations $TMP/sp0.txt > $TMP/sp0.out || true
+    run --cofactor $sjarg --sparse-apply                        --relations $TMP/spa.txt > $TMP/spa.out || true
+    run --cofactor $sjarg --sparse-apply --sparse-apply-rows 1  --relations $TMP/sp1.txt > $TMP/sp1.out || true
+    run --cofactor $sjarg --sparse-apply --sparse-apply-rows 2  --relations $TMP/sp2.txt > $TMP/sp2.out || true
+    n0=$(grep 'total relations' $TMP/sp0.out | tail -1 | awk '{print $NF}') || true
+    na=$(grep 'total relations' $TMP/spa.out | tail -1 | awk '{print $NF}') || true
+    n1=$(grep 'total relations' $TMP/sp1.out | tail -1 | awk '{print $NF}') || true
+    n2=$(grep 'total relations' $TMP/sp2.out | tail -1 | awk '{print $NF}') || true
+    ok_n=0
+    if [ "$want" = "any" ]; then
+        [ -n "$n0" ] && [ "$n0" -gt 0 ] 2>/dev/null && [ "$na" = "$n0" ] && [ "$n1" = "$n0" ] && [ "$n2" = "$n0" ] && ok_n=1
+    else
+        [ "$n0" = "$want" ] && [ "$na" = "$want" ] && [ "$n1" = "$want" ] && [ "$n2" = "$want" ] && ok_n=1
+    fi
+    if [ "$ok_n" -eq 1 ] &&
+       cmp -s $TMP/sp0.txt $TMP/spa.txt && cmp -s $TMP/sp0.txt $TMP/sp1.txt && cmp -s $TMP/sp0.txt $TMP/sp2.txt &&
+       ! grep -q -- '--sparse-apply used' $TMP/sp0.out &&
+       grep -q -- "--sparse-apply used.*$want_a" $TMP/spa.out &&
+       grep -q -- "--sparse-apply used.*$want_1" $TMP/sp1.out &&
+       grep -q -- "--sparse-apply used.*$want_2" $TMP/sp2.out; then
+        printf 'PASS   %-34s %s, %s dense/auto/1-row/2-row, byte-identical\n' "sparse-apply output identity" "$shape" "$n0"
+    else
+        printf 'FAIL   %-34s %s, got %s/%s/%s/%s\n' \
+               "sparse-apply output identity" "$shape" "${n0:-none}" "${na:-none}" "${n1:-none}" "${n2:-none}"; fail=1
+    fi
+done
+# Overflow fallback (k_apply_ovf_dense): raise side 1's allowance on a 512-row
+# slab so 1-row mixes sparse and overflowing blocks (0 < ov1 < 512) and 2-row
+# overflows too, while keeping side 0 tight. Compares both emitted candidates
+# and complete relations byte-for-byte against dense --no-sparse-apply.
+./bench --pipeline --cadofb $FB --poly $POLY $Q --J 512 --allowance 128 --allowance0 68.1 \
+    --no-sparse-apply                    --candidates $TMP/ov0.cand --relations $TMP/ov0.txt > $TMP/ov0.out 2>&1 || true
+./bench --pipeline --cadofb $FB --poly $POLY $Q --J 512 --allowance 128 --allowance0 68.1 \
+    --sparse-apply --sparse-apply-rows 1 --candidates $TMP/ov1.cand --relations $TMP/ov1.txt > $TMP/ov1.out 2>&1 || true
+./bench --pipeline --cadofb $FB --poly $POLY $Q --J 512 --allowance 128 --allowance0 68.1 \
+    --sparse-apply --sparse-apply-rows 2 --candidates $TMP/ov2.cand --relations $TMP/ov2.txt > $TMP/ov2.out 2>&1 || true
+ov1=$(grep -- '--sparse-apply used' $TMP/ov1.out | sed -n 's/.*dense fallback: \([0-9]*\) block.*/\1/p') || true
+ov2=$(grep -- '--sparse-apply used' $TMP/ov2.out | sed -n 's/.*dense fallback: \([0-9]*\) block.*/\1/p') || true
+if [ -s $TMP/ov0.cand ] && [ -s $TMP/ov0.txt ] &&
+   cmp -s $TMP/ov0.cand $TMP/ov1.cand && cmp -s $TMP/ov0.cand $TMP/ov2.cand &&
+   cmp -s $TMP/ov0.txt  $TMP/ov1.txt  && cmp -s $TMP/ov0.txt  $TMP/ov2.txt &&
+   [ -n "$ov1" ] && [ "$ov1" -gt 0 ] 2>/dev/null && [ "$ov1" -lt 512 ] 2>/dev/null &&
+   [ -n "$ov2" ] && [ "$ov2" -gt 0 ] 2>/dev/null; then
+    printf 'PASS   %-34s 1-row %s/512 mixed, 2-row %s ovf, cand+rel identical\n' "sparse-apply overflow fallback" "$ov1" "$ov2"
+else
+    printf 'FAIL   %-34s ovf blocks 1-row=%s 2-row=%s\n' "sparse-apply overflow fallback" "${ov1:-none}" "${ov2:-none}"; fail=1
+fi
+for off in --no-norm-gate --no-fill-gate --fill-concurrent; do
+    if ./bench --pipeline --cadofb $FB --poly $POLY $Q --cofactor --sparse-apply $off \
+               --relations $TMP/r.txt >$TMP/o 2>&1; then
+        printf 'FAIL   %-34s %s accepted, should have been refused\n' "sparse-apply without norm-gate" "$off"; fail=1
+    elif grep -q 'sparse-apply needs --norm-gate' $TMP/o; then
+        printf 'PASS   %-34s %s refused\n' "sparse-apply without norm-gate" "$off"
+    else
+        printf 'FAIL   %-34s %s refused, but not for norm-gate\n' "sparse-apply without norm-gate" "$off"; fail=1
+    fi
+done
+if ./bench --pipeline --cadofb $FB --poly $POLY $Q --cofactor --sparse-apply-rows 1 --no-sparse-apply \
+           --relations $TMP/r.txt >$TMP/o 2>&1; then
+    printf 'FAIL   %-34s accepted, should have been refused\n' "sparse-apply-rows without sparse"; fail=1
+elif grep -q 'sparse-apply-rows needs --sparse-apply' $TMP/o; then
+    printf 'PASS   %-34s refused\n' "sparse-apply-rows without sparse"
+else
+    printf 'FAIL   %-34s refused, but for the wrong reason\n' "sparse-apply-rows without sparse"; fail=1
+fi
+for badshape in "--apply-threads 256" "--logI 11 --region 11" "--region 5"; do
+    if ./bench --pipeline --cadofb $FB --poly $POLY $Q --cofactor --sparse-apply $badshape \
+               --relations $TMP/r.txt >$TMP/o 2>&1; then
+        printf 'FAIL   %-34s %s accepted, should have been refused\n' "sparse-apply unsupported shape" "$badshape"; fail=1
+    elif grep -q 'sparse-apply needs logI in' $TMP/o; then
+        printf 'PASS   %-34s %s refused\n' "sparse-apply unsupported shape" "$badshape"
+    else
+        printf 'FAIL   %-34s %s refused, but for the wrong reason\n' "sparse-apply unsupported shape" "$badshape"; fail=1
+    fi
+done
 expect_refused "sieve-skip not an integer"      --sieve-skip two
 expect_refused "bkthresh below I"               --bkthresh 16384
 expect_refused "bkthresh above 2^30"            --bkthresh 2147483648

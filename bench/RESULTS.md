@@ -20594,8 +20594,8 @@ runs at 2932 MHz under load. 70 SMs at 1582 MHz are about 79% of the 5070's
 about 110 measured. The CPU (Ryzen 7 5800X) is not the limit; PCIe ran Gen4
 x8 of x16. A core at half clock shifts the balance between the fill and the
 rest of the slab, so this card's best block count and gate shift do not carry
-over to a stock 5070 Ti. The 5080, a stock card at home, can settle the block
-count. Gate shift 1 won here (−4.54%; 2 −3.32%),
+over to a stock 5070 Ti. The 5080 (below) settled the block count: 12.8 per
+SM holds on a stock card. Gate shift 1 won here (−4.54%; 2 −3.32%),
 where the 5060 lost 21.5% at 1, so the gate shift stays with tuning. Saved:
 `--fill-gate-shift 1 --slab-fill-ahead --slab-fill-blocks 512`, −8.41%.
 
@@ -20631,6 +20631,40 @@ higher warp cut make up the rest. At the old defaults the card ran at
 clock and a Blackwell SM 128, so its 80 SMs at 2.67 GHz have about 76% of the
 5070's integer rate (48 at 2.93 GHz), and the 5070-sized fill grid held its
 fill to 44.9 ms of an 81.3 ms sieve chain (the 5070: 24.6 on the chain).
+
+**And the RTX 5080** (2026-11-26; sm_120, 84 SMs, 16 GB; commit 5c503a0a,
+so finding 162's defaults with the ahead fill on at 1075, and policy 2; host
+load about 20, spreads 0.36-1.40%; q 40000000:40002252, wider than the other
+tunes' range; `work/tune5080-20261126/`). It is the first tune run against
+the per-card defaults:
+- **The ahead fill's 12.8 per SM holds on a stock fast card.** 1075 was best
+  or level: 768 −0.16% and 1024 −0.13% against it (−0.29 and −0.32% beside
+  gate shift 1, both out after round 4), 512 +1.90%, 1536 +1.29%, off +1.41%
+  (+1.61% beside gate shift 1). So the 5070 Ti's lower best came from its
+  clock cap. The ahead fill is worth less here than on the other three
+  Blackwell cards: about 1.5%, against 3.9-7.2%.
+- **No warp cut helped** (384 +0.11%, 1024 +0.68%; 384 −0.22% beside gate
+  shift 1, below adoption), as on the other three Blackwell cards.
+- **A larger fill grid won, for the first time on Blackwell**, and a
+  moderate one is enough: 9216 −1.47%, 18432 −2.00%, 36864 −2.22%, 73728
+  −1.95%, 147456 −1.55 and −2.02%, 294912 −2.15%, 589824 −1.52 and −1.64%,
+  1048576 −1.10%. Beside gate shift 1, 36864 gave −2.61% and 9216 −1.93%.
+  The tie rule saved 9216, the step nearest the defaults within 1% of the
+  best, which leaves about 0.7%. Across Blackwell the gain grows with the SM
+  count: the 5060 (30 SMs) lost 0.6-0.8% at 9216-36864, the 5070 (48) lost
+  0.41% at 36864, the 5070 Ti (70, clock-capped) gained 0.72% at 9216 beside
+  gate shift 1, and the 5080 (84) gains 2.0-2.6%. bench.h's 4608 is the
+  5070's grid. A grid that grows with the SM count is a candidate default
+  for sm_120, but one stock card is not enough to set it.
+- **Gate shift 1 won**: −4.62%, 2 −3.49%, 4 +5.65%. On this job a shift
+  below 3 now wins on six of seven cards (the 4060 Ti only beside the big
+  grid), all but the 5060, which lost 3.07% at 2 and 21.5% at 1. 1 is best
+  on the three largest (the 5070 Ti, the 4080 SUPER beside the big grid,
+  the 5080) and 2 on the rest. It is still one job, and finding 150 found
+  the best shift differing by job on the 5070, so it stays with tuning.
+
+Saved: `--fill-gate-shift 1 --fill-blocks 9216`, −6.56% against the new
+defaults, under policy 2.
 
 ### What changed
 
@@ -20742,5 +20776,139 @@ policy 2.
   msieve's 8-thread filtering (`work/carddefaults/review/check2.log`).
 
 Not measured: any card not in the table above. On sm_86 the rule rests on
-one card. The ahead fill's grid at other SM counts is checked by the 5080's
-tune (84 SMs, where the rule gives 1075; tune.sh times 1024 beside it).
+one card. The ahead fill's grid was checked at 84 SMs by the 5080's tune
+(2026-11-26, above): the rule's 1075 was best or level.
+
+
+## Finding 163 — Row 52 (exact second probe on side 0's fill gate): negative on the RTX 5070, not ported (2026-11-27)
+
+Tested in an isolated prototype (`work/row52-gate2/`, sm_120 build on HEAD + finding 162's defaults with `--slab-fill-ahead` on) on an idle RTX 5070.
+
+### Design and parity
+
+Templated `fill_gate_drops<bool EXACT>` in `k_fill_rows`, `k_fill_atomic`, and `k_fill_merged`: keep `--fill-gate-shift`'s folded bitmap as the first check; when a hit passes it, test the exact bit in side 1's unfolded survivor bitmap (`S1.survbits`, 64 MB per 8192-row I16 slab).
+
+- **Byte-identity:** 4 of 4 jobs (`c135`, `de222b73`, `nfs.job`, `snfs301`) matched the base build's relation files byte for byte.
+
+### Timings (RTX 5070, 3 interleaved rounds, `--no-tuned`)
+
+| job | arm | wall (ms/q) | fill (ms/q) | side-0 rscan (ms/q) |
+|---|---|---:|---:|---:|
+| `de222b73` (I16, 2.96% surv) | `s3` (default shift 3) | 81.38 | 23.98 | 1.310 |
+| | `s2` (`--fill-gate-shift 2`) | **76.94** | **21.17** | 0.981 |
+| | `s0` (`--fill-gate-shift 0`) | 102.02 | 45.72 | 0.702 |
+| | `s3x` (shift 3 + exact 2nd probe) | 82.31 | 26.83 | 0.698 |
+| | `s2x` (shift 2 + exact 2nd probe) | 82.91 | 26.39 | 0.709 |
+| | `s4x` (shift 4 + exact 2nd probe) | 87.98 | 30.58 | 0.708 |
+| `nfs.job` (I16, 0.37% surv) | `s3` (default shift 3) | 120.43 | 28.19 | 0.785 |
+| | `s2` (`--fill-gate-shift 2`) | **118.28** | **27.05** | 0.634 |
+| | `s3x` (shift 3 + exact 2nd probe) | 118.99 | 29.83 | 0.485 |
+| | `s4x` (shift 4 + exact 2nd probe) | 121.80 | 31.94 | 0.486 |
+
+### Why it lost
+
+The second probe cut side 0's record scan nearly in half (`de222b73` 1.310 → 0.698 ms/q, `nfs` 0.785 → 0.485 ms/q), matching `s0`'s exact record volume. However, the random probes into the 64 MB unfolded `S1.survbits` bitmap blew out L2 (48 MB on the 5070) and added +1.6 to +2.9 ms/q to fill over `s3` (+2.8 to +5.7 ms/q over `s2`), outweighing the saved record writes and scan. Not ported to `bench/`.
+
+---
+
+## Finding 164 — Row 53 (`--sparse-apply`): row-wide sparse side-0 apply with dense overflow fallback: wall −3.8% (c135) to −12.8% (I16 GNFS), winning on all 8 benchmark jobs, byte-identical through every gate (2026-11-26 to 2026-11-27; gated on fat build, not yet installed)
+
+### 1. HEAD `ncu` stage profile (`work/applyprof-20261126/`)
+
+Profiled `k_apply` on HEAD (CUDA 13.5, RTX 5070, locked clocks, `--no-q-pipeline --no-slab-fill-ahead --no-tuned`) on `nfs.job`, `de222b73`, and `snfs301`:
+
+- **Side 0 share of `k_apply` duration:** 39.8% on `nfs` (5.83 vs 8.80 ms/slab), 46.0% on `snfs301` (6.25 vs 7.34 ms/slab), 47.1% on `de222b73` (6.44 vs 7.23 ms/slab).
+- **Side 0 per-stage warp-sample share (slab 0):**
+  - `nfs`: `init: loop/ngate/store` 26.5%, `init: norm math` 5.1%, `tiny-fold + tiny-table` 4.8%, `block + warp tiers` 18.3%, `thread tier` 33.4%, `threshold scan` 10.6%, `buckets` ~1.1%.
+  - `de222b73` / `snfs301`: `init: loop/ngate/store` 21.5–21.7%, `init: norm math` 11.9–13.0% (17.9–19.8% inst, warp-divergent under `--norm-gate`), `block + warp tiers` 16.5–17.0%, `thread tier` 29.1–30.1%, `threshold scan` 10.9%, `buckets` ~1.4–1.8%.
+- **Side 1 ceilings recorded for rows 57 & 59:** side 1 `init: norm math` is 15.8% of samples (`nfs`), 20.8% (`snfs301`), 21.4% (`de222b73`); side 1 `block + warp` is 18.9% (`nfs`), 15.8% (`snfs301`), 12.1% (`de222b73`).
+
+### 2. Seven-job per-row survivor census (`work/row53-census/summary.txt`)
+
+Measured side-1 survivor counts per row and per 2-row pair across 7 jobs:
+
+| job | surv rate | 1-row mean / p99 / max | >5632 ovf | 2-row mean / p99 / max | >3072 ovf |
+|---|---:|---:|---:|---:|---:|
+| `nfs_297M` | 0.366% | 240 / 605 / 1615 | 0.000% | 480 / 899 / 1784 | 0.000% |
+| `AS276_80M` | 0.528% | 346 / 1028 / 2552 | 0.000% | 692 / 1501 / 3267 | 0.000% |
+| `c194_80M` | 0.564% | 370 / 1128 / 2811 | 0.000% | 739 / 1697 / 3380 | 0.002% |
+| `snfs301_200M` | 1.820% | 1193 / 3579 / 14131 | ~0.04% | 2386 / 5720 / 18652 | 21.64% |
+| `snfs301_60M` | 2.595% | 1701 / 5137 / 24468 | ~0.4% | 3401 / 8117 / 32905 | 52.26% |
+| `de222b73_40M` | 2.960% | 1940 / 4930 / 17528 | ~0.4% | 3880 / 7683 / 25727 | 74.30% |
+| `c1147_300M` | 4.716% | 3091 / 9977 / 26546 | ~10% | 6182 / 16074 / 36351 | 87.79% |
+
+Early slabs (low `j`) carry ~2–2.5× higher survivor density than late slabs (high `j`) within the same special-q.
+
+### 3. Design (`k_apply_sparse` + `k_apply_ovf_dense`)
+
+Under `--norm-gate`, side 1's survivor bitmap is already complete before side 0's apply launches. `k_apply_sparse<NROWS, MAX_NS, SLABBED, SSTAIL>` gives one 512-thread block `NROWS` whole rows in ≤ 32.2 KB static shared memory (3 blocks/SM on 100 KB SMEM, 40 regs):
+
+- **2-row (`NROWS=2, MAX_NS=3072`):** 31,456 B static SMEM (`s_gate[4096]`, `s_rank[1024]`, `s_pos[3072]`, `s_sum[1536]`, tiny-prime tables). Amortizes thread-tier `ss_setup` across 8 quarter-row regions (`raw += rt; if (raw >= m) raw -= m;` for row `j0 + 1`).
+- **1-row (`NROWS=1, MAX_NS=5632`):** 32,160 B static SMEM (`s_gate[2048]`, `s_rank[512]`, `s_pos[5632]`, `s_sum[2816]`, tiny-prime tables). Amortizes thread-tier `ss_setup` across 4 quarter-row regions and fits SNFS deg-6 / `de222b73` / `c1147` rows with low overflow.
+- **Phases:**
+  0. Coalesced load of `ngate` into `s_gate` (masking even columns on even rows when `not_both_even || sieve_skip`), lock-free prefix popcount (`s_rank` per 4 words) + survivor column compaction into `s_pos`. Empty blocks zero `survbits` and exit; blocks with `ns_tot > MAX_NS` append `r_base` to `d_ovf_rows` via `d_novf` and return. Piggybacks tiny-prime `[0, min(nblk, 32))` setup + exact `ceil(2^32 / mm)` reciprocals on the same barrier.
+  1. Compacted norm init (`sparse_norm_eval<DEG>`, specialized for deg 1 with generic fallback, matching `k_apply` including `NORM_FAST_LOG2` and double cancellation fallback) + register accumulation of tiny primes `[0, min(nblk, 32))` via `col - __umulhi(col, inv) * mm == c0` (proved exact for all `col < 65536`, `2 <= mm <= 65535`).
+  2. Warp tier `[min(nblk, 32), nwrp)` and single unified thread tier `[nwrp, nsmall)` calling `sparse_add` (tests `s_gate` bit; if set, computes dense index from `s_rank` + `__popc` and updates packed 16-bit `s_sum` via `atomicAdd`).
+  3. Bucket records across `NROWS * rpr` regions via `sparse_add`.
+  4. Compacted threshold scan over `s_sum`, writing output bits into reused `s_gate`, then coalesced store to `survbits` and warp-reduced `atomicAdd(nsurv)`.
+- **Overflow fallback (`k_apply_ovf_dense<SLABBED, SSTAIL>`):** Launches immediately after `k_apply_sparse` on the same stream (zero host sync, grid `min(nregion, 1024)`). Reads `*d_novf` and returns immediately when 0; otherwise runs factored `apply_region_dense<16, 1, NORM_HORNER, SLABBED, SSTAIL, true>` on only the listed overflowing row blocks' regions.
+
+### 4. Prototype measurements (`work/row53-sparse/`, RTX 5070, quiet box, sm_120 defaults w/ `--slab-fill-ahead`)
+
+- **Byte-identity:** **18 of 18 PASS** across all 8 jobs (`c135`, `C148`, `c183`, `nfs`, `c194`, `snfs301`, `de222b73`, `c1147`), comparing both 1-row (`mode=1`) and 2-row (`mode=2`) against dense `--norm-gate` (`mode=0`).
+- **3-round interleaved means (I16 jobs) and single-pass crossover check (`c135`–`c1147`):**
+
+| job | `mode=0` dense wall (ms/q) | `mode=1` 1-row wall | `mode=2` 2-row wall | best Δ wall | auto picks |
+|---|---:|---:|---:|---:|---|
+| `nfs.job` (I16 GNFS, nq=40, 3r) | 117.57 | 103.74 (−11.8%) | **102.55 (−12.8%)** | **−12.8%** | 2-row |
+| `c194` (I16 GNFS, nq=30, 3r) | 126.93 | 113.97 (−10.2%) | **112.14 (−11.7%)** | **−11.7%** | 2-row |
+| `snfs301` (I16 SNFS, nq=40, 3r) | 126.17 | **112.79 (−10.6%)** | 115.72 (−8.3%) | **−10.6%** | 1-row |
+| `C148` (I14, nq=200) | 9.73 | 9.09 (−6.6%) | **8.88 (−8.7%)** | **−8.7%** | 2-row |
+| `de222b73` (I16 live, nq=60, 3r) | 80.76 | **74.72 (−7.5%)** | 80.24 (−0.6%) | **−7.5%** | 1-row |
+| `c183` (I15, nq=60) | 33.64 | 31.46 (−6.5%) | **31.30 (−7.0%)** | **−7.0%** | 2-row |
+| `c1147` (I16 4.72% surv, nq=10) | 173.69 | **163.20 (−6.0%)** | 173.38 (−0.2%) | **−6.0%** | 1-row |
+| `c135` (I13, nq=500) | 2.61 | 2.52 (−3.4%) | **2.51 (−3.8%)** | **−3.8%** | 2-row |
+
+On `nfs.job`, total `apply` dropped 68.10 → 54.32 ms/q (−20.2%), and freeing the card earlier also cut overlapped TD/norm contention (`norms + trial division` 20.63 → 9.24 ms/q), yielding the full −15.0 ms/q (−12.8%) wall reduction.
+
+### 5. Main-branch port & code-review fixes (2026-11-27)
+
+- `bench/bench.h`, `bench/tuned.h`, `bench/tuned.c`, `bench/tunedtest.c`: `SPARSE_APPLY_LOGI_MIN/MAX` (12..16), `SPARSE_APPLY_REGION_MIN` (6), `SPARSE_APPLY_AUTO_2ROW` (750.0), `SPARSE_APPLY_AUTO_1ROW` (4200.0); `cfg.sparse_apply`, `cfg.sparse_apply_default`, `cfg.sparse_apply_rows`; `tuned_card_defaults` enables `--sparse-apply` by default only on `sm_120` (matching `--slab-fill-ahead`'s precedent until timed on Ada/Ampere/Turing; gated in `tunedtest.c`).
+- `bench/bench_main.cu`: `--sparse-apply / --no-sparse-apply` (resolved at device query beside `--slab-fill-ahead`: on by default on `sm_120` when `--norm-gate` is on and launch shape fits; off elsewhere until timed), `--sparse-apply-rows N` (`0=auto, 1, 2`), `--help`, `pipeline_only[]`, refusals without `--norm-gate`, without `--sparse-apply`, or on unsupported launch shapes (`logI` outside 12..16, `--region` outside `6..logI`, `--apply-threads != 512`), and `runlog_note("fill", ...)` fields.
+- `bench/bench_kernels.cu`: factored `apply_region_dense(..., const norm_t &N, ...)` (passing `N` by const ref preserves `k_apply`'s exact 8 B stack / 0 spills / 40 regs), updated `CALLER CONTRACT` for disjoint-region grid-stride and multi-launch disjoint-row writers, added `PIPE_TEST_SPARSE_MAX_NS` test-only overflow cap, `k_apply_ovf_dense`, `sparse_norm_eval`, `sparse_add`, `k_apply_sparse`.
+- `bench/pipeline.cuh`: `pside_t` overflow buffers (`d_novf`, `d_ovf_rows`), join-time slab & overflow counters (`sp_slabs[3]`, `sp_ovf_blocks`, `last_sp_mode`, async `h_rb->sp_ovf` readback), `pipe_apply_ovf_kern` / `pipe_apply_sparse_kern` dispatch helpers, `MaxDynamicSharedMemorySize` opt-in for `k_apply_ovf_dense`, occupancy banner covering `k_apply_ovf_dense` and all four `k_apply_sparse` instances, per-slab-index side-1 survivor density tracker (`s1_mean_slab[64]`, updated at all three `pipe_side_sieve_join(1, ...)` call sites; auto thresholds: `<= 750/row` & even rows → 2-row, `<= 4200/row` or cold start → 1-row, `> 4200/row` → dense; odd row counts fall back cleanly to 1-row), startup banner (including card-default / shape notes) and band summary lines.
+- `bench/cofcheck.sh` & `bench/fillcheck.sh`: added `--sparse-apply` output-identity checks across unslabbed, odd slab rows (`--slab-j 4095`), and odd slab start with even row count (`--J 4097 --slab-j 2049`, exercising 2-row at odd global `j0 = 2049`) across dense / auto / 1-row / 2-row while verifying exact joined slab counts in `--sparse-apply used`; added a live overflow-fallback identity test (`--J 512 --allowance 128`) asserting byte-identical candidates and relations with mixed sparse/fallback blocks (`0 < ov1 < 512` on 1-row, `ov2 > 0` on 2-row, reported as `dense fallback: N block(s)` so log monitors and `abcheck.sh` never confuse lossless dense fallback with bucket overflow); added CLI refusal tests (without `--norm-gate`, without `--sparse-apply`, unsupported shape) and explicit `--sparse-apply` arms in `fillcheck.sh`.
+
+---
+
+## Finding 165 — Row 56 (`k_classify` & `mz_sprp2` on PTX `mz_mul<3>/<4>`, `mz_dbl_mod`, MSB-shifted `R mod n`): classify −44.8% and wall −3.75% at c135, wall −2.53% at C148, byte-identical through every gate (2026-11-27; gated on fat build, not yet installed)
+
+### Design
+
+- `bench/prp.cuh`: `#include "cofac_arith.cuh"` guarded under `#if defined(__CUDACC__)` (so CPU-only C++ targets like `slabtest.cpp` stay free of `-Wunknown-pragmas`). Added device `m_sprp2_mz<L>` called from `m_sprp2` under `#if defined(__CUDA_ARCH__)`: dispatches `mz_mul<3>` for odd `n < 2^96` (`n->v[3] == 0`) and `mz_mul<4>` for odd `n < 2^127` (`(n->v[3] >> 31) == 0`), replaces base-2 Montgomery products with `mz_dbl_mod<L>`, folds the top 1-bit of `d` into `x = 2R mod n`, and initializes `R mod n` from `2^(nbits-1)` via a statically unrolled loop (`for (int i = 0; i < L; i++) one.v[i] = (i == topw) ? topb : 0u;`) so `one` stays in registers with 0 B stack frame (an earlier runtime-indexed `one.v[topw] = topb` spilled 48 B of stack). Host / 128-bit fallback in `m_sprp2` updated with the same MSB-shifted `R mod n`, `m_dbl_mod`, and top-bit skip.
+- `bench/cofac.cuh`: `mz_sprp2<L>` updated with the same statically unrolled MSB-shifted `R mod n`, `mz_dbl_mod`, and top-bit skip.
+
+### Prototype measurements (`work/row56-prp/`, RTX 5070, quiet box, 4 interleaved rounds)
+
+- **Parity:** 50,032-case CPU parity test (0 mismatches across 3-limb, 4-limb, edge-bit, Carmichael, and strong-pseudoprime cases) + 4 of 4 GPU relation files (`c135`, `C148`, `de222b73`, `snfs301`) byte-identical.
+
+| job | base wall (ms/q) | new wall (ms/q) | Δ wall | rounds won | base classify (ms/q) | new classify (ms/q) | Δ classify |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `c135` (nq=1000) | 2.47 | **2.38** | **−3.75%** | 4 / 4 | 0.231 | **0.128** | **−44.8%** |
+| `C148` (nq=200) | 8.99 | **8.76** | **−2.53%** | 4 / 4 | 1.581 | **1.352** | **−14.5%** |
+| `de222b73` (nq=60) | 80.34 | 80.94 | +0.74% (noise) | 2 / 4 | 15.357 | **14.541** | **−5.3%** |
+
+### Combined full-gate verification for Findings 164 & 165 (`work/port5356/`, isolated fat build; `bench/bench` untouched)
+
+- **Fat build (`GPU_ARCH=all`: `sm_120, sm_90, sm_89, sm_86, sm_80, sm_75, compute_80`):** clean compile and link of `bench`, `fbgen`, `fbgen_gpu`, `normscan`, `dumpcmp`, `mkcofbatch`, `fbtest`, `ckpttest`, `stoptest`, `tunedtest`, `slabtest`, `sqgentest`, `multest`, `xftest` with zero C/C++ warnings.
+- **Cross-architecture `-Xptxas -v` audit (`work/port5356/ptxas_all.log`):**
+  - `sm_120`: `k_apply` 40 regs / 8 B stack / 0 spills (unchanged); `k_apply_sparse<2,3072>` 40 regs / 0 B stack / 0 spills (31,456 B smem); `k_apply_sparse<1,5632>` 40 regs / 16 B stack (32,160 B smem); `k_apply_ovf_dense` 40 regs / 16 B stack; `k_classify` 50 regs / 0 B stack / 0 spills (down from 52); `k_cofac<4,1,1>` 128 regs / 384 B stack / 28/20 B spills (unchanged). Runtime occupancy banner on RTX 5070: `apply: 3 blocks of 512 threads per SM, 32976 B shared memory each` and `sparse apply: 3 blocks of 512 threads per SM (32160 / 31456 B static shared memory)`.
+  - `sm_80 / sm_86 / sm_89`: `k_apply`, `k_apply_ovf_dense`, and `k_apply_sparse<2,3072>` all 40 regs / 0 B stack / 0 spills; `k_classify` 42 regs / 0 B stack / 0 spills; `k_cofac<4,1,1>` 128 regs / 368 B stack / 0 spills.
+  - `sm_75`: 0 B spills across all kernels (`k_classify` 42 regs, `k_apply_sparse` 50–54 regs, `k_apply` 42 regs).
+- **`make GPU_ARCH=all check` (`work/port5356/gate_check.log`):** exit 0, all gates passed — `ckpttest`, `stoptest`, `tunedtest` (96/96), `tunecheck.sh` (142/142), `multest` (0/34 failed), `xftest` (0/4 failed), `cofcheck.sh` (all golden cases + all 11 new `sparse-apply` cases: unslabbed, odd slab rows, odd-start 2-row, 217/512 mixed overflow fallback on candidates+relations, and all 7 refusal checks), `chunksimcheck.sh` (100,073 checks), `fbgencheck.sh`, `sqgentest`, `walkcheck`, `slabtest`, and `fbtest`.
+- **`fillcheck.sh` (`work/port5356/gate_fillcheck.log`):** **125 of 125 arms byte-identical** across `c143-i13`, `c143-i14`, `c183-i15`, `c183-i15-slab`, and `c194-i16` (including `gate3-nosparse`, `gate3-spauto`, `gate3-sp1`, `gate3-sp2`, and `default`).
+- **`abcheck.sh` vs installed `bench/bench` (`4b3b2cfb`) (`work/port5356/gate_abcheck.log`):** **36 of 36 cases identical, 0 failed, 0 skipped, 0 overflow warnings** (including all 4 NFS@Home I16 cases, `c183.slab`, `c183.sq0`, `c194`, `c143` I13/I14, `c143.target` stop, and all 18 harness bitmap cases). Caught and fixed a reporting clash during the first run where `(0 overflow block(s))` tripped `abcheck.sh`'s `overflow|truncated` grep; renamed to `(dense fallback: N block(s))`.
+- **`tunedgate.sh` (`work/port5356/gate_tunedgate.log`):** **48 of 48 checks passed**.
+- **`qhcheck.sh` (`work/port5356/gate_qhcheck.log`):** **11 of 11 cases passed, 0 failed** (including `c143`, `c183`, `c194`, `nfs`, 16,384-slot queue flushes, candidate-list growth, `compute-sanitizer --tool memcheck` 0 errors, and both `qe`/`qm` negative controls; 3 `c135` cases skipped for absent `work/c135/`).
+- **`PIPE_TEST_SPARSE_MAX_NS=40` pricing build (`work/port5356/ovf_test/`):** `c183` emitted 1,845 candidates byte-identical across dense, 1-row (`16383` fallback blocks), and 2-row (`8192` fallback blocks).
+- **Install status:** `bench/bench` remains untouched at `4b3b2cfb` pending explicit go-ahead to build & install into `bench/`.

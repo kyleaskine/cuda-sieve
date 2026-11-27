@@ -684,6 +684,27 @@ typedef struct {
      * bitmap, so it needs the gate: default on with it, off without, and
      * refused explicitly without it. Output-identical by construction. */
     int      norm_gate;
+    /* --sparse-apply (row 53, finding 164): side 0's apply runs a row-wide
+     * sparse kernel over side 1's survivors (compacted norms, register
+     * tiny-prime checks, s_gate-filtered small-sieve/bucket adds, and
+     * out-of-line dense fallback for rows exceeding MAX_NS). Needs --norm-gate
+     * and a supported launch shape (logI in 12..16, region in 6..logI, 512
+     * apply threads): default on for sm_120 (Blackwell, tuned_card_defaults),
+     * off elsewhere until timed on Ada/Ampere/Turing; refused explicitly
+     * without --norm-gate or on an unsupported shape. Output-identical by
+     * construction. sparse_apply_default says the value came from the card
+     * default, not a flag. sparse_apply_rows: 0 = auto per slab from side 1's
+     * per-row survivor mean (<= SPARSE_APPLY_AUTO_2ROW -> 2-row,
+     * <= SPARSE_APPLY_AUTO_1ROW -> 1-row, else dense), 1 = force 1-row,
+     * 2 = force 2-row (1-row on odd-row slabs). */
+#define SPARSE_APPLY_LOGI_MIN       12
+#define SPARSE_APPLY_LOGI_MAX       16
+#define SPARSE_APPLY_REGION_MIN      6   /* matches apply_scan_stores<16> */
+#define SPARSE_APPLY_AUTO_2ROW   750.0
+#define SPARSE_APPLY_AUTO_1ROW  4200.0
+    int      sparse_apply;
+    int      sparse_apply_default;
+    int      sparse_apply_rows;
     /* --row-cap (default; --no-row-cap): each bucket region holds its row
      * class's share of the capacity, by the positions --sieve-skip keeps in
      * its row (slab.h, bklay_t; finding 132). Output-identical. */
@@ -1055,8 +1076,10 @@ static inline int fill_blocks_auto(const bench_cfg_t *cfg)
  * 2026-11-24 the pair is the RTX 5060's best, 384 on its 30 SMs (12.8 per SM;
  * 256 lost most of the gain, 512 a third of it), which gives 614 on the 5070's
  * 48: level with 512 there on the NFS@Home job at J 16384, as 640 was at
- * J 32768 (work/sfagrid-20261124/, STATUS row 44). On by default on every
- * sm_120 card (tuned_card_defaults); bench/tune.sh times the grid on others. */
+ * J 32768 (work/sfagrid-20261124/, STATUS row 44). On the 5080's 84 SMs the
+ * rule's 1075 was best or level: 768 and 1024 within 0.2%, 512 1.9% slower
+ * (2026-11-26, work/tune5080-20261126/). On by default on every sm_120 card
+ * (tuned_card_defaults); bench/tune.sh times the grid on others. */
 #define SLAB_FILL_BLOCKS_DEFAULT 384
 #define SLAB_FILL_DEFAULT_SMS    30
 /* --fill-merge: the row tier's cut, and threads per block. 8 beat 4 and 16 on

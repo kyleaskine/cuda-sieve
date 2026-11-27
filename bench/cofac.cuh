@@ -215,15 +215,16 @@ template <int L> CF_FN void mz_divexact(mz<L> *q, const mz<L> *n, const mz<L> *d
  * around 2^-40, it never emits one with a composite ideal. */
 template <int L> CF_FN int mz_sprp2(const mz<L> *n)
 {
-    mz<L> one, two, nm1, x, base, d;
+    mz<L> one, nm1, x, d;
     uint32_t n0inv = mz_n0inv(n->v[0]);
+    const int nbits = mz_bits<L>(n);
     int r = 0, dbits;
 
+    const int topw = (nbits - 1) >> 5;
+    const uint32_t topb = 1u << ((nbits - 1) & 31);
     #pragma unroll
-    for (int i = 0; i < L; i++) one.v[i] = 0;
-    one.v[0] = 1;
-    for (int i = 0; i < 32 * L; i++) mz_dbl_mod<L>(&one, n);   /* R mod n */
-    two = one; mz_dbl_mod<L>(&two, n);
+    for (int i = 0; i < L; i++) one.v[i] = (i == topw) ? topb : 0u;
+    for (int i = nbits - 1; i < 32 * L; i++) mz_dbl_mod<L>(&one, n); /* R mod n */
 
     nm1 = *n; { mz<L> t = one; mz_sub<L>(&nm1, &t); }
 
@@ -231,11 +232,11 @@ template <int L> CF_FN int mz_sprp2(const mz<L> *n)
     while ((d.v[0] & 1u) == 0u) { mz_rshift1<L>(&d); r++; }
     dbits = mz_bits<L>(&d);
 
-    x = one; base = two;
-    for (int i = dbits - 1; i >= 0; i--) {
+    x = one; mz_dbl_mod<L>(&x, n);
+    for (int i = dbits - 2; i >= 0; i--) {
         mz<L> t;
         mz_mul<L>(&t, &x, &x, n, n0inv); x = t;
-        if ((d.v[i >> 5] >> (i & 31)) & 1u) { mz_mul<L>(&t, &x, &base, n, n0inv); x = t; }
+        if ((d.v[i >> 5] >> (i & 31)) & 1u) mz_dbl_mod<L>(&x, n);
     }
     if (mz_cmp<L>(&x, &one) == 0 || mz_cmp<L>(&x, &nm1) == 0) return 1;
     for (int i = 1; i < r; i++) {

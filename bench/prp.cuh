@@ -21,6 +21,9 @@
 
 #include <stdint.h>
 #include "bigint.cuh"
+#if defined(__CUDACC__)
+#include "cofac_arith.cuh"
+#endif
 
 #define M_LIMBS 4
 
@@ -108,21 +111,86 @@ PRP_FN void m_mul(m128_t *r, const m128_t *a, const m128_t *b,
     if (t[M_LIMBS] || m_cmp(r, n) >= 0) m_sub(r, n);
 }
 
+#if defined(__CUDACC__)
+/* Device-side L-limb SPRP2 built on cofac_arith.cuh's PTX Montgomery products
+ * (mz_mul<3>: 46 SASS for any odd n < 2^96; mz_mul<4>: 59 SASS for odd
+ * n < 2^127). Base-2 multiplies are mz_dbl_mod (exact: 2*(xR) == (2x)R mod n),
+ * the top 1-bit of d is folded into x = 2R mod n, and R mod n starts from
+ * 2^(nbits-1) < n (valid for all odd n >= 3) via static loop selection so
+ * `one` stays in registers. Output-identical to m_sprp2. */
+template <int L>
+__device__ __forceinline__ int m_sprp2_mz(const mz<L> *n)
+{
+    mz<L> one, nm1, x, d;
+    const uint32_t n0inv = mz_n0inv(n->v[0]);
+    const int nbits = mz_bits<L>(n);
+    int r = 0;
+
+    const int topw = (nbits - 1) >> 5;
+    const uint32_t topb = 1u << ((nbits - 1) & 31);
+    #pragma unroll
+    for (int i = 0; i < L; i++) one.v[i] = (i == topw) ? topb : 0u;
+    for (int i = nbits - 1; i < 32 * L; i++) mz_dbl_mod<L>(&one, n); /* R mod n */
+
+    nm1 = *n;
+    mz_sub<L>(&nm1, &one);                       /* (n-1) in Montgomery form */
+
+    /* n - 1 = d * 2^r, in ordinary form */
+    d = *n; d.v[0] -= 1u;                        /* n is odd, so no borrow */
+    while ((d.v[0] & 1u) == 0u) { mz_rshift1<L>(&d); r++; }
+    const int dbits = mz_bits<L>(&d);
+
+    /* left-to-right square and multiply on 2^d; top bit of d is 1 */
+    x = one;
+    mz_dbl_mod<L>(&x, n);
+    for (int i = dbits - 2; i >= 0; i--) {
+        mz<L> t;
+        mz_mul<L>(&t, &x, &x, n, n0inv); x = t;
+        if ((d.v[i >> 5] >> (i & 31)) & 1u) mz_dbl_mod<L>(&x, n);
+    }
+
+    if (mz_cmp<L>(&x, &one) == 0 || mz_cmp<L>(&x, &nm1) == 0) return 1;
+    for (int i = 1; i < r; i++) {
+        mz<L> t;
+        mz_mul<L>(&t, &x, &x, n, n0inv); x = t;
+        if (mz_cmp<L>(&x, &nm1) == 0) return 1;
+    }
+    return 0;
+}
+#endif
+
 /* Strong probable prime test, base 2. n must be odd and at least 3.
  * Returns 1 if n is a base-2 strong probable prime. */
 PRP_FN int m_sprp2(const m128_t *n)
 {
-    m128_t one, two, nm1, x, base;
+#if defined(__CUDA_ARCH__)
+    if (n->v[3] == 0u) {
+        mz<3> m3; m3.v[0] = n->v[0]; m3.v[1] = n->v[1]; m3.v[2] = n->v[2];
+        return m_sprp2_mz<3>(&m3);
+    }
+    if ((n->v[3] >> 31) == 0u) {
+        mz<4> m4;
+        m4.v[0] = n->v[0]; m4.v[1] = n->v[1]; m4.v[2] = n->v[2]; m4.v[3] = n->v[3];
+        return m_sprp2_mz<4>(&m4);
+    }
+#endif
+    m128_t one, nm1, x;
     uint32_t n0inv = m_n0inv(n->v[0]);
-    int r = 0, dbits;
+    int r = 0, dbits, nbits = 0;
     m128_t d;
 
-    /* R mod n by doubling 1 up 128 times: R itself does not fit in four
-     * limbs, and a division to reduce it is what this file exists to avoid. */
-    for (int i = 0; i < M_LIMBS; i++) one.v[i] = 0;
-    one.v[0] = 1;
-    for (int i = 0; i < 32 * M_LIMBS; i++) m_dbl_mod(&one, n);
-    two = one; m_dbl_mod(&two, n);              /* Montgomery form of 2 */
+    /* R mod n starting from 2^(nbits-1) < n (n is odd >= 3, so nbits >= 2). */
+    for (int i = M_LIMBS - 1; i >= 0; i--) {
+        if (n->v[i]) { uint32_t w = n->v[i]; int b = 0;
+                       while (w) { w >>= 1; b++; }
+                       nbits = i * 32 + b; break; }
+    }
+    {
+        const int topw = (nbits - 1) >> 5;
+        const uint32_t topb = 1u << ((nbits - 1) & 31);
+        for (int i = 0; i < M_LIMBS; i++) one.v[i] = (i == topw) ? topb : 0u;
+    }
+    for (int i = nbits - 1; i < 32 * M_LIMBS; i++) m_dbl_mod(&one, n);
 
     nm1 = *n;
     { m128_t t = one; m_sub(&nm1, &t); }        /* (n-1) in Montgomery form */
@@ -145,13 +213,12 @@ PRP_FN int m_sprp2(const m128_t *n)
                       dbits = i * 32 + b; break; }
     }
 
-    /* left-to-right square and multiply on 2^d */
-    x = one;
-    base = two;
-    for (int i = dbits - 1; i >= 0; i--) {
+    /* left-to-right square and multiply on 2^d; top bit of d is 1 */
+    x = one; m_dbl_mod(&x, n);
+    for (int i = dbits - 2; i >= 0; i--) {
         m128_t t;
         m_mul(&t, &x, &x, n, n0inv); x = t;
-        if ((d.v[i >> 5] >> (i & 31)) & 1u) { m_mul(&t, &x, &base, n, n0inv); x = t; }
+        if ((d.v[i >> 5] >> (i & 31)) & 1u) m_dbl_mod(&x, n);
     }
 
     if (m_cmp(&x, &one) == 0 || m_cmp(&x, &nm1) == 0) return 1;

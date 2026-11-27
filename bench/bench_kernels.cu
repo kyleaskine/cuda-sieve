@@ -1261,11 +1261,12 @@ template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
  * The 512 is a hard ceiling, not a hint: a launch with more than 512 threads
  * per block fails outright, which is why --apply-threads is capped at
  * APPLY_THREADS_MAX rather than the 1024 a block could otherwise carry. */
-__global__ __launch_bounds__(512, 3)
-void k_apply(const uint32_t *__restrict buckets,
+__device__ __forceinline__ void apply_region_dense(
+                        uint32_t *sm, uint32_t b,
+                        const uint32_t *__restrict buckets,
                         const uint32_t *__restrict cnt, bklay_t lay,
                         int logI, int log_region,
-                        norm_t N, uint32_t CINIT, uint32_t THRESH, uint32_t tconst,
+                        const norm_t &N, uint32_t CINIT, uint32_t THRESH, uint32_t tconst,
                         uint8_t *__restrict dump,
                         uint32_t *__restrict nsurv,
                         uint16_t *__restrict dbg_cells,
@@ -1280,13 +1281,12 @@ void k_apply(const uint32_t *__restrict buckets,
                         int sieve_skip, uint32_t j_base,
                         const uint32_t *__restrict ngate)
 {
-    extern __shared__ uint32_t sm[];
     const uint32_t ncell  = 1u << log_region;
     const uint32_t nword  = ncell / (32 / CELLBITS);
     const uint32_t CPW    = 32 / CELLBITS;          /* cells per 32-bit word */
     uint32_t *S   = sm;               /* the cells are all of the shared memory */
 
-    const uint32_t b = blockIdx.x, tid = threadIdx.x, nth = blockDim.x;
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
     const uint32_t Imask = (1u << logI) - 1;
     const int32_t  Ihalf = 1 << (logI - 1);
     const uint32_t xbase = b << log_region;
@@ -1530,11 +1530,16 @@ void k_apply(const uint32_t *__restrict buckets,
      *
      * **CALLER CONTRACT, unenforceable from inside the kernel.** The fast path
      * OVERWRITES survbits words rather than OR-ing into them, which is correct
-     * only when (a) blockIdx.x maps 1:1 onto regions, so `xbase = b <<
-     * log_region` makes each block's words private, and (b) exactly one launch
-     * writes a given bitmap. Both callers satisfy this today (`<<<nregion,
-     * athr>>>`, one launch per side per slab). A caller that grid-strides
-     * regions -- the pattern k_purge uses -- or that accumulates two slabs into
+     * only when every region `b` is written by at most one block and any
+     * multi-launch scheme writes disjoint sets of regions (words):
+     *   - `k_apply` launches `<<<nregion, athr>>>` with `b = blockIdx.x`,
+     *     covering the whole slab in one launch with private per-region words.
+     *   - `k_apply_sparse` + `k_apply_ovf_dense` partition the slab by whole
+     *     rows: non-overflowing blocks in `k_apply_sparse` overwrite their own
+     *     rows' words and overflowing blocks leave theirs untouched, after
+     *     which `k_apply_ovf_dense` grid-strides over only the disjoint
+     *     regions belonging to those overflowing rows.
+     * A caller that assigns the same region twice or accumulates two slabs into
      * one bitmap would get a bitmap where only the last-written words are
      * correct, and only when log_region >= 5, so it would pass --region 4 and
      * fail the default --region 14. The kernel cannot check this: it never
@@ -1633,6 +1638,522 @@ void k_apply(const uint32_t *__restrict buckets,
             dbg_cells[2 * w]     = (uint16_t)(S[w] & 0xFFFFu);
             dbg_cells[2 * w + 1] = (uint16_t)(S[w] >> 16);
         }
+}
+
+template <int CELLBITS, int ATOMIC, int NORMMODE, bool SLABBED = false,
+          bool SSTAIL = true, bool NGATE = false>
+__global__ __launch_bounds__(512, 3)
+void k_apply(const uint32_t *__restrict buckets,
+             const uint32_t *__restrict cnt, bklay_t lay,
+             int logI, int log_region,
+             norm_t N, uint32_t CINIT, uint32_t THRESH, uint32_t tconst,
+             uint8_t *__restrict dump,
+             uint32_t *__restrict nsurv,
+             uint16_t *__restrict dbg_cells,
+             uint32_t dbg_region,
+             const uint32_t *__restrict sp, const uint32_t *__restrict srt,
+             const uint32_t *__restrict sg, const uint16_t *__restrict slp,
+             const uint32_t *__restrict smag,
+             uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
+             uint32_t nsplit, uint32_t nfold, uint32_t ntab,
+             uint32_t probe_x, uint32_t *__restrict probe_out,
+             uint32_t *__restrict survbits, int not_both_even,
+             int sieve_skip, uint32_t j_base,
+             const uint32_t *__restrict ngate)
+{
+    extern __shared__ uint32_t sm[];
+    apply_region_dense<CELLBITS, ATOMIC, NORMMODE, SLABBED, SSTAIL, NGATE>(
+        sm, blockIdx.x, buckets, cnt, lay, logI, log_region,
+        N, CINIT, THRESH, tconst, dump, nsurv, dbg_cells, dbg_region,
+        sp, srt, sg, slp, smag, nsmall, nblk, nwrp, nsplit, nfold, ntab,
+        probe_x, probe_out, survbits, not_both_even, sieve_skip, j_base, ngate);
+}
+
+/* ---- --sparse-apply (row 53): row-wide sparse side-0 apply + fallback --- *
+ *
+ * Under --norm-gate, side 1's survivors are known before side 0's apply runs
+ * (0.24-0.56% of positions on GNFS, 1.8-3.0% on SNFS deg-6). Dense k_apply
+ * still runs per-quarter-row blocks (--region 14), repeating all ~6,500
+ * thread-tier ss_setup calls 4x per row, walking block/warp atomics into
+ * dead cells, and diverging in norm init when a 64-position group holds 1-2
+ * survivors.
+ *
+ * k_apply_sparse gives one 512-thread block NROWS whole rows in <= 32.2 KB
+ * static shared memory (3 blocks/SM on 100 KB SMEM, 40 regs):
+ *   NROWS=1, MAX_NS=5632 -> 32,160 B smem (SNFS deg-6: ~0.3% row fallback)
+ *   NROWS=2, MAX_NS=3072 -> 31,456 B smem (GNFS & logI<=15: ~0.0% fallback)
+ * Any block whose survivor count exceeds MAX_NS appends its row base to
+ * d_ovf_rows and returns; k_apply_ovf_dense runs apply_region_dense on only
+ * those regions (zero host sync; exits immediately when *d_novf == 0). */
+
+template <bool SLABBED, bool SSTAIL>
+__global__ __launch_bounds__(512, 3)
+void k_apply_ovf_dense(const uint32_t *__restrict d_novf,
+                       const uint32_t *__restrict d_ovf_rows,
+                       uint32_t nrows_per_blk,
+                       const uint32_t *__restrict buckets,
+                       const uint32_t *__restrict cnt, bklay_t lay,
+                       int logI, int log_region,
+                       norm_t N, uint32_t CINIT, uint32_t THRESH, uint32_t tconst,
+                       uint32_t *__restrict nsurv,
+                       const uint32_t *__restrict sp, const uint32_t *__restrict srt,
+                       const uint32_t *__restrict sg, const uint16_t *__restrict slp,
+                       const uint32_t *__restrict smag,
+                       uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
+                       uint32_t nsplit, uint32_t nfold, uint32_t ntab,
+                       uint32_t *__restrict survbits, int not_both_even,
+                       int sieve_skip, uint32_t j_base,
+                       const uint32_t *__restrict ngate)
+{
+    const uint32_t novf = *d_novf;
+    if (!novf) return;
+    extern __shared__ uint32_t sm[];
+    const uint32_t rpr = 1u << (logI - log_region);
+    const uint32_t regs_per_blk = nrows_per_blk * rpr;
+    const uint32_t total = novf * regs_per_blk;
+    for (uint32_t idx = blockIdx.x; idx < total; idx += gridDim.x) {
+        const uint32_t r0 = d_ovf_rows[idx / regs_per_blk];
+        const uint32_t b  = (r0 << (logI - log_region)) + (idx % regs_per_blk);
+        apply_region_dense<16, 1, NORM_HORNER, SLABBED, SSTAIL, true>(
+            sm, b, buckets, cnt, lay, logI, log_region,
+            N, CINIT, THRESH, tconst, nullptr, nsurv, nullptr, 0xFFFFFFFFu,
+            sp, srt, sg, slp, smag, nsmall, nblk, nwrp, nsplit, nfold, ntab,
+            0xFFFFFFFFu, nullptr, survbits, not_both_even, sieve_skip, j_base, ngate);
+        __syncthreads();
+    }
+}
+
+/* Exact norm evaluation for one survivor (ii, jj): bit-identical to k_apply. */
+template <int DEG>
+__device__ __forceinline__ uint32_t sparse_norm_eval(const norm_t &N, int32_t ii,
+                                                     uint32_t jj, uint32_t CINIT)
+{
+    const int deg = DEG > 0 ? DEG : N.deg;
+    const float fi = (float)ii;
+    const float fj = (float)jj;
+    const float u = fmaf(N.ua, fi, N.ub * fj);
+    const float v = fmaf(N.va, fi, N.vb * fj);
+    float acc = N.d[deg], vp = 1.0f;
+    float aabs = fabsf(N.d[deg]), vpa = 1.0f;
+    const float au = fabsf(u), av = fabsf(v);
+    #pragma unroll
+    for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+        if (k < deg) {
+            vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
+            vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
+        }
+    float s = fabsf(acc);
+    if (s < NORM_CANCEL_TOL * aabs) {
+        const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
+        const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
+        const double ud = a / N.A, vd = b / N.B;
+        double accd = N.dd[deg], vpd = 1.0;
+        #pragma unroll
+        for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+            if (k < deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
+        s = (float)fabs(accd);
+    }
+#ifdef NORM_FAST_LOG2
+    const float lg = N.scale * (N.log2M + __log2f(fmaxf(s, 1e-30f)) - N.bias);
+#else
+    const float lg = N.scale * (N.log2M + log2f(fmaxf(s, 1e-30f)) - N.bias);
+#endif
+    const int ti = (int)floorf(lg + 0.5f);
+    return (ti < 0) ? 0u : ((uint32_t)ti > CINIT ? CINIT : (uint32_t)ti);
+}
+
+__device__ __forceinline__ void sparse_add(const uint32_t *s_gate,
+                                           const uint16_t *s_rank,
+                                           uint32_t *s_sum,
+                                           uint32_t w_off, uint32_t c,
+                                           uint32_t lp)
+{
+    const uint32_t w = w_off + (c >> 5);
+    const uint32_t bit = 1u << (c & 31u);
+    const uint32_t gw = s_gate[w];
+    if (!(gw & bit)) return;
+    uint32_t idx = s_rank[w >> 2];
+    const uint32_t w0 = w & ~3u;
+    const uint32_t rem = w & 3u;
+    if (rem >= 1u) idx += __popc(s_gate[w0]);
+    if (rem >= 2u) idx += __popc(s_gate[w0 + 1u]);
+    if (rem == 3u) idx += __popc(s_gate[w0 + 2u]);
+    idx += __popc(gw & (bit - 1u));
+    atomicAdd(&s_sum[idx >> 1], lp << ((idx & 1u) * 16u));
+}
+
+/* TEST-ONLY (0 everywhere else): cap k_apply_sparse's survivor limit to a
+ * smaller value so k_apply_ovf_dense runs on ordinary jobs without raising
+ * the survivor threshold. Set through DEFS (pricing build). */
+#ifndef PIPE_TEST_SPARSE_MAX_NS
+#define PIPE_TEST_SPARSE_MAX_NS 0
+#endif
+
+/* Caller contract: blockDim.x == 512, logI in [12, 16], log_region <= logI,
+ * and gridDim.x * NROWS == rows (so rows must be even for NROWS == 2). */
+template <int NROWS, int MAX_NS, bool SLABBED, bool SSTAIL>
+__global__ __launch_bounds__(512, 3)
+void k_apply_sparse(const uint32_t *__restrict buckets,
+                    const uint32_t *__restrict cnt, bklay_t lay,
+                    int logI, int log_region,
+                    norm_t N, uint32_t CINIT, uint32_t THRESH,
+                    uint32_t *__restrict nsurv,
+                    const uint32_t *__restrict sp, const uint32_t *__restrict srt,
+                    const uint32_t *__restrict sg, const uint16_t *__restrict slp,
+                    const uint32_t *__restrict smag,
+                    uint32_t nsmall, uint32_t nblk, uint32_t nwrp,
+                    uint32_t nsplit,
+                    uint32_t *__restrict survbits, int not_both_even,
+                    int sieve_skip, uint32_t j_base,
+                    const uint32_t *__restrict ngate,
+                    uint32_t *__restrict d_novf,
+                    uint32_t *__restrict d_ovf_rows)
+{
+    __shared__ uint32_t s_gate[NROWS * 2048];
+    __shared__ uint16_t s_rank[NROWS * 512];
+    __shared__ uint16_t s_pos[MAX_NS];
+    __shared__ uint32_t s_sum[(MAX_NS + 1) / 2];
+    __shared__ uint32_t s_warp[20];
+    __shared__ uint32_t s_tiny_c0mm[NROWS * 32];
+    __shared__ uint32_t s_tiny_inv[NROWS * 32];
+    __shared__ uint16_t s_tiny_lp[NROWS * 32];
+    __shared__ uint32_t s_ntiny[NROWS];
+    __shared__ uint32_t s_base_add[NROWS];
+
+    const uint32_t tid = threadIdx.x, nth = 512u;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t I = 1u << logI;
+    const int32_t  Ihalf = (int32_t)(1u << (logI - 1));
+    const uint32_t wpr = 1u << (logI - 5);          /* words per row (2048 at I16) */
+    const uint32_t nw = (uint32_t)NROWS * wpr;
+    const uint32_t r_base = blockIdx.x * (uint32_t)NROWS;
+    const uint32_t j0 = (SLABBED ? j_base : 0u) + r_base;
+    const uint32_t wbase = r_base * wpr;
+    const int drop_both_even = not_both_even || sieve_skip;
+    const uint32_t kshift = SS_KSHIFT(logI);
+    const uint32_t ntiny_lim = (nblk < 32u) ? nblk : 32u;
+
+    /* ---- Phase 0: coalesced s_gate load, prefix popcount, overflow check ---- */
+    for (uint32_t w = tid; w < nw; w += nth) {
+        const uint32_t rr = (NROWS == 2 && w >= wpr) ? 1u : 0u;
+        uint32_t gw = ngate[wbase + w];
+        if (drop_both_even && !((j0 + rr) & 1u)) gw &= 0xAAAAAAAAu;
+        s_gate[w] = gw;
+    }
+    __syncthreads();
+
+    const uint32_t ngrp4 = nw >> 2;
+    const uint32_t K = (ngrp4 > 512u) ? 2u : 1u;
+    const uint32_t g0 = tid * K;
+    uint32_t gc0 = 0u, gc1 = 0u;
+    if (g0 < ngrp4) {
+        const uint32_t w0 = g0 << 2;
+        gc0 = __popc(s_gate[w0]) + __popc(s_gate[w0 + 1u])
+            + __popc(s_gate[w0 + 2u]) + __popc(s_gate[w0 + 3u]);
+    }
+    if (K == 2u && (g0 + 1u) < ngrp4) {
+        const uint32_t w1 = (g0 + 1u) << 2;
+        gc1 = __popc(s_gate[w1]) + __popc(s_gate[w1 + 1u])
+            + __popc(s_gate[w1 + 2u]) + __popc(s_gate[w1 + 3u]);
+    }
+    const uint32_t tsum = gc0 + gc1;
+    uint32_t wscan = tsum;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t v = __shfl_up_sync(0xFFFFFFFFu, wscan, off);
+        if (lane >= (uint32_t)off) wscan += v;
+    }
+    if (lane == 31u) s_warp[warp] = wscan;
+    __syncthreads();
+
+    if (warp == 0u) {
+        const uint32_t v = (lane < 16u) ? s_warp[lane] : 0u;
+        uint32_t inc = v;
+        #pragma unroll
+        for (int off = 1; off < 16; off <<= 1) {
+            const uint32_t u = __shfl_up_sync(0xFFFFFFFFu, inc, off);
+            if (lane >= (uint32_t)off) inc += u;
+        }
+        if (lane < 16u) s_warp[lane] = inc - v;
+        if (lane == 15u) s_warp[16] = inc;
+    }
+    __syncthreads();
+
+    const uint32_t ns_tot = s_warp[16];
+    if (ns_tot == 0u) {
+        for (uint32_t w = tid; w < nw; w += nth) survbits[wbase + w] = 0u;
+        return;
+    }
+    constexpr uint32_t ovf_lim =
+        (PIPE_TEST_SPARSE_MAX_NS > 0 && PIPE_TEST_SPARSE_MAX_NS < MAX_NS)
+        ? (uint32_t)PIPE_TEST_SPARSE_MAX_NS : (uint32_t)MAX_NS;
+    if (ns_tot > ovf_lim) {
+        if (tid == 0u) {
+            const uint32_t slot = atomicAdd(d_novf, 1u);
+            d_ovf_rows[slot] = r_base;
+        }
+        return;
+    }
+
+    /* Write s_rank and compact survivor column offsets into s_pos (lock-free). */
+    const uint32_t rbase = s_warp[warp] + (wscan - tsum);
+    if (g0 < ngrp4) {
+        s_rank[g0] = (uint16_t)rbase;
+        if (gc0) {
+            uint32_t pos = rbase;
+            const uint32_t w0 = g0 << 2;
+            #pragma unroll
+            for (uint32_t u = 0; u < 4u; u++) {
+                uint32_t gw = s_gate[w0 + u];
+                const uint32_t col_hi = ((w0 + u) & (wpr - 1u)) << 5;
+                while (gw) {
+                    const uint32_t bit = (uint32_t)__ffs((int)gw) - 1u;
+                    gw &= gw - 1u;
+                    s_pos[pos++] = (uint16_t)(col_hi | bit);
+                }
+            }
+        }
+    }
+    if (K == 2u && (g0 + 1u) < ngrp4) {
+        const uint32_t rbase1 = rbase + gc0;
+        s_rank[g0 + 1u] = (uint16_t)rbase1;
+        if (gc1) {
+            uint32_t pos = rbase1;
+            const uint32_t w1 = (g0 + 1u) << 2;
+            #pragma unroll
+            for (uint32_t u = 0; u < 4u; u++) {
+                uint32_t gw = s_gate[w1 + u];
+                const uint32_t col_hi = ((w1 + u) & (wpr - 1u)) << 5;
+                while (gw) {
+                    const uint32_t bit = (uint32_t)__ffs((int)gw) - 1u;
+                    gw &= gw - 1u;
+                    s_pos[pos++] = (uint16_t)(col_hi | bit);
+                }
+            }
+        }
+    }
+
+    /* Piggyback tiny-prime setup ([0, ntiny_lim)) on the same barrier.
+     * For col < 65536 and 2 <= mm <= 65535, inv = ceil(2^32 / mm) gives exact
+     * floor(col / mm) = __umulhi(col, inv) with no correction step. */
+    if (warp < (uint32_t)NROWS) {
+        const uint32_t rr = warp;
+        const uint32_t jr = j0 + rr;
+        const int evenrow_r = sieve_skip && !(jr & 1u);
+        uint32_t c0 = 0u, mm = 0u, lp = 0u;
+        if (nsmall && lane < ntiny_lim) {
+            c0 = ss_setup(lane, sp, srt, sg, smag, jr, -Ihalf, kshift, evenrow_r, &mm);
+            if (mm) lp = slp[lane];
+        }
+        uint32_t badd = (mm == 1u) ? lp : 0u;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            badd += __shfl_down_sync(0xFFFFFFFFu, badd, off);
+        if (lane == 0u) s_base_add[rr] = badd;
+
+        const uint32_t act = __ballot_sync(0xFFFFFFFFu, mm >= 2u);
+        if (mm >= 2u) {
+            const uint32_t slot = rr * 32u + (uint32_t)__popc(act & ((1u << lane) - 1u));
+            s_tiny_c0mm[slot] = c0 | (mm << 16);
+            s_tiny_inv[slot]  = (uint32_t)((0x100000000ull + mm - 1u) / mm);
+            s_tiny_lp[slot]   = (uint16_t)lp;
+        }
+        if (lane == 0u) s_ntiny[rr] = (uint32_t)__popc(act);
+    }
+    __syncthreads();
+
+    const uint32_t ns0 = (NROWS == 2) ? (uint32_t)s_rank[wpr >> 2] : ns_tot;
+
+    /* ---- Phase 1: compacted norm init + tiny-prime register accumulation ---- */
+    const uint32_t npairs = (ns_tot + 1u) >> 1;
+    auto init_sparse = [&](auto degc) {
+        constexpr int DEG = decltype(degc)::value;
+        for (uint32_t w = tid; w < npairs; w += nth) {
+            uint32_t word = 0u;
+            #pragma unroll
+            for (uint32_t c = 0; c < 2u; c++) {
+                const uint32_t idx = (w << 1) + c;
+                if (idx < ns_tot) {
+                    const uint32_t col = s_pos[idx];
+                    const uint32_t rr  = (NROWS == 2 && idx >= ns0) ? 1u : 0u;
+                    const uint32_t t   = sparse_norm_eval<DEG>(N, (int32_t)col - Ihalf,
+                                                               j0 + rr, CINIT);
+                    uint32_t val = (CINIT - t) + s_base_add[rr];
+                    const uint32_t nt = s_ntiny[rr];
+                    const uint32_t tb = rr * 32u;
+                    for (uint32_t k = 0; k < nt; k++) {
+                        const uint32_t cm  = s_tiny_c0mm[tb + k];
+                        const uint32_t c0  = cm & 0xFFFFu;
+                        const uint32_t mm  = cm >> 16;
+                        const uint32_t inv = s_tiny_inv[tb + k];
+                        if (col - __umulhi(col, inv) * mm == c0)
+                            val += s_tiny_lp[tb + k];
+                    }
+                    word |= (val & 0xFFFFu) << (c * 16u);
+                }
+            }
+            s_sum[w] = word;
+        }
+    };
+    /* Side 0 is degree 1 on every standard GNFS/SNFS job; specialise deg 1
+     * and keep the generic loop for higher-degree side-0 polynomials so ptxas
+     * holds 40 registers without spilling the 2-row instance. */
+    if (N.deg == 1) init_sparse(deg_c<1>{});
+    else            init_sparse(deg_c<0>{});
+    __syncthreads();
+
+    /* ---- Phase 2: warp tier ([ntiny_lim, nwrp)) & thread tier ([nwrp, nsmall)) ---- */
+    if (nsmall) {
+        const uint32_t nwarps = 16u;
+        if (ntiny_lim < nwrp) {
+            #pragma unroll
+            for (uint32_t rr = 0; rr < (uint32_t)NROWS; rr++) {
+                const uint32_t jr = j0 + rr;
+                const int evenrow_r = sieve_skip && !(jr & 1u);
+                const uint32_t w_off = rr * wpr;
+                for (uint32_t base = 0; ; base += 32u) {
+                    const uint32_t e0 = ntiny_lim + warp + base * nwarps;
+                    if (e0 >= nwrp) break;
+                    const uint32_t e = e0 + lane * nwarps;
+                    uint32_t pk = 0u, lp = 0u;
+                    if (e < nwrp) {
+                        uint32_t mm;
+                        const uint32_t c0 = ss_setup(e, sp, srt, sg, smag, jr, -Ihalf,
+                                                     kshift, evenrow_r, &mm);
+                        if (mm) { pk = c0 | (mm << 16); lp = slp[e]; }
+                    }
+                    const uint32_t left = (nwrp - e0 + nwarps - 1u) / nwarps;
+                    const uint32_t ne = left < 32u ? left : 32u;
+                    for (uint32_t k = 0; k < ne; k++) {
+                        const uint32_t q  = __shfl_sync(0xFFFFFFFFu, pk, k);
+                        const uint32_t kl = __shfl_sync(0xFFFFFFFFu, lp, k);
+                        const uint32_t mm = q >> 16;
+                        if (!mm) continue;
+                        for (uint32_t c = (q & 0xFFFFu) + lane * mm; c < I; c += 32u * mm)
+                            sparse_add(s_gate, s_rank, s_sum, w_off, c, kl);
+                    }
+                }
+            }
+        }
+
+        if constexpr (!SSTAIL) {
+            if (nsplit < nsmall) __trap();
+        }
+        /* Thread tier: single loop (finding 111), setup amortized over NROWS rows. */
+        for (uint32_t e = nwrp + tid; e < nsmall; e += nth) {
+            const uint32_t lp = slp[e];
+            const uint32_t m = sp[e], g = sg[e], rt = srt[e];
+            const uint32_t mg = smag ? smag[e] : 0u;
+            uint32_t c0_0 = 0u, mm_0 = 0u, c0_1 = 0u, mm_1 = 0u;
+            if (g == 1u) {
+                uint32_t raw = (SSTAIL && e >= nsplit)
+                    ? ss_first<true>(m, rt, j0, -Ihalf, mg, kshift)
+                    : ss_first<false>(m, rt, j0, -Ihalf, mg, kshift);
+                c0_0 = raw; mm_0 = m;
+                if (sieve_skip && !(j0 & 1u)) {
+                    if (m & 1u) { if (!(c0_0 & 1u)) c0_0 += m; mm_0 = 2u * m; }
+                    else if (!(c0_0 & 1u)) mm_0 = 0u;
+                }
+                if constexpr (NROWS == 2) {
+                    raw += rt; if (raw >= m) raw -= m;
+                    c0_1 = raw; mm_1 = m;
+                    if (sieve_skip && !((j0 + 1u) & 1u)) {
+                        if (m & 1u) { if (!(c0_1 & 1u)) c0_1 += m; mm_1 = 2u * m; }
+                        else if (!(c0_1 & 1u)) mm_1 = 0u;
+                    }
+                }
+            } else {
+                if ((j0 % g) == 0u) {
+                    c0_0 = (SSTAIL && e >= nsplit)
+                        ? ss_first<true>(m, rt, j0 / g, -Ihalf, mg, kshift)
+                        : ss_first<false>(m, rt, j0 / g, -Ihalf, mg, kshift);
+                    mm_0 = m;
+                    if (sieve_skip && !(j0 & 1u)) {
+                        if (m & 1u) { if (!(c0_0 & 1u)) c0_0 += m; mm_0 = 2u * m; }
+                        else if (!(c0_0 & 1u)) mm_0 = 0u;
+                    }
+                }
+                if constexpr (NROWS == 2) {
+                    const uint32_t j1 = j0 + 1u;
+                    if ((j1 % g) == 0u) {
+                        c0_1 = (SSTAIL && e >= nsplit)
+                            ? ss_first<true>(m, rt, j1 / g, -Ihalf, mg, kshift)
+                            : ss_first<false>(m, rt, j1 / g, -Ihalf, mg, kshift);
+                        mm_1 = m;
+                        if (sieve_skip && !(j1 & 1u)) {
+                            if (m & 1u) { if (!(c0_1 & 1u)) c0_1 += m; mm_1 = 2u * m; }
+                            else if (!(c0_1 & 1u)) mm_1 = 0u;
+                        }
+                    }
+                }
+            }
+            if (mm_0) {
+                for (uint32_t c = c0_0; c < I; c += mm_0)
+                    sparse_add(s_gate, s_rank, s_sum, 0u, c, lp);
+            }
+            if constexpr (NROWS == 2) {
+                if (mm_1) {
+                    for (uint32_t c = c0_1; c < I; c += mm_1)
+                        sparse_add(s_gate, s_rank, s_sum, wpr, c, lp);
+                }
+            }
+        }
+    }
+
+    /* ---- Phase 3: bucket records across all NROWS * RPR regions ---- */
+    {
+        const uint32_t ncell = 1u << log_region;
+        const uint32_t rpr = 1u << (logI - log_region);
+        #pragma unroll
+        for (uint32_t rr = 0; rr < (uint32_t)NROWS; rr++) {
+            const uint32_t b_start = (r_base + rr) << (logI - log_region);
+            const uint32_t w_off = rr * wpr;
+            for (uint32_t q = 0; q < rpr; q++) {
+                const uint32_t b = b_start + q;
+                uint32_t cap;
+                const uint32_t *const rec = buckets + bklay_base(lay, b, &cap);
+                uint32_t n = cnt[b];
+                if (n > cap) n = cap;
+                const uint32_t col_base = q << log_region;
+                for (uint32_t i = tid; i < n; i += nth) {
+                    const uint32_t r  = rec[i];
+                    const uint32_t c  = col_base + (r & (ncell - 1u));
+                    const uint32_t lp = r >> 16;
+                    sparse_add(s_gate, s_rank, s_sum, w_off, c, lp);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    /* ---- Phase 4: compacted threshold scan -> reuse s_gate for output bitmap ---- */
+    for (uint32_t w = tid; w < nw; w += nth) s_gate[w] = 0u;
+    __syncthreads();
+
+    uint32_t nlocal = 0u;
+    for (uint32_t w = tid; w < npairs; w += nth) {
+        const uint32_t sw = s_sum[w];
+        #pragma unroll
+        for (uint32_t c = 0; c < 2u; c++) {
+            const uint32_t idx = (w << 1) + c;
+            if (idx < ns_tot) {
+                const uint32_t v = (sw >> (c * 16u)) & 0xFFFFu;
+                if (v >= THRESH) {
+                    const uint32_t col = s_pos[idx];
+                    const uint32_t rr  = (NROWS == 2 && idx >= ns0) ? 1u : 0u;
+                    atomicOr(&s_gate[rr * wpr + (col >> 5)], 1u << (col & 31u));
+                    nlocal++;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t w = tid; w < nw; w += nth) survbits[wbase + w] = s_gate[w];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        nlocal += __shfl_down_sync(0xFFFFFFFFu, nlocal, off);
+    if (lane == 0u && nlocal) atomicAdd(nsurv, nlocal);
 }
 
 /* ---- stage (c) level 1: shared-memory staged split into super-buckets -- */

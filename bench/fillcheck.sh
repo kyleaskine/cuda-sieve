@@ -65,6 +65,10 @@ rows16|--fill-rows 16 --no-fill-merge --no-fill-skip57 --no-resieve-rows --no-fi
 rows16-bands7|--fill-rows 16 --no-fill-merge --no-fill-skip57 --fill-row-bands 7 --no-resieve-rows --no-fill-gate
 gate3|--fill-rows 0 --no-fill-skip57 --fill-gate
 gate3-nonorm|--fill-rows 0 --no-fill-skip57 --fill-gate --no-norm-gate
+gate3-nosparse|--fill-rows 0 --no-fill-skip57 --fill-gate --no-sparse-apply
+gate3-spauto|--fill-rows 0 --no-fill-skip57 --fill-gate --sparse-apply
+gate3-sp1|--fill-rows 0 --no-fill-skip57 --fill-gate --sparse-apply --sparse-apply-rows 1
+gate3-sp2|--fill-rows 0 --no-fill-skip57 --fill-gate --sparse-apply --sparse-apply-rows 2
 gate0|--fill-rows 0 --no-fill-skip57 --fill-gate --fill-gate-shift 0
 rows16-gate3|--fill-rows 16 --no-fill-merge --no-fill-skip57 --no-resieve-rows --fill-gate
 rows4-rs|--fill-rows 4 --no-fill-merge --no-fill-skip57 --resieve-rows --no-fill-gate

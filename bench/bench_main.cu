@@ -320,6 +320,13 @@ static void usage(void)
 "  --norm-gate / --no-norm-gate  --pipeline only; side 0's apply computes\n"
 "                   the log norm only where side 1 has a survivor\n"
 "                   [on with the gate, else off; refused without it]\n"
+"  --sparse-apply / --no-sparse-apply  --pipeline only; side 0's apply runs\n"
+"                   a row-wide sparse kernel over side 1's survivors. Needs\n"
+"                   --norm-gate, logI in 12..16, --region in 6..logI and\n"
+"                   --apply-threads 512. Output-identical  [on with\n"
+"                   --norm-gate on sm_120 (Blackwell), where it was timed;\n"
+"                   off elsewhere until timed]\n"
+"  --sparse-apply-rows N  rows per sparse block: 0=auto, 1, 2         [0]\n"
 "  --resieve-scan / --no-resieve-scan  --pipeline only; side 0's resieve\n"
 "                   reads its pairs from its own gated fill records instead\n"
 "                   of walking its factor base. Costs an index array the size\n"
@@ -1302,6 +1309,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     cfg.fill_gate = -1; cfg.fill_gate_shift = 3;
     cfg.resieve_scan = -1; cfg.resieve_scan_cap = 0; cfg.resieve_scan_pairs = 0;
     cfg.norm_gate = -1;
+    cfg.sparse_apply = -1; cfg.sparse_apply_default = 0; cfg.sparse_apply_rows = 0;
     cfg.row_cap = 1;
     cfg.q_pipeline = -1;   /* resolved with the fill defaults below */
     cfg.fill_ahead = -1;   /* resolved with --q-pipeline */
@@ -1378,6 +1386,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     int maxbits = 0, maxbits_set = 0;
     int sieve_skip_set = 0, tiny_fold_set = 0, tiny_table_set = 0, row_cap_set = 0;
     int fill_row_bands_set = 0, fill_gate_shift_set = 0, resieve_scan_knob = 0;
+    int sparse_apply_rows_set = 0;
     int q_prep_set = 0;
     int allowance_set = 0, allowance0_set = 0, scale0_set = 0;
     const char *cofac_in = NULL;
@@ -1523,6 +1532,13 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         else if (!strcmp(argv[i], "--no-resieve-scan")) { cfg.resieve_scan = 0; }
         else if (!strcmp(argv[i], "--norm-gate")) { cfg.norm_gate = 1; }
         else if (!strcmp(argv[i], "--no-norm-gate")) { cfg.norm_gate = 0; }
+        else if (!strcmp(argv[i], "--sparse-apply")) { cfg.sparse_apply = 1; }
+        else if (!strcmp(argv[i], "--no-sparse-apply")) { cfg.sparse_apply = 0; }
+        else if (!strcmp(argv[i], "--sparse-apply-rows") && i + 1 < argc) {
+            if (parse_int_range_arg("--sparse-apply-rows", argv[++i], 0, 2,
+                                    &cfg.sparse_apply_rows)) return 1;
+            sparse_apply_rows_set = 1;
+        }
         else if (!strcmp(argv[i], "--resieve-scan-cap") && i + 1 < argc) {
             if (parse_u32_range_arg("--resieve-scan-cap", argv[++i], 0u,
                                     UINT32_MAX, &cfg.resieve_scan_cap)) return 1;
@@ -1968,6 +1984,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     /* --norm-gate: likewise, since it reads the gate's bitmap (finding 140) */
     if (cfg.norm_gate < 0)
         cfg.norm_gate = (cfg.pipeline && cfg.fill_gate) ? 1 : 0;
+    /* --sparse-apply: default (-1) needs the card (tuned_card_defaults) and
+     * resolves at the device query below, beside --slab-fill-ahead. */
     /* --q-pipeline (findings 108-109): on wherever it can run. Its VRAM check
      * happens in run_pipeline_impl and falls back to one q at a time;
      * --fill-concurrent and --qspan exclude it, so there the default is off
@@ -2025,6 +2043,18 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
     if (cfg.pipeline && cfg.norm_gate && !cfg.fill_gate) {
         fprintf(stderr, "--norm-gate reads side 1's survivors through the fill"
                 " gate, which is off (--no-fill-gate, or --fill-concurrent)\n");
+        return 1;
+    }
+    /* an explicit request only: the default (-1) resolves at the device query
+     * below, where tuned_card_defaults says whether this architecture enables
+     * --sparse-apply by default. */
+    if (cfg.pipeline && cfg.sparse_apply > 0 && !cfg.norm_gate) {
+        fprintf(stderr, "--sparse-apply needs --norm-gate, which is off"
+                " (--no-norm-gate, --no-fill-gate, or --fill-concurrent)\n");
+        return 1;
+    }
+    if (cfg.pipeline && sparse_apply_rows_set && cfg.sparse_apply == 0) {
+        fprintf(stderr, "--sparse-apply-rows needs --sparse-apply, which is off\n");
         return 1;
     }
     if (cfg.pipeline && resieve_scan_knob && !cfg.resieve_scan) {
@@ -2610,6 +2640,53 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             return 1;
         }
 
+        /* --sparse-apply's default (finding 164): on only on the architecture
+         * where it was timed, sm_120 (tuned_card_defaults), wherever
+         * --norm-gate is on and the launch shape fits (logI in 12..16,
+         * region in 6..logI, 512 apply threads); off elsewhere until timed on
+         * Ada/Ampere/Turing. An explicit --sparse-apply on an unsupported
+         * shape is refused rather than silently running dense while the banner
+         * and run log say sparse-apply=1. */
+        {
+            const int athr = cfg.apply_threads ? cfg.apply_threads : 512;
+            const int sp_shape_ok = (cfg.logI >= SPARSE_APPLY_LOGI_MIN &&
+                                     cfg.logI <= SPARSE_APPLY_LOGI_MAX &&
+                                     cfg.log_region >= SPARSE_APPLY_REGION_MIN &&
+                                     cfg.log_region <= cfg.logI &&
+                                     athr == 512);
+            if (cfg.sparse_apply < 0) {
+                cfg.sparse_apply_default = 1;
+                cfg.sparse_apply = (cfg.pipeline && cfg.norm_gate && sp_shape_ok &&
+                                    card_def.sparse_apply) ? 1 : 0;
+            }
+            if (cfg.pipeline && cfg.sparse_apply && !sp_shape_ok) {
+                fprintf(stderr, "--sparse-apply needs logI in [%d, %d],"
+                        " --region in [%d, logI], and --apply-threads 512"
+                        " (got logI=%d, --region %d, --apply-threads %d)\n",
+                        SPARSE_APPLY_LOGI_MIN, SPARSE_APPLY_LOGI_MAX,
+                        SPARSE_APPLY_REGION_MIN, cfg.logI, cfg.log_region, athr);
+                return 1;
+            }
+            if (cfg.pipeline && sparse_apply_rows_set && !cfg.sparse_apply) {
+                if (!cfg.norm_gate)
+                    fprintf(stderr, "--sparse-apply-rows needs --sparse-apply,"
+                            " which is off (--norm-gate is off)\n");
+                else if (!sp_shape_ok)
+                    fprintf(stderr, "--sparse-apply-rows needs --sparse-apply,"
+                            " which is off (needs logI in [%d, %d], --region"
+                            " in [%d, logI], and --apply-threads 512)\n",
+                            SPARSE_APPLY_LOGI_MIN, SPARSE_APPLY_LOGI_MAX,
+                            SPARSE_APPLY_REGION_MIN);
+                else
+                    fprintf(stderr, "--sparse-apply-rows needs --sparse-apply,"
+                            " which is off%s\n",
+                            cfg.sparse_apply_default
+                                ? " by default on this card; add --sparse-apply"
+                                : "");
+                return 1;
+            }
+        }
+
         /* Armed HERE, not later: everything above this point is argument
          * checking that cannot stall for two minutes, and everything below it
          * -- factor-base generation, the GPU root finder, resume, and the band
@@ -2761,7 +2838,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             "--td-ahead", "--no-td-ahead",
             "--fill-gate-shift", "--resieve-scan", "--no-resieve-scan",
             "--resieve-scan-cap", "--resieve-scan-pairs", "--no-row-cap",
-            "--norm-gate", "--no-norm-gate", "--tuned", "--no-tuned", NULL
+            "--norm-gate", "--no-norm-gate",
+            "--sparse-apply", "--no-sparse-apply", "--sparse-apply-rows",
+            "--tuned", "--no-tuned", NULL
         };
         int nbad = 0;
         for (int i = 1; i < argc; i++)
@@ -3805,10 +3884,13 @@ resume_artifacts_ready:
              * free VRAM after setup, so run_pipeline_impl writes its own
              * `q-pipeline` line with what was granted. */
             runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
-                        " gate=%d shift=%d resieve-scan=%d norm-gate=%d",
+                        " gate=%d shift=%d resieve-scan=%d norm-gate=%d"
+                        " sparse-apply=%d sparse-rows=%d",
                         cfg.fill_rows, cfg.fill_row_bands, cfg.resieve_rows,
                         cfg.fill_gate, cfg.fill_gate ? cfg.fill_gate_shift : 0,
-                        cfg.resieve_scan, cfg.norm_gate);
+                        cfg.resieve_scan, cfg.norm_gate,
+                        cfg.sparse_apply,
+                        cfg.sparse_apply ? cfg.sparse_apply_rows : 0);
             if (cfg.resume)
                 runlog_note("resume", "at q=%llu rho=%llu after %llu q,"
                             " %llu relations",

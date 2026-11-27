@@ -70,18 +70,24 @@ extern "C" {
  *   sm_89 (Ada): --ss-warp-cut 1024. Never slower than 256 on six jobs on
  *     two cards (4070 SUPER: C143 -0.95% to C194 -6.7%; 4060 Ti: the
  *     NFS@Home I16 job -4.4%, C194 -5.8%), and the 4080 SUPER -4.2% on the
- *     I16 job, where 2048 was best (-5.3%); the 3060 and three Blackwell
+ *     I16 job, where 2048 was best (-5.3%); the 3060 and four Blackwell
  *     cards keep 256.
  *   sm_86 and sm_89 at logI 16: --fill-blocks 589824. The 3060 -18.5 to
  *     -23.4% on three logI 16 jobs; Ada -4.2 to -9.6% on four runs (three
  *     cards; the 4080 SUPER -7.9%).
  *     The one Ada loss was C183 at logI 15 (+2.08%), hence logI 16 only;
- *     three Blackwell cards lose with it.
+ *     the 5060, 5070 and 5070 Ti lose with it; the 5080 gains 1.6% there,
+ *     less than its 2.2% at 36864.
  *   sm_120 (Blackwell), any SM count: --slab-fill-ahead on, at bench.h's
  *     SLAB_FILL_BLOCKS_DEFAULT per SLAB_FILL_DEFAULT_SMS SMs: the 5070 -7.2%
  *     (finding 160), the 5060 -4.44% at 384 on 30 SMs, the 5070 Ti -3.86%
  *     at 512 and 768 on 70 SMs held at 1.58 GHz by its host (1024 -2.61%;
- *     896 untimed); Ada and the 3060 lose with it beside their best fill grid.
+ *     896 untimed), and on the 5080 the rule's 1075 (84 SMs) was best or
+ *     level (off +1.41%, 512 +1.90%, 1536 +1.29%); Ada and the 3060 lose
+ *     with it beside their best fill grid.
+ *   sm_120 (Blackwell): --sparse-apply on (finding 164: RTX 5070 -3.8% to
+ *     -12.8% across all 8 benchmark jobs); off elsewhere until timed on
+ *     Ada/Ampere/Turing.
  * 0 means bench.h's constant, as everywhere else. */
 #define TUNED_CARD_SS_WARP_CUT_SM89  1024
 #define TUNED_CARD_FILL_BLOCKS       589824
@@ -90,6 +96,7 @@ typedef struct {
     int ss_warp_cut;       /* 0 = SS_WARP_CUT_DEFAULT */
     int fill_blocks;       /* 0 = FILL_BLOCKS_DEFAULT (k_fill_atomic's grid) */
     int slab_fill_ahead;   /* 1 = on by default; bench_main adds the run's conditions */
+    int sparse_apply;      /* 1 = on by default on sm_120; bench_main adds conditions */
 } tuned_card_defaults_t;
 void tuned_card_defaults(int cc_major, int cc_minor, int logI,
                          tuned_card_defaults_t *d);

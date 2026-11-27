@@ -20,8 +20,10 @@ void tuned_card_defaults(int cc_major, int cc_minor, int logI,
     if (cc_major == 8 && (cc_minor == 6 || cc_minor == 9) &&
         logI == TUNED_CARD_FILL_LOGI)
         d->fill_blocks = TUNED_CARD_FILL_BLOCKS;
-    if (cc_major == 12 && cc_minor == 0)
+    if (cc_major == 12 && cc_minor == 0) {
         d->slab_fill_ahead = 1;
+        d->sparse_apply = 1;
+    }
 }
 
 /* Flags that only name the job, the band, the outputs and the device: a run
