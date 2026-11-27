@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include <math.h>
 #include "slab.h"
+/* BN_DEC_MAX sizes poly_t's exact-decimal buffers to the build's bignum
+ * width, so a `make BN_LIMBS=N` rebuild lifts the job-file parser cap with
+ * it instead of leaving two independent constants to drift apart. */
+#include "bigint.cuh"
 
 #ifdef __cplusplus
 extern "C" {
@@ -250,11 +254,20 @@ typedef struct {
     int    deg;
     double c[BENCH_NCOEFF];   /* algebraic coefficients, as doubles           */
     double skew, y0, y1;      /* doubles are fine for norms (a logarithm)...  */
-    char   y0s[80], y1s[80];  /* ...but roots need Y0,Y1 exactly. See rfb.c.  */
-    char   cs[BENCH_NCOEFF][80]; /* ...and so does TRIAL DIVISION, which factors */
-                              /* the exact integer F(a,b), not its log. c0 is */
-                              /* 147 bits on this job, so the double is only  */
-                              /* good to 53 of them. See bigint.cuh.          */
+    /* ...but roots need Y0,Y1 exactly. See rfb.c. ...and so does TRIAL
+     * DIVISION, which factors the exact integer F(a,b), not its log. c0 is
+     * 147 bits on this job, so the double is only good to 53 of them. See
+     * bigint.cuh.
+     *
+     * The buffers are BN_DEC_MAX, not a literal: 80 was sized for 256-bit
+     * Y0s (78 digits) and the large-base SNFS forms -- 15^97's Y0 alone is
+     * 361 bits, 110 digits -- hit the loader cap long before the norms
+     * they produce reached the bignum width. Tying the cap to BN_DEC_MAX
+     * keeps it one lift ahead of what bn_from_dec/big_parse can consume
+     * (the parsers themselves refuse overflow gracefully). fbtest's
+     * over-long-coefficient case derives the same limit from the struct. */
+    char   y0s[BN_DEC_MAX], y1s[BN_DEC_MAX];
+    char   cs[BENCH_NCOEFF][BN_DEC_MAX];
 
     /* Sieve parameters carried by a GGNFS .job file. Zero means ABSENT, which
      * is the normal case for a CADO .poly -- the caller then falls back to a
