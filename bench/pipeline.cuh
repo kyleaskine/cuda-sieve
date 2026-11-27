@@ -2713,6 +2713,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
 #endif
     /* q abandoned because every slab of it was skipped. */
     unsigned long long nq_lost = 0;
+    /* q that sieved clean yet found no two-sided survivor -- a degenerate
+     * special-q root, not a fault; skipped and counted, never fatal. */
+    unsigned long long nq_barren = 0;
     unsigned long long nqskip = 0;   /* special-q passed over on norm width */
     size_t optin_smem_limit = 0;
     double acc_isect = 0, acc_host = 0, acc_wall = 0;
@@ -3965,8 +3968,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
  * total finding 94 exists to forbid.
  *
  * It is a macro because there are THREE abandon sites, not one -- the nq_lost
- * path, and two hard failures further down (`no survivors at this q`, and the
- * cofactor-gate abort). Twice now this rollback has been written out by hand at
+ * path, the barren-q skip (a fully-sieved q with no two-sided survivor, no
+ * longer a hard failure), and the cofactor-gate abort. Twice now this rollback
+ * has been written out by hand at
  * one site and missed at the others: first acc_ovl was added to nq_lost alone,
  * then acc_td and tm were restored at the hard-failure break and not at the two
  * below it. Open-coding it is what keeps producing that bug.
@@ -5397,17 +5401,31 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * were there sieved correctly and is an empty q, as it was before
          * the drop, not a fault. */
         if (!hn && (nslab_skipped_q || !hrow0)) {
-            /* Still fatal when the sieve actually RAN: a fully-sieved q with
-             * no two-sided survivor means something is wrong, and that
-             * invariant predates slabbing. But if slabs were soft-skipped
-             * above, zero is explained rather than suspicious -- do not
-             * convert a bucket overflow into a dead task by the back door. */
-            if (!nslab_skipped_q) {
-                fprintf(stderr, "  pipeline: no survivors at this q\n");
-                PIPE_Q_ROLLBACK();
-                rc = -1; break;
+            /* A fully-sieved q with no two-sided survivor used to be fatal --
+             * "something is wrong, and that invariant predates slabbing" --
+             * but two SNFS jobs have since produced legitimate barren q: a
+             * special-q root landing within a few units of a lattice boundary
+             * (rho ~= q/2 or 2q/3) walks the transform into a degenerate
+             * corner that yields nothing. 15^251-1 died at exactly
+             * q=828778199 (3*rho == 17 mod q) and q=885998473 (2*rho == -19
+             * mod q), reproducibly, and the checkpoint can never advance
+             * past a fatal q, so every resume re-died there and the band was
+             * unfinishable. Count it, keep it visible on stderr, roll back,
+             * move on. A soft-skipped zero is explained the same way and is
+             * not converted into a dead task by the back door either; and a
+             * device gone truly bad still shows -- every q then lands here,
+             * the band ends with no yield, and nq_barren sits in the band
+             * summary. */
+            if (nslab_skipped_q)
+                nq_lost++;
+            else {
+                nq_barren++;
+                fprintf(stderr,
+                        "  pipeline: q=%llu sieved clean and found no"
+                        " two-sided survivors; skipping the barren q"
+                        " (%llu so far)\n",
+                        (unsigned long long)cur->q, nq_barren);
             }
-            nq_lost++;
             /* Roll back the accumulators this q already charged. The others
              * are either held in a local above (ts1/ts0, so acc_fi and acc_ap
              * never see this q) or added after this point.
@@ -6388,6 +6406,10 @@ done:
     if (nq_lost)
         runlog_warn("  %llu special-q produced nothing because every slab of"
                     " them was skipped", nq_lost);
+    if (nq_barren)
+        runlog_warn("  %llu special-q sieved clean and found no two-sided"
+                    " survivor (a degenerate root near a lattice boundary);"
+                    " they were skipped, not fatal", nq_barren);
     if (stop_hooked) bench_stop_hook_remove();
     /* CUDA failures can jump here from any stage. Normal completion already
      * finalized exactly once above; an early jump closes and discards here --
