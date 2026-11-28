@@ -212,6 +212,8 @@ static inline void ckpt_job_text(const poly_t *P, const bench_cfg_t *cfg,
                 cfg->ecm_b1[0], cfg->ecm_b1[1], cfg->ecm_b2[0], cfg->ecm_b2[1],
                 cfg->ecm_curves, cfg->cof_abort_side[0], cfg->cof_abort_side[1],
                 cfg->cof_rounds, cfg->cof_budget);
+    if (cfg->norm_mode == NORM_INTERP)
+        ckpt_fp_cat(out, n, &k, " norm=interp");
 }
 
 static inline void ckpt_fingerprint(const poly_t *P, const bench_cfg_t *cfg,

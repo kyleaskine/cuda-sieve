@@ -81,6 +81,36 @@ __host__ __device__ void ref_mul(mz<L> *r, const mz<L> *a, const mz<L> *b, const
     for (int k = 0; k < L; k++) r->v[k] = bw ? t[k] : d[k];
 }
 
+/* Independent reference for mz_half_mod: if odd, (x + n) >> 1; else x >> 1. */
+template <int L>
+__host__ __device__ void ref_half_mod(mz<L> *r, const mz<L> *x, const mz<L> *n)
+{
+    uint32_t t[L + 1];
+    for (int k = 0; k < L; k++) t[k] = x->v[k];
+    t[L] = 0;
+    if (t[0] & 1u) {
+        uint64_t c = 0;
+        for (int k = 0; k < L; k++) {
+            c += (uint64_t)t[k] + n->v[k];
+            t[k] = (uint32_t)c; c >>= 32;
+        }
+        t[L] = (uint32_t)c;
+    }
+    for (int k = 0; k < L; k++) r->v[k] = (t[k] >> 1) | (t[k + 1] << 31);
+}
+
+/* Independent reference for mz_sub_fast (a >= b). */
+template <int L>
+__host__ __device__ void ref_sub(mz<L> *r, const mz<L> *a, const mz<L> *b)
+{
+    uint64_t bw = 0;
+    for (int k = 0; k < L; k++) {
+        uint64_t d = (uint64_t)a->v[k] - b->v[k] - bw;
+        r->v[k] = (uint32_t)d;
+        bw = (d >> 32) & 1u;
+    }
+}
+
 /* ---- the kernels ---------------------------------------------------------- */
 
 template <int L>
@@ -94,8 +124,10 @@ __device__ void edges(mz<L> *e, const mz<L> &n, const mz<L> &x)
     e[5] = x;
 }
 
-/* out: per modulus, NE*NE products, then 2 chain results; the REF arm writes
- * the same layout from ref_mul */
+/* out: per modulus, NE*NE products, then 2 chain results, then NE halvings,
+ * then NE subtractions (e[i] >= e[j] -> e[i] - e[j], else e[j] - e[i] for
+ * j = (i+1)%NE); the REF arm writes the same layout from ref_* */
+#define PER_MOD (NE * NE + 2 + 2 * NE)
 template <int L, bool REF>
 __global__ void k_run(const mz<L> *nn, const mz<L> *xx, mz<L> *out)
 {
@@ -103,7 +135,7 @@ __global__ void k_run(const mz<L> *nn, const mz<L> *xx, mz<L> *out)
     if (t >= NT) return;
     const mz<L> n = nn[t];
     const uint32_t ni = mz_n0inv(n.v[0]);
-    mz<L> e[NE], *o = out + (size_t)t * (NE * NE + 2);
+    mz<L> e[NE], *o = out + (size_t)t * PER_MOD;
     edges<L>(e, n, xx[t]);
     for (int i = 0; i < NE; i++)
         for (int j = 0; j < NE; j++) {
@@ -117,6 +149,18 @@ __global__ void k_run(const mz<L> *nn, const mz<L> *xx, mz<L> *out)
         else     { mz_mul<L>(&s, &x, &y, &n, ni); x = s; mz_mul<L>(&s, &y, &x, &n, ni); y = s; }
     }
     o[NE * NE] = x; o[NE * NE + 1] = y;
+    for (int i = 0; i < NE; i++) {
+        mz<L> h = e[i];
+        if (REF) ref_half_mod<L>(&o[NE * NE + 2 + i], &h, &n);
+        else     { mz_half_mod<L>(&h, &n); o[NE * NE + 2 + i] = h; }
+    }
+    for (int i = 0; i < NE; i++) {
+        const mz<L> *hi = &e[i], *lo = &e[(i + 1) % NE];
+        if (mz_cmp<L>(hi, lo) < 0) { const mz<L> *tmp = hi; hi = lo; lo = tmp; }
+        mz<L> d = *hi;
+        if (REF) ref_sub<L>(&o[NE * NE + 2 + NE + i], hi, lo);
+        else     { mz_sub_fast<L>(&d, lo); o[NE * NE + 2 + NE + i] = d; }
+    }
 }
 
 /* ---- inputs ----------------------------------------------------------------- */
@@ -165,7 +209,7 @@ static void run_case(int bits, int kind)
 {
     std::vector<mz<L>> n, x;
     gen<L>(bits, kind, n, x);
-    const size_t per = NE * NE + 2, nout = (size_t)NT * per;
+    const size_t per = PER_MOD, nout = (size_t)NT * per;
     std::vector<mz<L>> got(nout), want(nout);
     mz<L> *dn, *dx, *dout;
     CK(cudaMalloc(&dn, NT * sizeof(mz<L>))); CK(cudaMalloc(&dx, NT * sizeof(mz<L>)));
@@ -200,9 +244,15 @@ static void run_case(int bits, int kind)
     const bool ok = bad == 0 && bad_ref == 0;
     if (!ok) fails++;
     printf("%-4s L=%d n %3d bits %-10s  %s", ok ? "PASS" : "FAIL", L, bits, kind_name[kind],
-           bad ? "" : "products identical to the reference");
-    if (bad) printf("%zu of %zu products differ (first: modulus %zu, %s %zu)", bad, nout,
-                    first / per, first % per < NE * NE ? "edge pair" : "chain", first % per);
+           bad ? "" : "products, half_mod, sub_fast identical to the reference");
+    if (bad) {
+        const size_t slot = first % per;
+        const char *what = slot < NE * NE ? "edge pair"
+                         : slot < NE * NE + 2 ? "chain"
+                         : slot < NE * NE + 2 + NE ? "half_mod" : "sub_fast";
+        printf("%zu of %zu results differ (first: modulus %zu, %s %zu)", bad, nout,
+               first / per, what, slot);
+    }
     if (bad_ref) printf("; device reference differs from host on %zu", bad_ref);
     printf("\n");
 }

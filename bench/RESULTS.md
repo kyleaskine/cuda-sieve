@@ -20873,7 +20873,20 @@ On `nfs.job`, total `apply` dropped 68.10 → 54.32 ms/q (−20.2%), and freeing
 
 ### 5. Main-branch port & code-review fixes (2026-11-27)
 
-- `bench/bench.h`, `bench/tuned.h`, `bench/tuned.c`, `bench/tunedtest.c`: `SPARSE_APPLY_LOGI_MIN/MAX` (12..16), `SPARSE_APPLY_REGION_MIN` (6), `SPARSE_APPLY_AUTO_2ROW` (750.0), `SPARSE_APPLY_AUTO_1ROW` (4200.0); `cfg.sparse_apply`, `cfg.sparse_apply_default`, `cfg.sparse_apply_rows`; `tuned_card_defaults` enables `--sparse-apply` by default only on `sm_120` (matching `--slab-fill-ahead`'s precedent until timed on Ada/Ampere/Turing; gated in `tunedtest.c`).
+- `bench/bench.h`, `bench/tuned.h`, `bench/tuned.c`, `bench/tunedtest.c`: `SPARSE_APPLY_LOGI_MIN/MAX` (12..16), `SPARSE_APPLY_REGION_MIN` (6), `SPARSE_APPLY_AUTO_2ROW` (750.0), `SPARSE_APPLY_AUTO_1ROW` (4200.0); `cfg.sparse_apply`, `cfg.sparse_apply_default`, `cfg.sparse_apply_rows`; `tuned_card_defaults` enables `--sparse-apply` by default on `sm_86` (Ampere), `sm_89` (Ada), and `sm_120` (Blackwell) (off elsewhere until timed on Turing/Hopper/A100; gated in `tunedtest.c`).
+
+### 6. Ada (`sm_89`) & Ampere (`sm_86`) confirmation (2026-11-27)
+
+Interleaved 4-round `tune.sh -n -q -f -r 4` runs on rented Ada and Ampere cards (relations byte-identical across all arms) against each card's defaults (dense side 0):
+
+- **RTX 4080 SUPER (`sm_89`, 80 SMs, `dfc21ba1`, driver/runtime 13.0, load 0.9–1.5, defaults `--fill-blocks 589824 --ss-warp-cut 1024`):**
+  - `de222b73` (I16 live, q 40000000:40003256, default 79.085 ms/q, spread 0.68%): `SP` (auto) **−9.79%** (4/4), `SP1` **−9.81%** (4/4), `SP2` −3.41% (4/4), `SP+W256` −3.13% (4/4), `SP+W2048` **−11.11%** (4/4), `SP+G1` **−15.05%** (~67.2 ms/q, 4/4).
+  - `c194.job` (I16 GNFS, J 32768, q 80000000: nq=30, default 137.225 ms/q, spread 0.60%): `SP` (auto) **−11.57%** (4/4), `SP1` **−12.09%** (4/4), `SP2` **−11.54%** (4/4), `SP+W256` −3.28% (4/4), `SP+W2048` **−12.50%** (4/4).
+- **RTX 3060 (`sm_86`, 28 SMs, `dfc21ba1-dirty`, driver 13.3 / runtime 12.1, load 0.2–1.3, default `--fill-blocks 589824`):**
+  - `de222b73` (I16 live, q 40000000:40003256, default 337.830 ms/q, spread 0.19%): `SP` (auto) **−4.98%** (4/4), `SP1` **−5.00%** (4/4), `SP2` −2.00% (4/4), `SP+W256` −4.93% (4/4), `SP+W2048` −4.81% (4/4), `SP+G1` **−6.87%** (~314.6 ms/q, 4/4).
+  - `c194.job` (I16 GNFS, J 32768, q 80000000: nq=30, default 549.430 ms/q, spread 0.44%): `SP` (auto) **−7.14%** (4/4), `SP1` −6.61% (4/4), `SP2` **−7.25%** (4/4), `SP+W256` −7.18% (4/4), `SP+W2048` −6.74% (4/4).
+- Promoted both `sm_89` and `sm_86` to default-on in `tuned_card_defaults` alongside `sm_120`; auto mode (`--sparse-apply-rows 0`) selected the winning row mode on every architecture and job (1-row on dense `de222b73`, 2-row on sparser `c194`), and `sm_86` keeps `--ss-warp-cut 256`.
+- **RTX 5070 (`sm_120`) installed tune (`cb5417b4`, 6 rounds, 2026-11-27):** `de222b73` default **72.980 ms/q** (down from ~84 ms/q on `4b3b2cfb`), `G2` (`--fill-gate-shift 2`) **−3.94%** (6/6 rounds, 0.10% spread; ~70.1 ms/q), saved under policy 2.
 - `bench/bench_main.cu`: `--sparse-apply / --no-sparse-apply` (resolved at device query beside `--slab-fill-ahead`: on by default on `sm_120` when `--norm-gate` is on and launch shape fits; off elsewhere until timed), `--sparse-apply-rows N` (`0=auto, 1, 2`), `--help`, `pipeline_only[]`, refusals without `--norm-gate`, without `--sparse-apply`, or on unsupported launch shapes (`logI` outside 12..16, `--region` outside `6..logI`, `--apply-threads != 512`), and `runlog_note("fill", ...)` fields.
 - `bench/bench_kernels.cu`: factored `apply_region_dense(..., const norm_t &N, ...)` (passing `N` by const ref preserves `k_apply`'s exact 8 B stack / 0 spills / 40 regs), updated `CALLER CONTRACT` for disjoint-region grid-stride and multi-launch disjoint-row writers, added `PIPE_TEST_SPARSE_MAX_NS` test-only overflow cap, `k_apply_ovf_dense`, `sparse_norm_eval`, `sparse_add`, `k_apply_sparse`.
 - `bench/pipeline.cuh`: `pside_t` overflow buffers (`d_novf`, `d_ovf_rows`), join-time slab & overflow counters (`sp_slabs[3]`, `sp_ovf_blocks`, `last_sp_mode`, async `h_rb->sp_ovf` readback), `pipe_apply_ovf_kern` / `pipe_apply_sparse_kern` dispatch helpers, `MaxDynamicSharedMemorySize` opt-in for `k_apply_ovf_dense`, occupancy banner covering `k_apply_ovf_dense` and all four `k_apply_sparse` instances, per-slab-index side-1 survivor density tracker (`s1_mean_slab[64]`, updated at all three `pipe_side_sieve_join(1, ...)` call sites; auto thresholds: `<= 750/row` & even rows → 2-row, `<= 4200/row` or cold start → 1-row, `> 4200/row` → dense; odd row counts fall back cleanly to 1-row), startup banner (including card-default / shape notes) and band summary lines.
@@ -20911,4 +20924,142 @@ On `nfs.job`, total `apply` dropped 68.10 → 54.32 ms/q (−20.2%), and freeing
 - **`tunedgate.sh` (`work/port5356/gate_tunedgate.log`):** **48 of 48 checks passed**.
 - **`qhcheck.sh` (`work/port5356/gate_qhcheck.log`):** **11 of 11 cases passed, 0 failed** (including `c143`, `c183`, `c194`, `nfs`, 16,384-slot queue flushes, candidate-list growth, `compute-sanitizer --tool memcheck` 0 errors, and both `qe`/`qm` negative controls; 3 `c135` cases skipped for absent `work/c135/`).
 - **`PIPE_TEST_SPARSE_MAX_NS=40` pricing build (`work/port5356/ovf_test/`):** `c183` emitted 1,845 candidates byte-identical across dense, 1-row (`16383` fallback blocks), and 2-row (`8192` fallback blocks).
-- **Install status:** `bench/bench` remains untouched at `4b3b2cfb` pending explicit go-ahead to build & install into `bench/`.
+- **Install status:** Fat `bench/bench` (`c3fc9b5a`, `GPU_ARCH=all CF_LMAX=4`, carrying Findings 164, 165, 167, and 168) installed 2026-11-27 20:01 (Kyle's call).
+
+---
+
+## Finding 166 — Row 55 (single-pass SMEM-staged side-1 bucket fill): stopped at the lab gate; −2.1% to −3.8% of side-1 fill (< 1% wall) on RTX 5070, do not build (2026-11-27)
+
+Measured in isolated standalone labs (`work/row55-fillstage/`, CUDA 13.5, idle RTX 5070, `sm_120`, 48 SMs, 48 MB L2, 2617 MHz) on real I16 interior slabs (`slab 1`, `j_base=8192`, `logI=16`, `log_region=14`, `nregion=32768`, `--sieve-skip 2`, `--fill-skip57`, `--row-cap`): `work/applyprof/nfs.job` (`alim=300M`, 16.25M ideals, 190.17M kept recs/slab) and `de222b73` (`alim=250M`, 13.67M ideals, 186.72M kept recs/slab).
+
+### 1. Per-octave census & exact ceiling (`census_nfs.txt`, `census_de222.txt`)
+
+| Band | Ideals (`nfs`) | Kept recs (`nfs`) | Share | Cum% | Standalone `4608×32` | Marginal `4608×32` (`nfs`/`de222`) | Walk only |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `[64K, 128K)` | 5,598 | 19.96M | 10.5% | 10.5% | 2.040 ms | 0.40 / 0.53 ms | 0.791 ms (tail) |
+| `[128K, 256K)` | 10,920 | 19.58M | 10.3% | 20.8% | 1.102 ms | 0.49 / 0.34 ms | 0.424 ms (tail) |
+| `[256K, 512K)` | 20,438 | 18.20M | 9.6% | 30.4% | 0.849 ms | 0.67 / 0.52 ms | 0.299 ms |
+| `[512K, 1M)` | 38,849 | 17.33M | 9.1% | 39.5% | 0.794 ms | 0.48 / 0.48 ms | 0.162 ms |
+| `[1M, 2M)` | 73,667 | 16.42M | 8.6% | 48.1% | 1.112 ms | 0.52 / 0.59 ms | 0.149 ms |
+| `[2M, 4M)` | 139,835 | 15.58M | 8.2% | 56.3% | 0.706 ms | 0.57 / 0.58 ms | 0.148 ms |
+| `[4M, 8M)` | 268,171 | 14.96M | 7.9% | 64.2% | 0.726 ms | 0.17 / 0.75 ms | 0.193 ms |
+| `[8M, 16M)` | 513,626 | 14.32M | 7.5% | 71.7% | 0.794 ms | 1.06 / 0.49 ms | 0.243 ms |
+| `[16M, alim)` | 15.18M | 53.81M | 28.3% | 100.0% | 3.036 ms | 3.04 / 2.88 ms | 1.536 ms |
+| **FULL `[64K, alim)`** | **16.25M** | **190.17M** | **100%** | — | **7.42–7.58 ms** | — | **1.926 ms** |
+
+Standalone `[64K, 512K)` takes 2.79 ms in `k_fill_atomic` only because of the `p = 65539` single-thread 8,192-hit tail when few warps run. Inside full `4608×32` fill that tail is completely hidden behind the other 16M primes, so `[64K, 512K)`'s true marginal cost is only **1.56 ms/slab (`nfs`) / 1.39 ms/slab (`de222`)** (~27.2 µs/Mrec), and `[64K, 1M)` is 2.04 / 1.88 ms/slab.
+
+### 2. Staged lab kernels raced (all verified 100% exact on bucket counts, order-invariant multiset hashes, and 64-bit `walk_next`)
+
+- **Flat equal-weight block plans (`stage_lab.cu`, `diag_lab.cu`):** `V1A` (1-pass flat collect via warp-aggregated `s_tot` + Blelloch scan + counting-sort + burst store), `V1B` (1-pass direct store), `V2A` (2-pass count + re-walk into sorted SMEM), `V2B` (2-pass direct store). All lost on `4608×32` (`+6.6%` to `+159%` slower on full fill; `0.33–1.40×` standalone). Phase ablation (`M0..M6`) isolated three causes: `s_tmp + s_sorted` (>48 KB SMEM) dropped occupancy to 1–2 blocks/SM, `s_tot` atomic contention added +0.44 ms on a single octave, and re-reading `plat[k]` (24 B) across 128 windows in SMEM `s_x[]` cost 1.62 ms in walk-only `M0` alone.
+- **Warp-independent `__syncwarp()` (`V4_WARP`, `fast_lab.cu`):** `K ≥ 2` live `plat_t` per lane spilled / halved occupancy (0.19–0.56×).
+- **Best kernel — `V3P_BAND` (`band_lab.cu`, `check_t1024.cu`):** `K=1` 100% register-resident (zero `s_x` SMEM, zero `plat` re-reads), `O(log q)` row-band splitting via `pl_rows_to_hit` (`NB = 8/8/4/2`), direct 2D SMEM buckets `s_buf[W][S+1]` (1 SMEM atomic/record, zero scan/sort, 11–28 KB SMEM, 4 blocks/SM), parallel global reserve burst (fixing an 8× serial L2 atomic stall in initial `M5`), and bank-free 8-lane 32B-sector coalesced flush with exact direct-global overflow fallback:
+
+| Band | Walk floor | Identical `BAND_UNSTAGED` | **`V3P_BAND` Staged** | Pure staging | vs. Marginal `4608` | Rate (µs/Mrec) |
+|---|---:|---:|---:|---:|---:|---:|
+| `[64K, 128K)` `T=256 W=64 S=48 NB=8` | 0.143 ms | 0.632 ms | **0.320 ms** | **1.98×** | **1.41×** | **16.0** |
+| `[128K, 256K)` `T=256 W=128 S=24 NB=8` | 0.173 ms | 0.785 ms | **0.408 ms** | **1.92×** | **1.10×** | **20.8** |
+| `[256K, 512K)` `T=256 W=256 S=16 NB=4` | 0.179 ms | 0.848 ms | **0.471 ms** | **1.80×** | **1.17×** | **25.9** |
+| `[512K, 1M)` `T=512 W=512 S=16 NB=2` | 0.163 ms | 0.801 ms | **0.511 ms** | **1.57×** | **0.94×** | **29.5** |
+| `[1M, 2M)` `T=1024 W=512 S=16 NB=2` | — | 0.852 ms | **0.692 ms** | **1.23×** | **0.75×** | **42.1** |
+| `[2M, 4M)` `T=1024 W=512 S=12 NB=1` | — | 0.734 ms | **0.760 ms** | **0.97×** | **0.75×** | **48.8** |
+
+### 3. Combined full-slab results & mechanism
+
+- **Full `4608×32` fill (`V3P_BAND [64K, 512K)` + `k_fill_atomic [512K, alim)`):**
+  - `nfs.job`: `7.583 → 7.293 ms/slab` (**−0.290 ms/slab, −3.8%** of side-1 fill; `[64K, 1M)` gives `7.405 ms`, −2.4%).
+  - `de222b73`: `7.295 → 7.142 ms/slab` (**−0.153 ms/slab, −2.1%** of side-1 fill; `[64K, 1M)` gives `7.307 ms`, +0.2%).
+- **Why staging hits a hard wall above 512K:** (a) RTX 5070's 48 MB L2 already absorbs the 4 MB active write-frontier (32,768 regions × 128 B) with zero DRAM write amplification, letting `k_fill_atomic` retire marginal small-prime records at ~27.2 µs/Mrec; (b) once `p >> I`, hits per prime per window become Poisson instead of quasi-periodic, so windowing + `__syncthreads()` alone (`fast.txt` `M1` sweep) inflates walk time on `[512K, 1M)` from 0.253 ms to 0.405–0.654 ms before any staging or stores; (c) growing `P_blk` past 512 hits either `K ≥ 2` register spills, `T = 1024` 1-block/SM occupancy, or `plat[k]` re-read traffic.
+- **SFA `614×32` grid note:** Standalone `[64K, 512K)` `V3P_BAND` + `[512K, alim)` `614×32` cut `9.170 → 8.063 ms` (`nfs`, −12.1%) and `8.817 → 7.482 ms` (`de222`, −15.1%; part of the `614×32` overhead is static grid-stride imbalance: dynamic warp-fed `614×32` drops `9.20 → 8.86 ms` with no staging). However, `V3P_BAND` ran unconfined with 13–20 KB SMEM (competing with `k_apply` unlike 0 B-SMEM `614×32`), and `side-1 fill ahead` (12.7–12.9 ms/slab) is already hidden inside `side-1 apply` (13.1–13.8 ms/slab). Not worth building; row 55 closed.
+
+---
+
+## Finding 167 — Row 57 (`--norm interp`): guarded 128-cell quadratic side-1 log-norm interpolation delivers −3.6% to −5.2% end-to-end wall with 0 lost / 0 gained relations across >211K relations (2026-11-27)
+
+Built and verified in `work/row57-norminterp/`, then ported into `bench/` (`bench.h`, `bench_kernels.cu`, `pipeline.cuh`, `bench_main.cu`, `ckpt.h`, `cofcheck.sh`) as opt-in `--norm interp` (exact `--norm horner` stays default) and gated on the full fat `GPU_ARCH=all CF_LMAX=4` build (`work/port5758/`).
+
+### 1. Isolated side-1 ceiling & kernel evolution (`work/row57-norminterp/`, RTX 5070, CUDA 13.5)
+
+Launching a scratch-buffer `NORM_CONST` copy directly after exact side-1 `k_apply` (so downstream bitmaps and traffic are unchanged) establishes the exact norm-math ceiling on I16 slabs (`logI=16, region=14, 512 threads, 3 blocks/SM`):
+
+| Job | Exact Horner | `NORM_CONST` ceiling | Ceiling % | **V4 Interp (`--norm interp`)** | Δ vs Horner | Ceiling captured |
+|---|---:|---:|---:|---:|---:|---:|
+| `nfs.job` (deg 5, 5 real roots) | 8.059 ms/slab | 6.089 ms/slab | −24.45% | **6.956 ms/slab** | **−13.69%** | **56.0%** |
+| `snfs301.job` (deg 6) | 6.802 ms/slab | 4.604 ms/slab | −32.32% | **5.287 ms/slab** | **−22.26%** | **68.9%** |
+| `de222b73` (deg 6) | 6.720 ms/slab | 4.602 ms/slab | −31.52% | **4.956 ms/slab** | **−26.25%** | **83.3%** |
+
+Design iterations that produced V4:
+- **V1 (48 B stack / 28 B spills):** A 9-way `switch (N.deg)` inlining `apply_eval_norm` 4× per degree plus inline exact fallback pushed registers over the 40-reg / 3-block cliff. Fixed in **V2** by running a single `deg_c<0>` path (17 warp knots in one step across 1,024 cells = 8 spans of 128 cells, `__shfl_sync` neighbours, ballot-packed sign/cancellation flags, direct `c(u) = CINIT − g(u)` + `__float2int_rn`, span-uniform `[0, CINIT]` range guard) and deferring guarded spans to a short Pass-2 exact Horner loop (`8 B` stack, `4/4 B` spills outside the hot loop on `sm_120`; `0 B` stack/spills on `sm_80/86/89`).
+- **V3 (Q16.16 64-cell piecewise-linear):** Ran at the exact same speed as FP quadratic but introduced a systematic −1 bias (0.058% vs 0.013%), so FP quadratic won strictly.
+- **V4 (incremental tiny-table modulo):** `cuobjdump` on V2 showed 8× `IMAD.WIDE.U32` per span from `wL % 45`, `wL % 7`, `wR % 45`, `wR % 7`. Replacing modulo with incremental `ta` (+32 mod 45) and `tb` (+4 mod 7) jumped `de222b73` ceiling capture from 72% to **83.3%**.
+
+### 2. Gate 1 (cell accuracy over 17.7B cells, `NORM_INTERP_CURV_TOL = 0.25f`, `NORM_INTERP_SLOPE_TOL = 4.0f`)
+
+| Job | Cells checked | Exact (`d=0`) | `+1` | `-1` | `\|d\| ≥ 2` | `max\|d\|` | Exact fallback spans |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `nfs.job` | 6,442,450,944 | 99.9757% | 0.0109% | 0.0135% | **0** | **1** | 1.333% |
+| `snfs301.job` | 8,053,063,680 | 99.9824% | 0.0081% | 0.0095% | **0** | **1** | 0.594% |
+| `de222b73` | 3,221,225,472 | 99.9873% | 0.0060% | 0.0067% | **0** | **1** | 0.010% |
+
+### 3. Gates 2 & 3 (relation accuracy & end-to-end throughput, RTX 5070, 4 interleaved rounds, `--no-tuned`)
+
+- **Gate 2 (relation set diff + `--check-relations`, all PASS):** `nfs` 1,520/1,520, `snfs301` 2,571/2,571, `de222b73` 3,013/3,013, `c135` 53,590/53,590 (`53,613/53,613` verified), `AS276` 1,950/1,950, `c183` 37/37 (unslabbed & `--slab-j 4096`) — **0 lost and 0 gained** across every Gate 2 and Gate 3 run (>211,800 total relations).
+- **Gate 3 (fat `bench/bench`, `--norm interp` vs `--norm horner`, both with row 58 ECM, `work/port5758/ab_bench.log`; `c135` from `work/row57-norminterp/gate3_results.txt`):**
+
+| Job | Band | Exact (`ms/q`) | `--norm interp` (`ms/q`) | Δ Wall (wins) | Δ Apply | Rels (exact → interp) |
+|---|---|---:|---:|---:|---:|---:|
+| `AS276` (`I16, J=32768`) | 89 q | 113.685 | **107.820** | **−5.16%** (4/4) | −10.54% | 7,582 → 7,582 (0) |
+| `nfs.job` (`I16, J=32768`) | 106 q | 101.380 | **96.340** | **−4.97%** (4/4) | −10.28% | 7,495 → 7,495 (0) |
+| `de222b73` (`I16, J=16384`) | 194 q | 70.695 | **67.580** | **−4.41%** (4/4) | −11.74% | 20,499 → 20,499 (0) |
+| `snfs301` (`I16, J=32768`) | 107 q | 120.695 | **116.380** | **−3.58%** (4/4) | −11.66% | 10,650 → 10,650 (0) |
+| `c135` (`I13, J=4096`) | 400 q | 2.420 | **2.385** | **−1.45%** (4/4) | −5.51% | 102,856 → 102,856 (0) |
+
+- **Port & policy:** Enabled in `--pipeline` (side 1 only) and standalone harness via `--norm interp`. `--norm const` stays refused under `--pipeline`; unsupported launch shapes (`!norm_interp_shape_ok`) are refused upfront rather than silently falling back; `ckpt.h` appends `norm=interp` to the resume fingerprint only when active (default `horner` fingerprints unchanged); `runlog_note("fill", ...)` logs `norm=interp|horner`. Remains opt-in while `--norm horner` stays the default.
+
+---
+
+## Finding 168 — Row 58 (ECM: affine `A24`, host-precomputed PRAC Stage 1, and `D = 60` striped-SMEM Stage 2): −17% to −21% ECM queue time and −1.4% to −3.3% end-to-end wall across all 4 production jobs (2026-11-27)
+
+Developed and ablated one piece at a time on real dumped candidate batches in `work/row58-ecm/` (`as276_cands.raw` 90,436 `L=4` cands; `snfs301_cands.raw` 107,162 `L=4` cands; `work/cpucofac/data/chunk.00` 100,000 `L=3` alg + 46,825 `L=3` rat cands), then ported as a universal drop-in into `bench/` (`cofac_arith.cuh`, `cofac.cuh`, `multest.cu`, `cofcheck.sh`) and gated across the full fat `GPU_ARCH=all CF_LMAX=4` build (`work/port5758/`).
+
+### 1. Isolated lab ablation (`work/row58-ecm/ecm_lab_v4.cu`, RTX 5070, median of 3 reps, all 128 regs / 2 blk/SM)
+
+| Variant | `AS276` `L=4` (`B1=400/B2=12000`, `OK=1995`) | `SNFS-301` `L=4` (`B1=400/B2=12000`, `OK=2680`) | `L2049` alg `L=3` (`B1=400/B2=12000`, `OK=1160`) | `L2049` rat `L=3` (`B1=200/B2=6000`, `OK=32874/5`) |
+|---|---:|---:|---:|---:|
+| `V0_BASE` (proj A24 + ladder + `D=30`) | 480.74 ms | 478.19 ms | 168.80 ms | 36.49 ms |
+| `V1_58a` (+ affine `A24` via `mz_div_mod_mont`) | 456.25 (−5.09%) | 448.34 (−6.24%) | 156.19 (−7.47%) | 35.71 (−2.14%) |
+| `V2_PNR` (+ inlined PRAC no-R1) | 458.20 (−4.69%) | 449.00 (−6.11%) | 158.03 (−6.38%) | 35.79 (−1.92%) |
+| `V2_PR1` (+ inlined PRAC with R1) | 446.38 (−7.15%) | 440.14 (−7.96%) | 154.05 (−8.74%) | 35.24 (−3.43%) |
+| `V4_D60S` (aff + ladder + `D=60` SMEM) | 424.42 (−11.71%) | 418.04 (−12.58%) | 148.40 (−12.08%) | 33.52 (−8.16%) |
+| `V5_D120L` (aff + ladder + `D=120` local) | 416.06 (−13.45%) | 407.50 (−14.78%) | 144.17 (−14.59%) | 35.33 (−3.18%) |
+| **`V7_60NRS` (ported: aff + PRAC no-R1 + `D=60` SMEM)** | **394.83 (−17.87%)** | **381.27 (−20.27%)** | **136.11 (−19.36%)** | **32.08 (−12.09%)** |
+| `V7_60R1S` (aff + PRAC w/ R1 + `D=60` SMEM) | 387.78 (−19.34%) | 375.61 (−21.45%) | 133.24 (−21.07%) | 32.16 (−11.87%) |
+| `V8_120NR` (aff + PRAC no-R1 + `D=120` local) | 381.01 (−20.74%) | 372.75 (−22.05%) | 134.03 (−20.60%) | 33.55 (−8.07%) |
+
+Key mechanisms and design calls:
+- **58(a) Affine `A24` (`mz_div_mod_mont`, `CF_NOINLINE`):** Flat-loop binary extended GCD (no nested `while`) backed by branchless PTX `mz_half_mod<3>/<4>` and `mz_sub_fast<3>/<4>` (`cofac_arith.cuh`). Measured inversion cost is 179 `mz_mul` equivalents (`L=4`, down from 273 with nested loops), 228 (`L=3` 96b), and 167 (`L=3` 64b), against ~600 `mz_mul` saved per curve in `x_dbl` (6 → 5 muls) at `B1=400`. Non-invertible `ad` immediately yields a factor.
+- **58(b) PRAC Stage 1 (`cf_ecm_prac_plan` + inlined `CF_FN x_prac_run`):** Host builds minimum-mul Lucas chains (weights `x_add=6, x_dbl=5`, exhaustive `r` search for `k ≤ 500`, golden-ratio neighbourhood + guaranteed fallback above, exact integer self-verification `cf_prac_verify` on every prime power). Drops `B1=400` Stage-1 muls from 6,900 (proj ladder) → 6,286 (aff ladder) → 5,514 (PRAC no-R1, 822 ops). Keeping `x_prac_run` inlined without `PRAC_R1` (only 3 live points `A,B,C`) avoids the +5–8% regression seen in V2/V3 when pointer-taking or `CF_NOINLINE` micro-ops forced local-memory spills.
+- **58(c) Stage 2 at `D = 60` (`mz_ecm_stage2_pass`):** 8 unsigned baby residues `{1,7,11,13,17,19,23,29}` and `60Q` built once before the replay loop in a 15-op differential chain, rescaled onto shared denominator `bz` via peeled forward/backward prefix products (`4*NBABY − 5 = 27` muls), and stored in bank-conflict-free striped SMEM `s_bx[(k*L + l) * COFAC_THREADS_MAX + tid]` (`24,576 B` at `L=3`, `32,768 B` at `L=4`; host fallback uses local array). `x_mul_pair` computes `[vmin](60Q)` and `[vmin+1](60Q)` in one ladder. Unrolling the `k = 0..7` loop proved essential: a dynamic `__ffs(m)` loop in V2 spilled heavily and regressed `L2049` rat by +15%, whereas unrolled `k` swung it to −12.09%. Preserves `uint8_t` masks and `B1 ≥ 30` (`CF_ECM_D / 2`) universally.
+- **Rejected lab options:** `D = 120` (requires `uint16_t` masks, `B1 ≥ 60`, and loses 4 points on `L2049` rat), `bz = 1` affine baby normalization (−0.5% `L=4`, +1.6% `L=3`), and dedicated `mz_sqr` (verified 100% bit-exact vs `mz_mul(a,a)` on 4,096×33 inputs, flat −0.3% to +1.0% under the 128-reg cap).
+
+### 2. Fat build (`GPU_ARCH=all CF_LMAX=4`), PTX audit, & full gate suite (`work/port5758/`)
+
+- **`-Xptxas -v` across all 6 targets (`sm_75, sm_80, sm_86, sm_89, sm_90, sm_120`):**
+  - `k_cofac<3,1,1>`: 128 regs, 24,576 B static SMEM, 288–304 B stack (`sm_75..90`) / 368 B (`sm_120`); `x_mul_pair`, `mz_div_mod_mont`, and `mz_ecm_stage2_pass` all 0 B stack / 0 spills.
+  - `k_cofac<4,1,1>`: 128 regs, 32,768 B static SMEM, 400 B stack (`sm_75..90`) / 432 B (`sm_120`); `x_mul_pair`, `mz_div_mod_mont`, and `mz_ecm_stage2_pass` all 0 B stack (16/24 B spills in `stage2_pass` on `sm_120` only).
+  - `k_cofac<3/4,1,0>` (Stage 1 only): 84–118 regs, 0/0 B spills; `k_cofac<3/4,0,0>` (rho): 72–96 regs, 0/0 B spills.
+- **`work/earlyclobber/aliascheck.py --selftest` across all 6 virtual arches (`compute_75..compute_120`):** 0 failures, 0 shared registers across 12,968–15,362 matched blocks in `bench_kernels.cu` and 1,241–1,457 in `multest.cu`; all 24 inline PTX templates matched and 24/24 single-sharing mutants caught.
+- **`make GPU_ARCH=all CF_LMAX=4 check` (`gate_check.log`):** all gates passed — `multest` 34/34 (extended to verify `mz_half_mod<3>/<4>` and `mz_sub_fast<3>/<4>` against bit-serial references across all sizes/kinds), `xftest` 4/4, `ckpttest`, `stoptest`, `tunedtest` (96/96), `tunecheck.sh`, `chunksimcheck.sh`, `fbgencheck.sh`, `sqgentest`, `walkcheck`, `slabtest`, `fbtest`, and `cofcheck.sh` (all 109 cases, including 3-vs-4-limb ECM byte-identity, `--ecm-b1 400000`, and 4 new `--norm interp` cases). Two weak-plan `cofcheck.sh` pins were traced and updated with exact mathematical cause: (i) Stage-2 control moved from `B1=1000` to `B1=500` (`36 → 37`) because `PRAC(431)` visits intermediate multiple `107`, catching a bonus `107² | #E` split on `-1148823280163,4939` (`σ=1006`) without Stage 2; (ii) weak abort test (`B1=70, 2 curves × 8 rounds`) moved `24 → 23` (`1506 → 1507` abandoned, `abort 1` still `13` and a strict subset) because baseline `D=30`'s `v=59` giant step caught a bonus `59² | #E` hit on `1032500890300,10623` (`σ=2007`) outside `D=60`'s `vmax=35`.
+- **`fillcheck.sh` (`gate_fill.log`):** 125/125 arms byte-identical.
+- **`tunedgate.sh` (`gate_tuned.log`):** 48/48 checks passed.
+- **`qhcheck.sh` (`gate_qh.log`):** 14/14 cases passed, 0 memcheck errors.
+- **`abcheck.sh` vs pre-change binary (`4b3b2cfb`):** **29/29 `sb`/`cand` cases AND 7/7 `cof`/`stop` cases (497,913 relations across `c143`, `c183`, `c194`, `nfs`) 100% byte-identical**.
+
+### 3. End-to-end 4-round interleaved A/B (`work/port5758/ab_bench.log`, RTX 5070, `--no-tuned`, fat `bench/bench` vs pre-change `4b3b2cfb`)
+
+| Job | Band (`q`, rels) | Baseline (`ms/q`) | **Row 58 ECM** (`ms/q`, Δwall, wins) | Rat queue (`ms/q`) | Alg queue (`ms/q`) | **Combined w/ Row 57 `--norm interp`** |
+|---|---|---:|---:|---:|---:|---:|
+| **AS276** (`L=4` alg, `L=3` rat) | 89 q, 7,582 (`B=N=I`) | 117.020 | **113.685 (−2.85%, 4/4)** | 1.8 → 1.5 (−16.7%) | **16.5 → 13.1 (−20.6%)** | **107.820 (−7.86%)** |
+| **SNFS-301** (`L=4` alg, `L=3` rat) | 107 q, 10,650 (`B=N=I`) | 124.825 | **120.695 (−3.31%, 4/4)** | 3.6 → 2.9 (−19.4%) | **14.1 → 11.2 (−20.6%)** | **116.380 (−6.77%)** |
+| **NFS@Home I16 (`nfs`)** (`L=3` both) | 106 q, 7,495 (`B=N=I`) | 102.765 | **101.380 (−1.35%, 4/4)** | 1.2 → 1.0 (−16.7%) | **4.8 → 4.0 (−16.7%)** | **96.340 (−6.25%)** |
+| **de222b73** (`L=3` both, `--sq-side 0`) | 194 q, 20,500→20,499 (`N=I`) | 72.520 | **70.695 (−2.52%, 4/4)** | 3.4 → 2.8 (−17.6%) | **5.8 → 4.6 (−20.7%)** | **67.580 (−6.81%)** |

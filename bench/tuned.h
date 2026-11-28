@@ -85,9 +85,11 @@ extern "C" {
  *     896 untimed), and on the 5080 the rule's 1075 (84 SMs) was best or
  *     level (off +1.41%, 512 +1.90%, 1536 +1.29%); Ada and the 3060 lose
  *     with it beside their best fill grid.
- *   sm_120 (Blackwell): --sparse-apply on (finding 164: RTX 5070 -3.8% to
- *     -12.8% across all 8 benchmark jobs); off elsewhere until timed on
- *     Ada/Ampere/Turing.
+ *   sm_86 (Ampere), sm_89 (Ada) and sm_120 (Blackwell): --sparse-apply on
+ *     (finding 164: RTX 5070 -3.8% to -12.8% across all 8 benchmark jobs;
+ *     RTX 4080 SUPER -9.79% on de222b73 and -11.57% on c194; RTX 3060 -4.98%
+ *     on de222b73 and -7.14% on c194, all 4 of 4 rounds); off elsewhere until
+ *     timed on Turing/Hopper/A100.
  * 0 means bench.h's constant, as everywhere else. */
 #define TUNED_CARD_SS_WARP_CUT_SM89  1024
 #define TUNED_CARD_FILL_BLOCKS       589824
@@ -96,7 +98,7 @@ typedef struct {
     int ss_warp_cut;       /* 0 = SS_WARP_CUT_DEFAULT */
     int fill_blocks;       /* 0 = FILL_BLOCKS_DEFAULT (k_fill_atomic's grid) */
     int slab_fill_ahead;   /* 1 = on by default; bench_main adds the run's conditions */
-    int sparse_apply;      /* 1 = on by default on sm_120; bench_main adds conditions */
+    int sparse_apply;      /* 1 = on by default on sm_86/sm_89/sm_120; bench_main adds conditions */
 } tuned_card_defaults_t;
 void tuned_card_defaults(int cc_major, int cc_minor, int logI,
                          tuned_card_defaults_t *d);

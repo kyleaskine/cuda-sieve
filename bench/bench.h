@@ -689,9 +689,10 @@ typedef struct {
      * tiny-prime checks, s_gate-filtered small-sieve/bucket adds, and
      * out-of-line dense fallback for rows exceeding MAX_NS). Needs --norm-gate
      * and a supported launch shape (logI in 12..16, region in 6..logI, 512
-     * apply threads): default on for sm_120 (Blackwell, tuned_card_defaults),
-     * off elsewhere until timed on Ada/Ampere/Turing; refused explicitly
-     * without --norm-gate or on an unsupported shape. Output-identical by
+     * apply threads): default on for sm_86 (Ampere), sm_89 (Ada) and sm_120
+     * (Blackwell, tuned_card_defaults), off elsewhere until timed on
+     * Turing/Hopper/A100; refused explicitly without --norm-gate or on an
+     * unsupported shape. Output-identical by
      * construction. sparse_apply_default says the value came from the card
      * default, not a flag. sparse_apply_rows: 0 = auto per slab from side 1's
      * per-row survivor mean (<= SPARSE_APPLY_AUTO_2ROW -> 2-row,
@@ -1206,6 +1207,38 @@ static __device__ __forceinline__ uint64_t bench_grid_stride_x(void)
 
 #define NORM_CONST    0     /* flat initial value -- isolates apply cost */
 #define NORM_HORNER   1     /* real per-position log2|F(a,b)| in fp32    */
+#define NORM_INTERP   2     /* guarded 128-cell quadratic (side 1, approx; row 57) */
+
+/* Guard thresholds for --norm interp (row 57, finding 167): fall back to exact
+ * Horner on any 128-cell span with a sign change, cancellation flag, curvature
+ * |a| > NORM_INTERP_CURV_TOL, slope |b| > NORM_INTERP_SLOPE_TOL, or midpoint
+ * too close to [0, CINIT]. Measured over 17.7B cells (nfs, snfs301, de222):
+ * 99.976-99.987% exact, max|d| = 1, 0 cells with |d| >= 2, 0/136,276 relation
+ * diffs. */
+#define NORM_INTERP_CURV_TOL   0.25f
+#define NORM_INTERP_SLOPE_TOL  4.0f
+
+/* Whether a 16-bit k_apply launch shape fits NORM_INTERP's 128-cell warp
+ * layout (one row per region, each warp covering a whole multiple of 64 words
+ * = 128 cells up to 15 spans = 31 knots fitting in one 32-lane warp). Shared
+ * by bench_main (refusal), pipeline.cuh, and bench_kernels.cu so none can
+ * disagree. */
+#ifdef __CUDACC__
+static __host__ __device__ __forceinline__
+#else
+static inline
+#endif
+int norm_interp_shape_ok(int logI, int log_region, uint32_t nth)
+{
+    if (log_region < 7 || log_region > logI) return 0;
+    if (nth < 32u || (nth & 31u) != 0u) return 0;
+    const uint32_t nword = 1u << (log_region - 1);
+    const uint32_t nwarps = nth >> 5;
+    const uint32_t w_per_warp = nword / nwarps;
+    return nwarps * w_per_warp == nword &&
+           (w_per_warp & 63u) == 0u &&
+           w_per_warp >= 64u && w_per_warp <= 960u;
+}
 
 /* Runs transform -> plattice -> fill -> apply and prints a timing breakdown.
  * Returns 0 on success. */

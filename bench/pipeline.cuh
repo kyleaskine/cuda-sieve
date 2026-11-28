@@ -1021,14 +1021,18 @@ typedef struct {
     cudaEvent_t after, t0, t1;
 } pipe_part_t;
 
-/* The pipeline's four k_apply instances, by --norm-gate (NGATE, side 0's
- * launches) and the two-step tail (SSTAIL, ss_needs_tail). The launch, the
- * shared-memory opt-in and the occupancy banner all pick from here, so an
- * instance cannot launch without its MaxDynamicSharedMemorySize or escape the
- * banner's check, and a fifth template flag changes one place. */
+/* The pipeline's k_apply instances, by --norm-gate (NGATE, side 0's launches),
+ * the two-step tail (SSTAIL, ss_needs_tail), and --norm interp (side 1's
+ * guarded 128-cell quadratic log-norm interpolation, NGATE always false). The
+ * launch, the shared-memory opt-in and the occupancy banner all pick from here,
+ * so an instance cannot launch without its MaxDynamicSharedMemorySize or escape
+ * the banner's check. */
 template <bool SLABBED>
-static auto pipe_apply_kern(int ngate, int tail)
+static auto pipe_apply_kern(int ngate, int tail, int interp = 0)
 {
+    if (interp)
+        return tail ? k_apply<PIPE_CELLBITS, 1, NORM_INTERP, SLABBED, true, false>
+                    : k_apply<PIPE_CELLBITS, 1, NORM_INTERP, SLABBED, false, false>;
     return ngate
         ? (tail ? k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, true, true>
                 : k_apply<PIPE_CELLBITS, 1, NORM_HORNER, SLABBED, false, true>)
@@ -1253,7 +1257,12 @@ apply:
                 S->survbits, cfg->not_both_even, cfg->sieve_skip,
                 j_base, ngate);
         } else {
-            auto *const apply_kern = pipe_apply_kern<SLABBED>(ngate != NULL, tail);
+            const int use_interp = (side == 1 && ngate == NULL &&
+                                    cfg->norm_mode == NORM_INTERP &&
+                                    norm_interp_shape_ok(cfg->logI, log_region,
+                                                         (uint32_t)athr));
+            auto *const apply_kern = pipe_apply_kern<SLABBED>(ngate != NULL, tail,
+                                                              use_interp);
             apply_kern<<<nregion, athr, S->apply_smem, st>>>(
                 (const uint32_t *)bk->bucket, bk->cursor, lay, cfg->logI, log_region,
                 S->N, S->CINIT, S->CINIT - S->BOUND,
@@ -2978,6 +2987,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                 PIPE_CK(cudaFuncSetAttribute(pipe_apply_kern<SLABBED>(g, t),
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
         for (int t = 0; t < 2; t++)
+            PIPE_CK(cudaFuncSetAttribute(pipe_apply_kern<SLABBED>(0, t, 1),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
+        for (int t = 0; t < 2; t++)
             PIPE_CK(cudaFuncSetAttribute(pipe_apply_ovf_kern<SLABBED>(t),
                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)apply_smem));
         /* Apply's blocks per SM, and whether shared memory is what limits
@@ -2986,8 +2998,9 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
          * comment's budget leaves 48 B with --tiny-table's tables (256 B
          * without). The count is the device's own
          * occupancy calculation, so it holds on every architecture. It covers
-         * every instance this run can launch -- both SSTAIL ones, and the
-         * NGATE pair under --norm-gate -- and prints the fewest, naming the
+         * every instance this run can launch -- both SSTAIL ones, the
+         * NGATE pair under --norm-gate, and the NORM_INTERP pair under
+         * --norm interp -- and prints the fewest, naming the
          * most when they differ. */
         {
             const int apply_thr = cfg->apply_threads ? cfg->apply_threads : 512;
@@ -3003,6 +3016,18 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                     if (n > nb_hi) nb_hi = n;
                     smem_limits |= n < n_nosmem;
                 }
+            if (cfg->norm_mode == NORM_INTERP) {
+                for (int t = 0; t < 2; t++) {
+                    int n = 0, n_nosmem = 0;
+                    PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,
+                        pipe_apply_kern<SLABBED>(0, t, 1), apply_thr, apply_smem));
+                    PIPE_CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n_nosmem,
+                        pipe_apply_kern<SLABBED>(0, t, 1), apply_thr, 0));
+                    if (nb < 0 || n < nb) nb = n;
+                    if (n > nb_hi) nb_hi = n;
+                    smem_limits |= n < n_nosmem;
+                }
+            }
             if (cfg->sparse_apply) {
                 for (int t = 0; t < 2; t++) {
                     int n = 0, n_nosmem = 0;
@@ -3539,6 +3564,10 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
         printf("  --fill-gate: side 0 stores fill records only under side 1's"
                " survivors, 1 gate bit per %u positions\n",
                1u << cfg->fill_gate_shift);
+    if (cfg->norm_mode == NORM_INTERP)
+        printf("  --norm interp: side 1's apply uses guarded 128-cell quadratic"
+               " log-norm interpolation (approximate; exact Horner fallback on"
+               " steep/sign-change spans)\n");
     if (cfg->norm_gate)
         printf("  --norm-gate: side 0's apply computes the log norm only under"
                " side 1's survivors\n");
@@ -3560,8 +3589,8 @@ static int run_pipeline_impl(const fb_t *fb1, const fb_t *fbs1,
                    SPARSE_APPLY_REGION_MIN);
         else
             printf("  --sparse-apply: off, this card's default: on by default"
-                   " only on sm_120 (Blackwell), where it was timed;"
-                   " --sparse-apply to use it\n");
+                   " only on sm_86 (Ampere), sm_89 (Ada) and sm_120 (Blackwell),"
+                   " where it was timed; --sparse-apply to use it\n");
     }
     if (cfg->small_sieve) {
         printf("  --tiny-fold: %s\n", cfg->tiny_fold

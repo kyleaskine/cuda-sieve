@@ -1184,6 +1184,51 @@ __host__ __device__ __forceinline__ bool apply_scan_stores(int logI, int log_reg
         && nth >= 32u && (nth & 31u) == 0u;
 }
 
+/* Exact single-position log norm for NORM_INTERP's knots and rare Pass-2
+ * fallback (row 57, finding 167). Same fp32 Horner + NORM_CANCEL_TOL fp64
+ * cancellation guard + log2f as NORM_HORNER; also returns the sign bit (bit 0)
+ * and cancellation flag (bit 1) for the span guard. */
+template <int DEG>
+__device__ __forceinline__ void apply_eval_norm(const norm_t &N, int32_t ii, uint32_t jj,
+                                                float *lg_out, uint32_t *flags_out)
+{
+    const int deg = DEG > 0 ? DEG : N.deg;
+    const float fi = (float)ii;
+    const float fj = (float)jj;
+    const float u = fmaf(N.ua, fi, N.ub * fj);
+    const float v = fmaf(N.va, fi, N.vb * fj);
+    float acc = N.d[deg], vp = 1.0f;
+    float aabs = fabsf(N.d[deg]), vpa = 1.0f;
+    const float au = fabsf(u), av = fabsf(v);
+    #pragma unroll
+    for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+        if (k < deg) {
+            vp  *= v;  acc  = fmaf(acc,  u,  N.d[k] * vp);
+            vpa *= av; aabs = fmaf(aabs, au, fabsf(N.d[k]) * vpa);
+        }
+    float s = fabsf(acc);
+    uint32_t sign = (acc < 0.0f) ? 1u : 0u;
+    uint32_t bad  = (s < NORM_CANCEL_TOL * aabs) ? 2u : 0u;
+    if (bad) {
+        const double a = (double)((int64_t)ii * N.a0 + (int64_t)jj * N.b0);
+        const double b = (double)((int64_t)ii * N.a1 + (int64_t)jj * N.b1);
+        const double ud = a / N.A, vd = b / N.B;
+        double accd = N.dd[deg], vpd = 1.0;
+        #pragma unroll
+        for (int k = BENCH_MAX_DEGREE - 1; k >= 0; k--)
+            if (k < deg) { vpd *= vd; accd = accd * ud + N.dd[k] * vpd; }
+        s = (float)fabs(accd);
+        sign = (accd < 0.0) ? 1u : 0u;
+    }
+#ifdef NORM_FAST_LOG2
+    const float l2 = __log2f(fmaxf(s, 1e-30f));
+#else
+    const float l2 = log2f(fmaxf(s, 1e-30f));
+#endif
+    *lg_out = N.scale * (N.log2M + l2 - N.bias);
+    if (flags_out) *flags_out = sign | bad;
+}
+
 /* One block owns one bucket region for its entire life: it initialises the
  * cells to the log-norm bound in shared memory, accumulates every log p that
  * landed in the region, scans for survivors, and writes only the survivors
@@ -1333,6 +1378,134 @@ __device__ __forceinline__ void apply_region_dense(
     auto init_words = [&](auto degc) {
         constexpr int DEG = decltype(degc)::value;
         const int deg = DEG > 0 ? DEG : N.deg;
+        if constexpr (NORMMODE == NORM_INTERP && CELLBITS == 16 && !NGATE) {
+            /* Guarded 128-cell warp quadratic norm interpolation (row 57,
+             * finding 167): each warp owns a contiguous run of w_per_warp words
+             * (512 words = 1024 cells at R14/512 thr), preserving w % 32 ==
+             * tid % 32 so --tiny-fold (even-row period 64 cells = 32 words) is
+             * exact and S[w] stores are conflict-free. Pass 0 evaluates all
+             * 2*n_spans+1 knots (17 at R14) in one parallel warp step and packs
+             * sign/cancel flags with __ballot_sync. Pass 1 interpolates safe
+             * spans directly in cell space c(u) = CINIT - g(u) with incremental
+             * tiny-table indices (no per-word % 45 / % 7). Pass 2 runs exact
+             * Horner on any flagged span after the hot loop's state is dead. */
+            if (norm_interp_shape_ok(logI, log_region, nth)) {
+                const uint32_t lane = tid & 31u;
+                const uint32_t warp = tid >> 5;
+                const uint32_t w_per_warp = nword / (nth >> 5);
+                const uint32_t n_spans = w_per_warp >> 6;
+                const uint32_t w_warp0 = warp * w_per_warp;
+                const uint32_t x_warp0 = xbase + (w_warp0 << 1);
+                const int32_t  ii_warp0 = (int32_t)(x_warp0 & Imask) - Ihalf;
+                const bool skip_c0 = sieve_skip && !(jblk & 1u);
+
+                float k_lg = 0.0f;
+                uint32_t k_fl = 0u;
+                if (lane <= (n_spans << 1)) {
+                    apply_eval_norm<DEG>(N, ii_warp0 + (int32_t)(lane << 6), jblk,
+                                         &k_lg, &k_fl);
+                }
+                const uint32_t sgn_mask = __ballot_sync(0xFFFFFFFFu, (k_fl & 1u) != 0u);
+                const uint32_t bad_mask = __ballot_sync(0xFFFFFFFFu, (k_fl & 2u) != 0u);
+
+                const float u0 = ((float)((int)(lane << 1) - 64)) * (1.0f / 64.0f);
+                const float ctol = NORM_INTERP_CURV_TOL;
+                const float stol = NORM_INTERP_SLOPE_TOL;
+                const float margin_lo = stol + ctol + 2.0f;
+                const float margin_hi = (float)CINIT - margin_lo;
+                const float fCINIT = (float)CINIT;
+                uint32_t wL = w_warp0 + lane;
+                uint32_t ta = ntab ? (wL % SS_TAB_A_WORDS) : 0u;
+                uint32_t tb = ntab ? (wL % SS_TAB_B_WORDS) : 0u;
+                uint32_t fb_mask = 0u;
+
+                for (uint32_t s = 0; s < n_spans; s++) {
+                    const uint32_t taL = ta, tbL = tb;
+                    uint32_t taR = taL + (32u % SS_TAB_A_WORDS);
+                    if (taR >= SS_TAB_A_WORDS) taR -= SS_TAB_A_WORDS;
+                    uint32_t tbR = tbL + (32u % SS_TAB_B_WORDS);
+                    if (tbR >= SS_TAB_B_WORDS) tbR -= SS_TAB_B_WORDS;
+                    ta = taR + (32u % SS_TAB_A_WORDS);
+                    if (ta >= SS_TAB_A_WORDS) ta -= SS_TAB_A_WORDS;
+                    tb = tbR + (32u % SS_TAB_B_WORDS);
+                    if (tb >= SS_TAB_B_WORDS) tb -= SS_TAB_B_WORDS;
+
+                    const uint32_t kL = s << 1;
+                    const float gL = __shfl_sync(0xFFFFFFFFu, k_lg, (int)kL);
+                    const float gM = __shfl_sync(0xFFFFFFFFu, k_lg, (int)(kL + 1u));
+                    const float gR = __shfl_sync(0xFFFFFFFFu, k_lg, (int)(kL + 2u));
+
+                    const float a = 0.5f * (gL + gR) - gM;
+                    const float b = 0.5f * (gR - gL);
+                    const uint32_t m3 = 7u << kL;
+                    const uint32_t sm = sgn_mask & m3;
+                    const bool exact_span = ((sm != 0u) && (sm != m3)) ||
+                                            ((bad_mask & m3) != 0u) ||
+                                            (fabsf(a) > ctol) || (fabsf(b) > stol) ||
+                                            (gM < margin_lo) || (gM > margin_hi);
+                    if (exact_span) {
+                        fb_mask |= (1u << s);
+                        wL += 64u;
+                        continue;
+                    }
+
+                    const float cM = fCINIT - gM;
+                    const float ca = -a;
+                    const float cb = -b;
+                    const float u1 = u0 + (1.0f / 64.0f);
+                    const float v0 = u0 + 1.0f;
+                    const float v1 = u1 + 1.0f;
+
+                    const uint32_t cL0 = skip_c0 ? 0u : (uint32_t)__float2int_rn(fmaf(u0, fmaf(ca, u0, cb), cM));
+                    const uint32_t cL1 = (uint32_t)__float2int_rn(fmaf(u1, fmaf(ca, u1, cb), cM));
+                    const uint32_t cR0 = skip_c0 ? 0u : (uint32_t)__float2int_rn(fmaf(v0, fmaf(ca, v0, cb), cM));
+                    const uint32_t cR1 = (uint32_t)__float2int_rn(fmaf(v1, fmaf(ca, v1, cb), cM));
+
+                    if (probe_out) {
+                        const uint32_t xL = xbase + (wL << 1);
+                        if (xL == probe_x) probe_out[0] = CINIT - cL0;
+                        if (xL + 1u == probe_x) probe_out[0] = CINIT - cL1;
+                        if (xL + 64u == probe_x) probe_out[0] = CINIT - cR0;
+                        if (xL + 65u == probe_x) probe_out[0] = CINIT - cR1;
+                    }
+
+                    const uint32_t wR = wL + 32u;
+                    S[wL] = (cL0 | (cL1 << 16)) + fw + (ntab ? (T[taL] + T[SS_TAB_A_WORDS + tbL]) : 0u);
+                    S[wR] = (cR0 | (cR1 << 16)) + fw + (ntab ? (T[taR] + T[SS_TAB_A_WORDS + tbR]) : 0u);
+                    wL += 64u;
+                }
+
+                if (fb_mask != 0u) {
+                    while (fb_mask != 0u) {
+                        const uint32_t s = (uint32_t)__ffs((int)fb_mask) - 1u;
+                        fb_mask &= fb_mask - 1u;
+                        for (uint32_t half = 0u; half < 2u; half++) {
+                            const uint32_t w = w_warp0 + (s << 6) + (half << 5) + lane;
+                            const uint32_t x0 = xbase + (w << 1);
+                            const int32_t ii0 = (int32_t)(x0 & Imask) - Ihalf;
+                            uint32_t t0, t1;
+                            if (skip_c0) {
+                                t0 = CINIT;
+                            } else {
+                                float ex0; apply_eval_norm<DEG>(N, ii0, jblk, &ex0, nullptr);
+                                const int ti0 = (int)floorf(ex0 + 0.5f);
+                                t0 = (ti0 < 0) ? 0u : ((uint32_t)ti0 > CINIT ? CINIT : (uint32_t)ti0);
+                            }
+                            float ex1; apply_eval_norm<DEG>(N, ii0 + 1, jblk, &ex1, nullptr);
+                            const int ti1 = (int)floorf(ex1 + 0.5f);
+                            t1 = (ti1 < 0) ? 0u : ((uint32_t)ti1 > CINIT ? CINIT : (uint32_t)ti1);
+                            if (probe_out) {
+                                if (x0 == probe_x) probe_out[0] = t0;
+                                if (x0 + 1u == probe_x) probe_out[0] = t1;
+                            }
+                            S[w] = ((CINIT - t0) | ((CINIT - t1) << 16)) + fw +
+                                   (ntab ? T[w % SS_TAB_A_WORDS] + T[SS_TAB_A_WORDS + w % SS_TAB_B_WORDS] : 0u);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         for (uint32_t w = tid; w < nword; w += nth) {
             uint32_t word = 0;
             /* --norm-gate (NGATE): ngate is the OTHER side's survivor bitmap for
@@ -1451,7 +1624,7 @@ __device__ __forceinline__ void apply_region_dense(
     };
     static_assert(BENCH_MAX_DEGREE == 8,
                   "one init_words copy per degree 1..BENCH_MAX_DEGREE");
-    if constexpr (NORMMODE == NORM_CONST) init_words(deg_c<0>{});
+    if constexpr (NORMMODE == NORM_CONST || NORMMODE == NORM_INTERP) init_words(deg_c<0>{});
     else switch (N.deg) {
         case 1: init_words(deg_c<1>{}); break;
         case 2: init_words(deg_c<2>{}); break;
@@ -4360,7 +4533,8 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
                    " %d threads, %s, norm=%s\n",
                    nregion, ncell, CB, smem, athr,
                    cfg->apply_atomic ? "smem atomicAdd" : "PLAIN (racy probe)",
-                   cfg->norm_mode == NORM_CONST ? "const" : "horner");
+                   cfg->norm_mode == NORM_CONST ? "const"
+                   : cfg->norm_mode == NORM_INTERP ? "interp" : "horner");
             if (smem > optin_smem_limit) {
                 printf("  SKIP: %zu B exceeds this device's %zu B opt-in"
                        " shared-memory limit\n", smem, optin_smem_limit);
@@ -4401,7 +4575,12 @@ extern "C" int run_bench(const fb_t *fb, const fb_t *fbs, const qlat_t *L,
             if (CB == 16) {
                 if (cfg->apply_atomic) {
                     if (cfg->norm_mode == NORM_CONST) LAUNCH_APPLY(16, 1, NORM_CONST, true);
-                    else if (ss_needs_tail(nsplit, nsmall))
+                    else if (cfg->norm_mode == NORM_INTERP) {
+                        if (ss_needs_tail(nsplit, nsmall))
+                            LAUNCH_APPLY(16, 1, NORM_INTERP, true);
+                        else
+                            LAUNCH_APPLY(16, 1, NORM_INTERP, false);
+                    } else if (ss_needs_tail(nsplit, nsmall))
                                                       LAUNCH_APPLY(16, 1, NORM_HORNER, true);
                     else                              LAUNCH_APPLY(16, 1, NORM_HORNER, false);
                 } else {

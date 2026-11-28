@@ -317,6 +317,12 @@ static void usage(void)
 "                   records only under side 1's survivors\n"
 "                   [on, off under --fill-concurrent, which refuses it]\n"
 "  --fill-gate-shift N  positions per gate bit = 2^N, 0..5        [3]\n"
+"  --norm horner|interp  side 1's apply log-norm method             [horner]\n"
+"                   horner evaluates log2|F(a,b)| at every position (exact);\n"
+"                   interp uses guarded 128-cell quadratic interpolation with\n"
+"                   exact Horner fallback on steep/sign-change spans\n"
+"                   (approximate, opt-in; needs --region in 7..logI and\n"
+"                   64..960 words/warp in multiples of 64)\n"
 "  --norm-gate / --no-norm-gate  --pipeline only; side 0's apply computes\n"
 "                   the log norm only where side 1 has a survivor\n"
 "                   [on with the gate, else off; refused without it]\n"
@@ -324,8 +330,8 @@ static void usage(void)
 "                   a row-wide sparse kernel over side 1's survivors. Needs\n"
 "                   --norm-gate, logI in 12..16, --region in 6..logI and\n"
 "                   --apply-threads 512. Output-identical  [on with\n"
-"                   --norm-gate on sm_120 (Blackwell), where it was timed;\n"
-"                   off elsewhere until timed]\n"
+"                   --norm-gate on sm_86 (Ampere), sm_89 (Ada) and sm_120\n"
+"                   (Blackwell), where it was timed; off elsewhere until timed]\n"
 "  --sparse-apply-rows N  rows per sparse block: 0=auto, 1, 2         [0]\n"
 "  --resieve-scan / --no-resieve-scan  --pipeline only; side 0's resieve\n"
 "                   reads its pairs from its own gated fill records instead\n"
@@ -392,7 +398,7 @@ static void usage(void)
 "  --mode M         atomic | twolevel          [atomic]  (twolevel lost by 2.7x)\n"
 "  --stage S        fill | both | apply        [both]\n"
 "  --cells N        16 | 8 bits per sieve cell [16]  (8 is unsafe; cost only)\n"
-"  --norm M         horner | const             [horner]\n"
+"  --norm M         horner | interp | const    [horner]  (const is harness-only)\n"
 "  --apply-mode M   atomic | plain             [atomic]  (plain is racy)\n"
 "  --apply-threads N  threads per apply block  [512] (max 512)\n"
 "  --reps N         timing repetitions         [3]\n"
@@ -584,7 +590,8 @@ static int resolve_and_check_cofactor_config(bench_cfg_t *cfg, uint32_t alim,
              *
              * 30*B1, CLAMPED INTO THE VALIDATOR'S OWN RANGE. A derived value
              * must never be able to fail the check that follows it: B1 below
-             * 30 is outside the D=30 continuation's domain, and 30*B1 above
+             * 30 is outside the D=60 continuation's domain (B1 >= D/2 = 30),
+             * and 30*B1 above
              * 10^7 exceeds the B2 ceiling -- so an unclamped rule turned
              * `--ecm-b1 2` and every `--ecm-b1` above 333,333 into a hard
              * refusal citing an --ecm-b2 the user never passed. Two thirds of
@@ -1580,8 +1587,9 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             const char *m = argv[++i];
             if (!strcmp(m, "const")) cfg.norm_mode = NORM_CONST;
             else if (!strcmp(m, "horner")) cfg.norm_mode = NORM_HORNER;
+            else if (!strcmp(m, "interp")) cfg.norm_mode = NORM_INTERP;
             else {
-                fprintf(stderr, "--norm: want const or horner, got %s\n", m);
+                fprintf(stderr, "--norm: want horner, interp or const, got %s\n", m);
                 return 1;
             }
         }
@@ -2279,6 +2287,26 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 cfg.logI, cfg.pipeline ? "" : ", or --no-smallsieve");
         return 1;
     }
+    if (cfg.norm_mode == NORM_INTERP) {
+        const uint32_t athr = (uint32_t)(cfg.apply_threads ? cfg.apply_threads : 512);
+        if (!norm_interp_shape_ok(cfg.logI, cfg.log_region, athr)) {
+            fprintf(stderr, "--norm interp needs --region in [7, logI] with"
+                    " 64..960 words/warp in multiples of 64 (got logI=%d,"
+                    " --region %d, --apply-threads %u)\n",
+                    cfg.logI, cfg.log_region, athr);
+            return 1;
+        }
+        if (!cfg.pipeline && (cfg.cell_bits != 16 || !cfg.apply_atomic)) {
+            fprintf(stderr, "--norm interp needs 16-bit cells and"
+                    " --apply-mode atomic\n");
+            return 1;
+        }
+        if (!cfg.pipeline && cfg.verify) {
+            fprintf(stderr, "--verify checks exact Horner cells and does not"
+                    " apply to --norm interp\n");
+            return 1;
+        }
+    }
     /* Scale is free with 16-bit cells (see k_apply), but not unbounded: the
      * norm must fit under CINIT and each ideal's log must fit in the uint8
      * that fb_t carries. Refuse rather than saturate. */
@@ -2640,11 +2668,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
             return 1;
         }
 
-        /* --sparse-apply's default (finding 164): on only on the architecture
-         * where it was timed, sm_120 (tuned_card_defaults), wherever
-         * --norm-gate is on and the launch shape fits (logI in 12..16,
+        /* --sparse-apply's default (finding 164): on only on the architectures
+         * where it was timed, sm_86, sm_89 and sm_120 (tuned_card_defaults),
+         * wherever --norm-gate is on and the launch shape fits (logI in 12..16,
          * region in 6..logI, 512 apply threads); off elsewhere until timed on
-         * Ada/Ampere/Turing. An explicit --sparse-apply on an unsupported
+         * Turing/Hopper/A100. An explicit --sparse-apply on an unsupported
          * shape is refused rather than silently running dense while the banner
          * and run log say sparse-apply=1. */
         {
@@ -2863,7 +2891,8 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
         /* Options that belong to the measurement harness only. The pipeline
          * runs ONE configuration -- the one every gate was closed against:
          * single-level atomic fill, 4 B records, 16-bit cells, the fp32/fp64
-         * Horner norm, both stages, no repetitions, side 1 then side 0. Taking
+         * Horner norm (or opt-in --norm interp), both stages, no repetitions,
+         * side 1 then side 0. Taking
          * a flag that changes none of that and running anyway is how a run gets
          * quoted as something it was not, so it is an error rather than a
          * silent no-op. */
@@ -2874,7 +2903,7 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
              * stream -- a log that proves a configuration the run did not
              * have, which is the exact defect this list exists to prevent. */
             "--fill-streams",
-            "--record-bytes", "--mode", "--cells", "--norm", "--apply-mode",
+            "--record-bytes", "--mode", "--cells", "--apply-mode",
             "--stage", "--reps", "--verify", "--verify-only", "--side", "--dump", "--probe",
             "--survbits", "--other-bits", "--emit", "--emit-cof", "--td",
             "--ab-resieve", "--resieve-sweep", NULL
@@ -2889,6 +2918,11 @@ static int bench_main_impl(int argc, char **argv, enum bench_outcome *outcome)
                 }
         if (nbad) {
             fprintf(stderr, "  drop --pipeline to use them, or drop them.\n");
+            return 2;
+        }
+        if (cfg.norm_mode == NORM_CONST) {
+            fprintf(stderr, "bench --pipeline: --norm const applies to the"
+                    " benchmark harness, not the pipeline (use horner or interp)\n");
             return 2;
         }
         /* The pipeline uses the FULL factor base up to each side's lim; the
@@ -3885,12 +3919,13 @@ resume_artifacts_ready:
              * `q-pipeline` line with what was granted. */
             runlog_note("fill", "rows<%d*I bands=%d resieve-rows=%d"
                         " gate=%d shift=%d resieve-scan=%d norm-gate=%d"
-                        " sparse-apply=%d sparse-rows=%d",
+                        " sparse-apply=%d sparse-rows=%d norm=%s",
                         cfg.fill_rows, cfg.fill_row_bands, cfg.resieve_rows,
                         cfg.fill_gate, cfg.fill_gate ? cfg.fill_gate_shift : 0,
                         cfg.resieve_scan, cfg.norm_gate,
                         cfg.sparse_apply,
-                        cfg.sparse_apply ? cfg.sparse_apply_rows : 0);
+                        cfg.sparse_apply ? cfg.sparse_apply_rows : 0,
+                        cfg.norm_mode == NORM_INTERP ? "interp" : "horner");
             if (cfg.resume)
                 runlog_note("resume", "at q=%llu rho=%llu after %llu q,"
                             " %llu relations",

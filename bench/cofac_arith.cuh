@@ -68,6 +68,34 @@ template <int L> CF_FN uint32_t mz_sub(mz<L> *a, const mz<L> *b)
     return (uint32_t)borrow;
 }
 
+/* a = a - b when a >= b (no borrow needed). PTX carry-chain specialisations
+ * for L = 3 and L = 4 below. */
+template <int L> CF_FN void mz_sub_fast(mz<L> *a, const mz<L> *b)
+{
+    (void)mz_sub<L>(a, b);
+}
+
+/* x = x / 2 mod n, for odd n and 0 <= x < n: if odd, (x + n) >> 1; else x >> 1.
+ * PTX branchless specialisations for L = 3 and L = 4 below. */
+template <int L> CF_FN void mz_half_mod(mz<L> *x, const mz<L> *n)
+{
+    uint32_t c = 0;
+    if (x->v[0] & 1u) {
+        uint64_t carry = 0;
+        #pragma unroll
+        for (int i = 0; i < L; i++) {
+            uint64_t s = (uint64_t)x->v[i] + n->v[i] + carry;
+            x->v[i] = (uint32_t)s;
+            carry = s >> 32;
+        }
+        c = (uint32_t)carry;
+    }
+    #pragma unroll
+    for (int i = 0; i < L - 1; i++)
+        x->v[i] = (x->v[i] >> 1) | (x->v[i + 1] << 31);
+    x->v[L - 1] = (x->v[L - 1] >> 1) | (c << 31);
+}
+
 /* a = a - b mod n, given a, b < n */
 template <int L> CF_FN void mz_sub_mod(mz<L> *a, const mz<L> *b, const mz<L> *n)
 {
@@ -393,6 +421,36 @@ CF_FN void mz_dbl_mod<3>(mz<3> *a, const mz<3> *n)
 }
 
 template <>
+CF_FN void mz_sub_fast<3>(mz<3> *a, const mz<3> *b)
+{
+    uint32_t d0, d1, d2;
+    asm("sub.cc.u32  %0, %3, %6;\n\t"
+        "subc.cc.u32 %1, %4, %7;\n\t"
+        "subc.u32    %2, %5, %8;"
+        : "=r"(d0), "=r"(d1), "=r"(d2)
+        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]),
+          "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]));
+    a->v[0] = d0; a->v[1] = d1; a->v[2] = d2;
+}
+
+template <>
+CF_FN void mz_half_mod<3>(mz<3> *x, const mz<3> *n)
+{
+    const uint32_t m = 0u - (x->v[0] & 1u);
+    uint32_t s0, s1, s2, c;
+    asm("add.cc.u32  %0, %4, %7;\n\t"
+        "addc.cc.u32 %1, %5, %8;\n\t"
+        "addc.cc.u32 %2, %6, %9;\n\t"
+        "addc.u32    %3, 0, 0;"
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(c)
+        : "r"(x->v[0]), "r"(x->v[1]), "r"(x->v[2]),
+          "r"(n->v[0] & m), "r"(n->v[1] & m), "r"(n->v[2] & m));
+    x->v[0] = (s0 >> 1) | (s1 << 31);
+    x->v[1] = (s1 >> 1) | (s2 << 31);
+    x->v[2] = (s2 >> 1) | (c  << 31);
+}
+
+template <>
 CF_FN void mz_mul<4>(mz<4> *r, const mz<4> *a, const mz<4> *b,
                       const mz<4> *n, uint32_t n0inv)
 {
@@ -540,6 +598,39 @@ CF_FN void mz_dbl_mod<4>(mz<4> *a, const mz<4> *n)
 {
     const mz<4> b = *a;
     mz_add_mod<4>(a, &b, n);
+}
+
+template <>
+CF_FN void mz_sub_fast<4>(mz<4> *a, const mz<4> *b)
+{
+    uint32_t d0, d1, d2, d3;
+    asm("sub.cc.u32  %0, %4, %8;\n\t"
+        "subc.cc.u32 %1, %5, %9;\n\t"
+        "subc.cc.u32 %2, %6, %10;\n\t"
+        "subc.u32    %3, %7, %11;"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(a->v[0]), "r"(a->v[1]), "r"(a->v[2]), "r"(a->v[3]),
+          "r"(b->v[0]), "r"(b->v[1]), "r"(b->v[2]), "r"(b->v[3]));
+    a->v[0] = d0; a->v[1] = d1; a->v[2] = d2; a->v[3] = d3;
+}
+
+template <>
+CF_FN void mz_half_mod<4>(mz<4> *x, const mz<4> *n)
+{
+    const uint32_t m = 0u - (x->v[0] & 1u);
+    uint32_t s0, s1, s2, s3, c;
+    asm("add.cc.u32  %0, %5, %9;\n\t"
+        "addc.cc.u32 %1, %6, %10;\n\t"
+        "addc.cc.u32 %2, %7, %11;\n\t"
+        "addc.cc.u32 %3, %8, %12;\n\t"
+        "addc.u32    %4, 0, 0;"
+        : "=r"(s0), "=r"(s1), "=r"(s2), "=r"(s3), "=r"(c)
+        : "r"(x->v[0]), "r"(x->v[1]), "r"(x->v[2]), "r"(x->v[3]),
+          "r"(n->v[0] & m), "r"(n->v[1] & m), "r"(n->v[2] & m), "r"(n->v[3] & m));
+    x->v[0] = (s0 >> 1) | (s1 << 31);
+    x->v[1] = (s1 >> 1) | (s2 << 31);
+    x->v[2] = (s2 >> 1) | (s3 << 31);
+    x->v[3] = (s3 >> 1) | (c  << 31);
 }
 #endif
 

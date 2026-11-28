@@ -74,12 +74,13 @@ expect_rel "ECM, inline queue"             37 --cofactor --cof-ecm --ecm-b1 2000
 expect_rel "rho, chunked launches"         37 --cofactor --cof-rho --cof-rounds 2 --cof-budget 65536 --cof-chunk 256
 expect_rel "ECM, chunked launches"         37 --cofactor --cof-ecm --ecm-b1 2000 --ecm-curves 48 --cof-chunk 256
 expect_refused "chunk below one block"     --cofactor --cof-rho --cof-chunk 1
-# --cof-rounds 2 pinned: the default became 4 on 2026-08-19, and at 4 rounds
-# stage 1 alone (64 curves) finds the relation this control exists to show
-# stage 2 finding. The case tests stage 2, so it must hold the curve budget
-# still.
-expect_rel "ECM stage 2 control, disabled" 36 --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 1000 --ecm-b2 0 --ecm-curves 16
-expect_rel "ECM stage 2, inline queue"     37 --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 1000 --ecm-b2 10000 --ecm-curves 16
+# --cof-rounds 2 and --ecm-b1 500 pinned: the default became 4 on 2026-08-19,
+# and PRAC stage 1 (finding 168) visits intermediate multiple 107 inside
+# PRAC(431) at B1=1000, catching the 107^2 | #E bonus split on round 1 without
+# stage 2. At B1=500 stage 1 alone finds 36 and stage 2 (B2=10000) lifts it to
+# 37, keeping the control testing stage 2 itself.
+expect_rel "ECM stage 2 control, disabled" 36 --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 500 --ecm-b2 0 --ecm-curves 16
+expect_rel "ECM stage 2, inline queue"     37 --cofactor --cof-ecm --cof-rounds 2 --ecm-b1 500 --ecm-b2 10000 --ecm-curves 16
 # The method switch must actually REACH the queue. B1 = 2 with one curve can
 # split essentially nothing, so this must fall back to the trial-division count;
 # 37 here would mean rho ran despite --cof-ecm, which is exactly the defect the
@@ -375,7 +376,9 @@ expect_rel "side 0 plan reaches side 0"     17 --cofactor --ecm-b1-0 2
 # run sees the same sigmas whatever else was selected -- so its relations must
 # be a subset of the rule-off run's, and on a plan weak enough that late rounds
 # matter it must drop some: B1 70 x 2 curves on the 3LP side over 8 rounds,
-# where off finds 24 and after round 1 finds 13, abandoning 1,506 records.
+# where off finds 23 (was 24 under D=30, whose v=59 giant step caught a bonus
+# 59^2 | #E curve that D=60's vmax=35 does not visit; finding 168) and after
+# round 1 finds 13, abandoning 1,507 records (was 1,506).
 WEAK="--cofactor --ecm-b1-1 70 --ecm-curves 2 --cof-rounds 8"
 run $WEAK --cof-abort 0 --relations $TMP/ab0.txt >/dev/null || true
 run $WEAK --cof-abort 8 --relations $TMP/ab8.txt >/dev/null || true
@@ -394,9 +397,9 @@ if [ -s $TMP/ab0.txt ] && [ -s $TMP/ab1.txt ]; then
     sort $TMP/ab0.txt > $TMP/ab0.s; sort $TMP/ab1.txt > $TMP/ab1.s
     extra=$(comm -23 $TMP/ab1.s $TMP/ab0.s | wc -l)
 fi
-abn=$(printf '%s\n' "$out" | grep -c 'left by the abort rule *1506 ' || true)
-if [ "$n0" = "24" ] && [ "$n1" = "13" ] && [ "$extra" = "0" ] && [ "$abn" = "1" ]; then
-    printf 'PASS   %-34s 13 of 24, a subset, 1506 abandoned\n' "--cof-abort 1 drops, and only drops"
+abn=$(printf '%s\n' "$out" | grep -c 'left by the abort rule *1507 ' || true)
+if [ "$n0" = "23" ] && [ "$n1" = "13" ] && [ "$extra" = "0" ] && [ "$abn" = "1" ]; then
+    printf 'PASS   %-34s 13 of 23, a subset, 1507 abandoned\n' "--cof-abort 1 drops, and only drops"
 else
     printf 'FAIL   %-34s off=%s abort1=%s not-in-off=%s abandoned-line=%s\n' \
            "--cof-abort 1 drops, and only drops" "$n0" "$n1" "$extra" "$abn"; fail=1
@@ -935,6 +938,45 @@ elif grep -q 'above the bucket threshold' $TMP/jg.out; then
 else
     printf 'FAIL   %-34s refused, but not by the J guard\n' "J above bkthresh, relations"
     tail -2 $TMP/jg.out | sed 's/^/       /'; fail=1
+fi
+
+# ---- --norm interp (row 57, finding 167) ---------------------------------
+# Guarded 128-cell quadratic log-norm interpolation on side 1: opt-in,
+# approximate, must emit valid relations (passing --check-relations) on both
+# unslabbed and slabbed paths, report itself in the startup banner, and refuse
+# --norm const under --pipeline and unsupported region shapes.
+out=$(run --cofactor --norm interp --relations $TMP/interp.txt || true)
+ni_rel=$(grep -vc '^#' $TMP/interp.txt 2>/dev/null || true)
+if [ -s $TMP/interp.txt ] && [ "$ni_rel" = "37" ] &&
+   printf '%s\n' "$out" | grep -q -- '--norm interp:' &&
+   ./bench --poly $POLY --check-relations $TMP/interp.txt >/dev/null 2>&1; then
+    printf 'PASS   %-34s %s relations verified, banner present\n' "--norm interp (unslabbed)" "$ni_rel"
+else
+    printf 'FAIL   %-34s rels=%s\n' "--norm interp (unslabbed)" "${ni_rel:-0}"; fail=1
+fi
+out=$(run --cofactor --norm interp --slab-j 4096 --relations $TMP/interp_sl.txt || true)
+ni_sl=$(grep -vc '^#' $TMP/interp_sl.txt 2>/dev/null || true)
+if [ -s $TMP/interp_sl.txt ] && [ "$ni_sl" = "37" ] &&
+   ./bench --poly $POLY --check-relations $TMP/interp_sl.txt >/dev/null 2>&1; then
+    printf 'PASS   %-34s %s relations verified\n' "--norm interp (slabbed)" "$ni_sl"
+else
+    printf 'FAIL   %-34s rels=%s\n' "--norm interp (slabbed)" "${ni_sl:-0}"; fail=1
+fi
+if ./bench --pipeline --cadofb $FB --poly $POLY $Q --norm const \
+           --relations $TMP/r.txt >$TMP/o 2>&1; then
+    printf 'FAIL   %-34s accepted, should have been refused\n' "--norm const under --pipeline"; fail=1
+elif grep -q -- '--norm const applies to the benchmark harness' $TMP/o; then
+    printf 'PASS   %-34s refused\n' "--norm const under --pipeline"
+else
+    printf 'FAIL   %-34s refused, but for the wrong reason\n' "--norm const under --pipeline"; fail=1
+fi
+if ./bench --pipeline --cadofb $FB --poly $POLY $Q --norm interp --region 10 \
+           --relations $TMP/r.txt >$TMP/o 2>&1; then
+    printf 'FAIL   %-34s accepted, should have been refused\n' "--norm interp unsupported shape"; fail=1
+elif grep -q -- '--norm interp needs' $TMP/o; then
+    printf 'PASS   %-34s refused\n' "--norm interp unsupported shape"
+else
+    printf 'FAIL   %-34s refused, but for the wrong reason\n' "--norm interp unsupported shape"; fail=1
 fi
 
 [ $fail = 0 ] && echo "cofactor golden test passed" || { echo "cofactor golden test FAILED"; exit 1; }

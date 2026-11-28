@@ -137,8 +137,63 @@ template <int L> CF_FN void mz_gcd(mz<L> *g, mz<L> a, mz<L> b)
     for (;;) {
         while ((b.v[0] & 1u) == 0u) mz_rshift1<L>(&b);
         if (mz_cmp<L>(&a, &b) > 0) { mz<L> t = a; a = b; b = t; }
-        mz_sub<L>(&b, &a);                       /* b >= a, so no borrow */
+        mz_sub_fast<L>(&b, &a);                  /* b >= a, so no borrow */
         if (mz_is_zero<L>(&b)) { *g = a; return; }
+    }
+}
+
+/* Montgomery modular division: res = (num / den) * R mod n given Montgomery
+ * inputs num_mont = num*R and den_mont = den*R mod n, for odd n.
+ *
+ * Reducing den_mont by 1*R^{-1} gives plain u = den mod n, and running the
+ * binary extended GCD with x1 = num_mont, x2 = 0 maintains
+ *     u * num_mont == x1 * den (mod n)   and   v * num_mont == x2 * den (mod n).
+ * When u == v == 1, x1 == num_mont * den^{-1} == (num / den) * R mod n directly,
+ * with no post-multiply or power-of-2 correction.
+ *
+ * Returns 0 on success (*res set), 1 on a nontrivial factor (*g_out set), or
+ * -1 on a degenerate gcd == n. Flat loop (no nested while) keeps warp
+ * divergence low; CF_NOINLINE keeps one copy per L out of k_cofac's register
+ * and icache budget. */
+template <int L>
+CF_NOINLINE int mz_div_mod_mont(mz<L> *res, mz<L> *g_out,
+                                const mz<L> *num_mont, const mz<L> *den_mont,
+                                const mz<L> *n, uint32_t n0inv)
+{
+    mz<L> plain1, u, v, x1, x2;
+    #pragma unroll
+    for (int i = 0; i < L; i++) { plain1.v[i] = 0; x2.v[i] = 0; }
+    plain1.v[0] = 1u;
+    mz_mul<L>(&u, den_mont, &plain1, n, n0inv);
+    if (mz_is_zero<L>(&u)) { *g_out = *n; return -1; }
+    v = *n;
+    x1 = *num_mont;
+    for (;;) {
+        if ((u.v[0] & 1u) == 0u) {
+            mz_rshift1<L>(&u);
+            mz_half_mod<L>(&x1, n);
+        } else if ((v.v[0] & 1u) == 0u) {
+            mz_rshift1<L>(&v);
+            mz_half_mod<L>(&x2, n);
+        } else {
+            const int cmp = mz_cmp<L>(&u, &v);
+            if (cmp == 0) {
+                if (mz_is_one<L>(&u)) { *res = x1; return 0; }
+                *g_out = u;
+                return (mz_cmp<L>(&u, n) == 0) ? -1 : 1;
+            }
+            if (cmp > 0) {
+                mz_sub_fast<L>(&u, &v);
+                mz_rshift1<L>(&u);
+                mz_sub_mod<L>(&x1, &x2, n);
+                mz_half_mod<L>(&x1, n);
+            } else {
+                mz_sub_fast<L>(&v, &u);
+                mz_rshift1<L>(&v);
+                mz_sub_mod<L>(&x2, &x1, n);
+                mz_half_mod<L>(&x2, n);
+            }
+        }
     }
 }
 
@@ -226,7 +281,7 @@ template <int L> CF_FN int mz_sprp2(const mz<L> *n)
     for (int i = 0; i < L; i++) one.v[i] = (i == topw) ? topb : 0u;
     for (int i = nbits - 1; i < 32 * L; i++) mz_dbl_mod<L>(&one, n); /* R mod n */
 
-    nm1 = *n; { mz<L> t = one; mz_sub<L>(&nm1, &t); }
+    nm1 = *n; { mz<L> t = one; mz_sub_fast<L>(&nm1, &t); }
 
     d = *n; d.v[0] -= 1u;
     while ((d.v[0] & 1u) == 0u) { mz_rshift1<L>(&d); r++; }
@@ -344,23 +399,26 @@ found:
  * Montgomery curves By^2 = x^3 + Ax^2 + x in XZ coordinates, which is the form
  * whose differential addition needs no y and no inversion.
  *
- * The curve constant is kept PROJECTIVE, A24 = (an : ad). Suyama's
- * parameterisation puts A24 = (v-u)^3 (3u+v) / (16 u^3 v), and carrying that as
- * a fraction costs one extra multiply per doubling -- 12 modmuls per ladder bit
- * against 11 -- while removing a modular inversion that would otherwise be paid
- * once per curve per record. At tens of curves per record that trade is clearly
- * the right way round, and it keeps a binary extended GCD out of the file.
- *
- * Stage 2 is the small-table Montgomery-XZ continuation below. It deliberately
- * uses D=30: the four unsigned baby residues {1,7,11,13} keep one curve's
- * private table small enough for this first GPU experiment. The host supplies
- * one four-bit mask per giant step; bit u is set when vD-u or vD+u is prime in
- * (B1,B2]. Thus every lane follows the same giant-step walk and only the cheap
- * product-of-differences loop is masked.
+ * Three algorithmic improvements (row 58, finding 168):
+ *   (a) Affine curve constant a24 = (v-u)^3*(3u+v) / (16 u^3 v) mod n, computed
+ *       once per curve by flat-loop binary extended GCD (mz_div_mod_mont, ~179
+ *       mz_mul equivalents at L=4). Cuts x_dbl from 6 to 5 mz_muls (~600 muls
+ *       saved per curve at B1=400); a non-invertible denominator immediately
+ *       yields a factor of n.
+ *   (b) Host-precomputed PRAC Lucas chains for stage 1 (warp-uniform because B1
+ *       is per side), run by an inlined fused-op interpreter without PRAC_R1
+ *       (only 3 live points A, B, C). Cuts stage-1 muls at B1=400 from 6,286
+ *       (affine ladder) to 5,514 (-12.3%) while keeping 128 regs / 2 blk/SM.
+ *   (c) Stage 2 at D = 60 with 8 unsigned baby residues {1,7,11,13,17,19,23,29}
+ *       stored in bank-conflict-free striped shared memory (24 KB at L=3,
+ *       32 KB at L=4; 2 blocks/SM on sm_80..120), built in a 15-op differential
+ *       chain + peeled shared denominator, with x_mul_pair computing both
+ *       [vmin](60Q) and [vmin+1](60Q) in one ladder. Halves giant steps while
+ *       preserving uint8_t masks and the B1 >= 30 (= D/2) stage-2 domain.
  */
 
-#define CF_ECM_D       30u
-#define CF_ECM_NBABY    4u
+#define CF_ECM_D       60u
+#define CF_ECM_NBABY    8u
 #define CF_ECM_MAX_B1   1000000u
 #define CF_ECM_MAX_B2  10000000u
 
@@ -369,7 +427,16 @@ found:
  * silently assigning different meanings to the same mask bit. */
 CF_HD uint8_t cf_ecm_baby(uint32_t k)
 {
-    return k == 0 ? 1u : k == 1 ? 7u : k == 2 ? 11u : 13u;
+    switch (k) {
+    case 0: return 1u;
+    case 1: return 7u;
+    case 2: return 11u;
+    case 3: return 13u;
+    case 4: return 17u;
+    case 5: return 19u;
+    case 6: return 23u;
+    default: return 29u;
+    }
 }
 
 /* Shared composite sieve for both ECM plans. Bounds live here as well as in
@@ -388,49 +455,224 @@ static uint8_t *cf_ecm_sieve(uint32_t limit)
     return composite;
 }
 
-/* The stage-1 exponent lcm(1..B1), held as its prime powers rather than as one
- * big integer: each is at most B1, so the ladder for it is a dozen bits and the
- * whole schedule is an array of uint32 instead of a 1.4*B1-bit number the device
- * would have to store and shift. Returns the count. */
-static uint32_t cf_ecm_plan(uint32_t b1, uint32_t **out)
+/* PRAC Lucas-chain opcodes for stage 1 (no PRAC_R1: only 3 live points A,B,C,
+ * avoiding local-memory register spills while giving up only ~15 muls out of
+ * 5,500 at B1=400). */
+enum cf_prac_op_t : uint8_t {
+    CF_PRAC_DBL_A = 0,  /* A <- 2A */
+    CF_PRAC_INIT  = 1,  /* B <- 2A; C <- A */
+    CF_PRAC_FIN   = 2,  /* A <- A + B (diff C) */
+    CF_PRAC_SWAP  = 3,  /* swap(A, B) */
+    CF_PRAC_R2    = 4,  /* B <- A + B (diff C); A <- 2A */
+    CF_PRAC_R4    = 5,  /* C <- A + C (diff B); A <- 2A */
+    CF_PRAC_R5    = 6,  /* T <- A + B (diff C); C <- B; B <- T */
+    CF_PRAC_R6    = 7   /* C <- B + C (diff A); B <- 2B */
+};
+
+static uint32_t cf_gcd_u32(uint32_t a, uint32_t b)
 {
-    uint32_t n = 0, cap = 0, *s = NULL;
-    uint8_t *sieve;
-    if (b1 < 2 || b1 > CF_ECM_MAX_B1) { *out = NULL; return 0; }
-    sieve = cf_ecm_sieve(b1);
-    if (!sieve) { *out = NULL; return 0; }
-    for (uint32_t p = 2; p <= b1; p++) {
-        if (sieve[p]) continue;
-        {   /* the largest power of p that still fits under B1 */
-            uint64_t pe = p;
-            while (pe * p <= b1) pe *= p;
-            if (n == cap) {
-                uint32_t *grown;
-                cap = cap ? cap * 2 : 256;
-                grown = (uint32_t *)realloc(s, (size_t)cap * sizeof(*s));
-                if (!grown) { free(s); free(sieve); *out = NULL; return 0; }
-                s = grown;
+    while (b) { uint32_t t = a % b; a = b; b = t; }
+    return a;
+}
+
+/* Exact integer verification of a PRAC opcode sequence: confirms that starting
+ * from A = 1 every differential addition has valid difference |P-Q| or P+Q and
+ * the chain ends at A == k. */
+static int cf_prac_verify(uint32_t k, const uint8_t *ops, uint32_t nops)
+{
+    int64_t A = 1, B = 0, C = 0;
+    for (uint32_t i = 0; i < nops; i++) {
+        auto sim_add = [](int64_t P, int64_t Q, int64_t D, int *ok) -> int64_t {
+            if (P <= 0 || Q <= 0 || D <= 0) { *ok = 0; return 0; }
+            const int64_t diff = P > Q ? P - Q : Q - P;
+            if (D == diff)  return P + Q;
+            if (D == P + Q) return diff;
+            *ok = 0;
+            return 0;
+        };
+        int ok = 1;
+        int64_t T;
+        switch (ops[i]) {
+        case CF_PRAC_DBL_A: A = 2 * A; break;
+        case CF_PRAC_INIT:  B = 2 * A; C = A; break;
+        case CF_PRAC_FIN:   A = sim_add(A, B, C, &ok); break;
+        case CF_PRAC_SWAP:  T = A; A = B; B = T; break;
+        case CF_PRAC_R2:    B = sim_add(A, B, C, &ok); A = 2 * A; break;
+        case CF_PRAC_R4:    C = sim_add(A, C, B, &ok); A = 2 * A; break;
+        case CF_PRAC_R5:    T = sim_add(A, B, C, &ok); C = B; B = T; break;
+        case CF_PRAC_R6:    C = sim_add(B, C, A, &ok); B = 2 * B; break;
+        default:            return 0;
+        }
+        if (!ok || A <= 0) return 0;
+    }
+    return A == (int64_t)k;
+}
+
+/* Build a minimum-mul PRAC Lucas chain (affine cost: x_add=6, x_dbl=5) for an
+ * odd multiplier k >= 3. Writes ops into best_ops (capacity >= 512) and returns
+ * the op count (0 on failure), with mul cost in *cost_out. */
+static uint32_t cf_prac_build_odd(uint32_t k, uint8_t best_ops[512], int *cost_out)
+{
+    static const double ratios[7] = {
+        1.6180339887498948, 1.7236067977499790, 1.6183471196562281,
+        1.6179144065288178, 1.6129032258064515, 1.5, 1.3819660112501051
+    };
+    uint32_t best_len = 0;
+    int best_cost = 0x3fffffff;
+
+    if (k == 3u) {
+        best_ops[0] = CF_PRAC_INIT;
+        best_ops[1] = CF_PRAC_FIN;
+        *cost_out = 5 + 6;
+        return 2u;
+    }
+
+    auto try_r = [&](uint32_t r, int max_lim) {
+        for (int r5_lim = 2; r5_lim <= max_lim; r5_lim++) {
+            uint8_t cur[512];
+            uint32_t len = 0;
+            int cost = 5;                       /* CF_PRAC_INIT */
+            uint32_t d = k - r, e = r;
+            cur[len++] = CF_PRAC_INIT;
+            d -= e;
+            while (d != e && len < 508u) {
+                if (d < e) {
+                    uint32_t tmp = d; d = e; e = tmp;
+                    cur[len++] = CF_PRAC_SWAP;
+                }
+                if (d <= 4u * e && (d - e) % 6u == 0u) {
+                    d = (d - e) >> 1;
+                    cur[len++] = CF_PRAC_R2; cost += 11;
+                } else if ((d & 1u) == 0u) {
+                    d >>= 1;
+                    cur[len++] = CF_PRAC_R4; cost += 11;
+                } else if ((e & 1u) != 0u) {
+                    d = (d - e) >> 1;
+                    cur[len++] = CF_PRAC_R2; cost += 11;
+                } else if (d <= (uint32_t)r5_lim * e) {
+                    d -= e;
+                    cur[len++] = CF_PRAC_R5; cost += 6;
+                } else {
+                    e >>= 1;
+                    cur[len++] = CF_PRAC_R6; cost += 11;
+                }
+                if (cost >= best_cost) break;
             }
-            s[n++] = (uint32_t)pe;
+            if (d == 1u && e == 1u && cost + 6 < best_cost) {
+                cur[len++] = CF_PRAC_FIN;
+                cost += 6;
+                best_cost = cost;
+                best_len = len;
+                memcpy(best_ops, cur, len);
+            }
+        }
+    };
+
+    if (k <= 500u) {
+        for (uint32_t r = 1u; r * 2u < k; r++)
+            if (cf_gcd_u32(k, r) == 1u) try_r(r, 4);
+    } else {
+        const int dspan = (k <= 4000u) ? 3 : 1;
+        const int mlim  = (k <= 4000u) ? 4 : 3;
+        for (int ri = 0; ri < 7; ri++) {
+            const uint32_t r0 = (uint32_t)((double)k / (1.0 + ratios[ri]) + 0.5);
+            for (int dl = -dspan; dl <= dspan; dl++) {
+                const int64_t rr = (int64_t)r0 + dl;
+                if (rr >= 1 && (uint64_t)rr * 2u < k &&
+                    cf_gcd_u32(k, (uint32_t)rr) == 1u)
+                    try_r((uint32_t)rr, mlim);
+            }
+        }
+        /* Guaranteed fallback if golden-ratio neighbourhood missed (e.g. small
+         * prime factor crowding). */
+        if (!best_len) {
+            for (uint32_t r = 1u; r * 2u < k && !best_len; r++)
+                if (cf_gcd_u32(k, r) == 1u) try_r(r, 4);
+        }
+    }
+    if (!best_len || !cf_prac_verify(k, best_ops, best_len)) return 0u;
+    *cost_out = best_cost;
+    return best_len;
+}
+
+/* Host stage-1 PRAC schedule for lcm(1..B1): emits the flat opcode stream into
+ * *ops_out (caller frees) and stores the prime-power count in *npp_out.
+ * Returns the opcode count (0 on invalid B1 or allocation failure). */
+static uint32_t cf_ecm_prac_plan(uint32_t b1, uint8_t **ops_out, uint32_t *npp_out)
+{
+    uint8_t *sieve, *ops = NULL;
+    uint32_t nops = 0, cap = 0, npp = 0;
+    *ops_out = NULL;
+    if (npp_out) *npp_out = 0;
+    if (b1 < 2u || b1 > CF_ECM_MAX_B1) return 0u;
+    sieve = cf_ecm_sieve(b1);
+    if (!sieve) return 0u;
+
+    auto append = [&](const uint8_t *src, uint32_t cnt) -> int {
+        if (nops + cnt > cap) {
+            uint32_t ncap = cap ? cap * 2u : 1024u;
+            while (ncap < nops + cnt) ncap *= 2u;
+            uint8_t *grown = (uint8_t *)realloc(ops, ncap);
+            if (!grown) return -1;
+            ops = grown;
+            cap = ncap;
+        }
+        memcpy(ops + nops, src, cnt);
+        nops += cnt;
+        return 0;
+    };
+
+    for (uint32_t p = 2u; p <= b1; p++) {
+        if (sieve[p]) continue;
+        npp++;
+        uint32_t e = 0;
+        uint64_t pe = 1;
+        while (pe * p <= b1) { pe *= p; e++; }
+        if (p == 2u) {
+            uint8_t dbls[32];
+            for (uint32_t i = 0; i < e; i++) dbls[i] = CF_PRAC_DBL_A;
+            if (append(dbls, e)) goto fail;
+        } else if (e == 1u) {
+            uint8_t cp[512];
+            int cost_p = 0;
+            const uint32_t lp = cf_prac_build_odd(p, cp, &cost_p);
+            if (!lp || append(cp, lp)) goto fail;
+        } else {
+            uint8_t cp[512], cpe[512];
+            int cost_p = 0, cost_pe = 0;
+            const uint32_t lp  = cf_prac_build_odd(p, cp, &cost_p);
+            const uint32_t lpe = cf_prac_build_odd((uint32_t)pe, cpe, &cost_pe);
+            if (!lp || !lpe) goto fail;
+            if ((int64_t)e * cost_p <= (int64_t)cost_pe) {
+                for (uint32_t i = 0; i < e; i++)
+                    if (append(cp, lp)) goto fail;
+            } else {
+                if (append(cpe, lpe)) goto fail;
+            }
         }
     }
     free(sieve);
-    *out = s;
-    return n;
+    *ops_out = ops;
+    if (npp_out) *npp_out = npp;
+    return nops;
+fail:
+    free(ops);
+    free(sieve);
+    return 0u;
 }
 
-/* Build the stage-2 prime-pair schedule. For every prime q in (B1,B2], write
- * q = vD +/- u with 0 < u < D/2. Since q > B1 >= 30 in the stage-2 path, q is
- * coprime to D and u is one of the four residues below. One x-coordinate
+/* Build the stage-2 prime-pair schedule for D = 60. For every prime q in
+ * (B1, B2], write q = vD +/- u with 0 < u < D/2. Since q > B1 >= D/2 = 30,
+ * q >= 31 is coprime to 60, v >= 1, and u is one of the 8 residues
+ * {1,7,11,13,17,19,23,29} (one uint8_t mask bit each). One x-coordinate
  * comparison covers both signs. Empty giant steps remain in the schedule so
- * the device can advance with one differential addition rather than restart a
- * scalar multiplication at every populated v. */
+ * the device advances with one differential addition. */
 static uint32_t cf_ecm_stage2_plan(uint32_t b1, uint32_t b2, uint32_t *vmin_out,
                                    uint8_t **mask_out)
 {
     uint8_t *composite = NULL, *mask = NULL;
     uint32_t qlo, qhi, vmin, vmax, nv;
-    if (b2 <= b1 || b1 < CF_ECM_D || b1 > CF_ECM_MAX_B1 ||
+    if (b2 <= b1 || b1 < CF_ECM_D / 2u || b1 > CF_ECM_MAX_B1 ||
         b2 > CF_ECM_MAX_B2) {
         *vmin_out = 0; *mask_out = NULL; return 0;
     }
@@ -478,9 +720,9 @@ CF_FN void mz_small(mz<L> *r, uint32_t k, const mz<L> *one, const mz<L> *n)
     }
 }
 
-/* 2P. r must not alias p. */
+/* 2P with affine a24 = (A+2)/4 mod n (5 mz_muls). r must not alias p. */
 template <int L>
-CF_FN void x_dbl(mpt<L> *r, const mpt<L> *p, const mz<L> *an, const mz<L> *ad,
+CF_FN void x_dbl(mpt<L> *r, const mpt<L> *p, const mz<L> *a24,
                  const mz<L> *n, uint32_t n0inv)
 {
     mz<L> t1, t2, s1, s2, d, w, z;
@@ -489,18 +731,13 @@ CF_FN void x_dbl(mpt<L> *r, const mpt<L> *p, const mz<L> *an, const mz<L> *ad,
     mz_mul<L>(&s1, &t1, &t1, n, n0inv);            /* (X+Z)^2 */
     mz_mul<L>(&s2, &t2, &t2, n, n0inv);            /* (X-Z)^2 */
     d = s1; mz_sub_mod<L>(&d, &s2, n);             /* 4XZ     */
-    /* ad*(X-Z)^2 serves both coordinates. X used to rebuild it as
-     * (ad*(X+Z)^2)*(X-Z)^2, one more product for the same residue: mz_mul
-     * returns the canonical a*b/R mod n in [0, n) (multest checks exactly
-     * that), so both groupings give the same bits (finding 154). */
-    mz_mul<L>(&t2, ad, &s2, n, n0inv);
-    mz_mul<L>(&r->X, &t2, &s1, n, n0inv);          /* ad*(X+Z)^2*(X-Z)^2 */
-    mz_mul<L>(&w, an, &d, n, n0inv);
-    z = t2; mz_add_mod<L>(&z, &w, n);
+    mz_mul<L>(&r->X, &s1, &s2, n, n0inv);          /* (X+Z)^2*(X-Z)^2 */
+    mz_mul<L>(&w, a24, &d, n, n0inv);              /* a24*4XZ */
+    z = s2; mz_add_mod<L>(&z, &w, n);
     mz_mul<L>(&r->Z, &d, &z, n, n0inv);
 }
 
-/* P+Q given the difference D = P-Q. r must not alias p, q or d. */
+/* P+Q given the difference D = P-Q. r must not alias p, q or dif. */
 template <int L>
 CF_FN void x_add(mpt<L> *r, const mpt<L> *p, const mpt<L> *q, const mpt<L> *dif,
                  const mz<L> *n, uint32_t n0inv)
@@ -520,154 +757,165 @@ CF_FN void x_add(mpt<L> *r, const mpt<L> *p, const mpt<L> *q, const mpt<L> *dif,
     mz_mul<L>(&r->Z, &dif->X, &b, n, n0inv);
 }
 
-/* P = [k]P by the Montgomery ladder. k is a prime power <= B1, so this is a
- * dozen bits at most and the ladder's constant-time shape costs nothing. */
+/* Compute both [k]P and [k+1]P in one Montgomery ladder (k >= 1). Used to seed
+ * stage 2's starting giant steps [vmin](60Q) and [vmin+1](60Q) in one call. */
 template <int L>
-CF_FN void x_mul(mpt<L> *p, uint32_t k, const mz<L> *an, const mz<L> *ad,
-                 const mz<L> *n, uint32_t n0inv, uint64_t *work)
+CF_NOINLINE void x_mul_pair(mpt<L> *r0_out, mpt<L> *r1_out, const mpt<L> *p,
+                            uint32_t k, const mz<L> *a24,
+                            const mz<L> *n, uint32_t n0inv, uint64_t *work)
 {
     mpt<L> r0 = *p, r1, t;
     int b = 31;
-    if (k < 2) { if (!k) { for (int i = 0; i < L; i++) { p->X.v[i] = 0; p->Z.v[i] = 0; } } return; }
+    if (k == 1u) {
+        *r0_out = *p;
+        x_dbl<L>(r1_out, p, a24, n, n0inv);
+        (*work)++;
+        return;
+    }
     while (b > 0 && !((k >> b) & 1u)) b--;
-    x_dbl<L>(&r1, p, an, ad, n, n0inv);
+    x_dbl<L>(&r1, p, a24, n, n0inv);
     for (b--; b >= 0; b--) {
         if ((k >> b) & 1u) {
             x_add<L>(&t, &r1, &r0, p, n, n0inv); r0 = t;
-            x_dbl<L>(&t, &r1, an, ad, n, n0inv);  r1 = t;
+            x_dbl<L>(&t, &r1, a24, n, n0inv);    r1 = t;
         } else {
             x_add<L>(&t, &r1, &r0, p, n, n0inv); r1 = t;
-            x_dbl<L>(&t, &r0, an, ad, n, n0inv);  r0 = t;
+            x_dbl<L>(&t, &r0, a24, n, n0inv);    r0 = t;
         }
         (*work)++;
     }
-    *p = r0;
+    *r0_out = r0;
+    *r1_out = r1;
 }
 
-/* Keep one copy of the ladder behind a call boundary. Force-inlining x_mul at
- * every baby/giant setup site makes nvcc expand seven copies of the bigint
- * arithmetic into this already-large kernel and markedly increases both
- * compile time and register pressure. */
+/* Execute the host-precomputed PRAC stage-1 Lucas chain. Inlined (CF_FN) so
+ * A, B, C stay in registers rather than spilling behind an ABI boundary. */
 template <int L>
-CF_NOINLINE void x_mul_s2(mpt<L> *p, uint32_t k, const mz<L> *an,
-                          const mz<L> *ad, const mz<L> *n, uint32_t n0inv,
-                          uint64_t *work)
+CF_FN void x_prac_run(mpt<L> *P, const uint8_t *__restrict ops, uint32_t nops,
+                      const mz<L> *a24, const mz<L> *n, uint32_t n0inv,
+                      uint64_t *work)
 {
-    x_mul<L>(p, k, an, ad, n, n0inv, work);
+    mpt<L> A = *P, B, C, T;
+    for (uint32_t i = 0; i < nops; i++) {
+        switch (ops[i]) {
+        case CF_PRAC_DBL_A:
+            x_dbl<L>(&T, &A, a24, n, n0inv); A = T;
+            break;
+        case CF_PRAC_INIT:
+            x_dbl<L>(&B, &A, a24, n, n0inv); C = A;
+            break;
+        case CF_PRAC_FIN:
+            x_add<L>(&T, &A, &B, &C, n, n0inv); A = T;
+            break;
+        case CF_PRAC_SWAP:
+            T = A; A = B; B = T;
+            break;
+        case CF_PRAC_R2:
+            x_add<L>(&T, &A, &B, &C, n, n0inv); B = T;
+            x_dbl<L>(&T, &A, a24, n, n0inv);    A = T;
+            break;
+        case CF_PRAC_R4:
+            x_add<L>(&T, &A, &C, &B, n, n0inv); C = T;
+            x_dbl<L>(&T, &A, a24, n, n0inv);    A = T;
+            break;
+        case CF_PRAC_R5:
+            x_add<L>(&T, &A, &B, &C, n, n0inv); C = B; B = T;
+            break;
+        default: /* CF_PRAC_R6 */
+            x_add<L>(&T, &B, &C, &A, n, n0inv); C = T;
+            x_dbl<L>(&T, &B, a24, n, n0inv);    B = T;
+            break;
+        }
+        (*work)++;
+    }
+    *P = A;
 }
 
-/* One pass over the D=30 baby-step/giant-step continuation. All selected
- * cross-products are accumulated and normally only one gcd is paid. If hits
- * for different prime factors make that gcd equal n, replay the same curve and
- * gcd each selected difference. The replay is rare, preserves the fast common
- * path, and prevents a batched product from swallowing every factor it found. */
+/* One pass over the D = 60 baby-step/giant-step continuation.
+ *
+ * The 8 baby steps {1,7,11,13,17,19,23,29}Q and the giant step 60Q are built
+ * once in a 15-op differential chain, then put on a shared denominator
+ * bz = prod_j Z_j with rescaled x-coordinates bx[k] = X_k * prod_{j!=k} Z_j
+ * stored in bank-conflict-free striped shared memory (24 KB at L=3, 32 KB at
+ * L=4 per 256-thread block) so they do not bloat the thread's local stack.
+ * Every active giant step hoists G->X * bz once and evaluates selected pairs
+ * with one multiply each. If the batched product's gcd equals n, replay the
+ * giant-step walk (reusing the already-computed baby table in s_bx) and gcd
+ * each selected difference individually. */
 template <int L>
 CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
-                                    const mz<L> *an, const mz<L> *ad,
-                                    const mz<L> *one, const mz<L> *n,
-                                    uint32_t n0inv,
-                                    const uint8_t *__restrict masks,
-                                    uint32_t vmin, uint32_t nv,
-                                    uint64_t *work)
+                                   const mz<L> *a24, const mz<L> *one,
+                                   const mz<L> *n, uint32_t n0inv,
+                                   const uint8_t *__restrict masks,
+                                   uint32_t vmin, uint32_t nv,
+                                   uint64_t *work,
+                                   uint32_t *s_bx, uint32_t tid)
 {
-    /* The baby steps are held on a SHARED DENOMINATOR: bx[k] = X_k *
-     * prod_{j!=k} Z_j against one bz = prod_j Z_j, so (bx[k] : bz) is the
-     * same projective point (X_k : Z_k) was. Every cross product below is
-     * then the old one scaled by prod_{j!=k} Z_j.
-     *
-     * That scaling leaves gcd(d, n) alone only when the scale factor is a UNIT
-     * mod n. It normally is -- cofcheck.sh's pinned counts match and a 148-q
-     * A/B produced identical relations either way -- but that is empirical,
-     * NOT a proof, and an earlier version of this comment wrongly claimed the
-     * factors were provably identical.
-     *
-     * Note the BLAST RADIUS when it is not. Every bx[k] except k's own carries
-     * Z_k as a factor, so ONE baby step whose Z shares a factor f with n
-     * contaminates the cross product of every OTHER k. All of those gcds
-     * become multiples of f, which may surface f earlier than the per-point
-     * form would, or may grow to exactly n and be discarded by the g != n
-     * guard -- losing chances the per-point form kept independent. Z_k == 0
-     * mod n is the extreme: every other k's d collapses to 0 and is rejected
-     * outright, while k's own term survives. The per-point form has no such
-     * coupling between k.
-     *
-     * It needs a baby-step Z sharing a factor with n (the lucky-hit case
-     * stage 1 usually catches), and it can NEVER return a wrong factor: any
-     * gcd with n is a true divisor, and g == n is rejected. That is what
-     * makes this safe -- "never returns a non-factor", not "same factors".
-     *
-     * The point is the inner loop: with one denominator for every baby step,
-     * the X_G * Z term is common to all k and hoists out, so a selected pair
-     * costs ONE multiply instead of two. At B1=200/B2=6000 that is ~540 fewer
-     * mz_mul per curve against the rescale's one-off cost -- 4*NBABY mz_mul
-     * issued, two per k in each of the forward and backward passes. Three of
-     * those are provably redundant (both passes open by multiplying into
-     * acc == one, which is the identity in Montgomery form, and the backward
-     * pass's final acc update is never read), so 4*NBABY - 3 do real work.
-     * Peeling them is left alone deliberately: 3 multiplies per replay is
-     * ~1% of the ~540 this change saves, and it is not worth restructuring
-     * delicate modular arithmetic for. Measured
-     * A/B on gfx1103 (oracle/c183, 148 q, only this function differing):
-     * algebraic queue 52.62/52.18 -> 50.19/49.75 ms, ~4.6%, with the rational
-     * (rho) queue unchanged as the control and 596 relations either way.
-     *
-     * Chosen over per-point affine normalisation deliberately: affine needs a
-     * modular inverse, there is no mz_inv in this file, and a binary extended
-     * GCD in device code is new delicate arithmetic for no extra gain here.
-     * The shared denominator needs no inversion at all.
-     *
-     * NOT a register-pressure fix, and not why RDNA1/2 lost stage 2 -- every
-     * stage-2 kernel is already at vgpr=128, so trimming live values relocates
-     * spill rather than freeing registers (measured: scratch 336 -> 384 on
-     * gfx1030 L=3). That was the gfx10 MUBUF stack lowering; see CLAUDE.md. */
-    mz<L> bx[CF_ECM_NBABY], bz;
+#if defined(__CUDACC__)
+    auto load_bx = [&](int k) -> mz<L> {
+        mz<L> r;
+        #pragma unroll
+        for (int l = 0; l < L; l++)
+            r.v[l] = s_bx[(k * L + l) * COFAC_THREADS_MAX + tid];
+        return r;
+    };
+    auto save_bx = [&](int k, const mz<L> &v) {
+        #pragma unroll
+        for (int l = 0; l < L; l++)
+            s_bx[(k * L + l) * COFAC_THREADS_MAX + tid] = v.v[l];
+    };
+#else
+    mz<L> bx_loc[CF_ECM_NBABY];
+    (void)s_bx; (void)tid;
+    auto load_bx = [&](int k) -> mz<L> { return bx_loc[k]; };
+    auto save_bx = [&](int k, const mz<L> &v) { bx_loc[k] = v; };
+#endif
+
+    mz<L> bz, prod, g;
     mpt<L> step, prev, cur, next;
-    mz<L> prod, g;
+
+    /* Build {1,7,11,13,17,19,23,29}Q and 60Q once (invariant across replay),
+     * then rescale bx[0..7] onto the shared denominator bz = prod Z_k. */
+    {
+        mz<L> bzs[CF_ECM_NBABY], acc, t;
+        mpt<L> q2, q3, q5, q6, q7, q11, q13, q17, q19, q23, q29, q10, q20, q30;
+        save_bx(0, Q->X); bzs[0] = Q->Z;
+        x_dbl<L>(&q2, Q, a24, n, n0inv);
+        x_add<L>(&q3, &q2, Q, Q, n, n0inv);
+        x_add<L>(&q5, &q3, &q2, Q, n, n0inv);
+        x_dbl<L>(&q6, &q3, a24, n, n0inv);
+        x_add<L>(&q7,  &q6,  Q,   &q5,  n, n0inv); save_bx(1, q7.X);  bzs[1] = q7.Z;
+        x_add<L>(&q11, &q6,  &q5, Q,    n, n0inv); save_bx(2, q11.X); bzs[2] = q11.Z;
+        x_add<L>(&q13, &q7,  &q6, Q,    n, n0inv); save_bx(3, q13.X); bzs[3] = q13.Z;
+        x_add<L>(&q17, &q11, &q6, &q5,  n, n0inv); save_bx(4, q17.X); bzs[4] = q17.Z;
+        x_add<L>(&q19, &q13, &q6, &q7,  n, n0inv); save_bx(5, q19.X); bzs[5] = q19.Z;
+        x_add<L>(&q23, &q17, &q6, &q11, n, n0inv); save_bx(6, q23.X); bzs[6] = q23.Z;
+        x_add<L>(&q29, &q23, &q6, &q17, n, n0inv); save_bx(7, q29.X); bzs[7] = q29.Z;
+        x_dbl<L>(&q10, &q5,  a24, n, n0inv);
+        x_dbl<L>(&q20, &q10, a24, n, n0inv);
+        x_add<L>(&q30, &q20, &q10, &q10, n, n0inv);
+        x_dbl<L>(&step, &q30, a24, n, n0inv);
+        (*work) += 15u;
+
+        /* Peeled forward/backward prefix products (4*NBABY - 5 = 27 muls). */
+        acc = bzs[0];
+        for (int k = 1; k < (int)CF_ECM_NBABY; k++) {
+            mz<L> bk = load_bx(k);
+            mz_mul<L>(&t, &bk, &acc, n, n0inv); save_bx(k, t);
+            mz_mul<L>(&t, &acc, &bzs[k], n, n0inv); acc = t;
+        }
+        bz = acc;
+        acc = bzs[CF_ECM_NBABY - 1];
+        for (int k = (int)CF_ECM_NBABY - 2; k >= 0; k--) {
+            mz<L> bk = load_bx(k);
+            mz_mul<L>(&t, &bk, &acc, n, n0inv); save_bx(k, t);
+            if (k > 0) { mz_mul<L>(&t, &acc, &bzs[k], n, n0inv); acc = t; }
+        }
+    }
 
     for (int replay = 0; replay < 2; replay++) {
         prod = *one;
-        {
-            /* Each baby step is built in ONE scratch point, then split into
-             * bx[k] and bzs[k]; bx[] doubles as the running accumulator, so
-             * no separate prefix array is needed.
-             *
-             * This does NOT reduce peak storage, and an earlier version of
-             * this comment wrongly implied it did: an mpt<L> is (X, Z), so
-             * the baby[CF_ECM_NBABY] this replaced was already 2*NBABY mz
-             * values -- exactly what bx[] + bzs[] is. With p, acc, t and gx
-             * live on top, the peak is slightly HIGHER, which is what the
-             * measured scratch 336 -> 384 below is. Deliberately NOT unrolled --
-             * x_mul_s2 is __noinline__, and unrolling its call sites widens
-             * the live range of every argument across all NBABY calls. */
-            mz<L> bzs[CF_ECM_NBABY], acc, t;
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-                const uint32_t scalar = cf_ecm_baby(k);
-                mpt<L> p = *Q;
-                if (scalar != 1)
-                    x_mul_s2<L>(&p, scalar, an, ad, n, n0inv, work);
-                bx[k] = p.X; bzs[k] = p.Z;
-            }
-            /* Forward: bx[k] = X_k * prod_{j<k} Z_j, acc ends at prod_j Z_j. */
-            acc = *one;
-            for (uint32_t k = 0; k < CF_ECM_NBABY; k++) {
-                mz_mul<L>(&t, &bx[k], &acc, n, n0inv); bx[k] = t;
-                mz_mul<L>(&t, &acc, &bzs[k], n, n0inv); acc = t;
-            }
-            bz = acc;
-            /* Backward: acc holds prod_{j>k} Z_j, so this completes each
-             * bx[k] to X_k * prod_{j!=k} Z_j. */
-            acc = *one;
-            for (int k = (int)CF_ECM_NBABY - 1; k >= 0; k--) {
-                mz_mul<L>(&t, &bx[k], &acc, n, n0inv); bx[k] = t;
-                mz_mul<L>(&t, &acc, &bzs[k], n, n0inv); acc = t;
-            }
-        }
-        step = *Q; x_mul_s2<L>(&step, CF_ECM_D, an, ad, n, n0inv, work);
-        prev = step; x_mul_s2<L>(&prev, vmin, an, ad, n, n0inv, work);
-        if (nv > 1) {
-            cur = step;
-            x_mul_s2<L>(&cur, vmin + 1, an, ad, n, n0inv, work);
-        }
+        x_mul_pair<L>(&prev, &cur, &step, vmin, a24, n, n0inv, work);
 
         for (uint32_t vi = 0; vi < nv; vi++) {
             const mpt<L> *G = vi ? &cur : &prev;
@@ -681,8 +929,8 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
                 #pragma unroll
                 for (uint32_t k = 0; k < CF_ECM_NBABY; k++)
                     if (mask & (1u << k)) {
-                        mz<L> b, d;
-                        mz_mul<L>(&b, &bx[k], &G->Z, n, n0inv);
+                        mz<L> bk = load_bx((int)k), b, d;
+                        mz_mul<L>(&b, &bk, &G->Z, n, n0inv);
                         d = gx; mz_sub_mod<L>(&d, &b, n);
                         (*work)++;              /* one selected stage-2 pair */
                         if (replay) {
@@ -697,7 +945,7 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
             }
             if (vi + 1 < nv && vi) {
                 x_add<L>(&next, &cur, &step, &prev, n, n0inv);
-                (*work)++;                       /* one stage-2 giant step */
+                (*work)++;                      /* one stage-2 giant step */
                 prev = cur; cur = next;
             }
         }
@@ -709,16 +957,18 @@ CF_NOINLINE int mz_ecm_stage2_pass(mz<L> *fac, const mpt<L> *Q,
     return 0;
 }
 
-/* One curve of stage 1. `s` holds the prime powers p^e <= B1, ascending.
- * Returns 1 and a nontrivial factor when gcd(Z, n) splits n. */
+/* One curve of ECM (stage 1 via PRAC + optional D = 60 stage 2).
+ * Returns 1 and a nontrivial factor when Suyama inversion, stage 1, or stage 2
+ * splits n. */
 template <int L, int STAGE2>
 CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
-                 const uint32_t *__restrict s, uint32_t ns,
+                 const uint8_t *__restrict prac, uint32_t nprac,
                  const uint8_t *__restrict s2mask, uint32_t s2vmin,
-                 uint32_t s2nv, uint64_t *work)
+                 uint32_t s2nv, uint64_t *work,
+                 uint32_t *s_bx, uint32_t tid)
 {
     const uint32_t n0inv = mz_n0inv(n->v[0]);
-    mz<L> one, sig, u, v, t, w, an, ad, g;
+    mz<L> one, sig, u, v, t, w, an, ad, a24, g;
     mpt<L> P;
 
     #pragma unroll
@@ -751,14 +1001,20 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
     mz_mul<L>(&ad, &w, &v, n, n0inv);                             /* *v       */
     if (mz_is_zero<L>(&ad)) return 0;
 
-    for (uint32_t i = 0; i < ns; i++)
-        x_mul<L>(&P, s[i], &an, &ad, n, n0inv, work);
+    {
+        const int rc = mz_div_mod_mont<L>(&a24, &g, &an, &ad, n, n0inv);
+        if (rc == 1) { *fac = g; return 1; }
+        if (rc < 0) return 0;
+    }
+
+    x_prac_run<L>(&P, prac, nprac, &a24, n, n0inv, work);
 
     mz_gcd<L>(&g, P.Z, *n);
     if (mz_is_one<L>(&g)) {
         if constexpr (STAGE2) {
-            if (mz_ecm_stage2_pass<L>(fac, &P, &an, &ad, &one, n, n0inv,
-                                      s2mask, s2vmin, s2nv, work)) return 1;
+            if (mz_ecm_stage2_pass<L>(fac, &P, &a24, &one, n, n0inv,
+                                      s2mask, s2vmin, s2nv, work,
+                                      s_bx, tid)) return 1;
         }
         return 0;
     }
@@ -793,9 +1049,9 @@ CF_FN int mz_ecm(mz<L> *fac, const mz<L> *n, uint32_t sigma,
 template <int L, int METHOD, int STAGE2>
 CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
                    uint32_t c0, uint32_t budget, uint64_t *out, int *nout,
-                   uint64_t *acc, const uint32_t *__restrict s, uint32_t ns,
+                   uint64_t *acc, const uint8_t *__restrict prac, uint32_t nprac,
                    const uint8_t *__restrict s2mask, uint32_t s2vmin,
-                   uint32_t s2nv)
+                   uint32_t s2nv, uint32_t *s_bx, uint32_t tid)
 {
     mz<L> st[CF_MAXFAC];
     int sp = 0, nf = 0;
@@ -820,8 +1076,8 @@ CF_FN int mz_split(const mz<L> *n0, const mz<L> *lim2, uint32_t lpb,
         } else {
             uint32_t cv = 0;
             for (; cv < budget; cv++)
-                if (mz_ecm<L, STAGE2>(&g, &m, c0 * 1000u + cv + 6u, s, ns,
-                                      s2mask, s2vmin, s2nv, acc)) break;
+                if (mz_ecm<L, STAGE2>(&g, &m, c0 * 1000u + cv + 6u, prac, nprac,
+                                      s2mask, s2vmin, s2nv, acc, s_bx, tid)) break;
             if (cv == budget) { *nout = nf + sp; return CF_INCOMPLETE; }
         }
         mz_divexact<L>(&h, &m, &g);
@@ -887,11 +1143,17 @@ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
                         uint8_t *__restrict status,
                         uint64_t *__restrict fac, uint8_t *__restrict nfac,
                         unsigned long long *__restrict iters,
-                        const uint32_t *__restrict s, uint32_t ns,
+                        const uint8_t *__restrict prac, uint32_t nprac,
                         const uint8_t *__restrict s2mask, uint32_t s2vmin,
                         uint32_t s2nv, uint32_t ibeg, uint32_t iend,
                         uint8_t *__restrict part)
 {
+    /* Striped bank-conflict-free shared memory for D=60 stage-2 baby table
+     * (24 KB at L=3, 32 KB at L=4; 4 B dummy for rho or stage-1-only). */
+    __shared__ uint32_t s_bx_arr[(METHOD == 1 && STAGE2 == 1)
+                                 ? (CF_ECM_NBABY * L * COFAC_THREADS_MAX) : 1];
+    uint32_t *const s_bx = (METHOD == 1 && STAGE2 == 1) ? s_bx_arr : NULL;
+    const uint32_t tid = threadIdx.x;
     /* [ibeg, iend) is this launch's slice of the compacted list; cf_sched_t's
      * `chunk` comment says why the caller may split a round this way. The
      * count is still read on the device, so the host never has to know it and
@@ -911,7 +1173,8 @@ void k_cofac(const mz<L> *__restrict n, mz<L> lim2, uint32_t lpb,
         if (status[t] != CF_INCOMPLETE) continue;
         v = n[t];
         st = mz_split<L, METHOD, STAGE2>(&v, &lim2, lpb, c0, budget, o, &k,
-                                         &acc, s, ns, s2mask, s2vmin, s2nv);
+                                         &acc, prac, nprac, s2mask, s2vmin,
+                                         s2nv, s_bx, tid);
         if (iters) iters[t] += (unsigned long long)acc;   /* summed over rounds */
         /* Sticky: a record that has split once is a record worth more rounds.
          * NULL when the side has no abort rule, so nothing is stored. */
@@ -966,14 +1229,15 @@ __global__ void k_cof_selscatter(uint32_t n, const uint32_t *__restrict flag,
  * So the schedule lives in one place now, parameterised by the two things that
  * actually differ between callers: which method, and how much of it.
  */
-/* One side's ECM plan on the device: stage 1's prime powers up to B1 and the
- * D=30 stage-2 mask for (B1, B2]. One per side since finding 126 -- a 2LP side
- * next to a 3LP one needs about half the 3LP side's B1 -- and shared by the
- * inline queue and the standalone --cofac path, which used to build one plan
- * each, inline. */
+/* One side's ECM plan on the device: stage 1's PRAC Lucas-chain opcodes up to
+ * B1 and the D=60 stage-2 mask for (B1, B2]. One per side since finding 126 --
+ * a 2LP side next to a 3LP one needs about half the 3LP side's B1 -- and shared
+ * by the inline queue and the standalone --cofac path, which used to build one
+ * plan each, inline. */
 typedef struct {
     uint32_t  b1, b2;
-    uint32_t *d_s, ns;
+    uint8_t  *d_prac;
+    uint32_t  nprac, ns;
     uint8_t  *d_s2mask;
     uint32_t  s2vmin, s2nv;
 } cf_ecm_dev_t;
@@ -1135,13 +1399,13 @@ static void cf_run_rounds(const mz<L> *d_n, mz<L> lim2, uint32_t lpb, uint32_t n
                     k_cofac<L, 1, 1><<<blocks, kth>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                        S->ecm->d_s, S->ecm->ns, S->ecm->d_s2mask,
+                        S->ecm->d_prac, S->ecm->nprac, S->ecm->d_s2mask,
                         S->ecm->s2vmin, S->ecm->s2nv, b, e, part);
                 else
                     k_cofac<L, 1, 0><<<blocks, kth>>>(
                         d_n, lim2, lpb, (uint32_t)(r + 1), S->curves,
                         W->d_sel, W->d_nsel, d_status, d_fac, d_nfac, d_iters,
-                        S->ecm->d_s, S->ecm->ns, NULL, 0, 0, b, e, part);
+                        S->ecm->d_prac, S->ecm->nprac, NULL, 0, 0, b, e, part);
             } else {
                 k_cofac<L, 0, 0><<<blocks, kth>>>(
                     d_n, lim2, lpb, (uint32_t)(r + 1), S->budget << r,
@@ -1251,11 +1515,11 @@ static int cf_run_rounds_dyn(int L, const uint32_t *d_n, uint64_t lim,
 #define COF_CHUNK_TARGET_MS   250.0f
 
 /* Giant steps per curve above which cf_ecm_dev_init warns that record
- * chunking can no longer bound a launch. ~18x the derived default's largest
- * (~1,120, at B1 1120) and ~16x below the ~320,000 of the one configuration
- * known to trip a watchdog; see the warning site for why this is a judgement
- * rather than a measurement. */
-#define COF_S2NV_WATCHDOG_WARN  20000u
+ * chunking can no longer bound a launch. At D = 60, ~18x the derived default's
+ * largest (~560, at B1 1120) and ~16x below the ~160,000 of the one
+ * configuration known to trip a watchdog; see the warning site for why this is
+ * a judgement rather than a measurement. */
+#define COF_S2NV_WATCHDOG_WARN  10000u
 
 /* The floor is `blocks * threads`: one record per thread, and never less.
  *
@@ -1311,7 +1575,7 @@ static void cof_report_chunk(uint32_t chunk, uint32_t n, int pinned)
 
 static void cf_ecm_dev_free(cf_ecm_dev_t *E)
 {
-    if (E->d_s) cudaFree(E->d_s);
+    if (E->d_prac) cudaFree(E->d_prac);
     if (E->d_s2mask) cudaFree(E->d_s2mask);
     memset(E, 0, sizeof(*E));
 }
@@ -1322,20 +1586,20 @@ static void cf_ecm_dev_free(cf_ecm_dev_t *E)
 static int cf_ecm_dev_init(cf_ecm_dev_t *E, uint32_t b1, uint32_t b2,
                            uint32_t curves, int side)
 {
-    uint32_t *h_s = NULL;
+    uint8_t *h_prac = NULL;
     uint8_t *h_s2mask = NULL;
     memset(E, 0, sizeof(*E));
     E->b1 = b1; E->b2 = b2;
-    E->ns = cf_ecm_plan(b1, &h_s);
-    if (!E->ns) {
+    E->nprac = cf_ecm_prac_plan(b1, &h_prac, &E->ns);
+    if (!E->nprac) {
         fprintf(stderr, "  cofac: empty ECM plan for B1=%u\n", b1);
         return -1;
     }
-    if (CUDA_CHECKED(cudaMalloc(&E->d_s, (size_t)E->ns * 4)) ||
-        CUDA_CHECKED(cudaMemcpy(E->d_s, h_s, (size_t)E->ns * 4,
+    if (CUDA_CHECKED(cudaMalloc(&E->d_prac, (size_t)E->nprac)) ||
+        CUDA_CHECKED(cudaMemcpy(E->d_prac, h_prac, (size_t)E->nprac,
                                 cudaMemcpyHostToDevice)))
         goto fail;
-    free(h_s); h_s = NULL;
+    free(h_prac); h_prac = NULL;
     if (b2) {
         E->s2nv = cf_ecm_stage2_plan(b1, b2, &E->s2vmin, &h_s2mask);
         if (!E->s2nv) {
@@ -1349,23 +1613,23 @@ static int cf_ecm_dev_init(cf_ecm_dev_t *E, uint32_t b1, uint32_t b2,
             goto fail;
         free(h_s2mask); h_s2mask = NULL;
     }
-    printf("  cofactor queue: side %d ECM B1 = %u, %u prime powers, B2 = %u"
-           " (%u giant steps), %u curves per round\n", side, b1, E->ns, b2,
-           E->s2nv, curves);
+    printf("  cofactor queue: side %d ECM B1 = %u, %u prime powers (%u PRAC ops),"
+           " B2 = %u (%u giant steps), %u curves per round\n", side, b1, E->ns,
+           E->nprac, b2, E->s2nv, curves);
     /* The one thing --cof-chunk cannot bound.
      *
      * Chunking splits the RECORD list, so the smallest launch it can make
      * is one record per thread. A launch therefore never gets shorter than
      * ONE record's own splitting work, and stage 2 is where that can grow
-     * without limit: the giant-step count is B2/30, so a large B2 buys a
+     * without limit: the giant-step count is B2/60, so a large B2 buys a
      * per-record cost no slice size can divide.
      *
      * The auto-derived configuration is nowhere near this -- cof_auto_b1
-     * returns 100..1120, so B2 is 3,000..33,600 and s2nv is ~100..1,120
+     * returns 100..1120, so B2 is 3,000..33,600 and s2nv is ~50..560
      * giant steps -- which is why the default path needs no warning. The
      * one configuration observed to actually trip a device watchdog is
-     * --ecm-b1 400000 (B2 clamped to 10^7, ~320,000 giant steps), which
-     * reproducibly kills the stage-2 kernel on gfx1103 and is why
+     * --ecm-b1 400000 (B2 clamped to 10^7, ~160,000 giant steps at D=60),
+     * which reproducibly kills the stage-2 kernel on gfx1103 and is why
      * cofcheck.sh skips that case on HIP.
      *
      * THE THRESHOLD IS A JUDGEMENT, NOT A MEASUREMENT. The real boundary
@@ -1375,7 +1639,7 @@ static int cf_ecm_dev_init(cf_ecm_dev_t *E, uint32_t b1, uint32_t b2,
      * perfectly well. Do not restate it as a supported limit. */
     if (E->s2nv > COF_S2NV_WATCHDOG_WARN)
         fprintf(stderr, "  cofactor queue: WARNING: side %d: %u giant steps/curve"
-                " x %u curves is far above the derived default (~100-1,120"
+                " x %u curves is far above the derived default (~50-560"
                 " steps at B1 100-1120). --cof-chunk bounds a launch by"
                 " RECORDS and cannot go below one record, so this much"
                 " stage-2 work per record can still exceed a slow device's"
@@ -1385,7 +1649,7 @@ static int cf_ecm_dev_init(cf_ecm_dev_t *E, uint32_t b1, uint32_t b2,
                 " way.\n", side, E->s2nv, curves);
     return 0;
 fail:
-    free(h_s); free(h_s2mask);
+    free(h_prac); free(h_s2mask);
     cf_ecm_dev_free(E);
     return -1;
 }

@@ -327,12 +327,12 @@ static void lookup_tests(void)
 static void card_tests(void)
 {
     static const struct { int maj, min, logI, warp, fill, sfa, sp; } t[] = {
-        {  8, 9, 16, 1024, 589824, 0, 0 },   /* Ada at the NFS@Home shape */
-        {  8, 9, 15, 1024,      0, 0, 0 },   /* C183 at logI 15 lost the grid */
-        {  8, 9, 17, 1024,      0, 0, 0 },
-        {  8, 9, 14, 1024,      0, 0, 0 },
-        {  8, 6, 16,    0, 589824, 0, 0 },   /* the 3060 */
-        {  8, 6, 15,    0,      0, 0, 0 },
+        {  8, 9, 16, 1024, 589824, 0, 1 },   /* Ada at the NFS@Home shape */
+        {  8, 9, 15, 1024,      0, 0, 1 },   /* C183 at logI 15 lost the grid */
+        {  8, 9, 17, 1024,      0, 0, 1 },
+        {  8, 9, 14, 1024,      0, 0, 1 },
+        {  8, 6, 16,    0, 589824, 0, 1 },   /* the 3060 */
+        {  8, 6, 15,    0,      0, 0, 1 },
         { 12, 0, 16,    0,      0, 1, 1 },   /* Blackwell: 5070, 5060 */
         { 12, 0, 13,    0,      0, 1, 1 },   /* bench adds the plan's conditions */
         { 12, 1, 16,    0,      0, 0, 0 },   /* untimed: sm_121 */
